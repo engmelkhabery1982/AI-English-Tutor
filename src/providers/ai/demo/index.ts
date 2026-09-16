@@ -179,6 +179,20 @@ function generateDeterministicOutcome(request: ConversationRequest): Determinist
   }
 
   // 4. Mode-specific & fallback responses
+  if (topic === 'Review Evaluation') {
+    // Generate deterministic JSON for ReviewEvaluator
+    const resultObj = {
+      result: lowerText.includes('dog') ? 'correct' : 'incorrect',
+      feedback: lowerText.includes('dog') ? 'Good job!' : 'Not quite.',
+      explanation: 'Demo explanation.',
+      suggestedCorrection: 'I have a dog'
+    };
+    return {
+      content: JSON.stringify(resultObj),
+      feedback: null
+    };
+  }
+
   if (mode === 'coach') {
     const content = topic
       ? `Good point regarding ${topic}! In coach mode, try expanding your idea with an example or reason. What else can you add?`

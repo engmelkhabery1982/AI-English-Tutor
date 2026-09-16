@@ -8,6 +8,7 @@
 import type { AppRepositories } from '../repositories';
 import type { AIProvider } from '../providers/ai/types';
 import type { LearnerWeakness } from '../domain/models/learner';
+import type { CoachingContext } from '../learner-model';
 import type {
   EvaluationResult,
   ReviewDashboardSummary,
@@ -90,8 +91,9 @@ export class ReviewService {
   async evaluateAnswer(
     candidate: ReviewItemCandidate,
     userAnswer: string,
+    coachingContext?: CoachingContext
   ): Promise<EvaluationResult> {
-    return this.evaluator.evaluate(candidate, userAnswer);
+    return this.evaluator.evaluate(candidate, userAnswer, coachingContext);
   }
 
   /**

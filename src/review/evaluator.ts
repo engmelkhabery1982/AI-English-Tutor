@@ -58,6 +58,7 @@ function isCloseTypo(user: string, target: string): boolean {
 export function evaluateSimpleItemLocally(
   candidate: ReviewItemCandidate,
   userAnswer: string,
+
 ): EvaluationResult {
   const normUser = normalizeText(userAnswer);
   const normExpected = normalizeText(candidate.expectedAnswer);
@@ -106,6 +107,7 @@ export function evaluateSimpleItemLocally(
 export function evaluateOpenEndedLocally(
   candidate: ReviewItemCandidate,
   userAnswer: string,
+
 ): EvaluationResult {
   const normUser = normalizeText(userAnswer);
   const normExpected = normalizeText(candidate.expectedAnswer);
@@ -205,6 +207,8 @@ export class ReviewEvaluator {
   async evaluate(
     candidate: ReviewItemCandidate,
     userAnswer: string,
+    coachingContext?: CoachingContext,
+
   ): Promise<EvaluationResult> {
     // 1. Simple items are always evaluated locally for speed & determinism
     if (
@@ -234,12 +238,12 @@ Evaluate the answer. You MUST respond with ONLY a valid JSON object matching thi
 }
 Important: Do NOT include any numbers, ratings, or percentages. Only qualitative feedback.`;
 
-        const emptyCoachingContext: CoachingContext = {
+        const coachingContextToUse = coachingContext ?? {
           profile: {
             learnerId: candidate.learnerId,
-            displayName: 'Student',
-            currentLevel: 'A1',
-            targetLevel: 'A1',
+            displayName: 'Learner',
+            currentLevel: 'unknown',
+            targetLevel: 'unknown',
             learningGoals: [],
             preferredModes: ['natural'],
           },
@@ -262,7 +266,7 @@ Important: Do NOT include any numbers, ratings, or percentages. Only qualitative
           ],
           mode: 'coach',
           topic: 'Review Evaluation',
-          coachingContext: emptyCoachingContext,
+          coachingContext: coachingContextToUse,
         };
 
         const resultObj = await this.aiProvider.generate(request);
