@@ -111,6 +111,15 @@ export interface ReviewRepository {
   upsert?(
     item: Omit<ReviewItem, 'id' | 'createdAt'> & { id?: string },
   ): Promise<ReviewItem>;
+  /**
+   * Delete review rows that point at a given domain object, restricted to
+   * one item kind. Used e.g. when removing a vocabulary item: its pending
+   * 'vocabulary' review rows must not linger and resurface in Review,
+   * while 'grammar'/'expression'/other reviews remain untouched.
+   * Optional: backends that do not support deletion may omit it.
+   * Returns the number of review rows removed.
+   */
+  deleteByReference?(referenceId: string, kind: ReviewItem['kind']): Promise<number>;
 }
 
 export interface LessonRepository {

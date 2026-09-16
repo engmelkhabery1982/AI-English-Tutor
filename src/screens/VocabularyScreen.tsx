@@ -30,10 +30,9 @@ import type { ViewStyle } from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 
-import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
-import { SQLiteUserProfileRepository } from '../data/local/sqlite/repositories';
 import type { Meaning } from '../domain/shared/types';
 import {
+  createDefaultVocabularyWorkspaceService,
   EMPTY_WORKSPACE_SUMMARY,
   filterWorkspaceEntries,
   resolvePracticeAction,
@@ -129,7 +128,6 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
   const [isDeleting, setIsDeleting] = useState<boolean>(false);
 
   const serviceRef = useRef<VocabularyWorkspaceService | null>(props?.service ?? null);
-  const dbAdapterRef = useRef<DatabaseAdapter | null>(null);
   const initialLoadDoneRef = useRef<boolean>(false);
 
   useEffect(() => {
@@ -141,14 +139,11 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
         return;
       }
       try {
-        const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-        const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-        await adapter.init();
+        // Composition (adapter bootstrap, repositories, learner resolution)
+        // lives behind the workspace factory — the screen owns no DB state.
+        const service = await createDefaultVocabularyWorkspaceService();
         if (!active) return;
-        dbAdapterRef.current = adapter;
-
-        const { createVocabularyWorkspaceService } = await import('../vocabulary-workspace');
-        serviceRef.current = createVocabularyWorkspaceService(adapter);
+        serviceRef.current = service;
 
         if (active) {
           await loadWorkspace(false);
@@ -190,21 +185,9 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
       }
       setLoadError(null);
 
-      if (!dbAdapterRef.current && !props?.service) {
-        // Adapter not ready yet; init() will call again.
-        return;
-      }
-
-      let learnerId: string | null = null;
-      if (dbAdapterRef.current) {
-        const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current);
-        try {
-          const profile = await profileRepo.get();
-          if (profile && profile.id) learnerId = profile.id;
-        } catch {
-          learnerId = null;
-        }
-      }
+      // Learner resolution goes through the service (existing profile
+      // repository behind it) — never fabricated, null when no profile.
+      const learnerId = await service.getActiveLearnerId();
 
       if (!learnerId) {
         setHasNoProfile(true);

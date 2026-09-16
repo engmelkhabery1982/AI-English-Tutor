@@ -14,7 +14,13 @@
 
 import type { IsoDate, Meaning, MeaningReview, UsageExample } from '../domain/shared/types';
 import type { ExpressionItem, VocabularyItem } from '../domain/models/vocabulary';
-import type { ExpressionRepository, VocabularyRepository } from '../repositories';
+import type {
+  ExpressionRepository,
+  ReviewRepository,
+  UserProfileRepository,
+  VocabularyRepository,
+} from '../repositories';
+import type { ReviewItem } from '../domain/models/learning';
 import type { ReviewService } from '../review/service';
 import type {
   PracticeAction,
@@ -176,6 +182,16 @@ export interface VocabularyWorkspaceRepositories {
 export interface VocabularyWorkspaceServiceDeps extends VocabularyWorkspaceRepositories {
   /** The EXISTING Adaptive Review service, used for practice availability. */
   readonly review?: Pick<ReviewService, 'planSession'>;
+  /**
+   * The EXISTING profile repository, used to resolve the active learner.
+   * Composition-owned so UI screens never need database access.
+   */
+  readonly profile?: Pick<UserProfileRepository, 'get'>;
+  /**
+   * The EXISTING review repository, used to remove review rows that point
+   * at a lexical item when that item is deleted.
+   */
+  readonly reviewCleanup?: Pick<ReviewRepository, 'deleteByReference'>;
 }
 
 export class VocabularyWorkspaceService {
@@ -253,7 +269,27 @@ export class VocabularyWorkspaceService {
   }
 
   /**
-   * Delete an item through the existing repository layer.
+   * Resolve the active learner through the existing profile repository.
+   * Returns null when no profile exists yet — the caller must show an
+   * honest "no profile" state; learner IDs are never fabricated.
+   */
+  async getActiveLearnerId(): Promise<string | null> {
+    if (!this.deps.profile) return null;
+    try {
+      const profile = await this.deps.profile.get();
+      if (profile && profile.id) return profile.id;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Delete an item through the existing repository layer. Any review rows
+   * that point at this exact lexical item (same referenceId, same kind) are
+   * cleaned through the review repository first, so no orphaned review item
+   * resurfaces in the Review flow afterwards. Kind-restricted cleanup means
+   * unrelated grammar/weakness/other reviews are never touched.
    * Throws when the repository does not support deletion; callers must
    * treat any error as "item remains".
    */
@@ -262,6 +298,15 @@ export class VocabularyWorkspaceService {
     if (!repo.delete) {
       throw new Error('Deleting is not supported by the current repository.');
     }
+
+    // Clean dependent review rows before removing the item itself.
+    if (this.deps.reviewCleanup?.deleteByReference) {
+      await this.deps.reviewCleanup.deleteByReference(
+        entry.entryId,
+        entry.kind as ReviewItem['kind'],
+      );
+    }
+
     return repo.delete(entry.entryId);
   }
 

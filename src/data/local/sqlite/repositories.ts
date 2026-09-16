@@ -2499,6 +2499,29 @@ export class SQLiteReviewRepository implements ReviewRepository {
     if (!updated) throw new Error('Review item disappeared after update');
     return updated;
   }
+
+  /**
+   * Delete review rows pointing at a domain object, restricted to one kind,
+   * together with their review_history rows. Kind-restricted by design so
+   * unrelated grammar/weakness/expression reviews are never touched.
+   * Returns the number of review_items rows removed.
+   */
+  async deleteByReference(referenceId: string, kind: ReviewItem['kind']): Promise<number> {
+    if (!isValidUuid(referenceId)) return 0;
+
+    await this.adapter.execute(
+      `DELETE FROM review_history WHERE review_item_id IN (
+        SELECT id FROM review_items WHERE reference_id = ? AND kind = ?
+      )`,
+      [referenceId, kind],
+    );
+
+    const result = await this.adapter.execute(
+      `DELETE FROM review_items WHERE reference_id = ? AND kind = ?`,
+      [referenceId, kind],
+    );
+    return result.rowsAffected;
+  }
 }
 
 /** Map progress_records row to ProgressRecord domain object. */

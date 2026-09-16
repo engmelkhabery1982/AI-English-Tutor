@@ -68,10 +68,13 @@ async function createContext(): Promise<TestContext> {
 
   const vocabulary = new SQLiteVocabularyRepository(adapter);
   const expressions = new SQLiteExpressionRepository(adapter);
+  const reviewRepo = new SQLiteReviewRepository(adapter);
   const service = new VocabularyWorkspaceService({
     vocabulary,
     expressions,
     review: buildReviewService(adapter),
+    profile: profileRepo,
+    reviewCleanup: reviewRepo,
   });
 
   return { adapter, learnerId: profile.id, vocabulary, expressions, service };
@@ -660,6 +663,145 @@ describe('Vocabulary & Expressions Workspace', () => {
       'not supported',
     );
     expect(await ctx.vocabulary.get(saved.id)).not.toBeNull();
+  });
+
+  // --- 3. DELETE INTEGRITY: no orphaned review rows resurface in Review ---
+  it('16c. deleting a lexical item removes its review rows and history but keeps unrelated reviews', async () => {
+    const reviewRepo = new SQLiteReviewRepository(ctx.adapter);
+
+    // Two lexical items, each with a pending review item (as Talk saves do).
+    const target = await saveVocabItem(ctx, { headword: 'target word' });
+    const other = await saveVocabItem(ctx, { headword: 'other word' });
+    const expression = await saveExpressionItem(ctx);
+
+    await reviewRepo.upsert({
+      learnerId: ctx.learnerId,
+      kind: 'vocabulary',
+      referenceId: target.id, // relevant: must be removed with the item
+      prompt: 'What word matches this definition?',
+      expectedResponse: 'target word',
+      state: 'learning',
+      dueAt: NOW,
+      reviewCount: 0,
+      consecutiveCorrect: 0,
+      outcomeHistory: [],
+    });
+    await reviewRepo.upsert({
+      learnerId: ctx.learnerId,
+      kind: 'vocabulary',
+      referenceId: other.id, // unrelated vocab review: must remain
+      prompt: 'What word matches this definition?',
+      expectedResponse: 'other word',
+      state: 'learning',
+      dueAt: NOW,
+      reviewCount: 0,
+      consecutiveCorrect: 0,
+      outcomeHistory: [],
+    });
+    await reviewRepo.upsert({
+      learnerId: ctx.learnerId,
+      kind: 'expression',
+      referenceId: expression.id, // unrelated expression review: must remain
+      prompt: 'Complete the expression.',
+      expectedResponse: 'hit the nail on the head',
+      state: 'learning',
+      dueAt: NOW,
+      reviewCount: 0,
+      consecutiveCorrect: 0,
+      outcomeHistory: [],
+    });
+    await reviewRepo.upsert({
+      learnerId: ctx.learnerId,
+      kind: 'grammar',
+      referenceId: '0d8b29d6-1c3e-4a2f-9b7d-5e6f8091a2b3', // weakness review: must remain
+      prompt: 'Correct the mistake in this sentence: "Yesterday I go".',
+      expectedResponse: 'Yesterday I went',
+      state: 'learning',
+      dueAt: NOW,
+      reviewCount: 0,
+      consecutiveCorrect: 0,
+      outcomeHistory: [],
+    });
+
+    // Give both the target review and the unrelated grammar review history rows.
+    const allBefore = await reviewRepo.list(ctx.learnerId);
+    const targetReview = allBefore.find((r) => r.referenceId === target.id);
+    const grammarReview = allBefore.find((r) => r.kind === 'grammar');
+    expect(targetReview).toBeDefined();
+    expect(grammarReview).toBeDefined();
+    await reviewRepo.markReviewed(targetReview!.id, 'partial', 'so close');
+    await reviewRepo.markReviewed(grammarReview!.id, 'correct', 'nice');
+
+    // Delete the lexical item through the workspace service.
+    const deleted = await ctx.service.deleteEntry({ entryId: target.id, kind: 'vocabulary' });
+    expect(deleted).toBe(true);
+
+    // 1) Lexical item gone.
+    expect(await ctx.vocabulary.get(target.id)).toBeNull();
+
+    // 2) Its review item gone (no orphan resurfacing in Review)...
+    const remaining = await reviewRepo.list(ctx.learnerId);
+    expect(remaining.some((r) => r.referenceId === target.id)).toBe(false);
+
+    // 3) ...along with its review_history rows.
+    const targetHistory = await ctx.adapter.query(
+      `SELECT * FROM review_history WHERE review_item_id = ?`,
+      [targetReview!.id],
+    );
+    expect(targetHistory).toHaveLength(0);
+
+    // 4) Unrelated reviews remain: other vocab, expression, grammar...
+    expect(remaining.some((r) => r.referenceId === other.id && r.kind === 'vocabulary')).toBe(true);
+    expect(remaining.some((r) => r.referenceId === expression.id && r.kind === 'expression')).toBe(true);
+    expect(remaining.some((r) => r.id === grammarReview!.id && r.kind === 'grammar')).toBe(true);
+
+    // 5) ...including their history (the grammar history must survive).
+    const grammarHistory = await ctx.adapter.query(
+      `SELECT * FROM review_history WHERE review_item_id = ?`,
+      [grammarReview!.id],
+    );
+    expect(grammarHistory.length).toBeGreaterThan(0);
+
+    // 6) The surviving lexical items are untouched.
+    expect(await ctx.vocabulary.get(other.id)).not.toBeNull();
+    expect(await ctx.expressions.get(expression.id)).not.toBeNull();
+  });
+
+  it('16d. deleting without review-cleanup wiring still removes the item (graceful degradation)', async () => {
+    const saved = await saveVocabItem(ctx);
+    const reviewRepo = new SQLiteReviewRepository(ctx.adapter);
+    await reviewRepo.upsert({
+      learnerId: ctx.learnerId,
+      kind: 'vocabulary',
+      referenceId: saved.id,
+      prompt: 'prompt',
+      expectedResponse: 'run',
+      state: 'learning',
+      dueAt: NOW,
+      reviewCount: 0,
+      consecutiveCorrect: 0,
+      outcomeHistory: [],
+    });
+
+    const bareService = new VocabularyWorkspaceService({
+      vocabulary: ctx.vocabulary,
+      expressions: ctx.expressions,
+    });
+    expect(await bareService.deleteEntry({ entryId: saved.id, kind: 'vocabulary' })).toBe(true);
+    expect(await ctx.vocabulary.get(saved.id)).toBeNull();
+  });
+
+  // --- 2b. LEARNER RESOLUTION LIVES BEHIND THE SERVICE ---
+  it('2b. getActiveLearnerId resolves the real profile and never fabricates one', async () => {
+    await expect(ctx.service.getActiveLearnerId()).resolves.toBe(ctx.learnerId);
+  });
+
+  it('2c. a service composed without a profile repository reports no learner', async () => {
+    const bareService = new VocabularyWorkspaceService({
+      vocabulary: ctx.vocabulary,
+      expressions: ctx.expressions,
+    });
+    await expect(bareService.getActiveLearnerId()).resolves.toBeNull();
   });
 
   // --- 17. TALK-SAVED VOCABULARY APPEARS ---
