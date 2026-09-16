@@ -189,9 +189,19 @@ export interface VocabularyWorkspaceServiceDeps extends VocabularyWorkspaceRepos
   readonly profile?: Pick<UserProfileRepository, 'get'>;
   /**
    * The EXISTING review repository, used to remove review rows that point
-   * at a lexical item when that item is deleted.
+   * at a lexical item when that item is deleted (non-atomic fallback path).
    */
   readonly reviewCleanup?: Pick<ReviewRepository, 'deleteByReference'>;
+  /**
+   * Atomic data-layer delete: removes the lexical item AND its matching
+   * review rows (same referenceId + same kind) in ONE adapter transaction.
+   * Provided by composition (see vocabulary-workspace/index.ts); when
+   * absent, deleteEntry degrades to the non-atomic repository path.
+   */
+  readonly atomicDelete?: (
+    lexicalItemId: string,
+    kind: WorkspaceItemKind,
+  ) => Promise<boolean>;
 }
 
 export class VocabularyWorkspaceService {
@@ -285,15 +295,22 @@ export class VocabularyWorkspaceService {
   }
 
   /**
-   * Delete an item through the existing repository layer. Any review rows
-   * that point at this exact lexical item (same referenceId, same kind) are
-   * cleaned through the review repository first, so no orphaned review item
-   * resurfaces in the Review flow afterwards. Kind-restricted cleanup means
-   * unrelated grammar/weakness/other reviews are never touched.
-   * Throws when the repository does not support deletion; callers must
-   * treat any error as "item remains".
+   * Delete an item through the data layer. Preferred path: one atomic
+   * adapter transaction removes the lexical item AND its matching review
+   * rows (same referenceId, same kind) together — if any step fails,
+   * everything rolls back and nothing is lost or half-deleted. Only when
+   * no atomic delete is composed does this degrade to the non-atomic
+   * repository path (review cleanup, then item delete).
+   * Throws when deletion is not supported; callers must treat any error
+   * as "item remains".
    */
   async deleteEntry(entry: { entryId: string; kind: WorkspaceItemKind }): Promise<boolean> {
+    // Preferred: single atomic transaction in the data layer.
+    if (this.deps.atomicDelete) {
+      return this.deps.atomicDelete(entry.entryId, entry.kind);
+    }
+
+    // Fallback for compositions without transaction support (non-atomic).
     const repo = entry.kind === 'expression' ? this.deps.expressions : this.deps.vocabulary;
     if (!repo.delete) {
       throw new Error('Deleting is not supported by the current repository.');

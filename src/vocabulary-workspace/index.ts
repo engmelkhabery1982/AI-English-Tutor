@@ -18,6 +18,7 @@ import {
   SQLiteVocabularyRepository,
   SQLiteExpressionRepository,
   SQLiteReviewRepository,
+  deleteLexicalItemWithReviews,
 } from '../data/local/sqlite/repositories';
 import { createReviewService } from '../review/factory';
 import { VocabularyWorkspaceService } from './service';
@@ -28,8 +29,8 @@ export * from './service';
 /**
  * Compose a VocabularyWorkspaceService on top of the existing SQLite
  * repositories and the existing Adaptive Review service factory.
- * Learner resolution and review-row cleanup go through the same
- * repository layer.
+ * Learner resolution and the atomic item+review delete go through the
+ * same data layer.
  */
 export function createVocabularyWorkspaceService(
   adapter: DatabaseAdapter,
@@ -40,6 +41,9 @@ export function createVocabularyWorkspaceService(
     review: createReviewService(adapter),
     profile: new SQLiteUserProfileRepository(adapter),
     reviewCleanup: new SQLiteReviewRepository(adapter),
+    // Atomic delete: lexical item + matching review rows in ONE transaction.
+    atomicDelete: (lexicalItemId, kind) =>
+      deleteLexicalItemWithReviews(adapter, lexicalItemId, kind),
   });
 }
 

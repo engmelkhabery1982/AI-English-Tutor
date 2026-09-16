@@ -26,6 +26,7 @@ import {
   SQLiteExpressionRepository,
   SQLiteReviewRepository,
   SQLiteProgressRepository,
+  deleteLexicalItemWithReviews,
 } from '../data/local/sqlite/repositories';
 import { ReviewService } from '../review/service';
 import { createVocabularyPersistenceService } from '../talk-demo/vocabulary-persistence';
@@ -75,6 +76,9 @@ async function createContext(): Promise<TestContext> {
     review: buildReviewService(adapter),
     profile: profileRepo,
     reviewCleanup: reviewRepo,
+    // Same wiring the real composition uses: atomic item+review delete.
+    atomicDelete: (lexicalItemId, kind) =>
+      deleteLexicalItemWithReviews(adapter, lexicalItemId, kind),
   });
 
   return { adapter, learnerId: profile.id, vocabulary, expressions, service };
@@ -789,6 +793,120 @@ describe('Vocabulary & Expressions Workspace', () => {
     });
     expect(await bareService.deleteEntry({ entryId: saved.id, kind: 'vocabulary' })).toBe(true);
     expect(await ctx.vocabulary.get(saved.id)).toBeNull();
+  });
+
+  // --- 3b. ATOMICITY: a mid-transaction failure rolls back everything ---
+  it('16e. a forced delete failure inside the transaction rolls back item, review rows and history', async () => {
+    const reviewRepo = new SQLiteReviewRepository(ctx.adapter);
+
+    // lexical item exists…
+    const saved = await saveVocabItem(ctx, { headword: 'atomic word' });
+    // …with a related review item…
+    await reviewRepo.upsert({
+      learnerId: ctx.learnerId,
+      kind: 'vocabulary',
+      referenceId: saved.id,
+      prompt: 'What word matches this definition?',
+      expectedResponse: 'atomic word',
+      state: 'learning',
+      dueAt: NOW,
+      reviewCount: 0,
+      consecutiveCorrect: 0,
+      outcomeHistory: [],
+    });
+    // …that already has review history.
+    const reviewBefore = (await reviewRepo.list(ctx.learnerId)).find(
+      (r) => r.referenceId === saved.id,
+    );
+    expect(reviewBefore).toBeDefined();
+    await reviewRepo.markReviewed(reviewBefore!.id, 'correct', 'history row');
+
+    const historyBefore = await ctx.adapter.query(
+      `SELECT * FROM review_history WHERE review_item_id = ?`,
+      [reviewBefore!.id],
+    );
+    expect(historyBefore.length).toBeGreaterThan(0);
+
+    // Force a failure INSIDE the real transaction: the adapter forwards
+    // every call to the real SQLite adapter but appends one poisoned step
+    // after the production delete steps, so the production steps have all
+    // executed when the failure fires and the real ROLLBACK path runs.
+    const poisoningAdapter: DatabaseAdapter = {
+      backend: ctx.adapter.backend,
+      path: ctx.adapter.path,
+      connected: ctx.adapter.connected,
+      init: () => ctx.adapter.init(),
+      execute: (sql, params) => ctx.adapter.execute(sql, params),
+      query: (sql, params) => ctx.adapter.query(sql, params),
+      close: () => ctx.adapter.close(),
+      transaction: (steps) =>
+        ctx.adapter.transaction([
+          ...steps,
+          { sql: 'DELETE FROM table_that_does_not_exist' },
+        ]),
+    };
+
+    const failingService = new VocabularyWorkspaceService({
+      vocabulary: ctx.vocabulary,
+      expressions: ctx.expressions,
+      atomicDelete: (lexicalItemId, kind) =>
+        deleteLexicalItemWithReviews(poisoningAdapter, lexicalItemId, kind),
+    });
+
+    await expect(
+      failingService.deleteEntry({ entryId: saved.id, kind: 'vocabulary' }),
+    ).rejects.toThrow();
+
+    // Nothing was lost: lexical item still exists…
+    expect(await ctx.vocabulary.get(saved.id)).not.toBeNull();
+
+    // …related review still exists…
+    const reviewAfter = (await reviewRepo.list(ctx.learnerId)).find(
+      (r) => r.referenceId === saved.id,
+    );
+    expect(reviewAfter).toBeDefined();
+
+    // …and review history still exists.
+    const historyAfter = await ctx.adapter.query(
+      `SELECT * FROM review_history WHERE review_item_id = ?`,
+      [reviewBefore!.id],
+    );
+    expect(historyAfter.length).toBe(historyBefore.length);
+
+    // The un-poisoned atomic delete still succeeds afterwards.
+    expect(await ctx.service.deleteEntry({ entryId: saved.id, kind: 'vocabulary' })).toBe(true);
+    expect(await ctx.vocabulary.get(saved.id)).toBeNull();
+    expect(
+      (await reviewRepo.list(ctx.learnerId)).some((r) => r.referenceId === saved.id),
+    ).toBe(false);
+  });
+
+  it('16f. the non-atomic fallback (cleanup then delete) still works when no atomic delete is composed', async () => {
+    const reviewRepo = new SQLiteReviewRepository(ctx.adapter);
+    const saved = await saveVocabItem(ctx, { headword: 'fallback word' });
+    await reviewRepo.upsert({
+      learnerId: ctx.learnerId,
+      kind: 'vocabulary',
+      referenceId: saved.id,
+      prompt: 'prompt',
+      expectedResponse: 'fallback word',
+      state: 'learning',
+      dueAt: NOW,
+      reviewCount: 0,
+      consecutiveCorrect: 0,
+      outcomeHistory: [],
+    });
+
+    const fallbackService = new VocabularyWorkspaceService({
+      vocabulary: ctx.vocabulary,
+      expressions: ctx.expressions,
+      reviewCleanup: reviewRepo,
+    });
+    expect(await fallbackService.deleteEntry({ entryId: saved.id, kind: 'vocabulary' })).toBe(true);
+    expect(await ctx.vocabulary.get(saved.id)).toBeNull();
+    expect(
+      (await reviewRepo.list(ctx.learnerId)).some((r) => r.referenceId === saved.id),
+    ).toBe(false);
   });
 
   // --- 2b. LEARNER RESOLUTION LIVES BEHIND THE SERVICE ---

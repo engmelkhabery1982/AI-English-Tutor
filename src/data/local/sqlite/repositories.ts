@@ -1460,6 +1460,63 @@ async function replaceLexicalMeanings(
   }
 }
 
+/**
+ * Atomically delete a lexical item together with every review row that
+ * points at it (same referenceId + same kind only), including the dependent
+ * review_history rows. All deletes run in ONE adapter transaction: if any
+ * step fails, the adapter rolls everything back and the lexical item, its
+ * review items, and their history all remain exactly as before.
+ *
+ * Unrelated reviews (other referenceIds or other kinds — grammar,
+ * weakness, pronunciation, other lexical items) are never touched.
+ *
+ * Returns true when the lexical item existed and was deleted; returns
+ * false (without touching anything) when it did not exist.
+ */
+async function deleteLexicalItemWithReviews(
+  adapter: DatabaseAdapter,
+  lexicalItemId: string,
+  kind: 'vocabulary' | 'expression',
+): Promise<boolean> {
+  if (!isValidUuid(lexicalItemId)) return false;
+
+  const existing = await adapter.query(
+    `SELECT id FROM lexical_items WHERE id = ?`,
+    [lexicalItemId],
+  );
+  if (existing.length === 0) return false;
+
+  await adapter.transaction([
+    // Review history of the matching review rows first.
+    {
+      sql: `DELETE FROM review_history WHERE review_item_id IN (
+        SELECT id FROM review_items WHERE reference_id = ? AND kind = ?
+      )`,
+      params: [lexicalItemId, kind],
+    },
+    // The review rows themselves — same referenceId AND same kind only.
+    {
+      sql: `DELETE FROM review_items WHERE reference_id = ? AND kind = ?`,
+      params: [lexicalItemId, kind],
+    },
+    // Then the lexical item and its children.
+    {
+      sql: `DELETE FROM lexical_examples WHERE lexical_item_id = ?`,
+      params: [lexicalItemId],
+    },
+    {
+      sql: `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
+      params: [lexicalItemId],
+    },
+    {
+      sql: `DELETE FROM lexical_items WHERE id = ?`,
+      params: [lexicalItemId],
+    },
+  ]);
+
+  return true;
+}
+
 /** Build partial UPDATE SQL and params for a lexical item. */
 function buildLexicalItemUpdate(
   id: string,
@@ -2632,3 +2689,5 @@ export class SQLiteProgressRepository implements ProgressRepository {
     return rows.length > 0 ? rowToProgressRecord(rows[0]) : null;
   }
 }
+
+export { deleteLexicalItemWithReviews };
