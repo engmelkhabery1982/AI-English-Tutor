@@ -12,6 +12,11 @@ import type {
   UserProfile,
 } from '../domain/models/learner';
 import type {
+  CefrLevelInput,
+  ConversationMode,
+  IsoDate,
+  MasteryState,
+  Uuid,
   WeaknessStatus,
 } from '../domain/shared/types';
 import type {
@@ -23,6 +28,69 @@ import type {
   ReviewItem,
 } from '../domain/models/learning';
 import type { AppRepositories } from '../repositories';
+
+export interface CoachingProfile {
+  readonly learnerId: Uuid;
+  readonly displayName: string;
+  readonly currentLevel: CefrLevelInput;
+  readonly targetLevel: CefrLevelInput;
+  readonly learningGoals: readonly string[];
+  readonly preferredModes: readonly ConversationMode[];
+}
+
+export interface CoachingActiveWeakness {
+  readonly id: Uuid;
+  readonly type: LearnerWeakness['type'];
+  readonly referenceId: Uuid;
+  readonly status: WeaknessStatus;
+  readonly severity: number;
+  readonly occurrenceCount: number;
+  readonly contexts: readonly string[];
+}
+
+export interface CoachingStrength {
+  readonly id: Uuid;
+  readonly type: LearnerStrength['type'];
+  readonly referenceId: Uuid;
+  readonly confidence: number;
+  readonly contexts: readonly string[];
+}
+
+export interface CoachingVocabularyFocus {
+  readonly itemId: Uuid;
+  readonly headword: string;
+  readonly type: VocabularyItem['type'];
+  readonly meaningDefinition: string;
+  readonly reviewState: MasteryState | null;
+  readonly nextReviewAt: IsoDate | null;
+}
+
+export interface CoachingExpressionFocus {
+  readonly itemId: Uuid;
+  readonly expression: string;
+  readonly type: ExpressionItem['type'];
+  readonly meaningDefinition: string;
+  readonly reviewState: MasteryState | null;
+  readonly nextReviewAt: IsoDate | null;
+}
+
+export interface CoachingContext {
+  readonly profile: CoachingProfile;
+  readonly activeWeaknesses: readonly CoachingActiveWeakness[];
+  readonly strengths: readonly CoachingStrength[];
+  readonly vocabularyFocus: readonly CoachingVocabularyFocus[];
+  readonly expressionFocus: readonly CoachingExpressionFocus[];
+  readonly recentProgress: ProgressRecord | null;
+  readonly dueReviewCount: number;
+  readonly generatedAt: IsoDate;
+}
+
+export interface CoachingContextOptions {
+  readonly weaknessLimit?: number;
+  readonly strengthLimit?: number;
+  readonly vocabularyLimit?: number;
+  readonly expressionLimit?: number;
+}
 
 export interface WeaknessSummary {
   readonly total: number;
@@ -142,6 +210,12 @@ export interface LearnerModel {
    * Combines all current summary metrics and loaded queue counts into a unified view.
    */
   getDashboardSnapshot(): DashboardSnapshot;
+
+  /**
+   * Coaching context query:
+   * Returns a compact, deterministic, read-only learner context for coaching and conversation.
+   */
+  getCoachingContext(options?: CoachingContextOptions): CoachingContext;
 }
 
 /** Factory signature for creating a LearnerModel bound to repositories. */
@@ -234,6 +308,121 @@ function summarizeLexicalItems(
     masteredMeanings,
     dueMeanings,
   };
+}
+
+function parseIsoTime(iso?: unknown): number | null {
+  if (typeof iso !== 'string' || !iso) {
+    return null;
+  }
+  const time = Date.parse(iso);
+  return Number.isNaN(time) ? null : time;
+}
+
+function applyPositiveLimit<T>(items: readonly T[], limit?: number): readonly T[] {
+  if (typeof limit === 'number' && Number.isInteger(limit) && limit > 0) {
+    return items.slice(0, limit);
+  }
+  return items;
+}
+
+function buildVocabularyFocus(
+  items: readonly VocabularyItem[],
+  nowMs: number,
+  limit?: number,
+): readonly CoachingVocabularyFocus[] {
+  const dueEntries: CoachingVocabularyFocus[] = [];
+  const nonDueEntries: CoachingVocabularyFocus[] = [];
+  const seenKeys = new Set<string>();
+
+  for (const item of items) {
+    if (!item.meanings || !Array.isArray(item.meanings)) continue;
+    for (const meaning of item.meanings) {
+      if (!meaning || typeof meaning.definition !== 'string') continue;
+      const key = `${item.id}:::${meaning.definition}`;
+      if (seenKeys.has(key)) continue;
+
+      const review = meaning.review;
+      const nextReviewTime = parseIsoTime(review?.nextReviewAt);
+      const isDue = nextReviewTime !== null && nextReviewTime <= nowMs;
+      const reviewState = review?.state;
+      const isNotMastered = !reviewState || reviewState !== 'mastered';
+
+      if (isDue) {
+        seenKeys.add(key);
+        dueEntries.push({
+          itemId: item.id,
+          headword: item.headword,
+          type: item.type,
+          meaningDefinition: meaning.definition,
+          reviewState: reviewState ?? null,
+          nextReviewAt: review?.nextReviewAt ?? null,
+        });
+      } else if (isNotMastered) {
+        seenKeys.add(key);
+        nonDueEntries.push({
+          itemId: item.id,
+          headword: item.headword,
+          type: item.type,
+          meaningDefinition: meaning.definition,
+          reviewState: reviewState ?? null,
+          nextReviewAt: review?.nextReviewAt ?? null,
+        });
+      }
+    }
+  }
+
+  const combined = [...dueEntries, ...nonDueEntries];
+  return applyPositiveLimit(combined, limit);
+}
+
+function buildExpressionFocus(
+  items: readonly ExpressionItem[],
+  nowMs: number,
+  limit?: number,
+): readonly CoachingExpressionFocus[] {
+  const dueEntries: CoachingExpressionFocus[] = [];
+  const nonDueEntries: CoachingExpressionFocus[] = [];
+  const seenKeys = new Set<string>();
+
+  for (const item of items) {
+    if (!item.meanings || !Array.isArray(item.meanings)) continue;
+    for (const meaning of item.meanings) {
+      if (!meaning || typeof meaning.definition !== 'string') continue;
+      const key = `${item.id}:::${meaning.definition}`;
+      if (seenKeys.has(key)) continue;
+
+      const review = meaning.review;
+      const nextReviewTime = parseIsoTime(review?.nextReviewAt);
+      const isDue = nextReviewTime !== null && nextReviewTime <= nowMs;
+      const reviewState = review?.state;
+      const isNotMastered = !reviewState || reviewState !== 'mastered';
+
+      if (isDue) {
+        seenKeys.add(key);
+        dueEntries.push({
+          itemId: item.id,
+          expression: item.expression,
+          type: item.type,
+          meaningDefinition: meaning.definition,
+          reviewState: reviewState ?? null,
+          nextReviewAt: review?.nextReviewAt ?? null,
+        });
+      } else if (isNotMastered) {
+        seenKeys.add(key);
+        nonDueEntries.push({
+          itemId: item.id,
+          expression: item.expression,
+          type: item.type,
+          meaningDefinition: meaning.definition,
+          reviewState: reviewState ?? null,
+          nextReviewAt: review?.nextReviewAt ?? null,
+        });
+      }
+    }
+  }
+
+  const combined = [...dueEntries, ...nonDueEntries];
+  return applyPositiveLimit(combined, limit);
 }
 
 class ReadOnlyLearnerModel implements LearnerModel {
@@ -398,6 +587,69 @@ class ReadOnlyLearnerModel implements LearnerModel {
       expressionSummary: this.getExpressionSummary(),
       progressSummary: this.getProgressSummary(),
       dueReviewCount: this.snapshot.reviewQueue.length,
+    };
+  }
+
+  getCoachingContext(options?: CoachingContextOptions): CoachingContext {
+    const generatedAt = new Date().toISOString();
+    const nowMs = Date.parse(generatedAt);
+
+    const profile: CoachingProfile = {
+      learnerId: this.snapshot.profile.id,
+      displayName: this.snapshot.profile.displayName,
+      currentLevel: this.snapshot.profile.currentLevel,
+      targetLevel: this.snapshot.profile.targetLevel,
+      learningGoals: [...this.snapshot.profile.learningGoals],
+      preferredModes: [...this.snapshot.profile.preferredModes],
+    };
+
+    const activeWeaknessesList: CoachingActiveWeakness[] = this.getActiveWeaknesses().map((w) => ({
+      id: w.id,
+      type: w.type,
+      referenceId: w.referenceId,
+      status: w.status,
+      severity: w.severity,
+      occurrenceCount: w.occurrenceCount,
+      contexts: [...w.contexts],
+    }));
+    const activeWeaknesses = applyPositiveLimit(activeWeaknessesList, options?.weaknessLimit);
+
+    const strengthsList: CoachingStrength[] = this.snapshot.strengths.map((s) => ({
+      id: s.id,
+      type: s.type,
+      referenceId: s.referenceId,
+      confidence: s.confidence,
+      contexts: [...s.contexts],
+    }));
+    const strengths = applyPositiveLimit(strengthsList, options?.strengthLimit);
+
+    const vocabularyFocus = buildVocabularyFocus(
+      this.snapshot.vocabulary,
+      nowMs,
+      options?.vocabularyLimit,
+    );
+
+    const expressionFocus = buildExpressionFocus(
+      this.snapshot.expressions,
+      nowMs,
+      options?.expressionLimit,
+    );
+
+    const recentProgress: ProgressRecord | null = this.snapshot.latestProgress
+      ? { ...this.snapshot.latestProgress }
+      : null;
+
+    const dueReviewCount = this.snapshot.reviewQueue.length;
+
+    return {
+      profile,
+      activeWeaknesses,
+      strengths,
+      vocabularyFocus,
+      expressionFocus,
+      recentProgress,
+      dueReviewCount,
+      generatedAt,
     };
   }
 
