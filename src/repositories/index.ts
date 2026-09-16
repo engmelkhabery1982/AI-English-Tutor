@@ -79,6 +79,12 @@ export interface VocabularyRepository {
   list(learnerId: string, opts?: { state?: string; limit?: number }): Promise<readonly VocabularyItem[]>;
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly VocabularyItem[]>;
   update(id: string, patch: Partial<Omit<VocabularyItem, 'id' | 'createdAt'>>): Promise<VocabularyItem>;
+  /**
+   * Permanently remove a vocabulary item and all of its meanings/examples.
+   * Optional: backends that do not support deletion may omit it.
+   * Returns true when a row was deleted, false when the item did not exist.
+   */
+  delete?(id: string): Promise<boolean>;
 }
 
 export interface ExpressionRepository {
@@ -87,6 +93,12 @@ export interface ExpressionRepository {
   list(learnerId: string, opts?: { limit?: number }): Promise<readonly ExpressionItem[]>;
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly ExpressionItem[]>;
   update(id: string, patch: Partial<Omit<ExpressionItem, 'id' | 'createdAt'>>): Promise<ExpressionItem>;
+  /**
+   * Permanently remove an expression item and all of its meanings/examples.
+   * Optional: backends that do not support deletion may omit it.
+   * Returns true when a row was deleted, false when the item did not exist.
+   */
+  delete?(id: string): Promise<boolean>;
 }
 
 export interface ReviewRepository {

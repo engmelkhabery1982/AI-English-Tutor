@@ -1368,6 +1368,98 @@ async function fetchExamplesForMeaning(
   }));
 }
 
+/**
+ * Delete a lexical item (vocabulary word or expression) and all dependent
+ * rows. Children are deleted explicitly so correctness does not depend on
+ * PRAGMA foreign_keys being enabled. Existence is checked up front so the
+ * boolean result is reliable across backends regardless of how each
+ * adapter reports rowsAffected for DELETE. Returns true when the item
+ * row existed.
+ */
+async function deleteLexicalItemCompletely(
+  adapter: DatabaseAdapter,
+  id: string,
+): Promise<boolean> {
+  if (!isValidUuid(id)) return false;
+
+  const existing = await adapter.query(
+    `SELECT id FROM lexical_items WHERE id = ?`,
+    [id],
+  );
+  if (existing.length === 0) return false;
+
+  await adapter.execute(
+    `DELETE FROM lexical_examples WHERE lexical_item_id = ?`,
+    [id],
+  );
+  await adapter.execute(
+    `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
+    [id],
+  );
+  await adapter.execute(
+    `DELETE FROM lexical_items WHERE id = ?`,
+    [id],
+  );
+  return true;
+}
+
+/**
+ * Replace all meanings of a lexical item with the provided list.
+ * Per-meaning review data is whatever the caller supplies; callers that
+ * loaded the item first naturally preserve review history.
+ */
+async function replaceLexicalMeanings(
+  adapter: DatabaseAdapter,
+  lexicalItemId: string,
+  meanings: readonly Meaning[],
+  now: string,
+): Promise<void> {
+  await adapter.execute(
+    `DELETE FROM lexical_examples WHERE lexical_item_id = ?`,
+    [lexicalItemId],
+  );
+  await adapter.execute(
+    `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
+    [lexicalItemId],
+  );
+
+  for (const meaning of meanings) {
+    const meaningId = generateId();
+    await adapter.execute(
+      `INSERT INTO lexical_meanings (
+        id, lexical_item_id, definition, part_of_speech, examples,
+        usage_notes, register, domain,
+        review_state, review_last_review_at, review_next_review_at,
+        review_review_count, review_consecutive_correct, review_ease_factor,
+        review_mastered_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        meaningId,
+        lexicalItemId,
+        meaning.definition,
+        meaning.partOfSpeech ?? null,
+        JSON.stringify(meaning.examples ?? []),
+        JSON.stringify(meaning.usageNotes ?? []),
+        meaning.register ?? null,
+        meaning.domain ?? null,
+        meaning.review?.state ?? 'new',
+        meaning.review?.lastReviewAt ?? null,
+        meaning.review?.nextReviewAt ?? null,
+        meaning.review?.reviewCount ?? 0,
+        meaning.review?.consecutiveCorrect ?? 0,
+        meaning.review?.easeFactor ?? null,
+        meaning.review?.masteredAt ?? null,
+        now,
+        now,
+      ],
+    );
+
+    if (meaning.examples && meaning.examples.length > 0) {
+      await insertExamplesForMeaning(adapter, lexicalItemId, meaningId, meaning.examples, now);
+    }
+  }
+}
+
 /** Build partial UPDATE SQL and params for a lexical item. */
 function buildLexicalItemUpdate(
   id: string,
@@ -1813,6 +1905,14 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
 
     return this.getFullItem(id);
   }
+
+  /**
+   * Delete a vocabulary item and all of its meanings/examples.
+   * Returns true when the item existed and was removed.
+   */
+  async delete(id: string): Promise<boolean> {
+    return deleteLexicalItemCompletely(this.adapter, id);
+  }
 }
 
 /** Map lexical_items row to ExpressionItem domain object. */
@@ -2114,7 +2214,22 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
       ],
     );
 
+    // Replace meanings when explicitly provided. Callers that loaded the
+    // item first supply the existing per-meaning review data unchanged,
+    // so review history is preserved.
+    if (patch.meanings !== undefined) {
+      await replaceLexicalMeanings(this.adapter, id, patch.meanings, now);
+    }
+
     return this.getFullItem(id);
+  }
+
+  /**
+   * Delete an expression item and all of its meanings/examples.
+   * Returns true when the item existed and was removed.
+   */
+  async delete(id: string): Promise<boolean> {
+    return deleteLexicalItemCompletely(this.adapter, id);
   }
 }
 
@@ -2211,8 +2326,19 @@ export class SQLiteReviewRepository implements ReviewRepository {
 
     const now = nowIso();
 
-    // Check if exists by id or by learnerId + referenceId + kind
-    let existingId: string | null = item.id ?? null;
+    // Check if exists by explicit id, or by learnerId + referenceId + kind.
+    // An explicit id that is not persisted yet must fall through to INSERT,
+    // not take the UPDATE branch (planner candidates carry fresh ids).
+    let existingId: string | null = null;
+    if (item.id) {
+      const byId = await this.adapter.query(
+        `SELECT id FROM review_items WHERE id = ?`,
+        [item.id],
+      );
+      if (byId.length > 0) {
+        existingId = byId[0].id as string;
+      }
+    }
     if (!existingId && item.referenceId) {
       const existing = await this.adapter.query(
         `SELECT id FROM review_items WHERE learner_id = ? AND reference_id = ? AND kind = ?`,
