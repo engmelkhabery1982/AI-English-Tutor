@@ -24,6 +24,9 @@ import type {
   PronunciationRepository,
   WeaknessRepository,
   VocabularyRepository,
+  ExpressionRepository,
+  ReviewRepository,
+  ProgressRepository,
 } from '../../../repositories';
 import type {
   UserProfile,
@@ -39,8 +42,14 @@ import type {
 } from '../../../domain/models/conversation';
 import type {
   VocabularyItem,
+  ExpressionItem,
   Meaning,
 } from '../../../domain/models/vocabulary';
+import type {
+  ReviewItem,
+  ReviewOutcome,
+  ProgressRecord,
+} from '../../../domain/models/learning';
 import type {
   ReviewSchedule,
   MasteryState,
@@ -1771,5 +1780,674 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
     }
 
     return this.getFullItem(id);
+  }
+}
+
+/** Map lexical_items row to ExpressionItem domain object. */
+function rowToExpressionItem(row: SqlRow): Omit<ExpressionItem, 'meanings'> {
+  return {
+    id: row.id as string,
+    learnerId: row.learner_id as string,
+    expression: row.headword as string,
+    type: row.type as ExpressionItem['type'],
+    pronunciation: safeJsonParse(row.pronunciation, {}),
+    naturalAlternatives: safeJsonParse(row.natural_alternatives, []),
+    register: (row.register as ExpressionItem['register']) ?? undefined,
+    domain: (row.domain as string) ?? undefined,
+    source: safeJsonParse(row.source, {
+      addedBy: 'system',
+      addedAt: row.created_at as string,
+    }),
+    tags: safeJsonParse(row.tags, []),
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+/**
+ * SQLiteExpressionRepository
+ *
+ * Implements ExpressionRepository for expressions stored in lexical_items + lexical_meanings.
+ */
+export class SQLiteExpressionRepository implements ExpressionRepository {
+  constructor(private readonly adapter: DatabaseAdapter) {}
+
+  private async getFullItem(id: string): Promise<ExpressionItem> {
+    const rows = await this.adapter.query(
+      `SELECT * FROM lexical_items WHERE id = ?`,
+      [id],
+    );
+    if (rows.length === 0) {
+      throw new Error(`Expression item not found: ${id}`);
+    }
+
+    const base = rowToExpressionItem(rows[0]);
+    const meaningRows = await this.adapter.query(
+      `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
+      [id],
+    );
+
+    const meanings: Meaning[] = [];
+    for (const meaningRow of meaningRows) {
+      const meaning = rowToMeaning(meaningRow);
+      const meaningId = meaningRow.id as string;
+      if (meaningId) {
+        const examples = await fetchExamplesForMeaning(this.adapter, meaningId);
+        meanings.push({ ...meaning, examples });
+      } else {
+        meanings.push(meaning);
+      }
+    }
+
+    return { ...base, meanings };
+  }
+
+  async upsert(
+    item: Omit<ExpressionItem, 'id' | 'createdAt' | 'updatedAt'>,
+  ): Promise<ExpressionItem> {
+    if (!item.learnerId || !isValidUuid(item.learnerId)) {
+      throw new Error('Invalid learnerId');
+    }
+    if (!item.expression) {
+      throw new Error('expression is required');
+    }
+    if (!item.type) {
+      throw new Error('type is required');
+    }
+
+    const existing = await this.adapter.query(
+      `SELECT * FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ?`,
+      [item.learnerId, item.expression, item.type],
+    );
+
+    const now = nowIso();
+
+    if (existing.length > 0) {
+      const id = existing[0].id as string;
+      await this.adapter.execute(
+        `UPDATE lexical_items SET
+          natural_alternatives = ?,
+          register = ?,
+          domain = ?,
+          source = ?,
+          tags = ?,
+          updated_at = ?
+        WHERE id = ?`,
+        [
+          JSON.stringify(item.naturalAlternatives ?? []),
+          item.register ?? null,
+          item.domain ?? null,
+          JSON.stringify(item.source ?? {}),
+          JSON.stringify(item.tags ?? []),
+          now,
+          id,
+        ],
+      );
+
+      // Replace meanings
+      await this.adapter.execute(
+        `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
+        [id],
+      );
+
+      for (const meaning of item.meanings ?? []) {
+        const meaningId = generateId();
+        await this.adapter.execute(
+          `INSERT INTO lexical_meanings (
+            id, lexical_item_id, definition, part_of_speech, examples,
+            usage_notes, register, domain,
+            review_state, review_last_review_at, review_next_review_at,
+            review_review_count, review_consecutive_correct, review_ease_factor,
+            review_mastered_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            meaningId,
+            id,
+            meaning.definition,
+            meaning.partOfSpeech ?? null,
+            JSON.stringify(meaning.examples ?? []),
+            JSON.stringify(meaning.usageNotes ?? []),
+            meaning.register ?? null,
+            meaning.domain ?? null,
+            meaning.review?.state ?? 'new',
+            meaning.review?.lastReviewAt ?? null,
+            meaning.review?.nextReviewAt ?? null,
+            meaning.review?.reviewCount ?? 0,
+            meaning.review?.consecutiveCorrect ?? 0,
+            meaning.review?.easeFactor ?? null,
+            meaning.review?.masteredAt ?? null,
+            now,
+            now,
+          ],
+        );
+      }
+
+      return this.getFullItem(id);
+    }
+
+    const id = generateId();
+    await this.adapter.execute(
+      `INSERT INTO lexical_items (
+        id, learner_id, headword, type, pronunciation,
+        synonyms, antonyms, related_expressions, natural_alternatives,
+        register, domain, source, tags, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        item.learnerId,
+        item.expression,
+        item.type,
+        JSON.stringify(item.pronunciation ?? {}),
+        JSON.stringify([]),
+        JSON.stringify([]),
+        JSON.stringify([]),
+        JSON.stringify(item.naturalAlternatives ?? []),
+        item.register ?? null,
+        item.domain ?? null,
+        JSON.stringify(item.source ?? {}),
+        JSON.stringify(item.tags ?? []),
+        now,
+        now,
+      ],
+    );
+
+    for (const meaning of item.meanings ?? []) {
+      const meaningId = generateId();
+      await this.adapter.execute(
+        `INSERT INTO lexical_meanings (
+          id, lexical_item_id, definition, part_of_speech, examples,
+          usage_notes, register, domain,
+          review_state, review_last_review_at, review_next_review_at,
+          review_review_count, review_consecutive_correct, review_ease_factor,
+          review_mastered_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          meaningId,
+          id,
+          meaning.definition,
+          meaning.partOfSpeech ?? null,
+          JSON.stringify(meaning.examples ?? []),
+          JSON.stringify(meaning.usageNotes ?? []),
+          meaning.register ?? null,
+          meaning.domain ?? null,
+          meaning.review?.state ?? 'new',
+          meaning.review?.lastReviewAt ?? null,
+          meaning.review?.nextReviewAt ?? null,
+          meaning.review?.reviewCount ?? 0,
+          meaning.review?.consecutiveCorrect ?? 0,
+          meaning.review?.easeFactor ?? null,
+          meaning.review?.masteredAt ?? null,
+          now,
+          now,
+        ],
+      );
+    }
+
+    return this.getFullItem(id);
+  }
+
+  async get(id: string): Promise<ExpressionItem | null> {
+    if (!isValidUuid(id)) return null;
+    try {
+      return await this.getFullItem(id);
+    } catch {
+      return null;
+    }
+  }
+
+  async list(
+    learnerId: string,
+    opts?: { limit?: number },
+  ): Promise<readonly ExpressionItem[]> {
+    if (!isValidUuid(learnerId)) return [];
+
+    let sql = `
+      SELECT * FROM lexical_items
+      WHERE learner_id = ?
+        AND type IN ('idiom', 'collocation', 'common_expression', 'professional_expression', 'linking_expression', 'phrasal_verb')
+      ORDER BY created_at DESC
+    `;
+    const params: SqlParam[] = [learnerId];
+
+    if (opts?.limit !== undefined && opts.limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(opts.limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+    const items: ExpressionItem[] = [];
+    for (const row of rows) {
+      const item = await this.getFullItem(row.id as string);
+      items.push(item);
+    }
+    return items;
+  }
+
+  async listDue(
+    learnerId: string,
+    now: string,
+    limit?: number,
+  ): Promise<readonly ExpressionItem[]> {
+    if (!isValidUuid(learnerId)) return [];
+
+    let sql = `
+      SELECT DISTINCT li.* FROM lexical_items li
+      INNER JOIN lexical_meanings lm ON lm.lexical_item_id = li.id
+      WHERE li.learner_id = ?
+        AND li.type IN ('idiom', 'collocation', 'common_expression', 'professional_expression', 'linking_expression', 'phrasal_verb')
+        AND lm.review_next_review_at IS NOT NULL
+        AND lm.review_next_review_at <= ?
+      ORDER BY lm.review_next_review_at ASC
+    `;
+    const params: SqlParam[] = [learnerId, now];
+
+    if (limit !== undefined && limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+    const items: ExpressionItem[] = [];
+    for (const row of rows) {
+      const item = await this.getFullItem(row.id as string);
+      items.push(item);
+    }
+    return items;
+  }
+
+  async update(
+    id: string,
+    patch: Partial<Omit<ExpressionItem, 'id' | 'createdAt'>>,
+  ): Promise<ExpressionItem> {
+    if (!isValidUuid(id)) throw new Error('Invalid expression item id');
+    const existing = await this.get(id);
+    if (!existing) throw new Error(`Expression item not found: ${id}`);
+
+    const now = nowIso();
+    await this.adapter.execute(
+      `UPDATE lexical_items SET
+        headword = COALESCE(?, headword),
+        natural_alternatives = COALESCE(?, natural_alternatives),
+        register = COALESCE(?, register),
+        domain = COALESCE(?, domain),
+        updated_at = ?
+      WHERE id = ?`,
+      [
+        patch.expression ?? null,
+        patch.naturalAlternatives ? JSON.stringify(patch.naturalAlternatives) : null,
+        patch.register ?? null,
+        patch.domain ?? null,
+        now,
+        id,
+      ],
+    );
+
+    return this.getFullItem(id);
+  }
+}
+
+/** Map review_items row to ReviewItem domain object. */
+function rowToReviewItem(row: SqlRow): ReviewItem {
+  return {
+    id: row.id as string,
+    learnerId: row.learner_id as string,
+    kind: row.kind as ReviewItem['kind'],
+    referenceId: row.reference_id as string,
+    prompt: row.prompt as string,
+    expectedResponse: (row.expected_response as string) ?? undefined,
+    contextTopic: (row.context_topic as string) ?? undefined,
+    state: row.state as MasteryState,
+    dueAt: row.due_at as string,
+    createdAt: row.created_at as string,
+    lastReviewAt: (row.last_review_at as string) ?? undefined,
+    reviewCount: Number(row.review_count ?? 0),
+    consecutiveCorrect: Number(row.consecutive_correct ?? 0),
+    easeFactor: row.ease_factor != null ? Number(row.ease_factor) : undefined,
+    outcomeHistory: safeJsonParse<ReviewOutcome[]>(row.outcome_history, []),
+  };
+}
+
+/**
+ * SQLiteReviewRepository
+ *
+ * Implements ReviewRepository for review_items + review_history.
+ */
+export class SQLiteReviewRepository implements ReviewRepository {
+  constructor(private readonly adapter: DatabaseAdapter) {}
+
+  async listDue(
+    learnerId: string,
+    now: string,
+    limit?: number,
+  ): Promise<readonly ReviewItem[]> {
+    if (!isValidUuid(learnerId)) return [];
+
+    let sql = `
+      SELECT * FROM review_items
+      WHERE learner_id = ?
+        AND due_at <= ?
+        AND state != 'retired'
+      ORDER BY due_at ASC
+    `;
+    const params: SqlParam[] = [learnerId, now];
+
+    if (limit !== undefined && limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+    return rows.map(rowToReviewItem);
+  }
+
+  async get(id: string): Promise<ReviewItem | null> {
+    if (!isValidUuid(id)) return null;
+    const rows = await this.adapter.query(
+      `SELECT * FROM review_items WHERE id = ?`,
+      [id],
+    );
+    return rows.length > 0 ? rowToReviewItem(rows[0]) : null;
+  }
+
+  async list(
+    learnerId: string,
+    limit?: number,
+  ): Promise<readonly ReviewItem[]> {
+    if (!isValidUuid(learnerId)) return [];
+
+    let sql = `SELECT * FROM review_items WHERE learner_id = ? ORDER BY due_at ASC`;
+    const params: SqlParam[] = [learnerId];
+
+    if (limit !== undefined && limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+    return rows.map(rowToReviewItem);
+  }
+
+  async upsert(
+    item: Omit<ReviewItem, 'id' | 'createdAt'> & { id?: string },
+  ): Promise<ReviewItem> {
+    if (!item.learnerId || !isValidUuid(item.learnerId)) {
+      throw new Error('Invalid learnerId');
+    }
+    if (!item.prompt) {
+      throw new Error('prompt is required');
+    }
+
+    const now = nowIso();
+
+    // Check if exists by id or by learnerId + referenceId + kind
+    let existingId: string | null = item.id ?? null;
+    if (!existingId && item.referenceId) {
+      const existing = await this.adapter.query(
+        `SELECT id FROM review_items WHERE learner_id = ? AND reference_id = ? AND kind = ?`,
+        [item.learnerId, item.referenceId, item.kind],
+      );
+      if (existing.length > 0) {
+        existingId = existing[0].id as string;
+      }
+    }
+
+    if (existingId) {
+      await this.adapter.execute(
+        `UPDATE review_items SET
+          prompt = ?,
+          expected_response = ?,
+          context_topic = ?,
+          state = ?,
+          due_at = ?,
+          last_review_at = ?,
+          review_count = ?,
+          consecutive_correct = ?,
+          ease_factor = ?,
+          outcome_history = ?
+        WHERE id = ?`,
+        [
+          item.prompt,
+          item.expectedResponse ?? null,
+          item.contextTopic ?? null,
+          item.state,
+          item.dueAt,
+          item.lastReviewAt ?? null,
+          item.reviewCount,
+          item.consecutiveCorrect,
+          item.easeFactor ?? null,
+          JSON.stringify(item.outcomeHistory ?? []),
+          existingId,
+        ],
+      );
+
+      const updated = await this.get(existingId);
+      if (!updated) throw new Error('Failed to retrieve updated review item');
+      return updated;
+    }
+
+    const id = item.id || generateId();
+    await this.adapter.execute(
+      `INSERT INTO review_items (
+        id, learner_id, kind, reference_id, prompt,
+        expected_response, context_topic, state, due_at,
+        created_at, last_review_at, review_count, consecutive_correct,
+        ease_factor, outcome_history
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        item.learnerId,
+        item.kind,
+        item.referenceId,
+        item.prompt,
+        item.expectedResponse ?? null,
+        item.contextTopic ?? null,
+        item.state,
+        item.dueAt,
+        now,
+        item.lastReviewAt ?? null,
+        item.reviewCount ?? 0,
+        item.consecutiveCorrect ?? 0,
+        item.easeFactor ?? null,
+        JSON.stringify(item.outcomeHistory ?? []),
+      ],
+    );
+
+    const created = await this.get(id);
+    if (!created) throw new Error('Failed to retrieve created review item');
+    return created;
+  }
+
+  async markReviewed(
+    id: string,
+    result: 'correct' | 'incorrect' | 'partial',
+    note?: string,
+  ): Promise<ReviewItem> {
+    if (!isValidUuid(id)) throw new Error('Invalid review item id');
+
+    const existing = await this.get(id);
+    if (!existing) {
+      throw new Error(`Review item not found: ${id}`);
+    }
+
+    const now = nowIso();
+    const newOutcome: ReviewOutcome = {
+      at: now,
+      result,
+      note,
+    };
+
+    let newConsecutiveCorrect = existing.consecutiveCorrect;
+    if (result === 'correct') {
+      newConsecutiveCorrect += 1;
+    } else if (result === 'incorrect') {
+      newConsecutiveCorrect = 0;
+    }
+
+    // Determine state
+    let newState: MasteryState = existing.state;
+    if (newConsecutiveCorrect >= 3) {
+      newState = 'mastered';
+    } else if (result === 'incorrect') {
+      newState = existing.reviewCount >= 1 ? 'struggling' : 'learning';
+    } else if (result === 'correct') {
+      newState = newConsecutiveCorrect >= 2 ? 'familiar' : 'learning';
+    }
+
+    // Determine next interval (days)
+    let intervalDays = 1;
+    if (result === 'correct') {
+      if (newConsecutiveCorrect === 1) intervalDays = 1;
+      else if (newConsecutiveCorrect === 2) intervalDays = 3;
+      else if (newConsecutiveCorrect === 3) intervalDays = 7;
+      else if (newConsecutiveCorrect === 4) intervalDays = 14;
+      else intervalDays = 30;
+    } else if (result === 'partial') {
+      intervalDays = 1;
+    } else {
+      intervalDays = 1;
+    }
+
+    const nextDueDate = new Date(Date.now() + intervalDays * 86400000).toISOString();
+    const updatedHistory = [...existing.outcomeHistory, newOutcome];
+
+    await this.adapter.execute(
+      `UPDATE review_items SET
+        last_review_at = ?,
+        review_count = review_count + 1,
+        consecutive_correct = ?,
+        state = ?,
+        due_at = ?,
+        outcome_history = ?
+      WHERE id = ?`,
+      [
+        now,
+        newConsecutiveCorrect,
+        newState,
+        nextDueDate,
+        JSON.stringify(updatedHistory),
+        id,
+      ],
+    );
+
+    // Also record in review_history table
+    const historyId = generateId();
+    await this.adapter.execute(
+      `INSERT INTO review_history (id, review_item_id, at, result, note)
+       VALUES (?, ?, ?, ?, ?)`,
+      [historyId, id, now, result, note ?? null],
+    );
+
+    const updated = await this.get(id);
+    if (!updated) throw new Error('Review item disappeared after update');
+    return updated;
+  }
+}
+
+/** Map progress_records row to ProgressRecord domain object. */
+function rowToProgressRecord(row: SqlRow): ProgressRecord {
+  return {
+    id: row.id as string,
+    learnerId: row.learner_id as string,
+    recordedAt: row.recorded_at as string,
+    windowStart: row.window_start as string,
+    windowEnd: row.window_end as string,
+    sessionsCompleted: Number(row.sessions_completed ?? 0),
+    turnsCompleted: Number(row.turns_completed ?? 0),
+    listeningScore: row.listening_score != null ? Number(row.listening_score) : undefined,
+    speakingScore: row.speaking_score != null ? Number(row.speaking_score) : undefined,
+    fluencyScore: row.fluency_score != null ? Number(row.fluency_score) : undefined,
+    confidenceScore: row.confidence_score != null ? Number(row.confidence_score) : undefined,
+    pronunciationScore: row.pronunciation_score != null ? Number(row.pronunciation_score) : undefined,
+    grammarScore: row.grammar_score != null ? Number(row.grammar_score) : undefined,
+    vocabularyScore: row.vocabulary_score != null ? Number(row.vocabulary_score) : undefined,
+    newWordsLearned: Number(row.new_words_learned ?? 0),
+    weaknessesImproved: Number(row.weaknesses_improved ?? 0),
+    weaknessesWorsened: Number(row.weaknesses_worsened ?? 0),
+    notes: (row.notes as string) ?? undefined,
+  };
+}
+
+/**
+ * SQLiteProgressRepository
+ *
+ * Implements ProgressRepository for progress_records.
+ */
+export class SQLiteProgressRepository implements ProgressRepository {
+  constructor(private readonly adapter: DatabaseAdapter) {}
+
+  async record(
+    record: Omit<ProgressRecord, 'id'>,
+  ): Promise<ProgressRecord> {
+    if (!record.learnerId || !isValidUuid(record.learnerId)) {
+      throw new Error('Invalid learnerId');
+    }
+
+    const id = generateId();
+    await this.adapter.execute(
+      `INSERT INTO progress_records (
+        id, learner_id, recorded_at, window_start, window_end,
+        sessions_completed, turns_completed,
+        listening_score, speaking_score, fluency_score, confidence_score,
+        pronunciation_score, grammar_score, vocabulary_score,
+        new_words_learned, weaknesses_improved, weaknesses_worsened, notes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        record.learnerId,
+        record.recordedAt,
+        record.windowStart,
+        record.windowEnd,
+        record.sessionsCompleted ?? 0,
+        record.turnsCompleted ?? 0,
+        record.listeningScore ?? null,
+        record.speakingScore ?? null,
+        record.fluencyScore ?? null,
+        record.confidenceScore ?? null,
+        record.pronunciationScore ?? null,
+        record.grammarScore ?? null,
+        record.vocabularyScore ?? null,
+        record.newWordsLearned ?? 0,
+        record.weaknessesImproved ?? 0,
+        record.weaknessesWorsened ?? 0,
+        record.notes ?? null,
+      ],
+    );
+
+    const rows = await this.adapter.query(
+      `SELECT * FROM progress_records WHERE id = ?`,
+      [id],
+    );
+    if (rows.length === 0) {
+      throw new Error('Failed to retrieve recorded progress');
+    }
+    return rowToProgressRecord(rows[0]);
+  }
+
+  async list(
+    learnerId: string,
+    limit?: number,
+  ): Promise<readonly ProgressRecord[]> {
+    if (!isValidUuid(learnerId)) return [];
+
+    let sql = `SELECT * FROM progress_records WHERE learner_id = ? ORDER BY recorded_at DESC`;
+    const params: SqlParam[] = [learnerId];
+
+    if (limit !== undefined && limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+    return rows.map(rowToProgressRecord);
+  }
+
+  async latest(learnerId: string): Promise<ProgressRecord | null> {
+    if (!isValidUuid(learnerId)) return null;
+
+    const rows = await this.adapter.query(
+      `SELECT * FROM progress_records WHERE learner_id = ? ORDER BY recorded_at DESC LIMIT 1`,
+      [learnerId],
+    );
+    return rows.length > 0 ? rowToProgressRecord(rows[0]) : null;
   }
 }

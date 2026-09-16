@@ -90,7 +90,14 @@ export interface ExpressionRepository {
 
 export interface ReviewRepository {
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly ReviewItem[]>;
-  markReviewed(id: string, result: 'correct' | 'incorrect' | 'partial'): Promise<ReviewItem>;
+  markReviewed(
+    id: string,
+    result: 'correct' | 'incorrect' | 'partial',
+    feedback?: string,
+  ): Promise<ReviewItem>;
+  upsert?(
+    item: Omit<ReviewItem, 'id' | 'createdAt'> & { id?: string },
+  ): Promise<ReviewItem>;
 }
 
 export interface LessonRepository {

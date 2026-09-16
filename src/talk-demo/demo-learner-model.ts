@@ -46,24 +46,6 @@ const DEMO_PROFILE: UserProfile = {
   updatedAt: FIXED_DATE,
 };
 
-const DEMO_COACHING_CONTEXT: CoachingContext = {
-  profile: {
-    learnerId: DEMO_LEARNER_ID,
-    displayName: 'Learner',
-    currentLevel: 'B1',
-    targetLevel: 'B2',
-    learningGoals: ['fluency', 'natural conversation'],
-    preferredModes: ['natural', 'coach', 'intensive'],
-  },
-  activeWeaknesses: [],
-  strengths: [],
-  vocabularyFocus: [],
-  expressionFocus: [],
-  recentProgress: null,
-  dueReviewCount: 0,
-  generatedAt: FIXED_DATE,
-};
-
 const EMPTY_WEAKNESS_SUMMARY: WeaknessSummary = {
   total: 0,
   active: 0,
@@ -106,6 +88,24 @@ const DEMO_DASHBOARD_SNAPSHOT: DashboardSnapshot = {
   expressionSummary: EMPTY_LEXICAL_SUMMARY,
   progressSummary: EMPTY_PROGRESS_SUMMARY,
   dueReviewCount: 0,
+};
+
+const DEMO_COACHING_CONTEXT: CoachingContext = {
+  profile: {
+    learnerId: DEMO_LEARNER_ID,
+    displayName: 'Learner',
+    currentLevel: 'B1',
+    targetLevel: 'B2',
+    learningGoals: ['fluency', 'natural conversation'],
+    preferredModes: ['natural', 'coach', 'intensive'],
+  },
+  activeWeaknesses: [],
+  strengths: [],
+  vocabularyFocus: [],
+  expressionFocus: [],
+  recentProgress: null,
+  dueReviewCount: 0,
+  generatedAt: FIXED_DATE,
 };
 
 /**
