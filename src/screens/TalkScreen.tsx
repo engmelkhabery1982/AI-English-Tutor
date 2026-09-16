@@ -11,10 +11,11 @@ import {
   View,
 } from 'react-native';
 import {
-  createTalkDemoSession,
+  createTalkSession,
   type ConversationMode,
   type ConversationSession,
   type ConversationTurn,
+  type TalkProviderKind,
 } from '../talk-demo';
 
 const MODES: { readonly key: ConversationMode; readonly label: string }[] = [
@@ -30,20 +31,23 @@ export default function TalkScreen() {
   const [history, setHistory] = useState<readonly ConversationTurn[]>([]);
   const [isSending, setIsSending] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [providerKind, setProviderKind] = useState<TalkProviderKind>('demo');
 
   const sessionRef = useRef<ConversationSession | null>(null);
   const scrollViewRef = useRef<ScrollView | null>(null);
 
-  // Initialize or retrieve the active session
+  // Initialize or retrieve the active session bundle
   const getOrCreateSession = (
     targetMode: ConversationMode,
     targetTopic: string
   ): ConversationSession => {
     if (!sessionRef.current) {
-      sessionRef.current = createTalkDemoSession({
+      const bundle = createTalkSession({
         mode: targetMode,
         topic: targetTopic.trim() || undefined,
       });
+      sessionRef.current = bundle.session;
+      setProviderKind(bundle.providerKind);
     }
     return sessionRef.current;
   };
@@ -51,10 +55,12 @@ export default function TalkScreen() {
   // Recreates session when mode/topic change while history is empty
   useEffect(() => {
     if (history.length === 0) {
-      sessionRef.current = createTalkDemoSession({
+      const bundle = createTalkSession({
         mode,
         topic: topic.trim() || undefined,
       });
+      sessionRef.current = bundle.session;
+      setProviderKind(bundle.providerKind);
     }
   }, [mode, topic, history.length]);
 
@@ -63,11 +69,12 @@ export default function TalkScreen() {
     if (newMode === mode) return;
     setMode(newMode);
     if (history.length > 0) {
-      // Recreate session and reset history when switching mode mid-conversation
-      sessionRef.current = createTalkDemoSession({
+      const bundle = createTalkSession({
         mode: newMode,
         topic: topic.trim() || undefined,
       });
+      sessionRef.current = bundle.session;
+      setProviderKind(bundle.providerKind);
       setHistory([]);
       setErrorMessage(null);
     }
@@ -75,10 +82,12 @@ export default function TalkScreen() {
 
   // Handle New / Clear conversation
   const handleNewConversation = () => {
-    sessionRef.current = createTalkDemoSession({
+    const bundle = createTalkSession({
       mode,
       topic: topic.trim() || undefined,
     });
+    sessionRef.current = bundle.session;
+    setProviderKind(bundle.providerKind);
     setHistory([]);
     setInputText('');
     setErrorMessage(null);
@@ -103,7 +112,7 @@ export default function TalkScreen() {
 
       if (!result.ok) {
         setErrorMessage(
-          result.error.message || 'The demo tutor returned an error. Please try again.'
+          result.error.message || 'The tutor returned an error. Please try again.'
         );
       }
     } catch (err: unknown) {
@@ -116,6 +125,7 @@ export default function TalkScreen() {
   };
 
   const isSendDisabled = inputText.trim().length === 0 || isSending;
+  const isGemini = providerKind === 'gemini';
 
   return (
     <KeyboardAvoidingView
@@ -127,7 +137,17 @@ export default function TalkScreen() {
       <View style={styles.header}>
         <View style={styles.headerTextGroup}>
           <Text style={styles.title}>Talk</Text>
-          <Text style={styles.subtitle}>Text Preview • Local Demo Mode</Text>
+          <View style={styles.providerBadgeContainer}>
+            <View
+              style={[
+                styles.statusDot,
+                isGemini ? styles.statusDotGemini : styles.statusDotDemo,
+              ]}
+            />
+            <Text style={styles.subtitle}>
+              {isGemini ? 'Gemini • Online' : 'Local Demo • Offline'}
+            </Text>
+          </View>
         </View>
         <TouchableOpacity
           style={styles.newChatButton}
@@ -224,7 +244,7 @@ export default function TalkScreen() {
                 ]}
               >
                 <Text style={styles.roleLabel}>
-                  {isUser ? 'You' : 'AI Tutor'}
+                  {isUser ? 'You' : isGemini ? 'Gemini Tutor' : 'AI Tutor (Demo)'}
                 </Text>
                 <View
                   style={[
@@ -250,7 +270,9 @@ export default function TalkScreen() {
         {isSending && (
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="small" color="#2563EB" />
-            <Text style={styles.loadingText}>Tutor is typing...</Text>
+            <Text style={styles.loadingText}>
+              {isGemini ? 'Gemini is thinking...' : 'Tutor is typing...'}
+            </Text>
           </View>
         )}
 
@@ -322,10 +344,27 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: '#111827',
   },
+  providerBadgeContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 2,
+  },
+  statusDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+  },
+  statusDotGemini: {
+    backgroundColor: '#10B981',
+  },
+  statusDotDemo: {
+    backgroundColor: '#9CA3AF',
+  },
   subtitle: {
     fontSize: 12,
     color: '#6B7280',
-    marginTop: 2,
+    fontWeight: '500',
   },
   newChatButton: {
     paddingHorizontal: 12,
