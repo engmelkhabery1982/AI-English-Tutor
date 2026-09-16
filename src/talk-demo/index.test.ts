@@ -17,11 +17,7 @@ describe('Talk Demo & Composition Stack', () => {
   const originalEnvKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
 
   beforeEach(() => {
-    if (typeof originalEnvKey === 'string') {
-      process.env.EXPO_PUBLIC_GEMINI_API_KEY = originalEnvKey;
-    } else {
-      delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-    }
+    delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
   });
 
   afterEach(() => {

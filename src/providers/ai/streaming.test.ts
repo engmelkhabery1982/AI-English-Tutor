@@ -2,13 +2,14 @@ import { describe, expect, it, vi } from 'vitest';
 import { createDemoAIProvider } from './demo';
 import { createGeminiAIProvider } from './gemini';
 import type { ConversationRequest } from '../../conversation-engine';
+import { createDemoLearnerModel } from '../../talk-demo/demo-learner-model';
 
 const SAMPLE_REQUEST: ConversationRequest = {
   mode: 'natural',
   topic: null,
   systemPrompt: 'You are an English tutor.',
   messages: [{ role: 'user', content: 'Hello there' }],
-  coachingContext: {} as any,
+  coachingContext: createDemoLearnerModel().getCoachingContext(),
 };
 
 describe('AIProvider Streaming & Feedback', () => {
