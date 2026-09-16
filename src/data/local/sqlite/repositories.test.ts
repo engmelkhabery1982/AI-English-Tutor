@@ -17,7 +17,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { SqlJsAdapter } from './SqlJsAdapter';
-import { SQLiteUserProfileRepository, SQLiteConversationRepository } from './repositories';
+import { SQLiteUserProfileRepository, SQLiteConversationRepository, SQLiteMistakeRepository, SQLitePronunciationRepository, SQLiteWeaknessRepository } from './repositories';
 import type { CefrLevelInput, ConversationMode } from '../../../domain/shared/types';
 import type { ConversationTurn } from '../../../domain/models/conversation';
 
@@ -518,6 +518,963 @@ describe('SQLite repositories (sql.js)', () => {
           turnIndex: 0,
         } as Omit<ConversationTurn, 'id'>),
       ).rejects.toThrow('startedAt is required');
+    });
+  });
+
+  describe('MistakeRepository (GrammarMistake)', () => {
+    let learnerId: string;
+    let mistakeRepo: SQLiteMistakeRepository;
+
+    beforeEach(async () => {
+      await createProfile();
+      learnerId = await getLearnerId();
+      mistakeRepo = new SQLiteMistakeRepository(adapter);
+    });
+
+    it('mistake persists and round-trips correctly', async () => {
+      const now = new Date().toISOString();
+      const mistake = await mistakeRepo.recordMistake({
+        learnerId,
+        category: 'for-vs-since',
+        pattern: 'I live here since 2020',
+        correction: 'I have lived here since 2020',
+        explanation: 'Use present perfect with since',
+        severity: 'moderate',
+        occurrenceCount: 1,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: ['daily life'],
+        exampleTurnIds: ['turn-1'],
+        originSessionId: 'session-1',
+        originTurnId: 'turn-1',
+        resolved: false,
+      });
+
+      expect(mistake.id).toBeDefined();
+      expect(mistake.learnerId).toBe(learnerId);
+      expect(mistake.category).toBe('for-vs-since');
+      expect(mistake.pattern).toBe('I live here since 2020');
+      expect(mistake.correction).toBe('I have lived here since 2020');
+      expect(mistake.explanation).toBe('Use present perfect with since');
+      expect(mistake.severity).toBe('moderate');
+      expect(mistake.occurrenceCount).toBe(1);
+      expect(mistake.contexts).toEqual(['daily life']);
+      expect(mistake.exampleTurnIds).toEqual(['turn-1']);
+      expect(mistake.originSessionId).toBe('session-1');
+      expect(mistake.originTurnId).toBe('turn-1');
+      expect(mistake.resolved).toBe(false);
+      expect(mistake.createdAt).toBeDefined();
+      expect(mistake.updatedAt).toBeDefined();
+
+      // Round-trip via listMistakes
+      const mistakes = await mistakeRepo.listMistakes(learnerId);
+      expect(mistakes).toHaveLength(1);
+      expect(mistakes[0].id).toBe(mistake.id);
+      expect(mistakes[0].category).toBe('for-vs-since');
+    });
+
+    it('resolved filter works', async () => {
+      const now = new Date().toISOString();
+
+      // Create resolved mistake
+      await mistakeRepo.recordMistake({
+        learnerId,
+        category: 'resolved-mistake',
+        pattern: 'wrong',
+        correction: 'right',
+        severity: 'minor',
+        occurrenceCount: 1,
+        contexts: [],
+        exampleTurnIds: [],
+        lastSeenAt: now,
+        firstSeenAt: now,
+        resolved: true,
+      });
+
+      // Create unresolved mistake
+      await mistakeRepo.recordMistake({
+        learnerId,
+        category: 'unresolved-mistake',
+        pattern: 'wrong',
+        correction: 'right',
+        severity: 'minor',
+        occurrenceCount: 1,
+        contexts: [],
+        exampleTurnIds: [],
+        lastSeenAt: now,
+        firstSeenAt: now,
+        resolved: false,
+      });
+
+      const resolved = await mistakeRepo.listMistakes(learnerId, { resolved: true });
+      expect(resolved).toHaveLength(1);
+      expect(resolved[0].category).toBe('resolved-mistake');
+      expect(resolved[0].resolved).toBe(true);
+
+      const unresolved = await mistakeRepo.listMistakes(learnerId, { resolved: false });
+      expect(unresolved).toHaveLength(1);
+      expect(unresolved[0].category).toBe('unresolved-mistake');
+      expect(unresolved[0].resolved).toBe(false);
+    });
+
+    it('unresolved filter works', async () => {
+      const now = new Date().toISOString();
+
+      await mistakeRepo.recordMistake({
+        learnerId,
+        category: 'test',
+        pattern: 'wrong',
+        correction: 'right',
+        severity: 'minor',
+        occurrenceCount: 1,
+        contexts: [],
+        exampleTurnIds: [],
+        lastSeenAt: now,
+        firstSeenAt: now,
+        resolved: false,
+      });
+
+      const unresolved = await mistakeRepo.listMistakes(learnerId, { resolved: false });
+      expect(unresolved).toHaveLength(1);
+      expect(unresolved[0].resolved).toBe(false);
+    });
+
+    it('markResolved updates target record', async () => {
+      const now = new Date().toISOString();
+      const mistake = await mistakeRepo.recordMistake({
+        learnerId,
+        category: 'test',
+        pattern: 'wrong',
+        correction: 'right',
+        severity: 'minor',
+        occurrenceCount: 1,
+        contexts: [],
+        exampleTurnIds: [],
+        lastSeenAt: now,
+        firstSeenAt: now,
+        resolved: false,
+      });
+
+      expect(mistake.resolved).toBe(false);
+
+      const updated = await mistakeRepo.markResolved(mistake.id, true);
+      expect(updated.id).toBe(mistake.id);
+      expect(updated.resolved).toBe(true);
+      expect(updated.updatedAt).not.toBe(mistake.updatedAt);
+
+      // Verify persistence
+      const mistakes = await mistakeRepo.listMistakes(learnerId, { resolved: true });
+      expect(mistakes).toHaveLength(1);
+      expect(mistakes[0].resolved).toBe(true);
+    });
+
+    it('unknown id fails clearly', async () => {
+      const validButMissing = '550e8400-e29b-41d4-a716-446655440000';
+      await expect(
+        mistakeRepo.markResolved(validButMissing, true),
+      ).rejects.toThrow('Grammar mistake not found');
+    });
+
+    it('learner filtering prevents cross-learner leakage', async () => {
+      // Create another learner
+      const otherAdapter = new SqlJsAdapter(':memory:');
+      await otherAdapter.init();
+      const otherProfileRepo = new SQLiteUserProfileRepository(otherAdapter);
+      await otherProfileRepo.update({
+        displayName: 'Other Learner',
+        targetLanguage: 'en',
+        targetLevel: 'A1',
+        currentLevel: 'A1',
+        learningGoals: [],
+        preferredModes: ['natural'],
+      });
+      const otherLearnerId = (await otherProfileRepo.get()).id;
+      const otherMistakeRepo = new SQLiteMistakeRepository(otherAdapter);
+
+      const now = new Date().toISOString();
+
+      // Create mistakes for both learners
+      await mistakeRepo.recordMistake({
+        learnerId,
+        category: 'my-mistake',
+        pattern: 'wrong',
+        correction: 'right',
+        severity: 'minor',
+        occurrenceCount: 1,
+        contexts: [],
+        exampleTurnIds: [],
+        lastSeenAt: now,
+        firstSeenAt: now,
+        resolved: false,
+      });
+
+      await otherMistakeRepo.recordMistake({
+        learnerId: otherLearnerId,
+        category: 'other-mistake',
+        pattern: 'wrong',
+        correction: 'right',
+        severity: 'minor',
+        occurrenceCount: 1,
+        contexts: [],
+        exampleTurnIds: [],
+        lastSeenAt: now,
+        firstSeenAt: now,
+        resolved: false,
+      });
+
+      // Each learner should only see their own mistakes
+      const myMistakes = await mistakeRepo.listMistakes(learnerId);
+      expect(myMistakes).toHaveLength(1);
+      expect(myMistakes[0].category).toBe('my-mistake');
+
+      const otherMistakes = await otherMistakeRepo.listMistakes(otherLearnerId);
+      expect(otherMistakes).toHaveLength(1);
+      expect(otherMistakes[0].category).toBe('other-mistake');
+    });
+
+    it('limit option works', async () => {
+      const now = new Date().toISOString();
+
+      for (let i = 0; i < 5; i++) {
+        await mistakeRepo.recordMistake({
+          learnerId,
+          category: `mistake-${i}`,
+          pattern: 'wrong',
+          correction: 'right',
+          severity: 'minor',
+          occurrenceCount: 1,
+          contexts: [],
+          exampleTurnIds: [],
+          lastSeenAt: now,
+          firstSeenAt: now,
+          resolved: false,
+        });
+      }
+
+      const limited = await mistakeRepo.listMistakes(learnerId, { limit: 3 });
+      expect(limited).toHaveLength(3);
+    });
+
+    it('ordering is newest first by last_seen_at', async () => {
+      const baseTime = new Date('2026-01-01T00:00:00Z').getTime();
+
+      await mistakeRepo.recordMistake({
+        learnerId,
+        category: 'oldest',
+        pattern: 'wrong',
+        correction: 'right',
+        severity: 'minor',
+        occurrenceCount: 1,
+        contexts: [],
+        exampleTurnIds: [],
+        lastSeenAt: new Date(baseTime).toISOString(),
+        firstSeenAt: new Date(baseTime).toISOString(),
+        resolved: false,
+      });
+
+      await mistakeRepo.recordMistake({
+        learnerId,
+        category: 'middle',
+        pattern: 'wrong',
+        correction: 'right',
+        severity: 'minor',
+        occurrenceCount: 1,
+        contexts: [],
+        exampleTurnIds: [],
+        lastSeenAt: new Date(baseTime + 1000).toISOString(),
+        firstSeenAt: new Date(baseTime + 1000).toISOString(),
+        resolved: false,
+      });
+
+      await mistakeRepo.recordMistake({
+        learnerId,
+        category: 'newest',
+        pattern: 'wrong',
+        correction: 'right',
+        severity: 'minor',
+        occurrenceCount: 1,
+        contexts: [],
+        exampleTurnIds: [],
+        lastSeenAt: new Date(baseTime + 2000).toISOString(),
+        firstSeenAt: new Date(baseTime + 2000).toISOString(),
+        resolved: false,
+      });
+
+      const mistakes = await mistakeRepo.listMistakes(learnerId);
+      expect(mistakes).toHaveLength(3);
+      expect(mistakes[0].category).toBe('newest');
+      expect(mistakes[1].category).toBe('middle');
+      expect(mistakes[2].category).toBe('oldest');
+    });
+  });
+
+  describe('PronunciationRepository (PronunciationWeakness)', () => {
+    let learnerId: string;
+    let pronunciationRepo: SQLitePronunciationRepository;
+
+    beforeEach(async () => {
+      await createProfile();
+      learnerId = await getLearnerId();
+      pronunciationRepo = new SQLitePronunciationRepository(adapter);
+    });
+
+    it('pronunciation weakness persists and round-trips', async () => {
+      const now = new Date().toISOString();
+      const weakness = await pronunciationRepo.recordWeakness({
+        learnerId,
+        targetSound: 'θ',
+        wordExamples: ['think', 'thought', 'through'],
+        occurrenceCount: 3,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: ['reading', 'conversation'],
+        exampleTurnIds: ['turn-1', 'turn-2'],
+        originSessionId: 'session-1',
+        originTurnId: 'turn-1',
+        resolved: false,
+        notes: 'Voiceless dental fricative',
+      });
+
+      expect(weakness.id).toBeDefined();
+      expect(weakness.learnerId).toBe(learnerId);
+      expect(weakness.targetSound).toBe('θ');
+      expect(weakness.wordExamples).toEqual(['think', 'thought', 'through']);
+      expect(weakness.occurrenceCount).toBe(3);
+      expect(weakness.contexts).toEqual(['reading', 'conversation']);
+      expect(weakness.exampleTurnIds).toEqual(['turn-1', 'turn-2']);
+      expect(weakness.originSessionId).toBe('session-1');
+      expect(weakness.originTurnId).toBe('turn-1');
+      expect(weakness.resolved).toBe(false);
+      expect(weakness.notes).toBe('Voiceless dental fricative');
+      expect(weakness.createdAt).toBeDefined();
+      expect(weakness.updatedAt).toBeDefined();
+
+      // Round-trip via listWeaknesses
+      const weaknesses = await pronunciationRepo.listWeaknesses(learnerId);
+      expect(weaknesses).toHaveLength(1);
+      expect(weaknesses[0].id).toBe(weakness.id);
+      expect(weaknesses[0].targetSound).toBe('θ');
+    });
+
+    it('no fabricated score field is produced', async () => {
+      const now = new Date().toISOString();
+      const weakness = await pronunciationRepo.recordWeakness({
+        learnerId,
+        targetSound: '/ɪ/ vs /iː/',
+        wordExamples: ['ship', 'sheep'],
+        occurrenceCount: 2,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: ['minimal pairs'],
+        exampleTurnIds: [],
+        resolved: false,
+      });
+
+      // Verify no score/accuracy/confidence fields exist on domain object
+      const weaknessKeys = Object.keys(weakness);
+      expect(weaknessKeys).not.toContain('score');
+      expect(weaknessKeys).not.toContain('accuracy');
+      expect(weaknessKeys).not.toContain('pronunciationScore');
+      expect(weaknessKeys).not.toContain('confidenceScore');
+
+      // Verify only actual observation fields exist
+      expect(weakness.targetSound).toBe('/ɪ/ vs /iː/');
+      expect(weakness.wordExamples).toEqual(['ship', 'sheep']);
+      expect(weakness.occurrenceCount).toBe(2);
+      expect(weakness.contexts).toEqual(['minimal pairs']);
+    });
+
+    it('resolved filter works', async () => {
+      const now = new Date().toISOString();
+
+      // Create resolved weakness
+      await pronunciationRepo.recordWeakness({
+        learnerId,
+        targetSound: 'resolved-sound',
+        wordExamples: ['test'],
+        occurrenceCount: 1,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: [],
+        exampleTurnIds: [],
+        resolved: true,
+      });
+
+      // Create unresolved weakness
+      await pronunciationRepo.recordWeakness({
+        learnerId,
+        targetSound: 'unresolved-sound',
+        wordExamples: ['test'],
+        occurrenceCount: 1,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: [],
+        exampleTurnIds: [],
+        resolved: false,
+      });
+
+      const resolved = await pronunciationRepo.listWeaknesses(learnerId, { resolved: true });
+      expect(resolved).toHaveLength(1);
+      expect(resolved[0].targetSound).toBe('resolved-sound');
+      expect(resolved[0].resolved).toBe(true);
+
+      const unresolved = await pronunciationRepo.listWeaknesses(learnerId, { resolved: false });
+      expect(unresolved).toHaveLength(1);
+      expect(unresolved[0].targetSound).toBe('unresolved-sound');
+      expect(unresolved[0].resolved).toBe(false);
+    });
+
+    it('unresolved filter works', async () => {
+      const now = new Date().toISOString();
+
+      await pronunciationRepo.recordWeakness({
+        learnerId,
+        targetSound: 'test-sound',
+        wordExamples: ['test'],
+        occurrenceCount: 1,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: [],
+        exampleTurnIds: [],
+        resolved: false,
+      });
+
+      const unresolved = await pronunciationRepo.listWeaknesses(learnerId, { resolved: false });
+      expect(unresolved).toHaveLength(1);
+      expect(unresolved[0].resolved).toBe(false);
+    });
+
+    it('markResolved updates correct record', async () => {
+      const now = new Date().toISOString();
+      const weakness = await pronunciationRepo.recordWeakness({
+        learnerId,
+        targetSound: 'test-sound',
+        wordExamples: ['test'],
+        occurrenceCount: 1,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: [],
+        exampleTurnIds: [],
+        resolved: false,
+      });
+
+      expect(weakness.resolved).toBe(false);
+
+      const updated = await pronunciationRepo.markResolved(weakness.id, true);
+      expect(updated.id).toBe(weakness.id);
+      expect(updated.resolved).toBe(true);
+      expect(updated.updatedAt).not.toBe(weakness.updatedAt);
+
+      // Verify persistence
+      const weaknesses = await pronunciationRepo.listWeaknesses(learnerId, { resolved: true });
+      expect(weaknesses).toHaveLength(1);
+      expect(weaknesses[0].resolved).toBe(true);
+    });
+
+    it('unknown id fails clearly', async () => {
+      const validButMissing = '550e8400-e29b-41d4-a716-446655440000';
+      await expect(
+        pronunciationRepo.markResolved(validButMissing, true),
+      ).rejects.toThrow('Pronunciation weakness not found');
+    });
+
+    it('learner filtering prevents cross-learner leakage', async () => {
+      // Create another learner
+      const otherAdapter = new SqlJsAdapter(':memory:');
+      await otherAdapter.init();
+      const otherProfileRepo = new SQLiteUserProfileRepository(otherAdapter);
+      await otherProfileRepo.update({
+        displayName: 'Other Learner',
+        targetLanguage: 'en',
+        targetLevel: 'A1',
+        currentLevel: 'A1',
+        learningGoals: [],
+        preferredModes: ['natural'],
+      });
+      const otherLearnerId = (await otherProfileRepo.get()).id;
+      const otherPronunciationRepo = new SQLitePronunciationRepository(otherAdapter);
+
+      const now = new Date().toISOString();
+
+      // Create weaknesses for both learners
+      await pronunciationRepo.recordWeakness({
+        learnerId,
+        targetSound: 'my-sound',
+        wordExamples: ['test'],
+        occurrenceCount: 1,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: [],
+        exampleTurnIds: [],
+        resolved: false,
+      });
+
+      await otherPronunciationRepo.recordWeakness({
+        learnerId: otherLearnerId,
+        targetSound: 'other-sound',
+        wordExamples: ['test'],
+        occurrenceCount: 1,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: [],
+        exampleTurnIds: [],
+        resolved: false,
+      });
+
+      // Each learner should only see their own weaknesses
+      const myWeaknesses = await pronunciationRepo.listWeaknesses(learnerId);
+      expect(myWeaknesses).toHaveLength(1);
+      expect(myWeaknesses[0].targetSound).toBe('my-sound');
+
+      const otherWeaknesses = await otherPronunciationRepo.listWeaknesses(otherLearnerId);
+      expect(otherWeaknesses).toHaveLength(1);
+      expect(otherWeaknesses[0].targetSound).toBe('other-sound');
+    });
+
+    it('limit option works', async () => {
+      const now = new Date().toISOString();
+
+      for (let i = 0; i < 5; i++) {
+        await pronunciationRepo.recordWeakness({
+          learnerId,
+          targetSound: `sound-${i}`,
+          wordExamples: ['test'],
+          occurrenceCount: 1,
+          lastSeenAt: now,
+          firstSeenAt: now,
+          contexts: [],
+          exampleTurnIds: [],
+          resolved: false,
+        });
+      }
+
+      const limited = await pronunciationRepo.listWeaknesses(learnerId, { limit: 3 });
+      expect(limited).toHaveLength(3);
+    });
+
+    it('ordering is newest first by last_seen_at', async () => {
+      const baseTime = new Date('2026-01-01T00:00:00Z').getTime();
+
+      await pronunciationRepo.recordWeakness({
+        learnerId,
+        targetSound: 'oldest-sound',
+        wordExamples: ['test'],
+        occurrenceCount: 1,
+        lastSeenAt: new Date(baseTime).toISOString(),
+        firstSeenAt: new Date(baseTime).toISOString(),
+        contexts: [],
+        exampleTurnIds: [],
+        resolved: false,
+      });
+
+      await pronunciationRepo.recordWeakness({
+        learnerId,
+        targetSound: 'middle-sound',
+        wordExamples: ['test'],
+        occurrenceCount: 1,
+        lastSeenAt: new Date(baseTime + 1000).toISOString(),
+        firstSeenAt: new Date(baseTime + 1000).toISOString(),
+        contexts: [],
+        exampleTurnIds: [],
+        resolved: false,
+      });
+
+      await pronunciationRepo.recordWeakness({
+        learnerId,
+        targetSound: 'newest-sound',
+        wordExamples: ['test'],
+        occurrenceCount: 1,
+        lastSeenAt: new Date(baseTime + 2000).toISOString(),
+        firstSeenAt: new Date(baseTime + 2000).toISOString(),
+        contexts: [],
+        exampleTurnIds: [],
+        resolved: false,
+      });
+
+      const weaknesses = await pronunciationRepo.listWeaknesses(learnerId);
+      expect(weaknesses).toHaveLength(3);
+      expect(weaknesses[0].targetSound).toBe('newest-sound');
+      expect(weaknesses[1].targetSound).toBe('middle-sound');
+      expect(weaknesses[2].targetSound).toBe('oldest-sound');
+    });
+  });
+
+  describe('WeaknessRepository (LearnerWeakness + LearnerStrength + Evidence)', () => {
+    let learnerId: string;
+    let weaknessRepo: SQLiteWeaknessRepository;
+
+    beforeEach(async () => {
+      await createProfile();
+      learnerId = await getLearnerId();
+      weaknessRepo = new SQLiteWeaknessRepository(adapter);
+    });
+
+    it('weakness persists and round-trips', async () => {
+      const now = new Date().toISOString();
+      const weakness = await weaknessRepo.upsertWeakness({
+        learnerId,
+        type: 'grammar',
+        referenceId: 'grammar-mistake-1',
+        status: 'confirmed',
+        severity: 0.7,
+        occurrenceCount: 3,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: ['conversation', 'writing'],
+        evidence: [
+          { kind: 'turn', id: 'turn-1', at: now, summary: 'First occurrence' },
+          { kind: 'turn', id: 'turn-2', at: now, summary: 'Second occurrence' },
+        ],
+        notes: 'Consistent error with prepositions',
+        resolved: false,
+      });
+
+      expect(weakness.id).toBeDefined();
+      expect(weakness.learnerId).toBe(learnerId);
+      expect(weakness.type).toBe('grammar');
+      expect(weakness.referenceId).toBe('grammar-mistake-1');
+      expect(weakness.status).toBe('confirmed');
+      expect(weakness.severity).toBe(0.7);
+      expect(weakness.occurrenceCount).toBe(3);
+      expect(weakness.contexts).toEqual(['conversation', 'writing']);
+      expect(weakness.evidence).toHaveLength(2);
+      expect(weakness.notes).toBe('Consistent error with prepositions');
+      expect(weakness.resolved).toBe(false);
+      expect(weakness.createdAt).toBeDefined();
+      expect(weakness.updatedAt).toBeDefined();
+
+      // Round-trip via listWeaknesses
+      const weaknesses = await weaknessRepo.listWeaknesses(learnerId);
+      expect(weaknesses).toHaveLength(1);
+      expect(weaknesses[0].id).toBe(weakness.id);
+      expect(weaknesses[0].status).toBe('confirmed');
+    });
+
+    it('lifecycle status survives round-trip', async () => {
+      const now = new Date().toISOString();
+      const statuses = [
+        'observed',
+        'repeated',
+        'confirmed',
+        'active_training',
+        'improving',
+        'stable',
+        'mastered',
+        'relapsed',
+      ] as const;
+
+      for (const status of statuses) {
+        await weaknessRepo.upsertWeakness({
+          learnerId,
+          type: 'grammar',
+          referenceId: `ref-${status}`,
+          status,
+          severity: 0.5,
+          occurrenceCount: 1,
+          lastSeenAt: now,
+          firstSeenAt: now,
+          contexts: [],
+          evidence: [],
+          resolved: false,
+        });
+      }
+
+      const weaknesses = await weaknessRepo.listWeaknesses(learnerId);
+      expect(weaknesses).toHaveLength(statuses.length);
+
+      const retrievedStatuses = weaknesses.map(w => w.status).sort();
+      expect(retrievedStatuses).toEqual([...statuses].sort());
+    });
+
+    it('evidence attaches to correct weakness', async () => {
+      const now = new Date().toISOString();
+      const weakness = await weaknessRepo.upsertWeakness({
+        learnerId,
+        type: 'pronunciation',
+        referenceId: 'pronunciation-weakness-1',
+        status: 'confirmed',
+        severity: 0.6,
+        occurrenceCount: 2,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: ['speaking'],
+        evidence: [],
+        resolved: false,
+      });
+
+      const evidenceId = '550e8400-e29b-41d4-a716-446655440001';
+      await weaknessRepo.addWeaknessEvidence({
+        id: evidenceId,
+        weaknessId: weakness.id,
+        kind: 'turn',
+        at: now,
+        summary: 'Pronunciation error in turn 5',
+      });
+
+      // Verify evidence was added by checking the weakness_evidence table directly
+      const evidenceRows = await adapter.query(
+        `SELECT * FROM weakness_evidence WHERE weakness_id = ?`,
+        [weakness.id],
+      );
+      expect(evidenceRows).toHaveLength(1);
+      expect(evidenceRows[0].id).toBe(evidenceId);
+      expect(evidenceRows[0].weakness_id).toBe(weakness.id);
+      expect(evidenceRows[0].kind).toBe('turn');
+      expect(evidenceRows[0].summary).toBe('Pronunciation error in turn 5');
+    });
+
+    it('multiple evidence records stay associated correctly', async () => {
+      const now = new Date().toISOString();
+      const weakness = await weaknessRepo.upsertWeakness({
+        learnerId,
+        type: 'vocabulary',
+        referenceId: 'vocab-item-1',
+        status: 'active_training',
+        severity: 0.4,
+        occurrenceCount: 5,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: ['reading', 'listening'],
+        evidence: [],
+        resolved: false,
+      });
+
+      const evidenceEntries = [
+        { id: '550e8400-e29b-41d4-a716-446655440002', kind: 'turn' as const, at: now, summary: 'Turn 1' },
+        { id: '550e8400-e29b-41d4-a716-446655440003', kind: 'session' as const, at: now, summary: 'Session 1' },
+        { id: '550e8400-e29b-41d4-a716-446655440004', kind: 'observation' as const, at: now, summary: 'Observation 1' },
+      ];
+
+      for (const ev of evidenceEntries) {
+        await weaknessRepo.addWeaknessEvidence({
+          id: ev.id,
+          weaknessId: weakness.id,
+          kind: ev.kind,
+          at: ev.at,
+          summary: ev.summary,
+        });
+      }
+
+      const evidenceRows = await adapter.query(
+        `SELECT * FROM weakness_evidence WHERE weakness_id = ? ORDER BY at`,
+        [weakness.id],
+      );
+      expect(evidenceRows).toHaveLength(3);
+      expect(evidenceRows[0].id).toBe('550e8400-e29b-41d4-a716-446655440002');
+      expect(evidenceRows[1].id).toBe('550e8400-e29b-41d4-a716-446655440003');
+      expect(evidenceRows[2].id).toBe('550e8400-e29b-41d4-a716-446655440004');
+      expect(evidenceRows[0].kind).toBe('turn');
+      expect(evidenceRows[1].kind).toBe('session');
+      expect(evidenceRows[2].kind).toBe('observation');
+    });
+
+    it('learner filtering prevents cross-learner leakage', async () => {
+      // Create another learner
+      const otherAdapter = new SqlJsAdapter(':memory:');
+      await otherAdapter.init();
+      const otherProfileRepo = new SQLiteUserProfileRepository(otherAdapter);
+      await otherProfileRepo.update({
+        displayName: 'Other Learner',
+        targetLanguage: 'en',
+        targetLevel: 'A1',
+        currentLevel: 'A1',
+        learningGoals: [],
+        preferredModes: ['natural'],
+      });
+      const otherLearnerId = (await otherProfileRepo.get()).id;
+      const otherWeaknessRepo = new SQLiteWeaknessRepository(otherAdapter);
+
+      const now = new Date().toISOString();
+
+      // Create weaknesses for both learners
+      await weaknessRepo.upsertWeakness({
+        learnerId,
+        type: 'grammar',
+        referenceId: 'my-ref',
+        status: 'confirmed',
+        severity: 0.5,
+        occurrenceCount: 1,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: [],
+        evidence: [],
+        resolved: false,
+      });
+
+      await otherWeaknessRepo.upsertWeakness({
+        learnerId: otherLearnerId,
+        type: 'pronunciation',
+        referenceId: 'other-ref',
+        status: 'observed',
+        severity: 0.3,
+        occurrenceCount: 1,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: [],
+        evidence: [],
+        resolved: false,
+      });
+
+      // Each learner should only see their own weaknesses
+      const myWeaknesses = await weaknessRepo.listWeaknesses(learnerId);
+      expect(myWeaknesses).toHaveLength(1);
+      expect(myWeaknesses[0].type).toBe('grammar');
+
+      const otherWeaknesses = await otherWeaknessRepo.listWeaknesses(otherLearnerId);
+      expect(otherWeaknesses).toHaveLength(1);
+      expect(otherWeaknesses[0].type).toBe('pronunciation');
+    });
+
+    it('strength persists and round-trips', async () => {
+      const now = new Date().toISOString();
+      const strength = await weaknessRepo.upsertStrength({
+        learnerId,
+        type: 'grammar',
+        referenceId: 'grammar-rule-1',
+        confidence: 0.9,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: ['writing', 'formal'],
+        evidence: [
+          { kind: 'turn', id: 'turn-1', at: now, summary: 'Correct usage' },
+        ],
+        notes: 'Strong command of conditionals',
+      });
+
+      expect(strength.id).toBeDefined();
+      expect(strength.learnerId).toBe(learnerId);
+      expect(strength.type).toBe('grammar');
+      expect(strength.referenceId).toBe('grammar-rule-1');
+      expect(strength.confidence).toBe(0.9);
+      expect(strength.contexts).toEqual(['writing', 'formal']);
+      expect(strength.evidence).toHaveLength(1);
+      expect(strength.notes).toBe('Strong command of conditionals');
+      expect(strength.createdAt).toBeDefined();
+      expect(strength.updatedAt).toBeDefined();
+
+      // Round-trip via listStrengths
+      const strengths = await weaknessRepo.listStrengths(learnerId);
+      expect(strengths).toHaveLength(1);
+      expect(strengths[0].id).toBe(strength.id);
+      expect(strengths[0].confidence).toBe(0.9);
+    });
+
+    it('strength learner filtering works', async () => {
+      // Create another learner
+      const otherAdapter = new SqlJsAdapter(':memory:');
+      await otherAdapter.init();
+      const otherProfileRepo = new SQLiteUserProfileRepository(otherAdapter);
+      await otherProfileRepo.update({
+        displayName: 'Other Learner',
+        targetLanguage: 'en',
+        targetLevel: 'A1',
+        currentLevel: 'A1',
+        learningGoals: [],
+        preferredModes: ['natural'],
+      });
+      const otherLearnerId = (await otherProfileRepo.get()).id;
+      const otherWeaknessRepo = new SQLiteWeaknessRepository(otherAdapter);
+
+      const now = new Date().toISOString();
+
+      // Create strengths for both learners
+      await weaknessRepo.upsertStrength({
+        learnerId,
+        type: 'vocabulary',
+        referenceId: 'my-vocab',
+        confidence: 0.8,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: [],
+        evidence: [],
+      });
+
+      await otherWeaknessRepo.upsertStrength({
+        learnerId: otherLearnerId,
+        type: 'fluency',
+        referenceId: 'other-fluency',
+        confidence: 0.7,
+        lastSeenAt: now,
+        firstSeenAt: now,
+        contexts: [],
+        evidence: [],
+      });
+
+      // Each learner should only see their own strengths
+      const myStrengths = await weaknessRepo.listStrengths(learnerId);
+      expect(myStrengths).toHaveLength(1);
+      expect(myStrengths[0].type).toBe('vocabulary');
+
+      const otherStrengths = await otherWeaknessRepo.listStrengths(otherLearnerId);
+      expect(otherStrengths).toHaveLength(1);
+      expect(otherStrengths[0].type).toBe('fluency');
+    });
+
+    it('unknown weakness evidence target fails via FK', async () => {
+      const now = new Date().toISOString();
+      const validButMissing = '550e8400-e29b-41d4-a716-446655440000';
+
+      await expect(
+        weaknessRepo.addWeaknessEvidence({
+          id: '550e8400-e29b-41d4-a716-446655440005',
+          weaknessId: validButMissing,
+          kind: 'turn',
+          at: now,
+        }),
+      ).rejects.toThrow('Weakness not found');
+    });
+
+    it('deterministic list ordering', async () => {
+      const baseTime = new Date('2026-01-01T00:00:00Z').getTime();
+
+      await weaknessRepo.upsertWeakness({
+        learnerId,
+        type: 'grammar',
+        referenceId: 'ref-oldest',
+        status: 'observed',
+        severity: 0.3,
+        occurrenceCount: 1,
+        lastSeenAt: new Date(baseTime).toISOString(),
+        firstSeenAt: new Date(baseTime).toISOString(),
+        contexts: [],
+        evidence: [],
+        resolved: false,
+      });
+
+      await weaknessRepo.upsertWeakness({
+        learnerId,
+        type: 'pronunciation',
+        referenceId: 'ref-middle',
+        status: 'confirmed',
+        severity: 0.6,
+        occurrenceCount: 2,
+        lastSeenAt: new Date(baseTime + 1000).toISOString(),
+        firstSeenAt: new Date(baseTime + 1000).toISOString(),
+        contexts: [],
+        evidence: [],
+        resolved: false,
+      });
+
+      await weaknessRepo.upsertWeakness({
+        learnerId,
+        type: 'vocabulary',
+        referenceId: 'ref-newest',
+        status: 'mastered',
+        severity: 0.1,
+        occurrenceCount: 1,
+        lastSeenAt: new Date(baseTime + 2000).toISOString(),
+        firstSeenAt: new Date(baseTime + 2000).toISOString(),
+        contexts: [],
+        evidence: [],
+        resolved: true,
+      });
+
+      const weaknesses = await weaknessRepo.listWeaknesses(learnerId);
+      expect(weaknesses).toHaveLength(3);
+      // Ordered by last_seen_at DESC (newest first)
+      expect(weaknesses[0].referenceId).toBe('ref-newest');
+      expect(weaknesses[1].referenceId).toBe('ref-middle');
+      expect(weaknesses[2].referenceId).toBe('ref-oldest');
     });
   });
 });

@@ -162,4 +162,4 @@ export interface FluencyObservation {
   readonly observedAt: IsoDate;
 }
 
-export type { CefrLevelInput as Cefr, ConversationMode };
+export type { CefrLevelInput as Cefr, ConversationMode, EvidenceRef };

@@ -20,10 +20,18 @@ import type {
 import type {
   UserProfileRepository,
   ConversationRepository,
+  MistakeRepository,
+  PronunciationRepository,
+  WeaknessRepository,
 } from '../../../repositories';
 import type {
   UserProfile,
+  GrammarMistake,
+  PronunciationWeakness,
+  LearnerWeakness,
+  LearnerStrength,
 } from '../../../domain/models/learner';
+import type { EvidenceRef } from '../../../domain/shared/types';
 import type {
   ConversationSession,
   ConversationTurn,
@@ -454,5 +462,775 @@ export class SQLiteConversationRepository implements ConversationRepository {
     );
 
     return rows.map(rowToConversationTurn);
+  }
+}
+
+/** Map grammar_mistakes row to GrammarMistake domain object. */
+function rowToGrammarMistake(row: SqlRow): GrammarMistake {
+  return {
+    id: row.id as string,
+    learnerId: row.learner_id as string,
+    category: row.category as string,
+    pattern: row.pattern as string,
+    correction: row.correction as string,
+    explanation: (row.explanation as string) ?? undefined,
+    severity: row.severity as GrammarMistake['severity'],
+    occurrenceCount: row.occurrence_count as number,
+    lastSeenAt: row.last_seen_at as string,
+    firstSeenAt: row.first_seen_at as string,
+    contexts: safeJsonParse(row.contexts, []),
+    exampleTurnIds: safeJsonParse(row.example_turn_ids, []),
+    originSessionId: (row.origin_session_id as string) ?? undefined,
+    originTurnId: (row.origin_turn_id as string) ?? undefined,
+    resolved: (row.resolved as number) === 1,
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+/** Map pronunciation_weaknesses row to PronunciationWeakness domain object. */
+function rowToPronunciationWeakness(row: SqlRow): PronunciationWeakness {
+  return {
+    id: row.id as string,
+    learnerId: row.learner_id as string,
+    targetSound: row.target_sound as string,
+    wordExamples: safeJsonParse(row.word_examples, []),
+    occurrenceCount: row.occurrence_count as number,
+    lastSeenAt: row.last_seen_at as string,
+    firstSeenAt: row.first_seen_at as string,
+    contexts: safeJsonParse(row.contexts, []),
+    exampleTurnIds: safeJsonParse(row.example_turn_ids, []),
+    originSessionId: (row.origin_session_id as string) ?? undefined,
+    originTurnId: (row.origin_turn_id as string) ?? undefined,
+    resolved: (row.resolved as number) === 1,
+    notes: (row.notes as string) ?? undefined,
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+/** Map learner_weaknesses row to LearnerWeakness domain object. */
+function rowToLearnerWeakness(row: SqlRow): LearnerWeakness {
+  return {
+    id: row.id as string,
+    learnerId: row.learner_id as string,
+    type: row.type as LearnerWeakness['type'],
+    referenceId: row.reference_id as string,
+    status: row.status as LearnerWeakness['status'],
+    severity: row.severity as number,
+    occurrenceCount: row.occurrence_count as number,
+    lastSeenAt: row.last_seen_at as string,
+    firstSeenAt: row.first_seen_at as string,
+    contexts: safeJsonParse(row.contexts, []),
+    evidence: safeJsonParse(row.evidence, []),
+    notes: (row.notes as string) ?? undefined,
+    resolved: (row.resolved as number) === 1,
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+/** Map learner_strengths row to LearnerStrength domain object. */
+function rowToLearnerStrength(row: SqlRow): LearnerStrength {
+  return {
+    id: row.id as string,
+    learnerId: row.learner_id as string,
+    type: row.type as LearnerStrength['type'],
+    referenceId: row.reference_id as string,
+    confidence: row.confidence as number,
+    lastSeenAt: row.last_seen_at as string,
+    firstSeenAt: row.first_seen_at as string,
+    contexts: safeJsonParse(row.contexts, []),
+    evidence: safeJsonParse(row.evidence, []),
+    notes: (row.notes as string) ?? undefined,
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+/** Build partial UPDATE SQL and params for a grammar mistake. */
+function buildGrammarMistakeUpdate(
+  id: string,
+  patch: Partial<Omit<GrammarMistake, 'id' | 'createdAt'>>,
+): { sql: string; params: SqlParam[] } {
+  const fields: string[] = [];
+  const params: SqlParam[] = [];
+
+  const fieldMap: Record<string, string> = {
+    learnerId: 'learner_id',
+    category: 'category',
+    pattern: 'pattern',
+    correction: 'correction',
+    explanation: 'explanation',
+    severity: 'severity',
+    occurrenceCount: 'occurrence_count',
+    lastSeenAt: 'last_seen_at',
+    firstSeenAt: 'first_seen_at',
+    contexts: 'contexts',
+    exampleTurnIds: 'example_turn_ids',
+    originSessionId: 'origin_session_id',
+    originTurnId: 'origin_turn_id',
+    resolved: 'resolved',
+  };
+
+  for (const [key, column] of Object.entries(fieldMap)) {
+    const value = patch[key as keyof typeof patch];
+    if (value !== undefined) {
+      fields.push(`${column} = ?`);
+      if (key === 'contexts' || key === 'exampleTurnIds') {
+        params.push(JSON.stringify(value));
+      } else if (key === 'resolved') {
+        params.push(value ? 1 : 0);
+      } else {
+        params.push(value as SqlParam);
+      }
+    }
+  }
+
+  fields.push('updated_at = ?');
+  params.push(nowIso());
+  params.push(id);
+
+  const sql = `UPDATE grammar_mistakes SET ${fields.join(', ')} WHERE id = ?`;
+  return { sql, params };
+}
+
+/** Build partial UPDATE SQL and params for a pronunciation weakness. */
+function buildPronunciationWeaknessUpdate(
+  id: string,
+  patch: Partial<Omit<PronunciationWeakness, 'id' | 'createdAt'>>,
+): { sql: string; params: SqlParam[] } {
+  const fields: string[] = [];
+  const params: SqlParam[] = [];
+
+  const fieldMap: Record<string, string> = {
+    learnerId: 'learner_id',
+    targetSound: 'target_sound',
+    wordExamples: 'word_examples',
+    occurrenceCount: 'occurrence_count',
+    lastSeenAt: 'last_seen_at',
+    firstSeenAt: 'first_seen_at',
+    contexts: 'contexts',
+    exampleTurnIds: 'example_turn_ids',
+    originSessionId: 'origin_session_id',
+    originTurnId: 'origin_turn_id',
+    resolved: 'resolved',
+    notes: 'notes',
+  };
+
+  for (const [key, column] of Object.entries(fieldMap)) {
+    const value = patch[key as keyof typeof patch];
+    if (value !== undefined) {
+      fields.push(`${column} = ?`);
+      if (key === 'wordExamples' || key === 'contexts' || key === 'exampleTurnIds') {
+        params.push(JSON.stringify(value));
+      } else if (key === 'resolved') {
+        params.push(value ? 1 : 0);
+      } else {
+        params.push(value as SqlParam);
+      }
+    }
+  }
+
+  fields.push('updated_at = ?');
+  params.push(nowIso());
+  params.push(id);
+
+  const sql = `UPDATE pronunciation_weaknesses SET ${fields.join(', ')} WHERE id = ?`;
+  return { sql, params };
+}
+
+/** Build partial UPDATE SQL and params for a learner weakness. */
+function buildLearnerWeaknessUpdate(
+  id: string,
+  patch: Partial<Omit<LearnerWeakness, 'id' | 'createdAt'>>,
+): { sql: string; params: SqlParam[] } {
+  const fields: string[] = [];
+  const params: SqlParam[] = [];
+
+  const fieldMap: Record<string, string> = {
+    learnerId: 'learner_id',
+    type: 'type',
+    referenceId: 'reference_id',
+    status: 'status',
+    severity: 'severity',
+    occurrenceCount: 'occurrence_count',
+    lastSeenAt: 'last_seen_at',
+    firstSeenAt: 'first_seen_at',
+    contexts: 'contexts',
+    evidence: 'evidence',
+    notes: 'notes',
+    resolved: 'resolved',
+  };
+
+  for (const [key, column] of Object.entries(fieldMap)) {
+    const value = patch[key as keyof typeof patch];
+    if (value !== undefined) {
+      fields.push(`${column} = ?`);
+      if (key === 'contexts' || key === 'evidence') {
+        params.push(JSON.stringify(value));
+      } else if (key === 'resolved') {
+        params.push(value ? 1 : 0);
+      } else {
+        params.push(value as SqlParam);
+      }
+    }
+  }
+
+  fields.push('updated_at = ?');
+  params.push(nowIso());
+  params.push(id);
+
+  const sql = `UPDATE learner_weaknesses SET ${fields.join(', ')} WHERE id = ?`;
+  return { sql, params };
+}
+
+/** Build partial UPDATE SQL and params for a learner strength. */
+function buildLearnerStrengthUpdate(
+  id: string,
+  patch: Partial<Omit<LearnerStrength, 'id' | 'createdAt'>>,
+): { sql: string; params: SqlParam[] } {
+  const fields: string[] = [];
+  const params: SqlParam[] = [];
+
+  const fieldMap: Record<string, string> = {
+    learnerId: 'learner_id',
+    type: 'type',
+    referenceId: 'reference_id',
+    confidence: 'confidence',
+    lastSeenAt: 'last_seen_at',
+    firstSeenAt: 'first_seen_at',
+    contexts: 'contexts',
+    evidence: 'evidence',
+    notes: 'notes',
+  };
+
+  for (const [key, column] of Object.entries(fieldMap)) {
+    const value = patch[key as keyof typeof patch];
+    if (value !== undefined) {
+      fields.push(`${column} = ?`);
+      if (key === 'contexts' || key === 'evidence') {
+        params.push(JSON.stringify(value));
+      } else {
+        params.push(value as SqlParam);
+      }
+    }
+  }
+
+  fields.push('updated_at = ?');
+  params.push(nowIso());
+  params.push(id);
+
+  const sql = `UPDATE learner_strengths SET ${fields.join(', ')} WHERE id = ?`;
+  return { sql, params };
+}
+
+/**
+ * SQLiteMistakeRepository
+ *
+ * Implements MistakeRepository for grammar mistakes.
+ */
+export class SQLiteMistakeRepository implements MistakeRepository {
+  constructor(private readonly adapter: DatabaseAdapter) {}
+
+  async recordMistake(
+    mistake: Omit<GrammarMistake, 'id' | 'createdAt' | 'updatedAt'>,
+  ): Promise<GrammarMistake> {
+    const id = generateId();
+    const now = nowIso();
+
+    // Validate required fields
+    if (!mistake.learnerId || !isValidUuid(mistake.learnerId)) {
+      throw new Error('Invalid learnerId');
+    }
+    if (!mistake.category) {
+      throw new Error('category is required');
+    }
+    if (!mistake.pattern) {
+      throw new Error('pattern is required');
+    }
+    if (!mistake.correction) {
+      throw new Error('correction is required');
+    }
+    if (!mistake.severity) {
+      throw new Error('severity is required');
+    }
+    if (!mistake.lastSeenAt) {
+      throw new Error('lastSeenAt is required');
+    }
+    if (!mistake.firstSeenAt) {
+      throw new Error('firstSeenAt is required');
+    }
+
+    await this.adapter.execute(
+      `INSERT INTO grammar_mistakes (
+        id, learner_id, category, pattern, correction, explanation,
+        severity, occurrence_count, last_seen_at, first_seen_at,
+        contexts, example_turn_ids, origin_session_id, origin_turn_id,
+        resolved, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        mistake.learnerId,
+        mistake.category,
+        mistake.pattern,
+        mistake.correction,
+        mistake.explanation ?? null,
+        mistake.severity,
+        mistake.occurrenceCount ?? 1,
+        mistake.lastSeenAt,
+        mistake.firstSeenAt,
+        JSON.stringify(mistake.contexts ?? []),
+        JSON.stringify(mistake.exampleTurnIds ?? []),
+        mistake.originSessionId ?? null,
+        mistake.originTurnId ?? null,
+        mistake.resolved ? 1 : 0,
+        now,
+        now,
+      ],
+    );
+
+    const rows = await this.adapter.query(
+      `SELECT * FROM grammar_mistakes WHERE id = ?`,
+      [id],
+    );
+
+    if (rows.length === 0) {
+      throw new Error('Failed to create grammar mistake');
+    }
+
+    return rowToGrammarMistake(rows[0]);
+  }
+
+  async listMistakes(
+    learnerId: string,
+    opts?: { resolved?: boolean; limit?: number },
+  ): Promise<readonly GrammarMistake[]> {
+    if (!isValidUuid(learnerId)) return [];
+
+    let sql = `SELECT * FROM grammar_mistakes WHERE learner_id = ?`;
+    const params: SqlParam[] = [learnerId];
+
+    if (opts?.resolved !== undefined) {
+      sql += ` AND resolved = ?`;
+      params.push(opts.resolved ? 1 : 0);
+    }
+
+    sql += ` ORDER BY last_seen_at DESC`;
+
+    if (opts?.limit !== undefined && opts.limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(opts.limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+    return rows.map(rowToGrammarMistake);
+  }
+
+  async markResolved(id: string, resolved: boolean): Promise<GrammarMistake> {
+    if (!isValidUuid(id)) {
+      throw new Error('Invalid mistake id');
+    }
+
+    const existing = await this.adapter.query(
+      `SELECT * FROM grammar_mistakes WHERE id = ?`,
+      [id],
+    );
+
+    if (existing.length === 0) {
+      throw new Error(`Grammar mistake not found: ${id}`);
+    }
+
+    const { sql, params } = buildGrammarMistakeUpdate(id, { resolved });
+    await this.adapter.execute(sql, params);
+
+    const rows = await this.adapter.query(
+      `SELECT * FROM grammar_mistakes WHERE id = ?`,
+      [id],
+    );
+
+    if (rows.length === 0) {
+      throw new Error('Grammar mistake disappeared after update');
+    }
+
+    return rowToGrammarMistake(rows[0]);
+  }
+}
+
+/**
+ * SQLitePronunciationRepository
+ *
+ * Implements PronunciationRepository for pronunciation weaknesses.
+ * NO fabricated pronunciation scores - only evidence/observations.
+ */
+export class SQLitePronunciationRepository implements PronunciationRepository {
+  constructor(private readonly adapter: DatabaseAdapter) {}
+
+  async recordWeakness(
+    weakness: Omit<PronunciationWeakness, 'id' | 'createdAt' | 'updatedAt'>,
+  ): Promise<PronunciationWeakness> {
+    const id = generateId();
+    const now = nowIso();
+
+    // Validate required fields
+    if (!weakness.learnerId || !isValidUuid(weakness.learnerId)) {
+      throw new Error('Invalid learnerId');
+    }
+    if (!weakness.targetSound) {
+      throw new Error('targetSound is required');
+    }
+    if (!weakness.lastSeenAt) {
+      throw new Error('lastSeenAt is required');
+    }
+    if (!weakness.firstSeenAt) {
+      throw new Error('firstSeenAt is required');
+    }
+
+    await this.adapter.execute(
+      `INSERT INTO pronunciation_weaknesses (
+        id, learner_id, target_sound, word_examples, occurrence_count,
+        last_seen_at, first_seen_at, contexts, example_turn_ids,
+        origin_session_id, origin_turn_id, resolved, notes,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        weakness.learnerId,
+        weakness.targetSound,
+        JSON.stringify(weakness.wordExamples ?? []),
+        weakness.occurrenceCount ?? 1,
+        weakness.lastSeenAt,
+        weakness.firstSeenAt,
+        JSON.stringify(weakness.contexts ?? []),
+        JSON.stringify(weakness.exampleTurnIds ?? []),
+        weakness.originSessionId ?? null,
+        weakness.originTurnId ?? null,
+        weakness.resolved ? 1 : 0,
+        weakness.notes ?? null,
+        now,
+        now,
+      ],
+    );
+
+    const rows = await this.adapter.query(
+      `SELECT * FROM pronunciation_weaknesses WHERE id = ?`,
+      [id],
+    );
+
+    if (rows.length === 0) {
+      throw new Error('Failed to create pronunciation weakness');
+    }
+
+    return rowToPronunciationWeakness(rows[0]);
+  }
+
+  async listWeaknesses(
+    learnerId: string,
+    opts?: { resolved?: boolean; limit?: number },
+  ): Promise<readonly PronunciationWeakness[]> {
+    if (!isValidUuid(learnerId)) return [];
+
+    let sql = `SELECT * FROM pronunciation_weaknesses WHERE learner_id = ?`;
+    const params: SqlParam[] = [learnerId];
+
+    if (opts?.resolved !== undefined) {
+      sql += ` AND resolved = ?`;
+      params.push(opts.resolved ? 1 : 0);
+    }
+
+    sql += ` ORDER BY last_seen_at DESC`;
+
+    if (opts?.limit !== undefined && opts.limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(opts.limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+    return rows.map(rowToPronunciationWeakness);
+  }
+
+  async markResolved(id: string, resolved: boolean): Promise<PronunciationWeakness> {
+    if (!isValidUuid(id)) {
+      throw new Error('Invalid pronunciation weakness id');
+    }
+
+    const existing = await this.adapter.query(
+      `SELECT * FROM pronunciation_weaknesses WHERE id = ?`,
+      [id],
+    );
+
+    if (existing.length === 0) {
+      throw new Error(`Pronunciation weakness not found: ${id}`);
+    }
+
+    const { sql, params } = buildPronunciationWeaknessUpdate(id, { resolved });
+    await this.adapter.execute(sql, params);
+
+    const rows = await this.adapter.query(
+      `SELECT * FROM pronunciation_weaknesses WHERE id = ?`,
+      [id],
+    );
+
+    if (rows.length === 0) {
+      throw new Error('Pronunciation weakness disappeared after update');
+    }
+
+    return rowToPronunciationWeakness(rows[0]);
+  }
+}
+
+/**
+ * SQLiteWeaknessRepository
+ *
+ * Implements WeaknessRepository for learner weaknesses and strengths.
+ * Includes persistence methods for upserting weaknesses/strengths and adding evidence.
+ */
+export class SQLiteWeaknessRepository implements WeaknessRepository {
+  constructor(private readonly adapter: DatabaseAdapter) {}
+
+  async listWeaknesses(learnerId: string, limit?: number): Promise<readonly LearnerWeakness[]> {
+    if (!isValidUuid(learnerId)) return [];
+
+    let sql = `SELECT * FROM learner_weaknesses WHERE learner_id = ? ORDER BY last_seen_at DESC`;
+    const params: SqlParam[] = [learnerId];
+
+    if (limit !== undefined && limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+    return rows.map(rowToLearnerWeakness);
+  }
+
+  async listStrengths(learnerId: string, limit?: number): Promise<readonly LearnerStrength[]> {
+    if (!isValidUuid(learnerId)) return [];
+
+    let sql = `SELECT * FROM learner_strengths WHERE learner_id = ? ORDER BY last_seen_at DESC`;
+    const params: SqlParam[] = [learnerId];
+
+    if (limit !== undefined && limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+    return rows.map(rowToLearnerStrength);
+  }
+
+  async upsertWeakness(
+    weakness: Omit<LearnerWeakness, 'id' | 'createdAt' | 'updatedAt'>,
+  ): Promise<LearnerWeakness> {
+    // Check if a weakness with same learner_id, type, reference_id exists
+    const existing = await this.adapter.query(
+      `SELECT * FROM learner_weaknesses WHERE learner_id = ? AND type = ? AND reference_id = ?`,
+      [weakness.learnerId, weakness.type, weakness.referenceId],
+    );
+
+    const now = nowIso();
+
+    if (existing.length > 0) {
+      // Update existing
+      const id = existing[0].id as string;
+      const { sql, params } = buildLearnerWeaknessUpdate(id, weakness);
+      await this.adapter.execute(sql, params);
+
+      const rows = await this.adapter.query(
+        `SELECT * FROM learner_weaknesses WHERE id = ?`,
+        [id],
+      );
+
+      if (rows.length === 0) {
+        throw new Error('Weakness disappeared after update');
+      }
+
+      return rowToLearnerWeakness(rows[0]);
+    }
+
+    // Create new
+    const id = generateId();
+
+    // Validate required fields
+    if (!weakness.learnerId || !isValidUuid(weakness.learnerId)) {
+      throw new Error('Invalid learnerId');
+    }
+    if (!weakness.type) {
+      throw new Error('type is required');
+    }
+    if (!weakness.referenceId) {
+      throw new Error('referenceId is required');
+    }
+    if (!weakness.status) {
+      throw new Error('status is required');
+    }
+    if (weakness.severity === undefined || weakness.severity === null) {
+      throw new Error('severity is required');
+    }
+    if (!weakness.lastSeenAt) {
+      throw new Error('lastSeenAt is required');
+    }
+    if (!weakness.firstSeenAt) {
+      throw new Error('firstSeenAt is required');
+    }
+
+    await this.adapter.execute(
+      `INSERT INTO learner_weaknesses (
+        id, learner_id, type, reference_id, status, severity,
+        occurrence_count, last_seen_at, first_seen_at, contexts,
+        evidence, notes, resolved, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        weakness.learnerId,
+        weakness.type,
+        weakness.referenceId,
+        weakness.status,
+        weakness.severity,
+        weakness.occurrenceCount ?? 1,
+        weakness.lastSeenAt,
+        weakness.firstSeenAt,
+        JSON.stringify(weakness.contexts ?? []),
+        JSON.stringify(weakness.evidence ?? []),
+        weakness.notes ?? null,
+        weakness.resolved ? 1 : 0,
+        now,
+        now,
+      ],
+    );
+
+    const rows = await this.adapter.query(
+      `SELECT * FROM learner_weaknesses WHERE id = ?`,
+      [id],
+    );
+
+    if (rows.length === 0) {
+      throw new Error('Failed to create learner weakness');
+    }
+
+    return rowToLearnerWeakness(rows[0]);
+  }
+
+  async upsertStrength(
+    strength: Omit<LearnerStrength, 'id' | 'createdAt' | 'updatedAt'>,
+  ): Promise<LearnerStrength> {
+    // Check if a strength with same learner_id, type, reference_id exists
+    const existing = await this.adapter.query(
+      `SELECT * FROM learner_strengths WHERE learner_id = ? AND type = ? AND reference_id = ?`,
+      [strength.learnerId, strength.type, strength.referenceId],
+    );
+
+    const now = nowIso();
+
+    if (existing.length > 0) {
+      // Update existing
+      const id = existing[0].id as string;
+      const { sql, params } = buildLearnerStrengthUpdate(id, strength);
+      await this.adapter.execute(sql, params);
+
+      const rows = await this.adapter.query(
+        `SELECT * FROM learner_strengths WHERE id = ?`,
+        [id],
+      );
+
+      if (rows.length === 0) {
+        throw new Error('Strength disappeared after update');
+      }
+
+      return rowToLearnerStrength(rows[0]);
+    }
+
+    // Create new
+    const id = generateId();
+
+    // Validate required fields
+    if (!strength.learnerId || !isValidUuid(strength.learnerId)) {
+      throw new Error('Invalid learnerId');
+    }
+    if (!strength.type) {
+      throw new Error('type is required');
+    }
+    if (!strength.referenceId) {
+      throw new Error('referenceId is required');
+    }
+    if (strength.confidence === undefined || strength.confidence === null) {
+      throw new Error('confidence is required');
+    }
+    if (!strength.lastSeenAt) {
+      throw new Error('lastSeenAt is required');
+    }
+    if (!strength.firstSeenAt) {
+      throw new Error('firstSeenAt is required');
+    }
+
+    await this.adapter.execute(
+      `INSERT INTO learner_strengths (
+        id, learner_id, type, reference_id, confidence,
+        last_seen_at, first_seen_at, contexts, evidence, notes,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        strength.learnerId,
+        strength.type,
+        strength.referenceId,
+        strength.confidence,
+        strength.lastSeenAt,
+        strength.firstSeenAt,
+        JSON.stringify(strength.contexts ?? []),
+        JSON.stringify(strength.evidence ?? []),
+        strength.notes ?? null,
+        now,
+        now,
+      ],
+    );
+
+    const rows = await this.adapter.query(
+      `SELECT * FROM learner_strengths WHERE id = ?`,
+      [id],
+    );
+
+    if (rows.length === 0) {
+      throw new Error('Failed to create learner strength');
+    }
+
+    return rowToLearnerStrength(rows[0]);
+  }
+
+  async addWeaknessEvidence(evidence: Omit<EvidenceRef, 'kind'> & { weaknessId: string; kind: EvidenceRef['kind'] }): Promise<void> {
+    if (!isValidUuid(evidence.weaknessId)) {
+      throw new Error('Invalid weaknessId');
+    }
+    if (!isValidUuid(evidence.id)) {
+      throw new Error('Invalid evidence id');
+    }
+    if (!evidence.kind) {
+      throw new Error('kind is required');
+    }
+    if (!evidence.at) {
+      throw new Error('at is required');
+    }
+
+    // Verify weakness exists
+    const existing = await this.adapter.query(
+      `SELECT id FROM learner_weaknesses WHERE id = ?`,
+      [evidence.weaknessId],
+    );
+
+    if (existing.length === 0) {
+      throw new Error(`Weakness not found: ${evidence.weaknessId}`);
+    }
+
+    await this.adapter.execute(
+      `INSERT INTO weakness_evidence (id, weakness_id, kind, ref_id, at, summary)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        evidence.id,
+        evidence.weaknessId,
+        evidence.kind,
+        evidence.id, // ref_id uses the same id as evidence id
+        evidence.at,
+        evidence.summary ?? null,
+      ],
+    );
   }
 }

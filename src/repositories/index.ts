@@ -19,6 +19,7 @@ import type {
   PronunciationWeakness,
   UserProfile,
 } from '../domain/models/learner';
+import type { EvidenceRef } from '../domain/shared/types';
 import type {
   ExpressionItem,
   VocabularyItem,
@@ -66,6 +67,9 @@ export interface PronunciationRepository {
 export interface WeaknessRepository {
   listWeaknesses(learnerId: string, limit?: number): Promise<readonly LearnerWeakness[]>;
   listStrengths(learnerId: string, limit?: number): Promise<readonly LearnerStrength[]>;
+  upsertWeakness(weakness: Omit<LearnerWeakness, 'id' | 'createdAt' | 'updatedAt'>): Promise<LearnerWeakness>;
+  upsertStrength(strength: Omit<LearnerStrength, 'id' | 'createdAt' | 'updatedAt'>): Promise<LearnerStrength>;
+  addWeaknessEvidence(evidence: Omit<EvidenceRef, 'kind'> & { weaknessId: string; kind: EvidenceRef['kind'] }): Promise<void>;
 }
 
 export interface VocabularyRepository {
