@@ -52,13 +52,32 @@ function isCloseTypo(user: string, target: string): boolean {
   return false;
 }
 
+function createNeutralReviewCoachingContext(): CoachingContext {
+  return {
+    profile: {
+      learnerId: '',
+      displayName: '',
+      currentLevel: 'unknown',
+      targetLevel: 'unknown',
+      learningGoals: [],
+      preferredModes: [],
+    },
+    activeWeaknesses: [],
+    strengths: [],
+    vocabularyFocus: [],
+    expressionFocus: [],
+    recentProgress: null,
+    dueReviewCount: 0,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
 /**
  * Evaluates simple items locally with deterministic logic.
  */
 export function evaluateSimpleItemLocally(
   candidate: ReviewItemCandidate,
   userAnswer: string,
-
 ): EvaluationResult {
   const normUser = normalizeText(userAnswer);
   const normExpected = normalizeText(candidate.expectedAnswer);
@@ -107,7 +126,6 @@ export function evaluateSimpleItemLocally(
 export function evaluateOpenEndedLocally(
   candidate: ReviewItemCandidate,
   userAnswer: string,
-
 ): EvaluationResult {
   const normUser = normalizeText(userAnswer);
   const normExpected = normalizeText(candidate.expectedAnswer);
@@ -134,7 +152,6 @@ export function evaluateOpenEndedLocally(
 
   // If sentence correction: check if user fixed the mistake pattern
   if (candidate.exerciseType === 'sentence_correction') {
-    // If user text contains the expected correction words
     const expectedWords = normExpected.split(' ').filter((w) => w.length > 2);
     const matchedCount = expectedWords.filter((w) => normUser.includes(w)).length;
     const matchRatio = expectedWords.length > 0 ? matchedCount / expectedWords.length : 0;
@@ -165,7 +182,6 @@ export function evaluateOpenEndedLocally(
     };
   }
 
-  // If expression use: check if user used the expression
   if (candidate.exerciseType === 'expression_use') {
     const expr = normalizeText(candidate.contextSentence ?? candidate.expectedAnswer);
     if (expr && normUser.includes(expr)) {
@@ -178,7 +194,6 @@ export function evaluateOpenEndedLocally(
     }
   }
 
-  // If natural phrasing
   if (candidate.exerciseType === 'natural_phrasing') {
     if (isCloseTypo(normUser, normExpected)) {
       return {
@@ -208,9 +223,7 @@ export class ReviewEvaluator {
     candidate: ReviewItemCandidate,
     userAnswer: string,
     coachingContext?: CoachingContext,
-
   ): Promise<EvaluationResult> {
-    // 1. Simple items are always evaluated locally for speed & determinism
     if (
       candidate.exerciseType === 'vocabulary_recall' ||
       candidate.exerciseType === 'fill_the_gap'
@@ -218,7 +231,6 @@ export class ReviewEvaluator {
       return evaluateSimpleItemLocally(candidate, userAnswer);
     }
 
-    // 2. Open-ended items: use AI Provider if available
     if (this.aiProvider) {
       try {
         const systemPrompt = 'You are an empathetic, expert English tutor evaluating practice exercises. Strictly return valid JSON.';
@@ -238,24 +250,6 @@ Evaluate the answer. You MUST respond with ONLY a valid JSON object matching thi
 }
 Important: Do NOT include any numbers, ratings, or percentages. Only qualitative feedback.`;
 
-        const coachingContextToUse = coachingContext ?? {
-          profile: {
-            learnerId: candidate.learnerId,
-            displayName: 'Learner',
-            currentLevel: 'unknown',
-            targetLevel: 'unknown',
-            learningGoals: [],
-            preferredModes: ['natural'],
-          },
-          activeWeaknesses: [],
-          strengths: [],
-          vocabularyFocus: [],
-          expressionFocus: [],
-          recentProgress: null,
-          dueReviewCount: 0,
-          generatedAt: new Date().toISOString(),
-        };
-
         const request: ConversationRequest = {
           systemPrompt,
           messages: [
@@ -266,7 +260,7 @@ Important: Do NOT include any numbers, ratings, or percentages. Only qualitative
           ],
           mode: 'coach',
           topic: 'Review Evaluation',
-          coachingContext: coachingContextToUse,
+          coachingContext: coachingContext ?? createNeutralReviewCoachingContext(),
         };
 
         const resultObj = await this.aiProvider.generate(request);
@@ -296,7 +290,6 @@ Important: Do NOT include any numbers, ratings, or percentages. Only qualitative
       }
     }
 
-    // 3. Fallback to local evaluation
     return evaluateOpenEndedLocally(candidate, userAnswer);
   }
 }
