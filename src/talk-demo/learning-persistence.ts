@@ -5,6 +5,7 @@
  */
 
 import type { ConversationFeedback } from '../providers/ai/types';
+import type { WeaknessStatus } from '../domain/shared/types';
 import { generateId } from '../shared/id';
 import { nowIso } from '../shared/time';
 import {
@@ -175,7 +176,7 @@ export function createLearningPersistenceService(injectedAdapter?: DatabaseAdapt
             (w.type === weaknessType && w.notes?.trim().toLowerCase() === normOriginal)
         );
 
-        let nextStatus = 'observed';
+        let nextStatus: WeaknessStatus = 'observed';
         if (existingWeakness) {
           // Repeated same issue: stable/mastered can relapse back to 'relapsed'
           if (['stable', 'mastered'].includes(existingWeakness.status)) {
@@ -194,7 +195,7 @@ export function createLearningPersistenceService(injectedAdapter?: DatabaseAdapt
           type: weaknessType,
           referenceId: mistakeId ?? generateId(),
           severity: corr.severity === 'incorrect' ? 0.8 : corr.severity === 'unnatural' ? 0.5 : 0.3,
-          status: nextStatus as any,
+          status: nextStatus,
           lastSeenAt: now,
           firstSeenAt: existingWeakness?.firstSeenAt ?? now,
           occurrenceCount,

@@ -181,7 +181,7 @@ describe('Real Integration Tests', () => {
     const coachingCtx = model.getCoachingContext();
 
     // Verify updated weakness status (should be 'active_training' now, not 'observed')
-    const activeWeakness = coachingCtx.activeWeaknesses.find((w: any) => w.id === targetReview.referenceId);
+    const activeWeakness = coachingCtx.activeWeaknesses.find((w) => w.id === targetReview.referenceId);
     expect(activeWeakness).toBeDefined();
     expect(activeWeakness?.status).toBe('active_training');
   });

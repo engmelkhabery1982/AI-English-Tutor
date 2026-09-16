@@ -8,6 +8,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import type { ViewStyle } from 'react-native';
 import type { ReviewService } from '../review/service';
 import { createReviewService } from '../review/factory';
 import type { ReviewItemCandidate, EvaluationResult, ReviewDashboardSummary } from '../review/types';
@@ -140,6 +141,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     partialCount: number;
     incorrectCount: number;
   }>({ correctCount: 0, partialCount: 0, incorrectCount: 0 });
+  // Explicit session-planning error (real mode): never masked with fabricated demo data
+  const [sessionError, setSessionError] = useState<string | null>(null);
 
   const reviewServiceRef = useRef<ReviewService | null>(null);
   const dbAdapterRef = useRef<DatabaseAdapter | null>(null);
@@ -255,9 +258,9 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
         } else {
           setRecorderError(sttRes.error || 'Failed to transcribe speech.');
         }
-      } catch (err: any) {
+      } catch (err) {
         console.error('Error stopping voice recording:', err);
-        setRecorderError(err.message || 'Error transcribing audio.');
+        setRecorderError(err instanceof Error ? err.message : 'Error transcribing audio.');
         setIsRecording(false);
       }
     } else {
@@ -273,9 +276,9 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
         }
         await recorderRef.current.startRecording();
         setIsRecording(true);
-      } catch (err: any) {
+      } catch (err) {
         console.error('Error starting voice recording:', err);
-        setRecorderError(err.message || 'Failed to start recording.');
+        setRecorderError(err instanceof Error ? err.message : 'Failed to start recording.');
         setIsRecording(false);
       }
     }
@@ -296,6 +299,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     if (!reviewServiceRef.current) return;
     try {
       setLoading(true);
+      setSessionError(null);
       const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
       const profile = await profileRepo.get();
       if (!profile || !profile.id) {
@@ -305,12 +309,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       const learnerId = profile.id;
 
       const candidates = await reviewServiceRef.current.planSession(learnerId);
-      if (candidates.length === 0) {
-        // Fallback to demo items if SQLite returns empty so user has something to review
-        setSessionCandidates(MOCK_ITEMS);
-      } else {
-        setSessionCandidates(candidates);
-      }
+      // A real empty queue stays genuinely empty — pre-built cards are only for explicit Demo Mode.
+      setSessionCandidates(candidates);
 
       setCurrentIndex(0);
       setSessionState('reviewing');
@@ -320,9 +320,9 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       startTimeRef.current = Date.now();
     } catch (err) {
       console.error('Error planning review session:', err);
-      // Fail-soft to Mock items
-      setSessionCandidates(MOCK_ITEMS);
-      setSessionState('reviewing');
+      // SQLite/planning failure must never fall back to fabricated demo items:
+      // surface an explicit error and stay on the dashboard.
+      setSessionError('Could not load the review queue. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -486,6 +486,12 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           </View>
         )}
 
+        {sessionError && !isDemoMode && (
+          <View style={styles.sessionErrorBanner}>
+            <Text style={styles.sessionErrorBannerText}>⚠️ {sessionError}</Text>
+          </View>
+        )}
+
         {/* High-Contrast Due Counter Card */}
         <View style={styles.totalDueCard}>
           <Text style={styles.totalDueNumber}>{summary.totalDue}</Text>
@@ -539,7 +545,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
             <View key={w.id || idx} style={styles.weaknessCard}>
               <View style={styles.weaknessHeader}>
                 <Text style={styles.weaknessCategory}>{w.notes || (w.type === 'grammar' ? 'Grammar Error' : 'Speaking Error')}</Text>
-                <View style={[styles.statusBadge, (styles as any)[`statusBadge_${w.status}`] || styles.statusBadge_observed]}>
+                <View style={[styles.statusBadge, STATUS_BADGE_STYLES[w.status] ?? styles.statusBadge_observed]}>
                   <Text style={styles.statusBadgeText}>{w.status.replace('_', ' ')}</Text>
                 </View>
               </View>
@@ -587,7 +593,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
         {/* Practice Card */}
         <View style={styles.card}>
           <View style={styles.cardTypeRow}>
-            <View style={[styles.typeBadge, (styles as any)[`typeBadge_${candidate.kind}`] || styles.typeBadge_vocabulary]}>
+            <View style={[styles.typeBadge, TYPE_BADGE_STYLES[candidate.kind] ?? styles.typeBadge_vocabulary]}>
               <Text style={styles.typeBadgeText}>
                 {candidate.kind.toUpperCase()}
               </Text>
@@ -799,6 +805,19 @@ const styles = StyleSheet.create({
   demoBannerText: {
     fontSize: 13,
     color: '#1E40AF',
+    lineHeight: 18,
+  },
+  sessionErrorBanner: {
+    backgroundColor: '#FEF2F2',
+    borderWidth: 1,
+    borderColor: '#FECACA',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 20,
+  },
+  sessionErrorBannerText: {
+    fontSize: 13,
+    color: '#B91C1C',
     lineHeight: 18,
   },
   totalDueCard: {
@@ -1279,3 +1298,18 @@ const styles = StyleSheet.create({
     backgroundColor: '#9CA3AF',
   },
 });
+
+/** Typed lookup for weakness status badge variants (falls back to `observed`). */
+const STATUS_BADGE_STYLES: Record<string, ViewStyle> = {
+  observed: styles.statusBadge_observed,
+  confirmed: styles.statusBadge_confirmed,
+  active_training: styles.statusBadge_active_training,
+  relapsed: styles.statusBadge_relapsed,
+};
+
+/** Typed lookup for review item kind badge variants (falls back to `vocabulary`). */
+const TYPE_BADGE_STYLES: Record<string, ViewStyle> = {
+  grammar: styles.typeBadge_grammar,
+  vocabulary: styles.typeBadge_vocabulary,
+  expression: styles.typeBadge_expression,
+};

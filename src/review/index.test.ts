@@ -17,7 +17,28 @@ import type { UserProfile, LearnerWeakness } from '../domain/models/learner';
 import type { VocabularyItem, ExpressionItem } from '../domain/models/vocabulary';
 import type { ReviewItem } from '../domain/models/learning';
 import type { AIProvider } from '../providers/ai/types';
+import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { AudioRecorderService, SpeechToTextProvider } from '../talk-demo';
+
+/**
+ * DatabaseAdapter-compatible test double.
+ *
+ * The demo evaluation path never touches persistence, so every method is an
+ * inert async stub — but the double still satisfies the full DatabaseAdapter
+ * contract, keeping `createReviewService` wiring type-safe.
+ */
+function createStubDatabaseAdapter(): DatabaseAdapter {
+  return {
+    backend: 'memory',
+    path: ':memory:',
+    connected: false,
+    init: vi.fn(async () => undefined),
+    execute: vi.fn(async () => ({ rowsAffected: 0 })),
+    query: vi.fn(async () => []),
+    transaction: vi.fn(async () => []),
+    close: vi.fn(async () => undefined),
+  };
+}
 
 describe('Adaptive Review Suite', () => {
   let mockRepos: AppRepositories;
@@ -662,18 +683,22 @@ describe('Adaptive Review Suite', () => {
 
   it('20. explicit demo toggle configures demo AI provider', async () => {
     const { createReviewService } = await import('./factory');
-    const fakeAdapter: any = { query: vi.fn().mockResolvedValue([]), execute: vi.fn() };
-    const demoService = createReviewService(fakeAdapter, true);
-    
+    const demoService = createReviewService(createStubDatabaseAdapter(), true);
+
     // Evaluate using DemoProvider's special json path
-    const candidate: any = {
+    const candidate: ReviewItemCandidate = {
       id: 'demo-open',
-      learnerId: '123',
+      learnerId,
+      kind: 'grammar',
+      referenceId: 'demo-open',
       exerciseType: 'sentence_correction',
       prompt: 'Fix this.',
       expectedAnswer: 'I have a dog',
+      dueAt: now,
+      consecutiveCorrect: 0,
+      reviewCount: 0,
     };
-    
+
     const evalResult = await demoService.evaluateAnswer(candidate, 'I have a dog');
     
     expect(evalResult.result).toBe('correct');
