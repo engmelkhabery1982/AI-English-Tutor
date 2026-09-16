@@ -6,6 +6,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import { createLearnerModel } from './index';
+import type { CoachingActiveWeakness } from './index';
 import type { AppRepositories } from '../repositories';
 import type {
   GrammarMistake,
@@ -1047,5 +1048,657 @@ describe('LearnerModel summary insights API', () => {
     (dashboard1 as unknown as { dueReviewCount: number }).dueReviewCount = 888;
     const dashboard2 = model.getDashboardSnapshot();
     expect(dashboard2.dueReviewCount).toBe(0);
+  });
+});
+
+describe('LearnerModel - CoachingContext Builder', () => {
+  function makeWeakness(
+    id: string,
+    status: LearnerWeakness['status'],
+    resolved: boolean,
+  ): LearnerWeakness {
+    return {
+      id,
+      learnerId: 'learner-123',
+      type: 'grammar',
+      referenceId: `ref-${id}`,
+      status,
+      severity: 0.5,
+      occurrenceCount: 2,
+      lastSeenAt: '2026-09-01T00:00:00.000Z',
+      firstSeenAt: '2026-08-01T00:00:00.000Z',
+      contexts: ['convo'],
+      evidence: [],
+      resolved,
+      createdAt: '2026-08-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+  }
+
+  it('1. profile fields map correctly', async () => {
+    const repos = createMockRepositories();
+    const customProfile: UserProfile = {
+      id: 'learner-profile-1',
+      displayName: 'Coaching User',
+      targetLanguage: 'en',
+      targetLevel: 'C1',
+      currentLevel: 'B2',
+      learningGoals: ['fluency', 'business_english'],
+      preferredModes: ['coach', 'intensive'],
+      createdAt: '2026-02-01T00:00:00.000Z',
+      updatedAt: '2026-02-02T00:00:00.000Z',
+    };
+    vi.mocked(repos.profile.get).mockResolvedValue(customProfile);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.profile.learnerId).toBe('learner-profile-1');
+    expect(context.profile.displayName).toBe('Coaching User');
+    expect(context.profile.currentLevel).toBe('B2');
+    expect(context.profile.targetLevel).toBe('C1');
+    expect(context.profile.learningGoals).toEqual(['fluency', 'business_english']);
+    expect(context.profile.preferredModes).toEqual(['coach', 'intensive']);
+  });
+
+  it('2. active weaknesses exclude mastered and resolved', async () => {
+    const repos = createMockRepositories();
+    const w1 = makeWeakness('w-1', 'confirmed', false);
+    const w2 = makeWeakness('w-2', 'mastered', false);
+    const w3 = makeWeakness('w-3', 'improving', true);
+    const w4 = makeWeakness('w-4', 'observed', false);
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([w1, w2, w3, w4]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.activeWeaknesses.map((w) => w.id)).toEqual(['w-1', 'w-4']);
+  });
+
+  it('3. weakness limit applies correctly and deterministically', async () => {
+    const repos = createMockRepositories();
+    const w1 = makeWeakness('w-1', 'confirmed', false);
+    const w2 = makeWeakness('w-2', 'repeated', false);
+    const w3 = makeWeakness('w-3', 'active_training', false);
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([w1, w2, w3]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const contextLimited = model.getCoachingContext({ weaknessLimit: 2 });
+    expect(contextLimited.activeWeaknesses.map((w) => w.id)).toEqual(['w-1', 'w-2']);
+  });
+
+  it('4. strength mapping copies expected fields', async () => {
+    const repos = createMockRepositories();
+    const s1: LearnerStrength = {
+      id: 's-1',
+      learnerId: 'learner-123',
+      type: 'grammar',
+      referenceId: 'ref-s1',
+      confidence: 0.95,
+      firstSeenAt: '2026-08-01T00:00:00.000Z',
+      lastSeenAt: '2026-09-01T00:00:00.000Z',
+      contexts: ['writing', 'interviews'],
+      evidence: [],
+      createdAt: '2026-08-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.weaknesses.listStrengths).mockResolvedValue([s1]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.strengths).toEqual([
+      {
+        id: 's-1',
+        type: 'grammar',
+        referenceId: 'ref-s1',
+        confidence: 0.95,
+        contexts: ['writing', 'interviews'],
+      },
+    ]);
+  });
+
+  it('5. due vocabulary meaning included', async () => {
+    const repos = createMockRepositories();
+    const pastIso = '2026-01-01T00:00:00.000Z';
+    const vocab: VocabularyItem = {
+      id: 'v-1',
+      learnerId: 'learner-123',
+      headword: 'meticulous',
+      type: 'word',
+      meanings: [
+        {
+          definition: 'showing great attention to detail',
+          examples: [],
+          review: {
+            state: 'mastered',
+            reviewCount: 5,
+            consecutiveCorrect: 5,
+            nextReviewAt: pastIso,
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-01-01T00:00:00.000Z' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.vocabularyFocus).toHaveLength(1);
+    expect(context.vocabularyFocus[0]).toEqual({
+      itemId: 'v-1',
+      headword: 'meticulous',
+      type: 'word',
+      meaningDefinition: 'showing great attention to detail',
+      reviewState: 'mastered',
+      nextReviewAt: pastIso,
+    });
+  });
+
+  it('6. non-mastered vocabulary meaning included', async () => {
+    const repos = createMockRepositories();
+    const futureIso = '2099-01-01T00:00:00.000Z';
+    const vocab: VocabularyItem = {
+      id: 'v-1',
+      learnerId: 'learner-123',
+      headword: 'lucid',
+      type: 'word',
+      meanings: [
+        {
+          definition: 'expressed clearly; easy to understand',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 1,
+            consecutiveCorrect: 1,
+            nextReviewAt: futureIso,
+          },
+        },
+        {
+          definition: 'bright or luminous',
+          examples: [],
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-01-01T00:00:00.000Z' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.vocabularyFocus).toHaveLength(2);
+    expect(context.vocabularyFocus[0].meaningDefinition).toBe('expressed clearly; easy to understand');
+    expect(context.vocabularyFocus[0].reviewState).toBe('learning');
+    expect(context.vocabularyFocus[1].meaningDefinition).toBe('bright or luminous');
+    expect(context.vocabularyFocus[1].reviewState).toBeNull();
+    expect(context.vocabularyFocus[1].nextReviewAt).toBeNull();
+  });
+
+  it('7. mastered non-due vocabulary excluded', async () => {
+    const repos = createMockRepositories();
+    const futureIso = '2099-01-01T00:00:00.000Z';
+    const vocab: VocabularyItem = {
+      id: 'v-1',
+      learnerId: 'learner-123',
+      headword: 'ubiquitous',
+      type: 'word',
+      meanings: [
+        {
+          definition: 'present, appearing, or found everywhere',
+          examples: [],
+          review: {
+            state: 'mastered',
+            reviewCount: 10,
+            consecutiveCorrect: 8,
+            nextReviewAt: futureIso,
+          },
+        },
+        {
+          definition: 'constantly encountered',
+          examples: [],
+          review: {
+            state: 'mastered',
+            reviewCount: 10,
+            consecutiveCorrect: 8,
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-01-01T00:00:00.000Z' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.vocabularyFocus).toEqual([]);
+  });
+
+  it('8. invalid nextReviewAt does not throw', async () => {
+    const repos = createMockRepositories();
+    const vocab: VocabularyItem = {
+      id: 'v-1',
+      learnerId: 'learner-123',
+      headword: 'resilient',
+      type: 'word',
+      meanings: [
+        {
+          definition: 'able to withstand or recover quickly',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 2,
+            consecutiveCorrect: 1,
+            nextReviewAt: 'not-a-valid-date-string',
+          },
+        },
+        {
+          definition: 'mastered with invalid date',
+          examples: [],
+          review: {
+            state: 'mastered',
+            reviewCount: 5,
+            consecutiveCorrect: 5,
+            nextReviewAt: 'also-invalid-date',
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-01-01T00:00:00.000Z' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    expect(() => model.getCoachingContext()).not.toThrow();
+    const context = model.getCoachingContext();
+    expect(context.vocabularyFocus).toHaveLength(1);
+    expect(context.vocabularyFocus[0].meaningDefinition).toBe('able to withstand or recover quickly');
+  });
+
+  it('9. expression focus follows same rules and preserves expression type', async () => {
+    const repos = createMockRepositories();
+    const pastIso = '2026-01-01T00:00:00.000Z';
+    const futureIso = '2099-01-01T00:00:00.000Z';
+    const expr: ExpressionItem = {
+      id: 'e-1',
+      learnerId: 'learner-123',
+      expression: 'cut corners',
+      type: 'idiom',
+      meanings: [
+        {
+          definition: 'do something perfunctorily to save time or money',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 3,
+            consecutiveCorrect: 2,
+            nextReviewAt: pastIso,
+          },
+        },
+        {
+          definition: 'take a shortcut',
+          examples: [],
+          review: {
+            state: 'mastered',
+            reviewCount: 8,
+            consecutiveCorrect: 8,
+            nextReviewAt: futureIso,
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-01-01T00:00:00.000Z' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.expressions.list).mockResolvedValue([expr]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.expressionFocus).toHaveLength(1);
+    expect(context.expressionFocus[0]).toEqual({
+      itemId: 'e-1',
+      expression: 'cut corners',
+      type: 'idiom',
+      meaningDefinition: 'do something perfunctorily to save time or money',
+      reviewState: 'learning',
+      nextReviewAt: pastIso,
+    });
+    expect(context.expressionFocus[0].type).toBe('idiom');
+  });
+
+  it('10. due meanings ordered before non-due', async () => {
+    const repos = createMockRepositories();
+    const pastIso = '2026-01-01T00:00:00.000Z';
+    const futureIso = '2099-01-01T00:00:00.000Z';
+    const vocab1: VocabularyItem = {
+      id: 'v-1',
+      learnerId: 'learner-123',
+      headword: 'first-word',
+      type: 'word',
+      meanings: [
+        {
+          definition: 'non-due meaning from word 1',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 1,
+            consecutiveCorrect: 1,
+            nextReviewAt: futureIso,
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-01-01T00:00:00.000Z' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const vocab2: VocabularyItem = {
+      id: 'v-2',
+      learnerId: 'learner-123',
+      headword: 'second-word',
+      type: 'word',
+      meanings: [
+        {
+          definition: 'due meaning from word 2',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 2,
+            consecutiveCorrect: 1,
+            nextReviewAt: pastIso,
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-01-01T00:00:00.000Z' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab1, vocab2]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.vocabularyFocus).toHaveLength(2);
+    expect(context.vocabularyFocus[0].meaningDefinition).toBe('due meaning from word 2');
+    expect(context.vocabularyFocus[1].meaningDefinition).toBe('non-due meaning from word 1');
+  });
+
+  it('11. recentProgress equals latestProgress', async () => {
+    const repos = createMockRepositories();
+    const progressRecord: ProgressRecord = {
+      id: 'prog-latest',
+      learnerId: 'learner-123',
+      recordedAt: '2026-09-10T12:00:00.000Z',
+      windowStart: '2026-09-01T00:00:00.000Z',
+      windowEnd: '2026-09-10T00:00:00.000Z',
+      sessionsCompleted: 4,
+      turnsCompleted: 32,
+      newWordsLearned: 6,
+      weaknessesImproved: 2,
+      weaknessesWorsened: 0,
+    };
+    vi.mocked(repos.progress.latest).mockResolvedValue(progressRecord);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.recentProgress).toEqual(progressRecord);
+    expect(context.recentProgress).toEqual(model.latestProgress);
+
+    // Also verify null when latestProgress is null
+    vi.mocked(repos.progress.latest).mockResolvedValue(null);
+    await model.refresh();
+    const contextNull = model.getCoachingContext();
+    expect(contextNull.recentProgress).toBeNull();
+  });
+
+  it('12. dueReviewCount matches reviewQueue', async () => {
+    const repos = createMockRepositories();
+    const dueReviews: ReviewItem[] = [
+      {
+        id: 'rev-1',
+        learnerId: 'learner-123',
+        kind: 'vocabulary',
+        referenceId: 'ref-v1',
+        prompt: 'test prompt 1',
+        state: 'learning',
+        dueAt: '2026-09-01T00:00:00.000Z',
+        createdAt: '2026-08-01T00:00:00.000Z',
+        reviewCount: 1,
+        consecutiveCorrect: 1,
+        outcomeHistory: [],
+      },
+      {
+        id: 'rev-2',
+        learnerId: 'learner-123',
+        kind: 'expression',
+        referenceId: 'ref-e1',
+        prompt: 'test prompt 2',
+        state: 'learning',
+        dueAt: '2026-09-01T00:00:00.000Z',
+        createdAt: '2026-08-01T00:00:00.000Z',
+        reviewCount: 2,
+        consecutiveCorrect: 2,
+        outcomeHistory: [],
+      },
+    ];
+    vi.mocked(repos.review.listDue).mockResolvedValue(dueReviews);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.dueReviewCount).toBe(2);
+    expect(context.dueReviewCount).toBe(model.reviewQueue.length);
+  });
+
+  it('13. safe before refresh', () => {
+    const repos = createMockRepositories();
+    const model = createLearnerModel(repos);
+
+    const context = model.getCoachingContext();
+    expect(context.profile).toEqual({
+      learnerId: '',
+      displayName: '',
+      targetLevel: 'unknown',
+      currentLevel: 'unknown',
+      learningGoals: [],
+      preferredModes: [],
+    });
+    expect(context.activeWeaknesses).toEqual([]);
+    expect(context.strengths).toEqual([]);
+    expect(context.vocabularyFocus).toEqual([]);
+    expect(context.expressionFocus).toEqual([]);
+    expect(context.recentProgress).toBeNull();
+    expect(context.dueReviewCount).toBe(0);
+    expect(typeof context.generatedAt).toBe('string');
+    expect(Number.isNaN(Date.parse(context.generatedAt))).toBe(false);
+  });
+
+  it('14. returned context cannot mutate model state', async () => {
+    const repos = createMockRepositories();
+    const customProfile: UserProfile = {
+      id: 'learner-mut-1',
+      displayName: 'Mutable Test',
+      targetLanguage: 'en',
+      targetLevel: 'B2',
+      currentLevel: 'B1',
+      learningGoals: ['goal-1'],
+      preferredModes: ['natural'],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const w1 = makeWeakness('w-1', 'confirmed', false);
+    vi.mocked(repos.profile.get).mockResolvedValue(customProfile);
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([w1]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context1 = model.getCoachingContext();
+    (context1.activeWeaknesses as unknown as CoachingActiveWeakness[]).push({
+      id: 'injected-w',
+      type: 'grammar',
+      referenceId: 'ref-inj',
+      status: 'confirmed',
+      severity: 0.5,
+      occurrenceCount: 1,
+      contexts: [],
+    });
+    (context1.profile.learningGoals as string[]).push('injected-goal');
+    (context1.activeWeaknesses[0].contexts as string[]).push('injected-context');
+
+    const context2 = model.getCoachingContext();
+    expect(context2.activeWeaknesses).toHaveLength(1);
+    expect(context2.activeWeaknesses[0].id).toBe('w-1');
+    expect(context2.profile.learningGoals).toEqual(['goal-1']);
+    expect(model.profile.learningGoals).toEqual(['goal-1']);
+    expect(model.weaknesses[0].contexts).toEqual(['convo']);
+  });
+
+  it('15. nested arrays are safely copied', async () => {
+    const repos = createMockRepositories();
+    const customProfile: UserProfile = {
+      id: 'learner-ref-test',
+      displayName: 'Ref Test',
+      targetLanguage: 'en',
+      targetLevel: 'C1',
+      currentLevel: 'B2',
+      learningGoals: ['fluency'],
+      preferredModes: ['coach'],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    const w1 = makeWeakness('w-1', 'confirmed', false);
+    const s1: LearnerStrength = {
+      id: 's-1',
+      learnerId: 'learner-ref-test',
+      type: 'grammar',
+      referenceId: 'ref-s1',
+      confidence: 0.9,
+      firstSeenAt: '2026-08-01T00:00:00.000Z',
+      lastSeenAt: '2026-09-01T00:00:00.000Z',
+      contexts: ['writing'],
+      evidence: [],
+      createdAt: '2026-08-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.profile.get).mockResolvedValue(customProfile);
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([w1]);
+    vi.mocked(repos.weaknesses.listStrengths).mockResolvedValue([s1]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.profile.learningGoals).not.toBe(model.profile.learningGoals);
+    expect(context.profile.preferredModes).not.toBe(model.profile.preferredModes);
+    expect(context.activeWeaknesses[0].contexts).not.toBe(model.weaknesses[0].contexts);
+    expect(context.strengths[0].contexts).not.toBe(model.strengths[0].contexts);
+  });
+
+  it('16. limits behave deterministically and invalid limits default safely', async () => {
+    const repos = createMockRepositories();
+    const w1 = makeWeakness('w-1', 'confirmed', false);
+    const w2 = makeWeakness('w-2', 'repeated', false);
+    const s1: LearnerStrength = {
+      id: 's-1',
+      learnerId: 'learner-123',
+      type: 'grammar',
+      referenceId: 'ref-s1',
+      confidence: 0.8,
+      firstSeenAt: '2026-08-01T00:00:00.000Z',
+      lastSeenAt: '2026-09-01T00:00:00.000Z',
+      contexts: ['convo'],
+      evidence: [],
+      createdAt: '2026-08-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    const s2: LearnerStrength = { ...s1, id: 's-2' };
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([w1, w2]);
+    vi.mocked(repos.weaknesses.listStrengths).mockResolvedValue([s1, s2]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const res1 = model.getCoachingContext({ weaknessLimit: 1, strengthLimit: 1 });
+    expect(res1.activeWeaknesses).toHaveLength(1);
+    expect(res1.strengths).toHaveLength(1);
+
+    const res1Again = model.getCoachingContext({ weaknessLimit: 1, strengthLimit: 1 });
+    expect(res1Again.activeWeaknesses.map((w) => w.id)).toEqual(res1.activeWeaknesses.map((w) => w.id));
+
+    const resZero = model.getCoachingContext({ weaknessLimit: 0, strengthLimit: -5 });
+    expect(resZero.activeWeaknesses).toHaveLength(2);
+    expect(resZero.strengths).toHaveLength(2);
+
+    const resFloat = model.getCoachingContext({ weaknessLimit: 1.5 });
+    expect(resFloat.activeWeaknesses).toHaveLength(2);
+
+    const resNaN = model.getCoachingContext({ weaknessLimit: NaN });
+    expect(resNaN.activeWeaknesses).toHaveLength(2);
+  });
+
+  it('17. deduplicates items with identical itemId + meaningDefinition', async () => {
+    const repos = createMockRepositories();
+    const pastIso = '2026-01-01T00:00:00.000Z';
+    const vocab: VocabularyItem = {
+      id: 'v-dup',
+      learnerId: 'learner-123',
+      headword: 'duplicate-test',
+      type: 'word',
+      meanings: [
+        {
+          definition: 'same definition',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 2,
+            consecutiveCorrect: 1,
+            nextReviewAt: pastIso,
+          },
+        },
+        {
+          definition: 'same definition',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 1,
+            consecutiveCorrect: 1,
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-01-01T00:00:00.000Z' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const context = model.getCoachingContext();
+    expect(context.vocabularyFocus).toHaveLength(1);
+    expect(context.vocabularyFocus[0].meaningDefinition).toBe('same definition');
   });
 });

@@ -1,0 +1,6 @@
+{
+  "name": "AI English Tutor",
+  "description": "An AI English Tutor providing personalized conversational coaching, vocabulary training, and learner modeling",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
