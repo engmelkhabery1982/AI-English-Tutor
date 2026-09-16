@@ -79,6 +79,12 @@ export interface VocabularyRepository {
   list(learnerId: string, opts?: { state?: string; limit?: number }): Promise<readonly VocabularyItem[]>;
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly VocabularyItem[]>;
   update(id: string, patch: Partial<Omit<VocabularyItem, 'id' | 'createdAt'>>): Promise<VocabularyItem>;
+  /**
+   * Permanently remove a vocabulary item and all of its meanings/examples.
+   * Optional: backends that do not support deletion may omit it.
+   * Returns true when a row was deleted, false when the item did not exist.
+   */
+  delete?(id: string): Promise<boolean>;
 }
 
 export interface ExpressionRepository {
@@ -87,6 +93,12 @@ export interface ExpressionRepository {
   list(learnerId: string, opts?: { limit?: number }): Promise<readonly ExpressionItem[]>;
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly ExpressionItem[]>;
   update(id: string, patch: Partial<Omit<ExpressionItem, 'id' | 'createdAt'>>): Promise<ExpressionItem>;
+  /**
+   * Permanently remove an expression item and all of its meanings/examples.
+   * Optional: backends that do not support deletion may omit it.
+   * Returns true when a row was deleted, false when the item did not exist.
+   */
+  delete?(id: string): Promise<boolean>;
 }
 
 export interface ReviewRepository {
@@ -99,6 +111,15 @@ export interface ReviewRepository {
   upsert?(
     item: Omit<ReviewItem, 'id' | 'createdAt'> & { id?: string },
   ): Promise<ReviewItem>;
+  /**
+   * Delete review rows that point at a given domain object, restricted to
+   * one item kind. Used e.g. when removing a vocabulary item: its pending
+   * 'vocabulary' review rows must not linger and resurface in Review,
+   * while 'grammar'/'expression'/other reviews remain untouched.
+   * Optional: backends that do not support deletion may omit it.
+   * Returns the number of review rows removed.
+   */
+  deleteByReference?(referenceId: string, kind: ReviewItem['kind']): Promise<number>;
 }
 
 export interface LessonRepository {
