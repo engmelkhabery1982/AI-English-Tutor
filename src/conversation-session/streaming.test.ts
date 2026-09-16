@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createConversationSession } from './index';
 import type { ConversationOrchestrator } from '../conversation-orchestrator';
 import type { AIStreamCallback, ConversationFeedbackVocabulary } from '../providers/ai';
+import { createDemoLearnerModel } from '../talk-demo/demo-learner-model';
 
 describe('ConversationSession Streaming & Vocabulary Persistence', () => {
   it('supports send with streaming callback and retains feedback', async () => {
@@ -17,7 +18,7 @@ describe('ConversationSession Streaming & Vocabulary Persistence', () => {
             topic: null,
             systemPrompt: '',
             messages: [],
-            coachingContext: {} as any,
+            coachingContext: createDemoLearnerModel().getCoachingContext(),
           },
           response: {
             content: 'Hello learner!',
