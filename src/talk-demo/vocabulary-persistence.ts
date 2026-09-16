@@ -62,45 +62,44 @@ export function createVocabularyPersistenceService(
   async function ensureDependencies(): Promise<{
     vocabRepo: VocabularyRepository;
     learnerId: string;
-  }> {
-    let adapter = options?.databaseAdapter;
-    if (!adapter && (!resolvedVocabRepo || !resolvedLearnerId)) {
-      adapter = await getDefaultDatabaseAdapter();
-    }
-
-    if (!resolvedVocabRepo && adapter) {
-      resolvedVocabRepo = new SQLiteVocabularyRepository(adapter);
-    }
-
-    if (!resolvedUserRepo && adapter) {
-      resolvedUserRepo = new SQLiteUserProfileRepository(adapter);
-    }
-
-    if (!resolvedLearnerId && resolvedUserRepo) {
-      try {
-        const profile = await resolvedUserRepo.get();
-        resolvedLearnerId = profile.id;
-      } catch {
-        const profile = await resolvedUserRepo.update({
-          displayName: 'Learner',
-          targetLanguage: 'en',
-          currentLevel: 'B1',
-          targetLevel: 'B2',
-          learningGoals: ['fluency', 'natural conversation'],
-          preferredModes: ['natural', 'coach', 'intensive'],
-        });
-        resolvedLearnerId = profile.id;
+  } | null> {
+    try {
+      let adapter = options?.databaseAdapter;
+      if (!adapter && (!resolvedVocabRepo || (!resolvedLearnerId && !resolvedUserRepo))) {
+        adapter = await getDefaultDatabaseAdapter();
       }
-    }
 
-    if (!resolvedVocabRepo || !resolvedLearnerId) {
-      throw new Error('Unable to initialize vocabulary repository or learner profile');
-    }
+      if (!resolvedVocabRepo && adapter) {
+        resolvedVocabRepo = new SQLiteVocabularyRepository(adapter);
+      }
 
-    return {
-      vocabRepo: resolvedVocabRepo,
-      learnerId: resolvedLearnerId,
-    };
+      if (!resolvedUserRepo && adapter) {
+        resolvedUserRepo = new SQLiteUserProfileRepository(adapter);
+      }
+
+      if (!resolvedLearnerId && resolvedUserRepo) {
+        try {
+          const profile = await resolvedUserRepo.get();
+          if (profile && profile.id) {
+            resolvedLearnerId = profile.id;
+          }
+        } catch {
+          // No user profile exists: do NOT create a fake/fabricated profile.
+          resolvedLearnerId = null;
+        }
+      }
+
+      if (!resolvedVocabRepo || !resolvedLearnerId) {
+        return null;
+      }
+
+      return {
+        vocabRepo: resolvedVocabRepo,
+        learnerId: resolvedLearnerId,
+      };
+    } catch {
+      return null;
+    }
   }
 
   return {
@@ -116,47 +115,56 @@ export function createVocabularyPersistenceService(
         return null;
       }
 
-      const { vocabRepo, learnerId } = await ensureDependencies();
+      const deps = await ensureDependencies();
+      if (!deps) {
+        return null;
+      }
 
-      const examples: UsageExample[] = vocab.example?.trim()
-        ? [
-            {
-              text: vocab.example.trim(),
-              source: 'original-conversation',
-            },
-          ]
-        : [];
+      const { vocabRepo, learnerId } = deps;
 
-      const meaning: Meaning = {
-        definition: vocab.meaning?.trim() || normalizedHeadword,
-        examples,
-        usageNotes: [],
-        register: 'neutral',
-        domain: 'everyday',
-        review: {
-          state: 'new',
-          reviewCount: 0,
-          consecutiveCorrect: 0,
-        },
-      };
+      try {
+        const examples: UsageExample[] = vocab.example?.trim()
+          ? [
+              {
+                text: vocab.example.trim(),
+                source: 'original-conversation',
+              },
+            ]
+          : [];
 
-      const itemInput: Omit<VocabularyItem, 'id' | 'createdAt' | 'updatedAt'> = {
-        learnerId,
-        headword: normalizedHeadword,
-        type: vocab.type || 'word',
-        meanings: [meaning],
-        pronunciation: {},
-        synonyms: [],
-        antonyms: [],
-        relatedExpressions: [],
-        source: {
-          addedBy: 'ai-suggested',
-          addedAt: new Date().toISOString(),
-        },
-        tags: ['talk-session'],
-      };
+        const meaning: Meaning = {
+          definition: vocab.meaning?.trim() || normalizedHeadword,
+          examples,
+          usageNotes: [],
+          register: 'neutral',
+          domain: 'everyday',
+          review: {
+            state: 'new',
+            reviewCount: 0,
+            consecutiveCorrect: 0,
+          },
+        };
 
-      return await vocabRepo.upsert(itemInput);
+        const itemInput: Omit<VocabularyItem, 'id' | 'createdAt' | 'updatedAt'> = {
+          learnerId,
+          headword: normalizedHeadword,
+          type: vocab.type || 'word',
+          meanings: [meaning],
+          pronunciation: {},
+          synonyms: [],
+          antonyms: [],
+          relatedExpressions: [],
+          source: {
+            addedBy: 'ai-suggested',
+            addedAt: new Date().toISOString(),
+          },
+          tags: ['talk-session'],
+        };
+
+        return await vocabRepo.upsert(itemInput);
+      } catch {
+        return null;
+      }
     },
   };
 }

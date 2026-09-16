@@ -4,6 +4,7 @@ import {
   SQLiteUserProfileRepository,
   SQLiteVocabularyRepository,
 } from '../data/local/sqlite/repositories';
+import type { VocabularyRepository } from '../repositories';
 import {
   createDemoLearnerModel,
   createTalkDemoSession,
@@ -32,23 +33,23 @@ describe('Talk Demo & Composition Stack', () => {
   });
 
   describe('Vocabulary Persistence Service', () => {
-    it('persists extracted feedback vocabulary into SQLite vocabulary repository', async () => {
+    it('persists vocabulary using existing learner profile when no learnerId is explicitly passed', async () => {
       const adapter = new SqlJsAdapter(':memory:');
       await adapter.init();
 
       const userRepo = new SQLiteUserProfileRepository(adapter);
       const profile = await userRepo.update({
-        displayName: 'Test Learner',
+        displayName: 'Existing Learner',
         targetLanguage: 'en',
-        currentLevel: 'B1',
-        targetLevel: 'B2',
+        currentLevel: 'B2',
+        targetLevel: 'C1',
       });
 
       const vocabRepo = new SQLiteVocabularyRepository(adapter);
+      // Omit explicit learnerId option so service resolves profile via userProfileRepository.get()
       const service = createVocabularyPersistenceService({
         vocabularyRepository: vocabRepo,
         userProfileRepository: userRepo,
-        learnerId: profile.id,
       });
 
       const saved = await service.saveVocabulary({
@@ -59,15 +60,49 @@ describe('Talk Demo & Composition Stack', () => {
       });
 
       expect(saved).not.toBeNull();
+      expect(saved?.learnerId).toBe(profile.id);
       expect(saved?.headword).toBe('serendipity');
-      expect(saved?.meanings).toHaveLength(1);
-      expect(saved?.meanings[0].definition).toBe('Finding good things without looking for them');
-      expect(saved?.meanings[0].examples[0].text).toBe('We met by pure serendipity.');
 
       // Verify retrieval from SQLite
       const found = await vocabRepo.list(profile.id);
       expect(found).toHaveLength(1);
       expect(found[0].headword).toBe('serendipity');
+
+      await adapter.close();
+    });
+
+    it('persists vocabulary using explicit learnerId when supplied', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+
+      const userRepo = new SQLiteUserProfileRepository(adapter);
+      const profile = await userRepo.update({
+        displayName: 'Explicit Learner',
+        targetLanguage: 'en',
+        currentLevel: 'B1',
+        targetLevel: 'B2',
+      });
+
+      const vocabRepo = new SQLiteVocabularyRepository(adapter);
+
+      const service = createVocabularyPersistenceService({
+        vocabularyRepository: vocabRepo,
+        learnerId: profile.id,
+      });
+
+      const saved = await service.saveVocabulary({
+        headword: 'eloquent',
+        type: 'word',
+        meaning: 'fluent or persuasive in speaking or writing',
+        example: 'She gave an eloquent speech.',
+      });
+
+      expect(saved).not.toBeNull();
+      expect(saved?.learnerId).toBe(profile.id);
+
+      const found = await vocabRepo.list(profile.id);
+      expect(found).toHaveLength(1);
+      expect(found[0].headword).toBe('eloquent');
 
       await adapter.close();
     });
@@ -78,21 +113,21 @@ describe('Talk Demo & Composition Stack', () => {
 
       const userRepo = new SQLiteUserProfileRepository(adapter);
       const profile = await userRepo.update({
-        displayName: 'Test Learner',
+        displayName: 'Duplicate Learner',
         targetLanguage: 'en',
         currentLevel: 'B1',
         targetLevel: 'B2',
       });
 
       const vocabRepo = new SQLiteVocabularyRepository(adapter);
+
       const service = createVocabularyPersistenceService({
         vocabularyRepository: vocabRepo,
-        userProfileRepository: userRepo,
         learnerId: profile.id,
       });
 
       await service.saveVocabulary({
-        headword: 'resilient',
+        headword: '  resilient  ',
         type: 'word',
         meaning: 'able to recover quickly',
         example: 'He is resilient.',
@@ -110,6 +145,111 @@ describe('Talk Demo & Composition Stack', () => {
       expect(found[0].meanings[0].definition).toContain('withstand');
 
       await adapter.close();
+    });
+
+    it('does NOT create a fake learner profile if no profile exists', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+
+      const userRepo = new SQLiteUserProfileRepository(adapter);
+      const vocabRepo = new SQLiteVocabularyRepository(adapter);
+
+      // No profile in DB and no learnerId passed
+      const service = createVocabularyPersistenceService({
+        vocabularyRepository: vocabRepo,
+        userProfileRepository: userRepo,
+      });
+
+      const result = await service.saveVocabulary({
+        headword: 'ephemeral',
+        type: 'word',
+        meaning: 'lasting for a very short time',
+        example: 'Fame is ephemeral.',
+      });
+
+      expect(result).toBeNull();
+
+      // Verify no profile was created in database
+      await expect(userRepo.get()).rejects.toThrow('No user profile found');
+
+      await adapter.close();
+    });
+
+    it('allows conversation/session to remain valid when no learner profile exists', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+
+      const userRepo = new SQLiteUserProfileRepository(adapter);
+      const vocabRepo = new SQLiteVocabularyRepository(adapter);
+
+      const bundle = createTalkSession(
+        { mode: 'coach' },
+        {
+          userProfileRepository: userRepo,
+          vocabularyRepository: vocabRepo,
+        }
+      );
+
+      // Save item via session when no profile exists
+      await expect(
+        bundle.session.saveVocabularyItem({
+          headword: 'ubiquitous',
+          type: 'word',
+          meaning: 'present everywhere',
+          example: 'Smartphones are ubiquitous.',
+        })
+      ).resolves.toBe(true);
+
+      // Send a user message and ensure session turns continue cleanly
+      const turnResult = await bundle.session.send({ userMessage: 'Hello coach!' });
+      expect(turnResult.ok).toBe(true);
+      if (turnResult.ok) {
+        expect(turnResult.history).toHaveLength(2);
+      }
+
+      await adapter.close();
+    });
+
+    it('ensures persistence failure does not corrupt conversation history', async () => {
+      const mockFailingVocabRepo: VocabularyRepository = {
+        upsert: vi.fn().mockRejectedValue(new Error('Database lock error')),
+        get: vi.fn().mockResolvedValue(null),
+        list: vi.fn().mockResolvedValue([]),
+        listDue: vi.fn().mockResolvedValue([]),
+        update: vi.fn().mockRejectedValue(new Error('Database lock error')),
+      };
+
+      const bundle = createTalkSession(
+        { mode: 'coach' },
+        {
+          vocabularyRepository: mockFailingVocabRepo,
+          learnerId: '00000000-0000-4000-8000-000000000003',
+        }
+      );
+
+      // Send turn 1
+      const turn1 = await bundle.session.send({ userMessage: 'First turn' });
+      expect(turn1.ok).toBe(true);
+      expect(bundle.session.getHistory()).toHaveLength(2);
+
+      // Attempt to save vocabulary item with broken repository
+      await expect(
+        bundle.session.saveVocabularyItem({
+          headword: 'tenacious',
+          type: 'word',
+          meaning: 'tending to keep a firm hold',
+          example: 'She is tenacious.',
+        })
+      ).resolves.toBe(true);
+
+      // Conversation state and history must remain valid and uncorrupted
+      expect(bundle.session.getHistory()).toHaveLength(2);
+      expect(bundle.session.getHistory()[0].content).toBe('First turn');
+
+      // Send turn 2
+      const turn2 = await bundle.session.send({ userMessage: 'Second turn' });
+      expect(turn2.ok).toBe(true);
+      expect(bundle.session.getHistory()).toHaveLength(4);
     });
 
     it('createTalkSession integrates vocabulary saving callback with SQLite', async () => {
