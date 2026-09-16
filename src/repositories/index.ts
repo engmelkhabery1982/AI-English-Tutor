@@ -19,7 +19,7 @@ import type {
   PronunciationWeakness,
   UserProfile,
 } from '../domain/models/learner';
-import type { EvidenceRef } from '../domain/shared/types';
+import type { EvidenceRef, WeaknessStatus } from '../domain/shared/types';
 import type {
   ExpressionItem,
   VocabularyItem,
@@ -30,6 +30,28 @@ import type {
   ProgressRecord,
   ReviewItem,
 } from '../domain/models/learning';
+
+/** Exact activity aggregates over a learner's persisted conversation sessions. */
+export interface ConversationActivityStats {
+  readonly sessionsTotal: number;
+  readonly sessionsCompleted: number;
+  readonly turnsTotal: number;
+}
+
+/** Exact lexical review-bucket counts (authoritative meaning.review semantics). */
+export interface LexicalBucketCounts {
+  readonly total: number;
+  readonly due: number;
+  readonly learning: number;
+  readonly familiar: number;
+  readonly mastered: number;
+}
+
+/** Exact unresolved-weakness status distribution. */
+export interface WeaknessStatusCounts {
+  readonly unresolved: number;
+  readonly byStatus: Readonly<Partial<Record<WeaknessStatus, number>>>;
+}
 
 export interface UserProfileRepository {
   get(): Promise<UserProfile>;
@@ -48,6 +70,14 @@ export interface ConversationRepository {
     id: string,
     patch: Partial<Omit<ConversationSession, 'id' | 'createdAt'>>,
   ): Promise<ConversationSession>;
+  /**
+   * Exact aggregate counts over persisted sessions (optionally bounded to a
+   * start-time range). Read-only; optional — backends may omit it.
+   */
+  getActivityStats?(
+    learnerId: string,
+    opts?: { startedAfter?: string; startedUntil?: string },
+  ): Promise<ConversationActivityStats>;
 }
 
 export interface MistakeRepository {
@@ -71,6 +101,21 @@ export interface WeaknessRepository {
   upsertWeakness(weakness: Omit<LearnerWeakness, 'id' | 'createdAt' | 'updatedAt'>): Promise<LearnerWeakness>;
   upsertStrength(strength: Omit<LearnerStrength, 'id' | 'createdAt' | 'updatedAt'>): Promise<LearnerStrength>;
   addWeaknessEvidence(evidence: Omit<EvidenceRef, 'kind'> & { weaknessId: string; kind: EvidenceRef['kind'] }): Promise<void>;
+  /**
+   * Exact unresolved-weakness counts grouped by persisted lifecycle state.
+   * Read-only; optional — backends may omit it.
+   */
+  getUnresolvedStatusCounts?(learnerId: string): Promise<WeaknessStatusCounts>;
+  /** Exact count of unresolved weaknesses first seen in an optional range. */
+  countUnresolved?(
+    learnerId: string,
+    opts?: { firstSeenAfter?: string; firstSeenUntil?: string },
+  ): Promise<number>;
+  /** Exact count of persisted weakness-evidence rows in an optional range. */
+  countEvidence?(
+    learnerId: string,
+    opts?: { atAfter?: string; atUntil?: string },
+  ): Promise<number>;
 }
 
 export interface VocabularyRepository {
@@ -85,6 +130,19 @@ export interface VocabularyRepository {
    * Returns true when a row was deleted, false when the item did not exist.
    */
   delete?(id: string): Promise<boolean>;
+  /**
+   * Exact review-bucket counts (authoritative meaning.review semantics)
+   * without loading items. Read-only; optional — backends may omit it.
+   */
+  getBucketCounts?(
+    learnerId: string,
+    opts: { now: string; types?: readonly VocabularyItem['type'][] },
+  ): Promise<LexicalBucketCounts>;
+  /** Exact count of items created in an optional range (optionally by type). */
+  countCreated?(
+    learnerId: string,
+    opts?: { createdAfter?: string; createdUntil?: string; types?: readonly VocabularyItem['type'][] },
+  ): Promise<number>;
 }
 
 export interface ExpressionRepository {
@@ -99,6 +157,16 @@ export interface ExpressionRepository {
    * Returns true when a row was deleted, false when the item did not exist.
    */
   delete?(id: string): Promise<boolean>;
+  /**
+   * Exact review-bucket counts for expression rows (authoritative
+   * meaning.review semantics) without loading items. Read-only; optional.
+   */
+  getBucketCounts?(learnerId: string, opts: { now: string }): Promise<LexicalBucketCounts>;
+  /** Exact count of expression items created in an optional range. */
+  countCreated?(
+    learnerId: string,
+    opts?: { createdAfter?: string; createdUntil?: string },
+  ): Promise<number>;
 }
 
 export interface ReviewRepository {
@@ -116,6 +184,13 @@ export interface ReviewRepository {
    * dashboards; optional — backends may omit it.
    */
   list?(learnerId: string, limit?: number): Promise<readonly ReviewItem[]>;
+  /** Exact count of reviews due at `now`. Read-only; optional. */
+  countDue?(learnerId: string, now: string): Promise<number>;
+  /** Exact count of reviews completed in an optional last-review range. */
+  countReviewed?(
+    learnerId: string,
+    opts?: { lastReviewAfter?: string; lastReviewUntil?: string },
+  ): Promise<number>;
   /**
    * Delete review rows that point at a given domain object, restricted to
    * one item kind. Used e.g. when removing a vocabulary item: its pending
@@ -141,6 +216,11 @@ export interface ProgressRepository {
   record(record: Omit<ProgressRecord, 'id'>): Promise<ProgressRecord>;
   list(learnerId: string, limit?: number): Promise<readonly ProgressRecord[]>;
   latest(learnerId: string): Promise<ProgressRecord | null>;
+  /** Exact count of persisted progress records in an optional range. */
+  countRecords?(
+    learnerId: string,
+    opts?: { recordedAfter?: string; recordedUntil?: string },
+  ): Promise<number>;
 }
 
 /** Aggregated repository facade used by engines/UI. */

@@ -32,14 +32,33 @@ export * from './service';
 export function createProgressDashboardService(
   adapter: DatabaseAdapter,
 ): ProgressDashboardService {
+  const conversations = new SQLiteConversationRepository(adapter);
+  const weaknesses = new SQLiteWeaknessRepository(adapter);
+  const vocabulary = new SQLiteVocabularyRepository(adapter);
+  const expressions = new SQLiteExpressionRepository(adapter);
+  const review = new SQLiteReviewRepository(adapter);
+  const progress = new SQLiteProgressRepository(adapter);
+
   return new ProgressDashboardService({
     profile: new SQLiteUserProfileRepository(adapter),
-    conversations: new SQLiteConversationRepository(adapter),
-    weaknesses: new SQLiteWeaknessRepository(adapter),
-    vocabulary: new SQLiteVocabularyRepository(adapter),
-    expressions: new SQLiteExpressionRepository(adapter),
-    review: new SQLiteReviewRepository(adapter),
-    progress: new SQLiteProgressRepository(adapter),
+    conversations,
+    weaknesses,
+    vocabulary,
+    expressions,
+    review,
+    progress,
+    // Exact aggregate reads — totals stay correct beyond any display limit.
+    conversationStats: (learnerId, opts) => conversations.getActivityStats(learnerId, opts),
+    vocabularyBuckets: (learnerId, opts) => vocabulary.getBucketCounts(learnerId, opts),
+    vocabularyCreatedCount: (learnerId, opts) => vocabulary.countCreated(learnerId, opts),
+    expressionBuckets: (learnerId, opts) => expressions.getBucketCounts(learnerId, opts),
+    expressionCreatedCount: (learnerId, opts) => expressions.countCreated(learnerId, opts),
+    weaknessStatusCounts: (learnerId) => weaknesses.getUnresolvedStatusCounts(learnerId),
+    weaknessCreatedCount: (learnerId, opts) => weaknesses.countUnresolved(learnerId, opts),
+    weaknessEvidenceCount: (learnerId, opts) => weaknesses.countEvidence(learnerId, opts),
+    dueReviewCount: (learnerId, now) => review.countDue(learnerId, now),
+    reviewedCount: (learnerId, opts) => review.countReviewed(learnerId, opts),
+    progressRecordCount: (learnerId, opts) => progress.countRecords(learnerId, opts),
   });
 }
 

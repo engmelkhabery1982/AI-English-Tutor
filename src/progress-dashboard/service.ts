@@ -83,6 +83,19 @@ export interface ProgressDashboardServiceDeps {
     readonly list?: ReviewRepository['list'];
   };
   readonly progress: Pick<ProgressRepository, 'list'>;
+
+  // ----- Optional EXACT aggregate reads (preferred over bounded lists) -----
+  readonly conversationStats?: ConversationRepository['getActivityStats'];
+  readonly vocabularyBuckets?: VocabularyRepository['getBucketCounts'];
+  readonly vocabularyCreatedCount?: VocabularyRepository['countCreated'];
+  readonly expressionBuckets?: ExpressionRepository['getBucketCounts'];
+  readonly expressionCreatedCount?: ExpressionRepository['countCreated'];
+  readonly weaknessStatusCounts?: WeaknessRepository['getUnresolvedStatusCounts'];
+  readonly weaknessCreatedCount?: WeaknessRepository['countUnresolved'];
+  readonly weaknessEvidenceCount?: WeaknessRepository['countEvidence'];
+  readonly dueReviewCount?: ReviewRepository['countDue'];
+  readonly reviewedCount?: ReviewRepository['countReviewed'];
+  readonly progressRecordCount?: ProgressRepository['countRecords'];
 }
 
 /** Format an ISO date as a short stable label, e.g. "Sep 12". */
@@ -189,57 +202,113 @@ export class ProgressDashboardService {
     const inWindow = (at: IsoDate): boolean =>
       windowStart === null ? true : at >= windowStart && at <= now;
 
-    // Bounded parallel reads — no unbounded history, no N+1 loops.
+    // Exact aggregates (preferred) versus bounded detail lists: totals are
+    // computed with aggregate COUNT/SUM queries so they stay correct beyond
+    // any display limit; only detail/timeline lists are bounded.
+    const d = this.deps;
+    const hasAggregates = Boolean(
+      d.conversationStats &&
+        d.vocabularyBuckets &&
+        d.vocabularyCreatedCount &&
+        d.expressionBuckets &&
+        d.expressionCreatedCount &&
+        d.weaknessStatusCounts &&
+        d.dueReviewCount,
+    );
+
+    // Bounded parallel detail reads — no unbounded history, no N+1 loops.
     const [sessions, weaknesses, vocabList, exprList, dueReviews, recentReviews, progressRecords] =
       await Promise.all([
-        this.deps.conversations.listSessions(learnerId, LIMITS.sessions),
-        this.deps.weaknesses.listWeaknesses(learnerId, LIMITS.weaknesses),
+        d.conversations.listSessions(learnerId, LIMITS.sessions),
+        d.weaknesses.listWeaknesses(learnerId, LIMITS.weaknesses),
         // word/phrase rows only — expression rows share the table under other types.
-        this.deps.vocabulary.list(learnerId, { limit: LIMITS.vocabulary, types: ['word', 'phrase'] }),
-        this.deps.expressions.list(learnerId, { limit: LIMITS.expressions }),
-        this.deps.review.listDue(learnerId, now, LIMITS.dueReviews),
-        this.deps.review.list
-          ? this.deps.review.list(learnerId, LIMITS.recentReviews)
+        d.vocabulary.list(learnerId, { limit: LIMITS.vocabulary, types: ['word', 'phrase'] }),
+        d.expressions.list(learnerId, { limit: LIMITS.expressions }),
+        d.review.listDue(learnerId, now, LIMITS.dueReviews),
+        d.review.list
+          ? d.review.list(learnerId, LIMITS.recentReviews)
           : Promise.resolve([]),
-        this.deps.progress.list(learnerId, LIMITS.progressRecords),
+        d.progress.list(learnerId, LIMITS.progressRecords),
       ]);
 
-    // ---------- OVERVIEW (real counts) ----------
-    const overview: OverviewStats = {
-      sessionsCompleted: sessions.filter(
-        (s) => s.status === 'completed' || s.status === 'summarized',
-      ).length,
-      conversationTurns: sessions.reduce((sum, s) => sum + (s.turnCount ?? 0), 0),
-      vocabularySaved: vocabList.length,
-      expressionsSaved: exprList.length,
-      reviewsDue: dueReviews.length,
-      activeWeaknesses: weaknesses.filter((w) => !w.resolved).length,
+    // ---------- EXACT AGGREGATES (when the composition provides them) ----------
+    const [conversationStats, vocabBuckets, exprBuckets, weaknessCounts, exactDueCount] =
+      hasAggregates
+        ? await Promise.all([
+            d.conversationStats!(learnerId),
+            d.vocabularyBuckets!(learnerId, { now, types: ['word', 'phrase'] }),
+            d.expressionBuckets!(learnerId, { now }),
+            d.weaknessStatusCounts!(learnerId),
+            d.dueReviewCount!(learnerId, now),
+          ])
+        : [null, null, null, null, null];
+
+    // ---------- OVERVIEW (exact totals, bounded fallback) ----------
+    const overview: OverviewStats = conversationStats
+      ? {
+          sessionsCompleted: conversationStats.sessionsCompleted,
+          conversationTurns: conversationStats.turnsTotal,
+          vocabularySaved: vocabBuckets!.total,
+          expressionsSaved: exprBuckets!.total,
+          reviewsDue: exactDueCount!,
+          activeWeaknesses: weaknessCounts!.unresolved,
+        }
+      : {
+          sessionsCompleted: sessions.filter(
+            (s) => s.status === 'completed' || s.status === 'summarized',
+          ).length,
+          conversationTurns: sessions.reduce((sum, s) => sum + (s.turnCount ?? 0), 0),
+          vocabularySaved: vocabList.length,
+          expressionsSaved: exprList.length,
+          reviewsDue: dueReviews.length,
+          activeWeaknesses: weaknesses.filter((w) => !w.resolved).length,
+        };
+
+    // ---------- LEARNING STATUS (exact, shared meaning.review semantics) ----------
+    const vocabularyStatus: LexicalStatusCounts = vocabBuckets ?? {
+      ...lexicalStatusCountsOf(vocabList, 'vocabulary', now),
+    };
+    const expressionStatus: LexicalStatusCounts = exprBuckets ?? {
+      ...lexicalStatusCountsOf(exprList, 'expression', now),
     };
 
-    // ---------- LEARNING STATUS (shared meaning.review logic) ----------
-    const vocabularyStatus = lexicalStatusCountsOf(vocabList, 'vocabulary', now);
-    const expressionStatus = lexicalStatusCountsOf(exprList, 'expression', now);
-
-    // ---------- WEAKNESS STATUS ----------
-    const unresolved = weaknesses.filter((w) => !w.resolved);
-    const groupCounts = new Map<WeaknessPresentationGroup, number>();
-    for (const weakness of unresolved) {
-      const group = weaknessPresentationGroup(weakness.status);
-      groupCounts.set(group, (groupCounts.get(group) ?? 0) + 1);
+    // ---------- WEAKNESS STATUS (exact group counts, bounded cards) ----------
+    let weaknessGroups: WeaknessGroupCount[];
+    if (weaknessCounts) {
+      const groupTotals = new Map<WeaknessPresentationGroup, number>();
+      for (const [status, count] of Object.entries(weaknessCounts.byStatus)) {
+        const group = weaknessPresentationGroup(status as WeaknessStatus);
+        groupTotals.set(group, (groupTotals.get(group) ?? 0) + (count ?? 0));
+      }
+      weaknessGroups = (
+        ['needs_attention', 'improving', 'stable_mastered', 'relapsed'] as const
+      ).map((group) => ({
+        group,
+        label: GROUP_LABELS[group],
+        count: groupTotals.get(group) ?? 0,
+      }));
+    } else {
+      const unresolved = weaknesses.filter((w) => !w.resolved);
+      const groupCounts = new Map<WeaknessPresentationGroup, number>();
+      for (const weakness of unresolved) {
+        const group = weaknessPresentationGroup(weakness.status);
+        groupCounts.set(group, (groupCounts.get(group) ?? 0) + 1);
+      }
+      weaknessGroups = (
+        ['needs_attention', 'improving', 'stable_mastered', 'relapsed'] as const
+      ).map((group) => ({
+        group,
+        label: GROUP_LABELS[group],
+        count: groupCounts.get(group) ?? 0,
+      }));
     }
-    const weaknessGroups: WeaknessGroupCount[] = (
-      ['needs_attention', 'improving', 'stable_mastered', 'relapsed'] as const
-    ).map((group) => ({
-      group,
-      label: GROUP_LABELS[group],
-      count: groupCounts.get(group) ?? 0,
-    }));
 
-    const weaknessCards: WeaknessCardView[] = unresolved
+    const weaknessCards: WeaknessCardView[] = weaknesses
+      .filter((w) => !w.resolved)
       .slice(0, LIMITS.weaknessCards)
       .map((weakness) => weaknessToCard(weakness));
 
-    // ---------- REVIEW STATUS ----------
+    // ---------- REVIEW STATUS (exact due count, bounded lists) ----------
     const recentlyReviewed = recentReviews
       .filter((item) => item.lastReviewAt != null)
       .sort((a, b) => (a.lastReviewAt! < b.lastReviewAt! ? 1 : -1))
@@ -255,7 +324,7 @@ export class ProgressDashboardService {
       });
 
     const reviewStatus: ReviewStatusView = {
-      dueCount: dueReviews.length,
+      dueCount: exactDueCount ?? dueReviews.length,
       upcoming: dueReviews.slice(0, LIMITS.upcomingReviews).map((item) => ({
         id: item.id,
         kind: item.kind,
@@ -265,11 +334,11 @@ export class ProgressDashboardService {
       recentlyReviewed,
     };
 
-    // ---------- RECENT ACTIVITY (merged read-only timeline) ----------
+    // ---------- RECENT ACTIVITY (bounded merged read-only timeline) ----------
     const allEvents = buildActivityTimeline({
       learnerId,
       sessions,
-      weaknesses: unresolved,
+      weaknesses: weaknesses.filter((w) => !w.resolved),
       vocabulary: vocabList,
       expressions: exprList,
       recentReviews,
@@ -278,8 +347,10 @@ export class ProgressDashboardService {
     const windowEvents = allEvents.filter((event) => inWindow(event.at));
     const recentActivity = windowEvents.slice(0, LIMITS.activityEvents);
 
-    // ---------- TRENDS (honest count buckets, dependency-free) ----------
-    const trends = buildTrendBuckets(window, now, windowStart, windowEvents);
+    // ---------- TRENDS (exact aggregate counts, bounded fallback) ----------
+    const trends = hasAggregates
+      ? await this.buildExactTrends(learnerId, window, now, windowStart)
+      : buildBoundedTrends(window, now, windowStart, windowEvents);
 
     // ---------- RECENT PROGRESS RECORDS (count fields only) ----------
     const recentProgress: ProgressRecordView[] = progressRecords
@@ -301,6 +372,7 @@ export class ProgressDashboardService {
       window,
       windowStart,
       generatedAt: now,
+      aggregatesExact: hasAggregates,
       overview,
       vocabularyStatus,
       expressionStatus,
@@ -311,6 +383,78 @@ export class ProgressDashboardService {
       trends,
       recentProgress,
     };
+  }
+
+  /**
+   * Exact per-bucket activity counts via aggregate queries — trend totals
+   * are never truncated by the bounded detail-list limits.
+   */
+  private async buildExactTrends(
+    learnerId: string,
+    window: DashboardWindow,
+    now: IsoDate,
+    windowStart: IsoDate | null,
+  ): Promise<TrendBucket[]> {
+    const ranges = buildTrendRanges(window, now, windowStart);
+    const d = this.deps;
+
+    const buckets = await Promise.all(
+      ranges.map(async (range) => {
+        const [sessions, vocabulary, expressions, reviews, weaknessFirstSeen, weaknessEvidence, progressRows] =
+          await Promise.all([
+            d.conversationStats!(learnerId, {
+              startedAfter: range.rangeStart,
+              startedUntil: range.rangeEnd,
+            }),
+            d.vocabularyCreatedCount!(learnerId, {
+              createdAfter: range.rangeStart,
+              createdUntil: range.rangeEnd,
+            }),
+            d.expressionCreatedCount!(learnerId, {
+              createdAfter: range.rangeStart,
+              createdUntil: range.rangeEnd,
+            }),
+            d.reviewedCount
+              ? d.reviewedCount(learnerId, {
+                  lastReviewAfter: range.rangeStart,
+                  lastReviewUntil: range.rangeEnd,
+                })
+              : Promise.resolve(0),
+            d.weaknessCreatedCount
+              ? d.weaknessCreatedCount(learnerId, {
+                  firstSeenAfter: range.rangeStart,
+                  firstSeenUntil: range.rangeEnd,
+                })
+              : Promise.resolve(0),
+            d.weaknessEvidenceCount
+              ? d.weaknessEvidenceCount(learnerId, {
+                  atAfter: range.rangeStart,
+                  atUntil: range.rangeEnd,
+                })
+              : Promise.resolve(0),
+            d.progressRecordCount
+              ? d.progressRecordCount(learnerId, {
+                  recordedAfter: range.rangeStart,
+                  recordedUntil: range.rangeEnd,
+                })
+              : Promise.resolve(0),
+          ]);
+
+        const weaknessEvents = weaknessFirstSeen + weaknessEvidence;
+        return {
+          label: range.label,
+          rangeStart: range.rangeStart,
+          rangeEnd: range.rangeEnd,
+          total: sessions.sessionsTotal + vocabulary + expressions + reviews + weaknessEvents + progressRows,
+          sessions: sessions.sessionsTotal,
+          vocabulary,
+          expressions,
+          reviews,
+        } satisfies TrendBucket;
+      }),
+    );
+
+    return buckets;
   }
 }
 
@@ -448,33 +592,27 @@ function buildActivityTimeline(input: TimelineInput): ActivityEventView[] {
  * Buckets count ACTIVITY only — learning-state changes are shown from
  * current persisted states (weaknessGroups / lexical status), never inferred.
  */
-function buildTrendBuckets(
+/** One date range of the trend axis: [rangeStart, rangeEnd). */
+interface TrendRange {
+  readonly label: string;
+  readonly rangeStart: IsoDate;
+  readonly rangeEnd: IsoDate;
+}
+
+/** Build the trend axis ranges for a window (shared by both count paths). */
+function buildTrendRanges(
   window: DashboardWindow,
   now: IsoDate,
   windowStart: IsoDate | null,
-  events: readonly ActivityEventView[],
-): TrendBucket[] {
-  type MutableTrendBucket = { -readonly [K in keyof TrendBucket]: TrendBucket[K] };
-
-  const emptyBucket = (label: string, start: IsoDate, end: IsoDate): MutableTrendBucket => ({
-    label,
-    rangeStart: start,
-    rangeEnd: end,
-    total: 0,
-    sessions: 0,
-    vocabulary: 0,
-    expressions: 0,
-    reviews: 0,
-  });
-
-  const buckets: MutableTrendBucket[] = [];
+): TrendRange[] {
+  const ranges: TrendRange[] = [];
   const nowMs = new Date(now).getTime();
 
   if (window === '7d') {
     for (let i = 7; i >= 1; i--) {
       const start = new Date(nowMs - i * DAY_MS).toISOString();
       const end = new Date(nowMs - (i - 1) * DAY_MS).toISOString();
-      buckets.push(emptyBucket(shortDateLabel(start), start, end));
+      ranges.push({ label: shortDateLabel(start), rangeStart: start, rangeEnd: end });
     }
   } else if (window === '30d') {
     const startMs = new Date(windowStart ?? now).getTime();
@@ -482,7 +620,7 @@ function buildTrendBuckets(
     for (let i = 0; i < 5; i++) {
       const start = new Date(startMs + i * span).toISOString();
       const end = new Date(startMs + (i + 1) * span).toISOString();
-      buckets.push(emptyBucket(shortDateLabel(start), start, end));
+      ranges.push({ label: shortDateLabel(start), rangeStart: start, rangeEnd: end });
     }
   } else {
     // All time: the six most recent calendar months, plus an "Older" bucket
@@ -493,11 +631,30 @@ function buildTrendBuckets(
     for (let back = 5; back >= 0; back--) {
       const start = monthStart(anchor.getUTCFullYear(), anchor.getUTCMonth() - back);
       const end = monthStart(anchor.getUTCFullYear(), anchor.getUTCMonth() - back + 1);
-      buckets.push(emptyBucket(monthLabel(start), start, end));
+      ranges.push({ label: monthLabel(start), rangeStart: start, rangeEnd: end });
     }
-    buckets.push(emptyBucket('Older', '1970-01-01T00:00:00.000Z', buckets[0].rangeStart));
+    ranges.push({
+      label: 'Older',
+      rangeStart: '1970-01-01T00:00:00.000Z',
+      rangeEnd: ranges[0].rangeStart,
+    });
   }
 
+  return ranges;
+}
+
+/**
+ * Bounded fallback: count loaded timeline events into the trend ranges.
+ * Used only when the composition provides no aggregate reads — totals in
+ * this mode reflect the loaded detail lists, and the snapshot is marked
+ * aggregatesExact: false so the UI labels them honestly.
+ */
+function buildBoundedTrends(
+  window: DashboardWindow,
+  now: IsoDate,
+  windowStart: IsoDate | null,
+  events: readonly ActivityEventView[],
+): TrendBucket[] {
   const kindKey: Record<ActivityEventKind, keyof TrendBucket | undefined> = {
     session: 'sessions',
     vocabulary: 'vocabulary',
@@ -507,13 +664,26 @@ function buildTrendBuckets(
     progress: undefined,
   };
 
+  type MutableTrendBucket = { -readonly [K in keyof TrendBucket]: TrendBucket[K] };
+  const ranges = buildTrendRanges(window, now, windowStart);
+  const buckets: MutableTrendBucket[] = ranges.map((range) => ({
+    label: range.label,
+    rangeStart: range.rangeStart,
+    rangeEnd: range.rangeEnd,
+    total: 0,
+    sessions: 0,
+    vocabulary: 0,
+    expressions: 0,
+    reviews: 0,
+  }));
+
   for (const event of events) {
-    for (const bucket of buckets) {
-      if (event.at >= bucket.rangeStart && event.at < bucket.rangeEnd) {
-        bucket.total += 1;
+    for (let i = 0; i < buckets.length; i++) {
+      if (event.at >= ranges[i].rangeStart && event.at < ranges[i].rangeEnd) {
+        buckets[i].total += 1;
         const key = kindKey[event.kind];
         if (key) {
-          (bucket[key] as number) += 1;
+          (buckets[i][key] as number) += 1;
         }
         break;
       }

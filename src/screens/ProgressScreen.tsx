@@ -205,7 +205,7 @@ export default function ProgressScreen(props?: ProgressScreenProps) {
   );
 
   const renderOverview = () => {
-    const { overview } = snapshot!;
+    const { overview, aggregatesExact } = snapshot!;
     const cards: { value: number; label: string }[] = [
       { value: overview.sessionsCompleted, label: 'Sessions completed' },
       { value: overview.conversationTurns, label: 'Conversation turns' },
@@ -224,7 +224,11 @@ export default function ProgressScreen(props?: ProgressScreenProps) {
             </View>
           ))}
         </View>
-        <Text style={styles.allTimeNote}>All-time totals from your saved learning data</Text>
+        <Text style={styles.allTimeNote}>
+          {aggregatesExact
+            ? 'All-time totals from your saved learning data'
+            : 'Totals from your most recent saved learning data'}
+        </Text>
       </View>
     );
   };

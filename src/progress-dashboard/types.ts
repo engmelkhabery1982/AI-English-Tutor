@@ -150,6 +150,12 @@ export interface ProgressDashboardSnapshot {
   /** Start of the activity/trend window (null for all-time). */
   readonly windowStart: IsoDate | null;
   readonly generatedAt: IsoDate;
+  /**
+   * True when overview/trend totals come from exact aggregate queries and
+   * may be labeled as all-time. False when totals are derived from bounded
+   * detail lists — the UI must present them as limited, never all-time.
+   */
+  readonly aggregatesExact: boolean;
   readonly overview: OverviewStats;
   readonly vocabularyStatus: LexicalStatusCounts;
   readonly expressionStatus: LexicalStatusCounts;

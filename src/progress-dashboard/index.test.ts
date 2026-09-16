@@ -78,6 +78,18 @@ async function createContext(): Promise<TestContext> {
     expressions,
     review,
     progress,
+    // Same exact-aggregate wiring the real composition uses.
+    conversationStats: (learnerId, opts) => conversations.getActivityStats(learnerId, opts),
+    vocabularyBuckets: (learnerId, opts) => vocabulary.getBucketCounts(learnerId, opts),
+    vocabularyCreatedCount: (learnerId, opts) => vocabulary.countCreated(learnerId, opts),
+    expressionBuckets: (learnerId, opts) => expressions.getBucketCounts(learnerId, opts),
+    expressionCreatedCount: (learnerId, opts) => expressions.countCreated(learnerId, opts),
+    weaknessStatusCounts: (learnerId) => weaknesses.getUnresolvedStatusCounts(learnerId),
+    weaknessCreatedCount: (learnerId, opts) => weaknesses.countUnresolved(learnerId, opts),
+    weaknessEvidenceCount: (learnerId, opts) => weaknesses.countEvidence(learnerId, opts),
+    dueReviewCount: (learnerId, now) => review.countDue(learnerId, now),
+    reviewedCount: (learnerId, opts) => review.countReviewed(learnerId, opts),
+    progressRecordCount: (learnerId, opts) => progress.countRecords(learnerId, opts),
   });
 
   return {
@@ -644,5 +656,150 @@ describe('ProgressScreen composition contract', () => {
     ]) {
       expect(screenSource.includes(banned)).toBe(false);
     }
+  });
+  it('8. the screen claims all-time totals only when aggregates are exact', () => {
+    // The all-time claim must be conditional on the snapshot's exactness flag...
+    expect(screenSource.includes('aggregatesExact')).toBe(true);
+    expect(
+      screenSource.includes(
+        "snapshot.aggregatesExact ? 'All-time totals" ,
+      ),
+    ).toBe(false); // it reads the destructured const, not the snapshot object directly
+    expect(screenSource.includes("'All-time totals from your saved learning data'")).toBe(true);
+    // ...with an honest alternative label for bounded totals.
+    expect(screenSource.includes("'Totals from your most recent saved learning data'")).toBe(true);
+  });
+});
+
+// --- ACCURACY BEYOND DISPLAY LIMITS ---
+
+describe('Progress Dashboard accuracy beyond display limits', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(NOW));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('overview sessionsCompleted and conversationTurns stay exact with more than 50 sessions', async () => {
+    const ctx = await createContext();
+
+    // 55 completed sessions with varying turn counts (sum = 55 * 4 + extra)
+    let expectedTurns = 0;
+    for (let i = 0; i < 55; i++) {
+      const turns = 1 + (i % 5);
+      expectedTurns += turns;
+      await saveSession(ctx, { status: 'completed', turnCount: turns, startedAt: daysAgoIso(i * 0.1) });
+    }
+    // one active session that must not count as completed but its turns count
+    await saveSession(ctx, { status: 'active', turnCount: 7, startedAt: daysAgoIso(0.05) });
+
+    const snapshot = await ctx.service.loadDashboard(ctx.learnerId, { window: '30d', now: NOW });
+
+    expect(snapshot.overview.sessionsCompleted).toBe(55); // NOT capped at the 50-session detail limit
+    expect(snapshot.overview.conversationTurns).toBe(expectedTurns + 7);
+    expect(snapshot.aggregatesExact).toBe(true);
+  });
+
+  it('saved counts stay exact with more than 500 lexical rows and exclude expression rows', async () => {
+    const ctx = await createContext();
+
+    for (let i = 0; i < 505; i++) {
+      await saveVocab(ctx, `word-${i}`);
+    }
+    await saveExpression(ctx, 'beyond limit idiom');
+
+    const snapshot = await ctx.service.loadDashboard(ctx.learnerId, { window: '30d', now: NOW });
+
+    expect(snapshot.overview.vocabularySaved).toBe(505); // NOT capped at the 500-item detail limit
+    expect(snapshot.overview.expressionsSaved).toBe(1);
+    expect(snapshot.vocabularyStatus.total).toBe(505);
+    expect(snapshot.expressionStatus.total).toBe(1);
+  }, 30000);
+
+  it('active weakness counts and groups stay exact with more than 200 weaknesses; cards stay bounded', async () => {
+    const ctx = await createContext();
+
+    for (let i = 0; i < 60; i++) await saveWeakness(ctx, { status: 'observed' });
+    for (let i = 0; i < 60; i++) await saveWeakness(ctx, { status: 'improving' });
+    for (let i = 0; i < 50; i++) await saveWeakness(ctx, { status: 'stable' });
+    for (let i = 0; i < 40; i++) await saveWeakness(ctx, { status: 'relapsed' });
+    await saveWeakness(ctx, { status: 'observed', resolved: true }); // must not count
+
+    const snapshot = await ctx.service.loadDashboard(ctx.learnerId, { window: '30d', now: NOW });
+
+    expect(snapshot.overview.activeWeaknesses).toBe(210); // NOT capped at the 200-weakness detail limit
+    const byGroup = new Map(snapshot.weaknessGroups.map((g) => [g.group, g.count]));
+    expect(byGroup.get('needs_attention')).toBe(60);
+    expect(byGroup.get('improving')).toBe(60);
+    expect(byGroup.get('stable_mastered')).toBe(50);
+    expect(byGroup.get('relapsed')).toBe(40);
+
+    // detail lists remain bounded even though totals are exact
+    expect(snapshot.weaknessCards.length).toBeLessThanOrEqual(50);
+  }, 30000);
+
+  it('due review count stays exact with more than 200 due reviews; upcoming stays bounded', async () => {
+    const ctx = await createContext();
+
+    for (let i = 0; i < 210; i++) {
+      await saveReviewItem(ctx, { dueAt: daysAgoIso(1), prompt: `due review ${i}` });
+    }
+    await saveReviewItem(ctx, { dueAt: daysAgoIso(-3), prompt: 'future review' });
+
+    const snapshot = await ctx.service.loadDashboard(ctx.learnerId, { window: '30d', now: NOW });
+
+    expect(snapshot.reviewStatus.dueCount).toBe(210); // NOT capped at the 200-due detail limit
+    expect(snapshot.overview.reviewsDue).toBe(210);
+    expect(snapshot.reviewStatus.upcoming.length).toBeLessThanOrEqual(5);
+  }, 30000);
+
+  it('30d/all-time trend activity totals include sessions beyond the 50-row detail limit', async () => {
+    const ctx = await createContext();
+
+    // 60 sessions spread across the last 30 days (two per day) + one 40 days old
+    for (let i = 1; i <= 30; i++) {
+      await saveSession(ctx, { status: 'completed', turnCount: 2, startedAt: daysAgoIso(i - 0.5) });
+      await saveSession(ctx, { status: 'completed', turnCount: 2, startedAt: daysAgoIso(i - 0.25) });
+    }
+    await saveSession(ctx, { status: 'completed', turnCount: 2, startedAt: daysAgoIso(40) });
+
+    const in30 = await ctx.service.loadDashboard(ctx.learnerId, { window: '30d', now: NOW });
+    const sessionsIn30 = in30.trends.reduce((sum, bucket) => sum + bucket.sessions, 0);
+    expect(sessionsIn30).toBe(60); // exact, though the detail list caps at 50
+    const totalIn30 = in30.trends.reduce((sum, bucket) => sum + bucket.total, 0);
+    expect(totalIn30).toBe(60);
+
+    const all = await ctx.service.loadDashboard(ctx.learnerId, { window: 'all', now: NOW });
+    const sessionsAll = all.trends.reduce((sum, bucket) => sum + bucket.sessions, 0);
+    expect(sessionsAll).toBe(61); // the old session lands in an all-time bucket
+
+    // detail timeline stays bounded even with 61 persisted sessions
+    expect(in30.recentActivity.length).toBeLessThanOrEqual(30);
+  }, 30000);
+
+  it('a composition without aggregate reads stays honest: bounded totals flagged as not exact', async () => {
+    const ctx = await createContext();
+    for (let i = 0; i < 55; i++) {
+      await saveSession(ctx, { status: 'completed', turnCount: 2, startedAt: daysAgoIso(i * 0.1) });
+    }
+
+    const boundedService = new ProgressDashboardService({
+      profile: { get: async () => ({ id: ctx.learnerId }) as UserProfile },
+      conversations: ctx.conversations,
+      weaknesses: ctx.weaknesses,
+      vocabulary: ctx.vocabulary,
+      expressions: ctx.expressions,
+      review: ctx.review,
+      progress: ctx.progress,
+      // no aggregate methods provided
+    });
+
+    const snapshot = await boundedService.loadDashboard(ctx.learnerId, { window: '30d', now: NOW });
+    expect(snapshot.aggregatesExact).toBe(false);
+    // bounded fallback: capped at the 50-session detail limit — honestly flagged, not all-time
+    expect(snapshot.overview.sessionsCompleted).toBeLessThanOrEqual(50);
   });
 });
