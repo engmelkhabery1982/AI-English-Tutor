@@ -190,15 +190,16 @@ describe('Talk Demo & Composition Stack', () => {
         }
       );
 
-      // Save item via session when no profile exists
-      await expect(
-        bundle.session.saveVocabularyItem({
-          headword: 'ubiquitous',
-          type: 'word',
-          meaning: 'present everywhere',
-          example: 'Smartphones are ubiquitous.',
-        })
-      ).resolves.toBe(true);
+      // Save item via session when no profile exists: returns false and is NOT saved in memory
+      const saved = await bundle.session.saveVocabularyItem({
+        headword: 'ubiquitous',
+        type: 'word',
+        meaning: 'present everywhere',
+        example: 'Smartphones are ubiquitous.',
+      });
+
+      expect(saved).toBe(false);
+      expect(bundle.session.isVocabularySaved('ubiquitous')).toBe(false);
 
       // Send a user message and ensure session turns continue cleanly
       const turnResult = await bundle.session.send({ userMessage: 'Hello coach!' });
@@ -232,15 +233,16 @@ describe('Talk Demo & Composition Stack', () => {
       expect(turn1.ok).toBe(true);
       expect(bundle.session.getHistory()).toHaveLength(2);
 
-      // Attempt to save vocabulary item with broken repository
-      await expect(
-        bundle.session.saveVocabularyItem({
-          headword: 'tenacious',
-          type: 'word',
-          meaning: 'tending to keep a firm hold',
-          example: 'She is tenacious.',
-        })
-      ).resolves.toBe(true);
+      // Attempt to save vocabulary item with broken repository: returns false, isVocabularySaved is false
+      const saved = await bundle.session.saveVocabularyItem({
+        headword: 'tenacious',
+        type: 'word',
+        meaning: 'tending to keep a firm hold',
+        example: 'She is tenacious.',
+      });
+
+      expect(saved).toBe(false);
+      expect(bundle.session.isVocabularySaved('tenacious')).toBe(false);
 
       // Conversation state and history must remain valid and uncorrupted
       expect(bundle.session.getHistory()).toHaveLength(2);

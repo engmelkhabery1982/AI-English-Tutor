@@ -98,10 +98,9 @@ export function createTalkSession(
   const sessionConfig: ConversationSessionConfig = {
     ...config,
     onSaveVocabulary: async (vocab) => {
-      try {
-        await persistenceService.saveVocabulary(vocab);
-      } catch {
-        // Non-blocking: failure to persist must never corrupt conversation state
+      const savedItem = await persistenceService.saveVocabulary(vocab);
+      if (!savedItem) {
+        throw new Error('Vocabulary persistence failed or no learner profile exists');
       }
       if (config.onSaveVocabulary) {
         await config.onSaveVocabulary(vocab);

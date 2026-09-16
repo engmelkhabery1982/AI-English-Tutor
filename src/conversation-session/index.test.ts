@@ -825,4 +825,147 @@ describe('ConversationSession', () => {
       }
     }
   });
+
+  describe('saveVocabularyItem and persistence error handling', () => {
+    it('returns true and marks in-memory state when onSaveVocabulary callback succeeds', async () => {
+      const mockOrchestrator: ConversationOrchestrator = { execute: vi.fn() };
+      const onSaveMock = vi.fn().mockResolvedValue(true);
+      const session = createConversationSession(mockOrchestrator, {
+        mode: 'natural',
+        onSaveVocabulary: onSaveMock,
+      });
+
+      const vocab = {
+        headword: 'resilient',
+        type: 'word' as const,
+        meaning: 'able to withstand recovery',
+        example: 'They are resilient.',
+      };
+
+      const result = await session.saveVocabularyItem(vocab);
+      expect(result).toBe(true);
+      expect(session.isVocabularySaved('resilient')).toBe(true);
+      expect(session.isVocabularySaved('RESILIENT')).toBe(true);
+      expect(onSaveMock).toHaveBeenCalledWith(vocab);
+    });
+
+    it('returns false and does NOT mark in-memory state when onSaveVocabulary callback throws an error', async () => {
+      const mockOrchestrator: ConversationOrchestrator = { execute: vi.fn() };
+      const onSaveMock = vi.fn().mockRejectedValue(new Error('SQLite write error'));
+      const session = createConversationSession(mockOrchestrator, {
+        mode: 'natural',
+        onSaveVocabulary: onSaveMock,
+      });
+
+      const vocab = {
+        headword: 'ephemeral',
+        type: 'word' as const,
+        meaning: 'short-lived',
+        example: 'Beauty is ephemeral.',
+      };
+
+      const result = await session.saveVocabularyItem(vocab);
+      expect(result).toBe(false);
+      expect(session.isVocabularySaved('ephemeral')).toBe(false);
+      expect(session.getSavedVocabulary()).toEqual([]);
+    });
+
+    it('returns false and does NOT mark in-memory state when onSaveVocabulary callback returns false or null', async () => {
+      const mockOrchestrator: ConversationOrchestrator = { execute: vi.fn() };
+      const onSaveMock = vi.fn().mockResolvedValue(null);
+      const session = createConversationSession(mockOrchestrator, {
+        mode: 'natural',
+        onSaveVocabulary: onSaveMock,
+      });
+
+      const vocab = {
+        headword: 'fleeting',
+        type: 'word' as const,
+        meaning: 'lasting for a very short time',
+        example: 'A fleeting moment.',
+      };
+
+      const result = await session.saveVocabularyItem(vocab);
+      expect(result).toBe(false);
+      expect(session.isVocabularySaved('fleeting')).toBe(false);
+    });
+
+    it('saves in-memory and returns true when no onSaveVocabulary callback is configured (Demo mode)', async () => {
+      const mockOrchestrator: ConversationOrchestrator = { execute: vi.fn() };
+      const session = createConversationSession(mockOrchestrator, { mode: 'natural' });
+
+      const vocab = {
+        headword: 'ubiquitous',
+        type: 'word' as const,
+        meaning: 'found everywhere',
+        example: 'Wi-Fi is ubiquitous.',
+      };
+
+      const result = await session.saveVocabularyItem(vocab);
+      expect(result).toBe(true);
+      expect(session.isVocabularySaved('ubiquitous')).toBe(true);
+    });
+
+    it('auto-saves feedback vocabulary in memory when callback succeeds on assistant turn', async () => {
+      const mockOrchestrator: ConversationOrchestrator = {
+        execute: vi.fn().mockResolvedValue({
+          ok: true,
+          request: createMockConversationRequest(),
+          response: {
+            content: 'That is a great word!',
+            feedback: {
+              vocabulary: {
+                headword: 'serendipity',
+                type: 'word',
+                meaning: 'chance discovery',
+                example: 'By serendipity.',
+              },
+            },
+          },
+        }),
+      };
+      const onSaveMock = vi.fn().mockResolvedValue(true);
+
+      const session = createConversationSession(mockOrchestrator, {
+        mode: 'natural',
+        onSaveVocabulary: onSaveMock,
+      });
+
+      const result = await session.send({ userMessage: 'What does serendipity mean?' });
+      expect(result.ok).toBe(true);
+      expect(session.isVocabularySaved('serendipity')).toBe(true);
+      expect(onSaveMock).toHaveBeenCalled();
+    });
+
+    it('auto-save failure on assistant turn is non-blocking and does not mark in-memory saved status', async () => {
+      const mockOrchestrator: ConversationOrchestrator = {
+        execute: vi.fn().mockResolvedValue({
+          ok: true,
+          request: createMockConversationRequest(),
+          response: {
+            content: 'Great turn!',
+            feedback: {
+              vocabulary: {
+                headword: 'ephemeral',
+                type: 'word',
+                meaning: 'short-lived',
+                example: 'Ephemeral joy.',
+              },
+            },
+          },
+        }),
+      };
+      const onSaveMock = vi.fn().mockRejectedValue(new Error('Database write error'));
+
+      const session = createConversationSession(mockOrchestrator, {
+        mode: 'natural',
+        onSaveVocabulary: onSaveMock,
+      });
+
+      const result = await session.send({ userMessage: 'Hello' });
+      expect(result.ok).toBe(true);
+      expect(result.history).toHaveLength(2);
+      expect(session.isVocabularySaved('ephemeral')).toBe(false);
+    });
+  });
 });

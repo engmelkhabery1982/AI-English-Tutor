@@ -43,7 +43,7 @@ export interface ConversationSessionConfig {
   readonly historyLimit?: number;
   readonly onSaveVocabulary?: (
     vocab: ConversationFeedbackVocabulary
-  ) => Promise<void> | void;
+  ) => Promise<unknown> | unknown;
 }
 
 /**

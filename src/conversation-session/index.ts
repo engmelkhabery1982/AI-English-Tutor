@@ -129,7 +129,7 @@ export function createConversationSession(
             lastFeedback.vocabulary
           );
         } catch {
-          // Non-blocking auto-save
+          // Non-blocking auto-save failure: do not mark saved in memory if persistence failed
         }
       }
 
@@ -174,19 +174,31 @@ export function createConversationSession(
 
     async saveVocabularyItem(vocab: ConversationFeedbackVocabulary): Promise<boolean> {
       if (!vocab || !vocab.headword) return false;
+
+      if (sessionConfig.onSaveVocabulary) {
+        try {
+          const result = await sessionConfig.onSaveVocabulary(vocab);
+          if (result === false || result === null) {
+            return false;
+          }
+          savedVocabularyMap.set(vocab.headword.toLowerCase(), {
+            headword: vocab.headword,
+            type: vocab.type,
+            meaning: vocab.meaning,
+            example: vocab.example,
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
       savedVocabularyMap.set(vocab.headword.toLowerCase(), {
         headword: vocab.headword,
         type: vocab.type,
         meaning: vocab.meaning,
         example: vocab.example,
       });
-      if (sessionConfig.onSaveVocabulary) {
-        try {
-          await sessionConfig.onSaveVocabulary(vocab);
-        } catch {
-          // Ignore
-        }
-      }
       return true;
     },
 

@@ -107,8 +107,10 @@ export default function TalkScreen() {
   // Handle save vocabulary item
   const handleSaveVocabulary = async (vocab: ConversationFeedbackVocabulary) => {
     if (!sessionRef.current || !vocab.headword) return;
-    await sessionRef.current.saveVocabularyItem(vocab);
-    setSavedWords((prev) => ({ ...prev, [vocab.headword.toLowerCase()]: true }));
+    const saved = await sessionRef.current.saveVocabularyItem(vocab);
+    if (saved) {
+      setSavedWords((prev) => ({ ...prev, [vocab.headword.toLowerCase()]: true }));
+    }
   };
 
   // Handle send message with streaming
