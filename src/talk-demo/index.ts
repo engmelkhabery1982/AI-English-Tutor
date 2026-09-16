@@ -15,6 +15,7 @@ import {
   type ConversationSessionResult,
   type ConversationTurn,
 } from '../conversation-session';
+import type { AIProvider } from '../providers/ai';
 import { createDemoAIProvider } from '../providers/ai/demo';
 import { createGeminiAIProvider } from '../providers/ai/gemini';
 import { createDemoLearnerModel } from './demo-learner-model';
@@ -47,6 +48,19 @@ export function getGeminiApiKey(): string | null {
 }
 
 /**
+ * Internal helper to compose the session stack around a given AIProvider.
+ */
+function composeSessionWithProvider(
+  config: ConversationSessionConfig,
+  provider: AIProvider
+): ConversationSession {
+  const learnerModel = createDemoLearnerModel();
+  const engine = createConversationEngine(learnerModel);
+  const orchestrator = createConversationOrchestrator(engine, provider);
+  return createConversationSession(orchestrator, config);
+}
+
+/**
  * Creates an end-to-end runnable ConversationSession bundle.
  * Uses Gemini AI Provider when an API key is available, falling back to Demo AI Provider.
  */
@@ -54,9 +68,6 @@ export function createTalkSession(
   config: ConversationSessionConfig,
   options?: { readonly apiKey?: string; readonly fetchImpl?: typeof fetch }
 ): TalkSessionBundle {
-  const learnerModel = createDemoLearnerModel();
-  const engine = createConversationEngine(learnerModel);
-
   const key = options?.apiKey?.trim() || getGeminiApiKey();
 
   if (key) {
@@ -64,28 +75,26 @@ export function createTalkSession(
       apiKey: key,
       fetchImpl: options?.fetchImpl,
     });
-    const orchestrator = createConversationOrchestrator(engine, provider);
-    const session = createConversationSession(orchestrator, config);
     return {
-      session,
+      session: composeSessionWithProvider(config, provider),
       providerKind: 'gemini',
     };
   }
 
   const provider = createDemoAIProvider();
-  const orchestrator = createConversationOrchestrator(engine, provider);
-  const session = createConversationSession(orchestrator, config);
   return {
-    session,
+    session: composeSessionWithProvider(config, provider),
     providerKind: 'demo',
   };
 }
 
 /**
- * Backwards-compatible factory creating a demo session.
+ * Creates a ConversationSession that ALWAYS uses the local DemoAIProvider,
+ * completely independent of any environment variables, API keys, or network availability.
  */
 export function createTalkDemoSession(
   config: ConversationSessionConfig
 ): ConversationSession {
-  return createTalkSession(config).session;
+  const provider = createDemoAIProvider();
+  return composeSessionWithProvider(config, provider);
 }

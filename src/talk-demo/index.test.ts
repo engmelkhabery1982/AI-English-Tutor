@@ -1,11 +1,30 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createDemoLearnerModel,
   createTalkDemoSession,
   createTalkSession,
+  getGeminiApiKey,
 } from './index';
 
 describe('Talk Demo & Composition Stack', () => {
+  const originalEnvKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+
+  beforeEach(() => {
+    if (typeof originalEnvKey === 'string') {
+      process.env.EXPO_PUBLIC_GEMINI_API_KEY = originalEnvKey;
+    } else {
+      delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+    }
+  });
+
+  afterEach(() => {
+    if (typeof originalEnvKey === 'string') {
+      process.env.EXPO_PUBLIC_GEMINI_API_KEY = originalEnvKey;
+    } else {
+      delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+    }
+  });
+
   describe('DemoLearnerModel', () => {
     it('provides deterministic profile and coaching context', async () => {
       const model = createDemoLearnerModel();
@@ -40,21 +59,33 @@ describe('Talk Demo & Composition Stack', () => {
     });
   });
 
+  describe('getGeminiApiKey', () => {
+    it('returns trimmed key when EXPO_PUBLIC_GEMINI_API_KEY is present', () => {
+      process.env.EXPO_PUBLIC_GEMINI_API_KEY = '  env-secret-key-123  ';
+      expect(getGeminiApiKey()).toBe('env-secret-key-123');
+    });
+
+    it('returns null when EXPO_PUBLIC_GEMINI_API_KEY is absent or empty', () => {
+      delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+      expect(getGeminiApiKey()).toBeNull();
+
+      process.env.EXPO_PUBLIC_GEMINI_API_KEY = '   ';
+      expect(getGeminiApiKey()).toBeNull();
+    });
+  });
+
   describe('createTalkSession provider selection', () => {
-    it('selects Demo provider when no API key is provided', () => {
-      const originalEnv = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+    it('selects Demo provider when no API key is provided or in env', () => {
       delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
 
       const bundle = createTalkSession({ mode: 'natural' });
       expect(bundle.providerKind).toBe('demo');
       expect(typeof bundle.session.send).toBe('function');
-
-      if (originalEnv !== undefined) {
-        process.env.EXPO_PUBLIC_GEMINI_API_KEY = originalEnv;
-      }
     });
 
-    it('selects Gemini provider when API key is provided', () => {
+    it('selects Gemini provider when API key is provided explicitly in options', () => {
+      delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+
       const bundle = createTalkSession(
         { mode: 'coach', topic: 'Travel' },
         { apiKey: 'explicit-test-api-key' }
@@ -63,6 +94,14 @@ describe('Talk Demo & Composition Stack', () => {
       expect(typeof bundle.session.send).toBe('function');
       expect(bundle.session.getConfig().mode).toBe('coach');
       expect(bundle.session.getConfig().topic).toBe('Travel');
+    });
+
+    it('selects Gemini provider when EXPO_PUBLIC_GEMINI_API_KEY is present in env', () => {
+      process.env.EXPO_PUBLIC_GEMINI_API_KEY = 'env-api-key-xyz';
+
+      const bundle = createTalkSession({ mode: 'natural', topic: 'Hobbies' });
+      expect(bundle.providerKind).toBe('gemini');
+      expect(typeof bundle.session.send).toBe('function');
     });
 
     it('executes end-to-end multi-turn session with mocked Gemini provider', async () => {
@@ -150,7 +189,9 @@ describe('Talk Demo & Composition Stack', () => {
   });
 
   describe('createTalkDemoSession', () => {
-    it('creates an end-to-end working ConversationSession with demo provider', async () => {
+    it('uses DemoAIProvider when no environment key exists', async () => {
+      delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+
       const session = createTalkDemoSession({
         mode: 'natural',
         topic: 'Travel',
@@ -159,6 +200,39 @@ describe('Talk Demo & Composition Stack', () => {
       expect(session.getConfig().mode).toBe('natural');
       expect(session.getConfig().topic).toBe('Travel');
       expect(session.getHistory()).toEqual([]);
+
+      const result = await session.send({ userMessage: 'Hello!' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Deterministic demo response
+        expect(result.response.content).toContain("Let's talk about Travel!");
+      }
+    });
+
+    it('STILL uses DemoAIProvider when EXPO_PUBLIC_GEMINI_API_KEY contains a non-empty value', async () => {
+      // Set a valid non-empty environment key
+      process.env.EXPO_PUBLIC_GEMINI_API_KEY = 'AIzaSyRealLookingKeyForTestingDeterministicDemoSession';
+
+      const session = createTalkDemoSession({
+        mode: 'natural',
+        topic: 'Books',
+      });
+
+      // Must NOT attempt network / Gemini API call and MUST produce deterministic Demo responses
+      const result = await session.send({ userMessage: 'Hello!' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.response.content).toContain("Let's talk about Books!");
+      }
+    });
+
+    it('preserves deterministic Demo greeting and topic behavior across multi-turn exchanges', async () => {
+      process.env.EXPO_PUBLIC_GEMINI_API_KEY = 'AIzaSyDummyKey';
+
+      const session = createTalkDemoSession({
+        mode: 'natural',
+        topic: 'Travel',
+      });
 
       // 1. First send
       const firstResult = await session.send({ userMessage: 'Hello!' });
@@ -170,7 +244,7 @@ describe('Talk Demo & Composition Stack', () => {
         expect(firstResult.history[1].content).toContain("Let's talk about Travel!");
       }
 
-      // 2. Second send includes previous completed exchange
+      // 2. Second send includes previous completed exchange and correction pattern
       const secondResult = await session.send({
         userMessage: 'I went to meeting yesterday',
       });
@@ -190,7 +264,9 @@ describe('Talk Demo & Composition Stack', () => {
       expect(session.getHistory()).toEqual([]);
     });
 
-    it('works across coach and intensive modes', async () => {
+    it('remains deterministic Demo behavior in coach mode even with env API key present', async () => {
+      process.env.EXPO_PUBLIC_GEMINI_API_KEY = 'AIzaSyDummyKey';
+
       const coachSession = createTalkDemoSession({
         mode: 'coach',
       });
@@ -199,6 +275,10 @@ describe('Talk Demo & Composition Stack', () => {
       if (coachResult.ok) {
         expect(coachResult.response.content).toContain('coach mode');
       }
+    });
+
+    it('remains deterministic Demo behavior in intensive mode even with env API key present', async () => {
+      process.env.EXPO_PUBLIC_GEMINI_API_KEY = 'AIzaSyDummyKey';
 
       const intensiveSession = createTalkDemoSession({
         mode: 'intensive',
