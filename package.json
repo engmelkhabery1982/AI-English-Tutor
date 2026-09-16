@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "main": "index.ts",
   "dependencies": {
-    "@expo/metro-runtime": "^57.0.15",
     "@react-navigation/bottom-tabs": "^7.18.18",
     "@react-navigation/native": "^7.3.18",
     "@react-navigation/stack": "^7.10.24",
@@ -11,12 +10,10 @@
     "expo-sqlite": "~57.0.3",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
-    "react-dom": "19.2.3",
     "react-native": "0.86.3",
     "react-native-gesture-handler": "~2.32.0",
     "react-native-safe-area-context": "~5.7.0",
-    "react-native-screens": "~4.26.0",
-    "react-native-web": "^0.21.2"
+    "react-native-screens": "~4.26.0"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",
@@ -30,12 +27,10 @@
     "vitest": "^5.0.0"
   },
   "scripts": {
-    "dev": "expo start --web --port 3000",
-    "start": "expo start --web --port 3000",
-    "build": "expo export -p web",
+    "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "web": "expo start --web --port 3000",
+    "web": "expo start --web",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src",
     "test": "vitest run"
