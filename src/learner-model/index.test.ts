@@ -51,6 +51,7 @@ function createMockRepositories(overrides: Partial<AppRepositories> = {}): AppRe
       updateSession: vi.fn(),
     },
     mistakes: {
+      updateMistake: vi.fn(),
       recordMistake: vi.fn(),
       listMistakes: vi.fn().mockResolvedValue([]),
       markResolved: vi.fn(),

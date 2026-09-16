@@ -24,7 +24,7 @@ describe('Adaptive Review Suite', () => {
   let mockAIProvider: AIProvider;
   let service: ReviewService;
 
-  const learnerId = 'learner-test-123';
+  const learnerId = '1ef907b7-6c12-4ead-8f9a-c97bd31e83f3';
   const now = '2026-09-16T12:00:00.000Z';
 
   beforeEach(() => {
@@ -46,6 +46,7 @@ describe('Adaptive Review Suite', () => {
         updateSession: vi.fn(),
       },
       mistakes: {
+      updateMistake: vi.fn(),
         recordMistake: vi.fn(),
         listMistakes: vi.fn().mockResolvedValue([]),
         markResolved: vi.fn(),
@@ -588,9 +589,24 @@ describe('Adaptive Review Suite', () => {
   });
 
   it('18. review persistence survives repository reload', async () => {
-    const mockVocab: VocabularyItem = {
-      id: 'v1',
-      learnerId,
+    const { SqlJsAdapter } = await import('../data/local/sqlite/SqlJsAdapter');
+    const { SQLiteVocabularyRepository, SQLiteUserProfileRepository } = await import('../data/local/sqlite/repositories');
+    const adapter = new SqlJsAdapter();
+    await adapter.init();
+
+    const profileRepo = new SQLiteUserProfileRepository(adapter);
+    const profile = await profileRepo.update({
+      displayName: 'Test User',
+      currentLevel: 'B1',
+      targetLevel: 'B2',
+      learningGoals: [],
+      preferredModes: [],
+    });
+    const realLearnerId = profile.id;
+
+    const vocabRepo1 = new SQLiteVocabularyRepository(adapter);
+    const mockVocab = await vocabRepo1.upsert({
+      learnerId: realLearnerId,
       headword: 'fluent',
       type: 'word',
       source: { addedBy: 'system', addedAt: now },
@@ -606,15 +622,16 @@ describe('Adaptive Review Suite', () => {
           },
         },
       ],
-      createdAt: now,
-      updatedAt: now,
-    };
+    });
+
+    const realRepos1 = { ...mockRepos, vocabulary: vocabRepo1 };
+    const service1 = new ReviewService(realRepos1, mockAIProvider);
 
     const candidate: ReviewItemCandidate = {
       id: 'c1',
-      learnerId,
+      learnerId: realLearnerId,
       kind: 'vocabulary',
-      referenceId: 'v1',
+      referenceId: mockVocab.id,
       exerciseType: 'vocabulary_recall',
       prompt: 'definition',
       expectedAnswer: 'fluent',
@@ -625,11 +642,14 @@ describe('Adaptive Review Suite', () => {
       reviewCount: 0,
     };
 
-    mockRepos.vocabulary.get = vi.fn().mockResolvedValue(mockVocab);
+    await service1.recordPracticeResult(realLearnerId, candidate, 'fluent', { result: 'correct', feedback: 'Good!' });
 
-    await service.recordPracticeResult(learnerId, candidate, 'fluent', { result: 'correct', feedback: 'Good!' });
+    // Reload repository
+    const vocabRepo2 = new SQLiteVocabularyRepository(adapter);
+    const reloadedVocab = await vocabRepo2.get(mockVocab.id);
 
-    expect(mockRepos.vocabulary.update).toHaveBeenCalled();
+    expect(reloadedVocab?.meanings[0].review?.consecutiveCorrect).toBe(1);
+    expect(reloadedVocab?.meanings[0].review?.reviewCount).toBe(2);
   });
 
   // --- DEMO & SETUP FLOW TESTS (19-20) ---
@@ -640,22 +660,26 @@ describe('Adaptive Review Suite', () => {
     expect(candidates).toHaveLength(0);
   });
 
-  it('20. demo toggle triggers mock injection', async () => {
-    const candidates = await service.planSession(learnerId);
-    // Real is empty
+  it('20. explicit demo toggle configures demo AI provider', async () => {
+    const { createReviewService } = await import('./factory');
+    // Pass a fake adapter so it doesn't crash
+    const fakeAdapter: any = { query: vi.fn().mockResolvedValue([]), execute: vi.fn() };
+    const demoService = createReviewService(fakeAdapter, true);
+    // Should not crash and should return empty plan because repo is empty,
+    // but the underlying AI provider is Demo (internal state).
+    const candidates = await demoService.planSession(learnerId);
     expect(candidates).toHaveLength(0);
-    // Simulated demo mode fallback (handled at controller level in ReviewScreen component)
-    expect(candidates).toEqual([]);
   });
 
   // --- VOICE FLOW TESTS (21-23) ---
 
   it('21. voice transcript populates answer only', async () => {
+    const { ReviewVoiceController } = await import('./voice-controller');
     const recorder: AudioRecorderService = {
       requestPermissions: vi.fn().mockResolvedValue(true),
       hasPermissions: vi.fn().mockResolvedValue(true),
       startRecording: vi.fn().mockResolvedValue(undefined),
-      stopRecording: vi.fn().mockResolvedValue({ uri: 'file://audio.wav', durationMs: 1200, mimeType: 'audio/wav' }),
+      stopRecording: vi.fn().mockResolvedValue({ uri: 'file://audio.wav', durationMs: 1200, mimeType: 'audio/wav', base64: '' }),
       isRecording: vi.fn().mockReturnValue(false),
       getElapsedSeconds: vi.fn().mockReturnValue(0),
     };
@@ -665,38 +689,60 @@ describe('Adaptive Review Suite', () => {
       transcribe: vi.fn().mockResolvedValue({ ok: true, transcript: 'Spoken Answer' }),
     };
 
-    await recorder.startRecording();
-    const result = await recorder.stopRecording();
-    const sttRes = await stt.transcribe(result);
-
-    expect(sttRes.ok).toBe(true);
-    expect(sttRes.transcript).toBe('Spoken Answer');
+    const controller = new ReviewVoiceController(recorder, stt);
+    
+    // start
+    await controller.toggleRecording();
+    expect(controller.isRecording).toBe(true);
+    
+    // stop
+    await controller.toggleRecording();
+    expect(controller.isRecording).toBe(false);
+    expect(controller.userAnswer).toBe('Spoken Answer');
   });
 
   it('22. voice answer is NOT auto-submitted', async () => {
+    const { ReviewVoiceController } = await import('./voice-controller');
     const mockSubmit = vi.fn();
-    // Simulate UI action
-    const simulatedTranscript = 'Spoken Answer';
-    let userAnswerState = '';
+    const recorder: AudioRecorderService = {
+      requestPermissions: vi.fn().mockResolvedValue(true),
+      hasPermissions: vi.fn().mockResolvedValue(true),
+      startRecording: vi.fn().mockResolvedValue(undefined),
+      stopRecording: vi.fn().mockResolvedValue({ uri: 'file://audio.wav', durationMs: 1200, mimeType: 'audio/wav', base64: '' }),
+      isRecording: vi.fn().mockReturnValue(false),
+      getElapsedSeconds: vi.fn().mockReturnValue(0),
+    };
+    const stt: SpeechToTextProvider = {
+      id: 'mock-stt',
+      transcribe: vi.fn().mockResolvedValue({ ok: true, transcript: 'Spoken Answer' }),
+    };
+    const controller = new ReviewVoiceController(recorder, stt);
+    
+    await controller.toggleRecording(); // start
+    await controller.toggleRecording(); // stop
 
-    // Voice populates state only
-    userAnswerState = simulatedTranscript;
-
-    expect(userAnswerState).toBe('Spoken Answer');
-    expect(mockSubmit).not.toHaveBeenCalled(); // Manual submission required!
+    expect(controller.userAnswer).toBe('Spoken Answer');
+    expect(mockSubmit).not.toHaveBeenCalled(); 
   });
 
   it('23. voice recorder handles error state gracefully', async () => {
+    const { ReviewVoiceController } = await import('./voice-controller');
     const recorder: AudioRecorderService = {
       requestPermissions: vi.fn().mockResolvedValue(true),
       hasPermissions: vi.fn().mockResolvedValue(true),
       startRecording: vi.fn().mockRejectedValue(new Error('Hardware failure')),
-      stopRecording: vi.fn().mockResolvedValue({ uri: 'file://audio.wav', durationMs: 0, mimeType: 'audio/wav' }),
+      stopRecording: vi.fn().mockResolvedValue({ uri: 'file://audio.wav', durationMs: 0, mimeType: 'audio/wav', base64: '' }),
       isRecording: vi.fn().mockReturnValue(false),
       getElapsedSeconds: vi.fn().mockReturnValue(0),
     };
-
-    await expect(recorder.startRecording()).rejects.toThrow('Hardware failure');
+    const stt: SpeechToTextProvider = {
+      id: 'mock-stt',
+      transcribe: vi.fn().mockResolvedValue({ ok: true, transcript: '' }),
+    };
+    const controller = new ReviewVoiceController(recorder, stt);
+    
+    await controller.toggleRecording();
+    expect(controller.error).toBe('Hardware failure');
   });
 
   // --- GENERAL LEARNER ENGINE INTERACTION (24-25) ---

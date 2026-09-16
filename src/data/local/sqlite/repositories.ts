@@ -840,6 +840,38 @@ export class SQLiteMistakeRepository implements MistakeRepository {
 
     return rowToGrammarMistake(rows[0]);
   }
+
+  async updateMistake(
+    id: string,
+    patch: Partial<Omit<GrammarMistake, 'id' | 'createdAt'>>,
+  ): Promise<GrammarMistake> {
+    if (!isValidUuid(id)) {
+      throw new Error('Invalid mistake id');
+    }
+
+    const existing = await this.adapter.query(
+      `SELECT * FROM grammar_mistakes WHERE id = ?`,
+      [id],
+    );
+
+    if (existing.length === 0) {
+      throw new Error(`Grammar mistake not found: ${id}`);
+    }
+
+    const { sql, params } = buildGrammarMistakeUpdate(id, patch);
+    await this.adapter.execute(sql, params);
+
+    const rows = await this.adapter.query(
+      `SELECT * FROM grammar_mistakes WHERE id = ?`,
+      [id],
+    );
+
+    if (rows.length === 0) {
+      throw new Error('Grammar mistake disappeared after update');
+    }
+
+    return rowToGrammarMistake(rows[0]);
+  }
 }
 
 /**

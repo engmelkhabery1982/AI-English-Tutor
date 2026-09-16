@@ -54,6 +54,7 @@ export interface MistakeRepository {
   recordMistake(mistake: Omit<GrammarMistake, 'id' | 'createdAt' | 'updatedAt'>): Promise<GrammarMistake>;
   listMistakes(learnerId: string, opts?: { resolved?: boolean; limit?: number }): Promise<readonly GrammarMistake[]>;
   markResolved(id: string, resolved: boolean): Promise<GrammarMistake>;
+  updateMistake(id: string, patch: Partial<Omit<GrammarMistake, 'id' | 'createdAt'>>): Promise<GrammarMistake>;
 }
 
 export interface PronunciationRepository {

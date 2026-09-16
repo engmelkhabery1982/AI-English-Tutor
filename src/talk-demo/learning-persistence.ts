@@ -13,6 +13,7 @@ import {
   SQLiteWeaknessRepository,
   SQLiteUserProfileRepository,
 } from '../data/local/sqlite/repositories';
+import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 
 // Categorizer helper to assign meaningful categories
 function categorizeCorrection(
@@ -53,9 +54,13 @@ export interface LearningPersistenceService {
   recordFeedbackEvidence(feedback: ConversationFeedback): Promise<void>;
 }
 
-export function createLearningPersistenceService(): LearningPersistenceService {
+export function createLearningPersistenceService(injectedAdapter?: DatabaseAdapter, injectedLearnerId?: string): LearningPersistenceService {
   async function resolveDependencies() {
     try {
+      if (injectedAdapter && injectedLearnerId) {
+        return { adapter: injectedAdapter, learnerId: injectedLearnerId };
+      }
+      
       const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
       const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
       await adapter.init();
@@ -144,6 +149,14 @@ export function createLearningPersistenceService(): LearningPersistenceService {
           });
           mistakeId = mistake.id;
           occurrenceCount = 1;
+        } else {
+          // Update existing mistake
+          const updatedContexts = Array.from(new Set([...(existingMistake.contexts ?? []), 'conversation-turn']));
+          await mistakeRepo.updateMistake(existingMistake.id, {
+            occurrenceCount,
+            lastSeenAt: now,
+            contexts: updatedContexts,
+          });
         }
 
         // Determine mapped weakness type
@@ -205,7 +218,6 @@ export function createLearningPersistenceService(): LearningPersistenceService {
           const alreadyScheduled = dueReviews.some((r) => r.referenceId === weakness.id);
           if (!alreadyScheduled) {
             await reviewRepo.upsert({
-              id: generateId(),
               learnerId,
               kind: category,
               referenceId: weakness.id,

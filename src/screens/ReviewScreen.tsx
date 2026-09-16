@@ -116,6 +116,7 @@ export interface ReviewScreenProps {
 
 export default function ReviewScreen(props?: ReviewScreenProps) {
   const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
   const [isDemoMode, setIsDemoMode] = useState<boolean>(props?.initialDemoMode ?? false);
   const [hasNoProfile, setHasNoProfile] = useState<boolean>(false);
   const [summary, setSummary] = useState<ReviewDashboardSummary>({
@@ -177,19 +178,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       } catch (err) {
         console.error('Failed to initialize SQLite Review repositories:', err);
         if (active) {
-          // If loading actual SQLite fails, fallback to Mock Demo Mode
-          setIsDemoMode(true);
-          setSummary({
-            totalDue: 5,
-            dueVocabularyCount: 2,
-            dueExpressionCount: 1,
-            activeWeaknessCount: 2,
-            categories: [
-              { key: 'grammar', label: 'Grammar & Phrasing', dueCount: 2 },
-              { key: 'vocabulary', label: 'Vocabulary Recall', dueCount: 2 },
-              { key: 'expression', label: 'Expressions & Idioms', dueCount: 1 },
-            ],
-          });
+          setError('Local storage unavailable. Failed to initialize review database.');
           setLoading(false);
         }
       }
@@ -451,6 +440,14 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color="#2563EB" />
         <Text style={styles.loadingText}>Loading adaptive review system...</Text>
+      </View>
+    );
+  }
+
+  if (error && sessionState === 'dashboard') {
+    return (
+      <View style={styles.loadingContainer}>
+        <Text style={[styles.loadingText, { color: '#DC2626' }]}>{error}</Text>
       </View>
     );
   }

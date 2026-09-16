@@ -9,6 +9,8 @@
 
 import type { AIProvider } from '../providers/ai/types';
 import type { EvaluationResult, QualitativeResult, ReviewItemCandidate } from './types';
+import type { ConversationRequest } from '../conversation-engine/types';
+import type { CoachingContext } from '../learner-model';
 
 /** Clean and normalize a string for deterministic comparison */
 export function normalizeText(text: string): string {
@@ -232,27 +234,38 @@ Evaluate the answer. You MUST respond with ONLY a valid JSON object matching thi
 }
 Important: Do NOT include any numbers, ratings, or percentages. Only qualitative feedback.`;
 
-        const request = {
+        const emptyCoachingContext: CoachingContext = {
+          profile: {
+            learnerId: candidate.learnerId,
+            displayName: 'Student',
+            currentLevel: 'A1',
+            targetLevel: 'A1',
+            learningGoals: [],
+            preferredModes: ['natural'],
+          },
+          activeWeaknesses: [],
+          strengths: [],
+          vocabularyFocus: [],
+          expressionFocus: [],
+          recentProgress: null,
+          dueReviewCount: 0,
+          generatedAt: new Date().toISOString(),
+        };
+
+        const request: ConversationRequest = {
           systemPrompt,
           messages: [
             {
-              id: 'eval-user-turn',
-              role: 'user' as const,
+              role: 'user',
               content: prompt,
-              createdAt: new Date().toISOString(),
             },
           ],
-          mode: 'coach' as const,
+          mode: 'coach',
           topic: 'Review Evaluation',
-          coachingContext: {
-            focusArea: candidate.exerciseType,
-            weaknesses: [],
-            strengths: [],
-            recentErrors: [],
-          },
+          coachingContext: emptyCoachingContext,
         };
 
-        const resultObj = await this.aiProvider.generate(request as any);
+        const resultObj = await this.aiProvider.generate(request);
         if (resultObj.ok && resultObj.response && resultObj.response.content) {
           const rawText = resultObj.response.content.trim();
           const jsonMatch = rawText.match(/\{[\s\S]*\}/);
