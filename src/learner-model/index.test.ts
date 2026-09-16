@@ -1,7 +1,7 @@
 /**
  * src/learner-model/index.test.ts
  *
- * Unit tests for the read-only LearnerModel facade and query API using mock AppRepositories.
+ * Unit tests for the read-only LearnerModel facade, query API, and summary insights.
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -640,5 +640,412 @@ describe('LearnerModel query API', () => {
     // Internal model snapshot must remain unchanged
     expect(model.getSavedVocabulary()).toHaveLength(1);
     expect(model.vocabulary).toHaveLength(1);
+  });
+});
+
+describe('LearnerModel summary insights API', () => {
+  function makeWeakness(
+    id: string,
+    status: LearnerWeakness['status'],
+    resolved: boolean,
+  ): LearnerWeakness {
+    return {
+      id,
+      learnerId: 'learner-123',
+      type: 'grammar',
+      referenceId: `ref-${id}`,
+      status,
+      severity: 0.5,
+      occurrenceCount: 1,
+      lastSeenAt: '2026-09-01T00:00:00.000Z',
+      firstSeenAt: '2026-08-01T00:00:00.000Z',
+      contexts: ['chat'],
+      evidence: [],
+      resolved,
+      createdAt: '2026-08-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+  }
+
+  it('1. weakness summary counts total/active/mastered/resolved', async () => {
+    const repos = createMockRepositories();
+    const w1 = makeWeakness('w-1', 'confirmed', false); // active
+    const w2 = makeWeakness('w-2', 'mastered', false); // mastered
+    const w3 = makeWeakness('w-3', 'observed', true); // resolved
+    const w4 = makeWeakness('w-4', 'mastered', true); // mastered AND resolved
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([w1, w2, w3, w4]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const summary = model.getWeaknessSummary();
+    expect(summary.total).toBe(4);
+    expect(summary.active).toBe(1); // w1
+    expect(summary.mastered).toBe(2); // w2, w4
+    expect(summary.resolved).toBe(2); // w3, w4
+  });
+
+  it('2. weakness byStatus counts are correct', async () => {
+    const repos = createMockRepositories();
+    const w1 = makeWeakness('w-1', 'observed', false);
+    const w2 = makeWeakness('w-2', 'observed', false);
+    const w3 = makeWeakness('w-3', 'relapsed', false);
+    const w4 = makeWeakness('w-4', 'active_training', false);
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([w1, w2, w3, w4]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const summary = model.getWeaknessSummary();
+    expect(summary.byStatus.observed).toBe(2);
+    expect(summary.byStatus.relapsed).toBe(1);
+    expect(summary.byStatus.active_training).toBe(1);
+    expect(summary.byStatus.mastered).toBe(0);
+    expect(summary.byStatus.confirmed).toBe(0);
+    expect(summary.byStatus.improving).toBe(0);
+    expect(summary.byStatus.stable).toBe(0);
+    expect(summary.byStatus.repeated).toBe(0);
+  });
+
+  it('3. vocabulary summary counts meanings', async () => {
+    const repos = createMockRepositories();
+    const vocab1: VocabularyItem = {
+      id: 'v-1',
+      learnerId: 'learner-123',
+      headword: 'run',
+      type: 'word',
+      meanings: [
+        { definition: 'to move fast', examples: [] },
+        { definition: 'to manage', examples: [] },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-09-01T00:00:00.000Z' },
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    const vocab2: VocabularyItem = {
+      id: 'v-2',
+      learnerId: 'learner-123',
+      headword: 'jump',
+      type: 'word',
+      meanings: [{ definition: 'to leap', examples: [] }],
+      source: { addedBy: 'system', addedAt: '2026-09-01T00:00:00.000Z' },
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab1, vocab2]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const summary = model.getVocabularySummary();
+    expect(summary.totalItems).toBe(2);
+    expect(summary.totalMeanings).toBe(3);
+    expect(summary.reviewedMeanings).toBe(0);
+    expect(summary.masteredMeanings).toBe(0);
+    expect(summary.dueMeanings).toBe(0);
+  });
+
+  it('4. vocabulary masteredMeaning count uses persisted review state', async () => {
+    const repos = createMockRepositories();
+    const vocab: VocabularyItem = {
+      id: 'v-1',
+      learnerId: 'learner-123',
+      headword: 'fast',
+      type: 'word',
+      meanings: [
+        {
+          definition: 'quick',
+          examples: [],
+          review: {
+            state: 'mastered',
+            reviewCount: 5,
+            consecutiveCorrect: 5,
+          },
+        },
+        {
+          definition: 'firmly fixed',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 1,
+            consecutiveCorrect: 1,
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-09-01T00:00:00.000Z' },
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const summary = model.getVocabularySummary();
+    expect(summary.totalMeanings).toBe(2);
+    expect(summary.reviewedMeanings).toBe(2);
+    expect(summary.masteredMeanings).toBe(1);
+  });
+
+  it('5. vocabulary dueMeaning count uses persisted nextReviewAt', async () => {
+    const repos = createMockRepositories();
+    const pastIso = new Date(Date.now() - 3600000).toISOString(); // 1 hour ago
+    const futureIso = new Date(Date.now() + 3600000).toISOString(); // 1 hour later
+
+    const vocab: VocabularyItem = {
+      id: 'v-1',
+      learnerId: 'learner-123',
+      headword: 'time',
+      type: 'word',
+      meanings: [
+        {
+          definition: 'past due meaning',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 2,
+            consecutiveCorrect: 1,
+            nextReviewAt: pastIso,
+          },
+        },
+        {
+          definition: 'future due meaning',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 2,
+            consecutiveCorrect: 2,
+            nextReviewAt: futureIso,
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-09-01T00:00:00.000Z' },
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const summary = model.getVocabularySummary();
+    expect(summary.dueMeanings).toBe(1);
+  });
+
+  it('6. invalid review date is ignored safely', async () => {
+    const repos = createMockRepositories();
+    const vocab: VocabularyItem = {
+      id: 'v-1',
+      learnerId: 'learner-123',
+      headword: 'broken-date',
+      type: 'word',
+      meanings: [
+        {
+          definition: 'has invalid nextReviewAt',
+          examples: [],
+          review: {
+            state: 'learning',
+            reviewCount: 1,
+            consecutiveCorrect: 1,
+            nextReviewAt: 'not-a-valid-date',
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-09-01T00:00:00.000Z' },
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    expect(() => model.getVocabularySummary()).not.toThrow();
+    const summary = model.getVocabularySummary();
+    expect(summary.dueMeanings).toBe(0);
+    expect(summary.reviewedMeanings).toBe(1);
+  });
+
+  it('7. expression summary behaves equivalently', async () => {
+    const repos = createMockRepositories();
+    const pastIso = new Date(Date.now() - 3600000).toISOString();
+    const expr: ExpressionItem = {
+      id: 'e-1',
+      learnerId: 'learner-123',
+      expression: 'piece of cake',
+      type: 'idiom',
+      meanings: [
+        {
+          definition: 'very easy',
+          examples: [],
+          review: {
+            state: 'mastered',
+            reviewCount: 4,
+            consecutiveCorrect: 4,
+            nextReviewAt: pastIso,
+          },
+        },
+      ],
+      source: { addedBy: 'system', addedAt: '2026-09-01T00:00:00.000Z' },
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.expressions.list).mockResolvedValue([expr]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const summary = model.getExpressionSummary();
+    expect(summary.totalItems).toBe(1);
+    expect(summary.totalMeanings).toBe(1);
+    expect(summary.reviewedMeanings).toBe(1);
+    expect(summary.masteredMeanings).toBe(1);
+    expect(summary.dueMeanings).toBe(1);
+  });
+
+  it('8. progress aggregation sums persisted fields correctly', async () => {
+    const repos = createMockRepositories();
+    const p1: ProgressRecord = {
+      id: 'p-1',
+      learnerId: 'learner-123',
+      recordedAt: '2026-08-01T00:00:00.000Z',
+      windowStart: '2026-07-25T00:00:00.000Z',
+      windowEnd: '2026-08-01T00:00:00.000Z',
+      sessionsCompleted: 2,
+      turnsCompleted: 20,
+      newWordsLearned: 3,
+      weaknessesImproved: 1,
+      weaknessesWorsened: 0,
+    };
+    const p2: ProgressRecord = {
+      id: 'p-2',
+      learnerId: 'learner-123',
+      recordedAt: '2026-09-01T00:00:00.000Z',
+      windowStart: '2026-08-25T00:00:00.000Z',
+      windowEnd: '2026-09-01T00:00:00.000Z',
+      sessionsCompleted: 3,
+      turnsCompleted: 35,
+      newWordsLearned: 7,
+      weaknessesImproved: 2,
+      weaknessesWorsened: 1,
+    };
+    vi.mocked(repos.progress.list).mockResolvedValue([p1, p2]);
+    vi.mocked(repos.progress.latest).mockResolvedValue(p2);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const summary = model.getProgressSummary();
+    expect(summary.recordsCount).toBe(2);
+    expect(summary.latest).toEqual(p2);
+    expect(summary.totalSessionsCompleted).toBe(5);
+    expect(summary.totalTurnsCompleted).toBe(55);
+    expect(summary.totalNewWordsLearned).toBe(10);
+    expect(summary.totalWeaknessesImproved).toBe(3);
+    expect(summary.totalWeaknessesWorsened).toBe(1);
+  });
+
+  it('9. dashboard snapshot combines all summaries', async () => {
+    const repos = createMockRepositories();
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const snapshot = model.getDashboardSnapshot();
+    expect(snapshot.profile.id).toBe('learner-123');
+    expect(snapshot.weaknessSummary).toBeDefined();
+    expect(snapshot.vocabularySummary).toBeDefined();
+    expect(snapshot.expressionSummary).toBeDefined();
+    expect(snapshot.progressSummary).toBeDefined();
+    expect(snapshot.dueReviewCount).toBeDefined();
+  });
+
+  it('10. dashboard dueReviewCount matches loaded reviewQueue', async () => {
+    const repos = createMockRepositories();
+    const r1: ReviewItem = {
+      id: 'r-1',
+      learnerId: 'learner-123',
+      kind: 'vocabulary',
+      referenceId: 'v-1',
+      prompt: 'word',
+      state: 'learning',
+      dueAt: '2026-09-01T00:00:00.000Z',
+      createdAt: '2026-08-01T00:00:00.000Z',
+      reviewCount: 1,
+      consecutiveCorrect: 1,
+      outcomeHistory: [],
+    };
+    const r2: ReviewItem = {
+      id: 'r-2',
+      learnerId: 'learner-123',
+      kind: 'expression',
+      referenceId: 'e-1',
+      prompt: 'phrase',
+      state: 'learning',
+      dueAt: '2026-09-01T00:00:00.000Z',
+      createdAt: '2026-08-01T00:00:00.000Z',
+      reviewCount: 1,
+      consecutiveCorrect: 1,
+      outcomeHistory: [],
+    };
+    vi.mocked(repos.review.listDue).mockResolvedValue([r1, r2]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const snapshot = model.getDashboardSnapshot();
+    expect(snapshot.dueReviewCount).toBe(2);
+  });
+
+  it('11. methods work safely before first refresh', () => {
+    const repos = createMockRepositories();
+    const model = createLearnerModel(repos);
+
+    const weaknessSum = model.getWeaknessSummary();
+    expect(weaknessSum.total).toBe(0);
+    expect(weaknessSum.active).toBe(0);
+    expect(weaknessSum.mastered).toBe(0);
+    expect(weaknessSum.resolved).toBe(0);
+    expect(weaknessSum.byStatus.observed).toBe(0);
+
+    const vocabSum = model.getVocabularySummary();
+    expect(vocabSum.totalItems).toBe(0);
+    expect(vocabSum.totalMeanings).toBe(0);
+    expect(vocabSum.reviewedMeanings).toBe(0);
+    expect(vocabSum.masteredMeanings).toBe(0);
+    expect(vocabSum.dueMeanings).toBe(0);
+
+    const exprSum = model.getExpressionSummary();
+    expect(exprSum.totalItems).toBe(0);
+
+    const progSum = model.getProgressSummary();
+    expect(progSum.recordsCount).toBe(0);
+    expect(progSum.latest).toBeNull();
+    expect(progSum.totalSessionsCompleted).toBe(0);
+
+    const dashboard = model.getDashboardSnapshot();
+    expect(dashboard.profile.id).toBe('');
+    expect(dashboard.dueReviewCount).toBe(0);
+  });
+
+  it('12. mutating returned summary/dashboard object does not alter later results', async () => {
+    const repos = createMockRepositories();
+    const w1 = makeWeakness('w-1', 'confirmed', false);
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([w1]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const summary1 = model.getWeaknessSummary();
+    (summary1.byStatus as Record<string, number>).confirmed = 999;
+    (summary1 as unknown as { total: number }).total = 555;
+
+    const summary2 = model.getWeaknessSummary();
+    expect(summary2.total).toBe(1);
+    expect(summary2.byStatus.confirmed).toBe(1);
+
+    const dashboard1 = model.getDashboardSnapshot();
+    (dashboard1 as unknown as { dueReviewCount: number }).dueReviewCount = 888;
+    const dashboard2 = model.getDashboardSnapshot();
+    expect(dashboard2.dueReviewCount).toBe(0);
   });
 });
