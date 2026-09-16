@@ -3,6 +3,7 @@ import type { ConversationRequest } from '../types';
 import {
   createGeminiAIProvider,
   DEFAULT_GEMINI_MODEL,
+  DEFAULT_GEMINI_TIMEOUT_MS,
   GEMINI_PROVIDER_ID,
 } from './index';
 import type { CoachingContext } from '../../../learner-model';
@@ -38,10 +39,11 @@ const SAMPLE_REQUEST: ConversationRequest = {
 };
 
 describe('GeminiAIProvider', () => {
-  it('has provider id "gemini" and default model "gemini-3.7-flash"', () => {
+  it('has provider id "gemini", default model "gemini-3.6-flash", and 20s default timeout', () => {
     const provider = createGeminiAIProvider({ apiKey: 'test-key-123' });
     expect(provider.id).toBe(GEMINI_PROVIDER_ID);
-    expect(DEFAULT_GEMINI_MODEL).toBe('gemini-3.7-flash');
+    expect(DEFAULT_GEMINI_MODEL).toBe('gemini-3.6-flash');
+    expect(DEFAULT_GEMINI_TIMEOUT_MS).toBe(20000);
   });
 
   it('throws when apiKey is empty', () => {
@@ -87,7 +89,7 @@ describe('GeminiAIProvider', () => {
 
     const result = await provider.generate(SAMPLE_REQUEST);
 
-    expect(capturedUrl).toContain('/models/gemini-3.7-flash:generateContent');
+    expect(capturedUrl).toContain('/models/gemini-3.6-flash:generateContent');
     expect(capturedHeaders['x-goog-api-key']).toBe('SECRET_API_KEY_999');
     expect(capturedHeaders['Content-Type']).toBe('application/json');
 
@@ -112,6 +114,64 @@ describe('GeminiAIProvider', () => {
         outputTokens: 8,
         totalTokens: 23,
       });
+    }
+  });
+
+  it('aborts fetch on timeout, returns code timeout and retryable true without throwing', async () => {
+    const captured: { signal?: AbortSignal | null } = {};
+
+    const mockFetchWithTimeout: typeof fetch = vi.fn(async (_input, init) => {
+      captured.signal = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        if (init?.signal) {
+          init.signal.addEventListener('abort', () => {
+            const abortError = new Error('The operation was aborted');
+            abortError.name = 'AbortError';
+            reject(abortError);
+          });
+        }
+      });
+    });
+
+    const provider = createGeminiAIProvider({
+      apiKey: 'test-key',
+      timeoutMs: 25,
+      fetchImpl: mockFetchWithTimeout,
+    });
+
+    const result = await provider.generate(SAMPLE_REQUEST);
+
+    expect(captured.signal).toBeDefined();
+    expect(captured.signal?.aborted).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('timeout');
+      expect(result.error.retryable).toBe(true);
+      expect(result.error.message).toContain('timed out');
+    }
+  });
+
+  it('sanitizes API key from timeout and network error messages', async () => {
+    const secretKey = 'SUPER_SECRET_TIMEOUT_KEY_999';
+
+    const mockFetchLeakingAbort: typeof fetch = vi.fn(async () => {
+      const abortError = new Error(`Connection timed out for key ${secretKey}`);
+      abortError.name = 'AbortError';
+      throw abortError;
+    });
+
+    const provider = createGeminiAIProvider({
+      apiKey: secretKey,
+      timeoutMs: 10,
+      fetchImpl: mockFetchLeakingAbort,
+    });
+
+    const result = await provider.generate(SAMPLE_REQUEST);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('timeout');
+      expect(result.error.retryable).toBe(true);
+      expect(result.error.message).not.toContain(secretKey);
     }
   });
 

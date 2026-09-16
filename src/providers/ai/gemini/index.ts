@@ -21,11 +21,12 @@ import {
 } from '../index';
 import {
   DEFAULT_GEMINI_MODEL,
+  DEFAULT_GEMINI_TIMEOUT_MS,
   GEMINI_PROVIDER_ID,
   type GeminiAIProviderConfig,
 } from './types';
 
-export { DEFAULT_GEMINI_MODEL, GEMINI_PROVIDER_ID };
+export { DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_TIMEOUT_MS, GEMINI_PROVIDER_ID };
 export type { GeminiAIProviderConfig };
 
 /**
@@ -73,6 +74,7 @@ class GeminiAIProvider implements AIProvider {
   private readonly model: string;
   private readonly fetchImpl: typeof fetch;
   private readonly endpointBaseUrl: string;
+  private readonly timeoutMs: number;
 
   constructor(config: GeminiAIProviderConfig) {
     if (!config.apiKey || config.apiKey.trim().length === 0) {
@@ -83,6 +85,10 @@ class GeminiAIProvider implements AIProvider {
     this.fetchImpl = config.fetchImpl || globalThis.fetch;
     this.endpointBaseUrl =
       config.endpointBaseUrl || 'https://generativelanguage.googleapis.com/v1beta';
+    this.timeoutMs =
+      typeof config.timeoutMs === 'number' && config.timeoutMs > 0
+        ? config.timeoutMs
+        : DEFAULT_GEMINI_TIMEOUT_MS;
   }
 
   async generate(request: ConversationRequest): Promise<AIProviderResult> {
@@ -116,6 +122,11 @@ class GeminiAIProvider implements AIProvider {
       };
     }
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, this.timeoutMs);
+
     try {
       const response = await this.fetchImpl(url, {
         method: 'POST',
@@ -124,6 +135,7 @@ class GeminiAIProvider implements AIProvider {
           'x-goog-api-key': this.apiKey,
         },
         body: JSON.stringify(bodyPayload),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -195,6 +207,8 @@ class GeminiAIProvider implements AIProvider {
       return createAIProviderSuccess(aiResponse);
     } catch (err: unknown) {
       return this.handleNetworkException(err);
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
