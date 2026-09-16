@@ -104,12 +104,20 @@ export class ExpoAudioRecorder implements AudioRecorderService {
       // Best-effort audio mode configuration
     }
 
-    const recorder = new AudioModule.AudioRecorder(RecordingPresets.HIGH_QUALITY);
-    recorder.record();
+    try {
+      const recorder = new AudioModule.AudioRecorder(RecordingPresets.HIGH_QUALITY);
+      await recorder.prepareToRecordAsync();
+      recorder.record();
 
-    this.recordingInstance = recorder;
-    this.recordingStartTime = Date.now();
-    this.active = true;
+      this.recordingInstance = recorder;
+      this.recordingStartTime = Date.now();
+      this.active = true;
+    } catch (err) {
+      this.active = false;
+      this.recordingInstance = null;
+      this.recordingStartTime = null;
+      throw err;
+    }
   }
 
   async stopRecording(): Promise<AudioRecordingResult> {

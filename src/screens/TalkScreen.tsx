@@ -88,10 +88,14 @@ export default function TalkScreen(props?: TalkScreenProps) {
         }
       });
       voiceCoordinatorRef.current = coordinator;
-    } else {
-      voiceCoordinatorRef.current.setSession(currentSession);
     }
     return voiceCoordinatorRef.current;
+  };
+
+  const updateCoordinatorSession = (newSession: ConversationSession) => {
+    if (voiceCoordinatorRef.current) {
+      voiceCoordinatorRef.current.setSession(newSession);
+    }
   };
 
   // Initialize or retrieve the active session bundle
@@ -120,7 +124,11 @@ export default function TalkScreen(props?: TalkScreenProps) {
       });
       sessionRef.current = bundle.session;
       setProviderKind(bundle.providerKind);
-      getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+      if (voiceCoordinatorRef.current) {
+        updateCoordinatorSession(bundle.session);
+      } else {
+        getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+      }
     }
   }, [mode, topic, history.length]);
 
@@ -143,7 +151,11 @@ export default function TalkScreen(props?: TalkScreenProps) {
       });
       sessionRef.current = bundle.session;
       setProviderKind(bundle.providerKind);
-      getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+      if (voiceCoordinatorRef.current) {
+        updateCoordinatorSession(bundle.session);
+      } else {
+        getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+      }
       setHistory([]);
       setLastFeedback(null);
       setSavedWords({});
@@ -161,7 +173,11 @@ export default function TalkScreen(props?: TalkScreenProps) {
     });
     sessionRef.current = bundle.session;
     setProviderKind(bundle.providerKind);
-    getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+    if (voiceCoordinatorRef.current) {
+      updateCoordinatorSession(bundle.session);
+    } else {
+      getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+    }
     setHistory([]);
     setLastFeedback(null);
     setSavedWords({});

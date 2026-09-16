@@ -9,9 +9,13 @@ import {
   createDemoLearnerModel,
   createTalkDemoSession,
   createTalkSession,
+  createTalkVoiceCoordinator,
   createVocabularyPersistenceService,
   getGeminiApiKey,
 } from './index';
+import { createDemoAudioRecorder } from '../voice/recorder';
+import { createDemoSTTProvider } from '../providers/stt/demo';
+import { createDemoTTSProvider } from '../providers/tts/demo';
 
 describe('Talk Demo & Composition Stack', () => {
   const originalEnvKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
@@ -573,6 +577,48 @@ describe('Talk Demo & Composition Stack', () => {
         'User message cannot be empty or whitespace only.'
       );
       expect(session.getHistory()).toEqual([]);
+    });
+  });
+
+  describe('TalkVoiceCoordinator Integration', () => {
+    it('integrates with TalkSession maintaining active recording on second mic press and submitting exactly one turn', async () => {
+      const bundle = createTalkSession({ mode: 'natural', topic: 'Music' });
+      const recorder = createDemoAudioRecorder();
+      const stt = createDemoSTTProvider({ defaultTranscript: 'I love acoustic guitar.' });
+      const tts = createDemoTTSProvider();
+
+      const coordinator = createTalkVoiceCoordinator({
+        session: bundle.session,
+        providerKind: bundle.providerKind,
+        recorder,
+        sttProvider: stt,
+        ttsProvider: tts,
+      });
+
+      // User presses mic button to start recording
+      await coordinator.startRecording();
+      expect(coordinator.getStatus().state).toBe('recording');
+      expect(recorder.isRecording()).toBe(true);
+
+      // On second mic press, the app retrieves the existing coordinator with the same session
+      coordinator.setSession(bundle.session);
+
+      // Recorder MUST still be recording
+      expect(coordinator.getStatus().state).toBe('recording');
+      expect(recorder.isRecording()).toBe(true);
+
+      // Processing recording completes successfully
+      const result = await coordinator.stopRecordingAndProcess();
+      expect(result.ok).toBe(true);
+      expect(result.transcript).toBe('I love acoustic guitar.');
+
+      // Exactly one user turn is submitted
+      const turns = bundle.session.getHistory();
+      const userTurns = turns.filter((t) => t.role === 'user');
+      expect(userTurns).toHaveLength(1);
+      expect(userTurns[0].content).toBe('I love acoustic guitar.');
+      expect(turns).toHaveLength(2);
+      expect(turns[1].role).toBe('assistant');
     });
   });
 });

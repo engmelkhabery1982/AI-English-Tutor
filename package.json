@@ -30,7 +30,6 @@
     "vitest": "^5.0.0"
   },
   "scripts": {
-    "build": "tsc --noEmit",
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",

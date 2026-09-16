@@ -50,6 +50,9 @@ export class VoiceSessionCoordinator {
    * Updates the active ConversationSession (e.g. on new chat or mode switch).
    */
   setSession(newSession: ConversationSession): void {
+    if (this.session === newSession) {
+      return;
+    }
     this.stopSpeaking();
     if (this.state === 'recording') {
       this.cancelRecording();
@@ -250,9 +253,9 @@ export class VoiceSessionCoordinator {
 
       if (!sessionResult.ok) {
         this.errorMessage = sessionResult.error?.message || 'Tutor response failed.';
-        this.state = 'idle';
+        this.state = 'error';
         this.notifyListeners();
-        return { ok: true, transcript, error: this.errorMessage };
+        return { ok: false, transcript, error: this.errorMessage };
       }
 
       // 3. Play assistant response via TTS if not muted
@@ -260,7 +263,11 @@ export class VoiceSessionCoordinator {
         const history = this.session.getHistory();
         const lastAssistantTurn = this.findLastAssistantTurn(history);
         if (lastAssistantTurn && lastAssistantTurn.content.trim().length > 0) {
-          await this.speakResponse(lastAssistantTurn.content);
+          try {
+            await this.speakResponse(lastAssistantTurn.content);
+          } catch {
+            // TTS failure must not roll back conversation or fail the conversational turn
+          }
           return { ok: true, transcript };
         }
       }
@@ -272,9 +279,9 @@ export class VoiceSessionCoordinator {
       const message =
         err instanceof Error ? err.message : 'Error processing tutor response.';
       this.errorMessage = message;
-      this.state = 'idle';
+      this.state = 'error';
       this.notifyListeners();
-      return { ok: true, transcript, error: message };
+      return { ok: false, transcript, error: message };
     }
   }
 

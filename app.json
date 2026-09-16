@@ -23,7 +23,12 @@
     },
     "plugins": [
       "expo-sqlite",
-      "expo-audio"
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow AI English Tutor to access your microphone for voice conversation practice."
+        }
+      ]
     ]
   }
 }

@@ -186,4 +186,96 @@ describe('VoiceSessionCoordinator', () => {
     await coordinator.stopSpeaking();
     expect(coordinator.getStatus().isSpeaking).toBe(false);
   });
+
+  it('regression: calling setSession with same session or second mic press does not cancel active recording', async () => {
+    const { session } = createTalkSession({ mode: 'natural' });
+    const recorder = createDemoAudioRecorder();
+    const stt = createDemoSTTProvider({ defaultTranscript: 'I enjoy reading books.' });
+    const tts = createDemoTTSProvider();
+
+    const coordinator = createVoiceSessionCoordinator({
+      session,
+      recorder,
+      sttProvider: stt,
+      ttsProvider: tts,
+    });
+
+    // 1. User taps mic to start recording
+    await coordinator.startRecording();
+    expect(coordinator.getStatus().state).toBe('recording');
+    expect(recorder.isRecording()).toBe(true);
+
+    // 2. Second mic press flow: retrieve coordinator and pass same active session
+    coordinator.setSession(session);
+
+    // Recorder must remain active! Not cancelled!
+    expect(coordinator.getStatus().state).toBe('recording');
+    expect(recorder.isRecording()).toBe(true);
+
+    // 3. User finishes recording and processes
+    const res = await coordinator.stopRecordingAndProcess();
+    expect(res.ok).toBe(true);
+    expect(res.transcript).toBe('I enjoy reading books.');
+
+    // Exactly one user turn was submitted
+    const history = session.getHistory();
+    const userTurns = history.filter((turn) => turn.role === 'user');
+    expect(userTurns).toHaveLength(1);
+    expect(userTurns[0].content).toBe('I enjoy reading books.');
+  });
+
+  it('returns unambiguous failure (ok: false) when conversation session fails after STT succeeds', async () => {
+    const { session } = createTalkSession({ mode: 'natural' });
+    vi.spyOn(session, 'send').mockResolvedValueOnce({
+      ok: false,
+      error: {
+        code: 'unavailable',
+        message: 'AI Provider quota exceeded or unavailable.',
+        retryable: false,
+      },
+      history: [],
+    });
+
+    const coordinator = createVoiceSessionCoordinator({
+      session,
+      recorder: createDemoAudioRecorder(),
+      sttProvider: createDemoSTTProvider({ defaultTranscript: 'Testing error flow' }),
+      ttsProvider: createDemoTTSProvider(),
+    });
+
+    await coordinator.startRecording();
+    const result = await coordinator.stopRecordingAndProcess();
+
+    expect(result.ok).toBe(false);
+    expect(result.transcript).toBe('Testing error flow');
+    expect(result.error).toContain('AI Provider quota exceeded');
+    expect(coordinator.getStatus().state).toBe('error');
+    expect(coordinator.getStatus().errorMessage).toContain('AI Provider quota exceeded');
+  });
+
+  it('does not roll back conversation when TTS playback fails', async () => {
+    const { session } = createTalkSession({ mode: 'coach' });
+    const tts = createDemoTTSProvider();
+    vi.spyOn(tts, 'speak').mockRejectedValueOnce(new Error('Audio playback device error'));
+
+    const coordinator = createVoiceSessionCoordinator({
+      session,
+      recorder: createDemoAudioRecorder(),
+      sttProvider: createDemoSTTProvider({ defaultTranscript: 'How is my grammar?' }),
+      ttsProvider: tts,
+    });
+
+    await coordinator.startRecording();
+    const result = await coordinator.stopRecordingAndProcess();
+
+    // Turn is successful despite TTS audio error
+    expect(result.ok).toBe(true);
+    expect(result.transcript).toBe('How is my grammar?');
+
+    // Conversation history has been committed and preserved
+    const history = session.getHistory();
+    expect(history.length).toBe(2);
+    expect(history[0].content).toBe('How is my grammar?');
+    expect(history[1].role).toBe('assistant');
+  });
 });

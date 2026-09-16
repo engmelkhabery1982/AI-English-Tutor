@@ -97,8 +97,68 @@ describe('SpeechToText Providers', () => {
       }
 
       expect(mockFetch).toHaveBeenCalledTimes(1);
-      const callArgs = mockFetch.mock.calls[0];
-      expect(callArgs[0]).toContain('key=test-gemini-key');
+      const [requestUrl, requestOptions] = mockFetch.mock.calls[0] as [string, RequestInit];
+
+      // Blocker 3 assertions: URL does not contain API key; x-goog-api-key header contains key
+      expect(requestUrl).not.toContain('key=');
+      expect(requestUrl).not.toContain('test-gemini-key');
+      expect(requestUrl).toContain(':generateContent');
+      expect((requestOptions.headers as Record<string, string>)['x-goog-api-key']).toBe(
+        'test-gemini-key'
+      );
+      expect((requestOptions.headers as Record<string, string>)['Content-Type']).toBe(
+        'application/json'
+      );
+    });
+
+    it('redacts API key from returned error messages when HTTP response leaks key', async () => {
+      const secretKey = 'super-secret-gemini-key-12345';
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 403,
+        text: async () =>
+          `The provided key=${secretKey} is invalid or expired for project-999.`,
+      });
+
+      const provider = createGeminiSTTProvider({
+        apiKey: secretKey,
+        fetchImpl: mockFetch as unknown as typeof fetch,
+      });
+
+      const res = await provider.transcribe({
+        uri: 'file:///audio.m4a',
+        base64: 'invalid',
+      });
+
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error).not.toContain(secretKey);
+        expect(res.error).toContain('[REDACTED]');
+        expect(res.error).toContain('Gemini STT request failed with status 403');
+      }
+    });
+
+    it('redacts API key when fetch throws network error containing the key', async () => {
+      const secretKey = 'sensitive-api-key-value-abcde';
+      const mockFetch = vi.fn().mockRejectedValue(
+        new Error(`Connection refused to https://generativelanguage.googleapis.com with key ${secretKey}`)
+      );
+
+      const provider = createGeminiSTTProvider({
+        apiKey: secretKey,
+        fetchImpl: mockFetch as unknown as typeof fetch,
+      });
+
+      const res = await provider.transcribe({
+        uri: 'file:///audio.m4a',
+        base64: 'audio-bytes',
+      });
+
+      expect(res.ok).toBe(false);
+      if (!res.ok) {
+        expect(res.error).not.toContain(secretKey);
+        expect(res.error).toContain('[REDACTED]');
+      }
     });
 
     it('handles non-200 HTTP response gracefully', async () => {

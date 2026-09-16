@@ -163,7 +163,7 @@ export class GeminiSTTProvider implements SpeechToTextProvider {
 
     const url = `${this.endpointBaseUrl}/models/${encodeURIComponent(
       this.model
-    )}:generateContent?key=${encodeURIComponent(this.apiKey)}`;
+    )}:generateContent`;
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => {
@@ -175,6 +175,7 @@ export class GeminiSTTProvider implements SpeechToTextProvider {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'x-goog-api-key': this.apiKey,
         },
         body: JSON.stringify(requestBody),
         signal: controller.signal,
