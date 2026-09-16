@@ -12,12 +12,18 @@ import {
 } from 'react-native';
 import {
   createTalkSession,
+  createTalkVoiceCoordinator,
+  type AudioRecorderService,
   type ConversationFeedback,
   type ConversationFeedbackVocabulary,
   type ConversationMode,
   type ConversationSession,
   type ConversationTurn,
+  type SpeechToTextProvider,
   type TalkProviderKind,
+  type TextToSpeechProvider,
+  type VoiceSessionCoordinator,
+  type VoiceStatus,
 } from '../talk-demo';
 
 const MODES: { readonly key: ConversationMode; readonly label: string }[] = [
@@ -26,7 +32,14 @@ const MODES: { readonly key: ConversationMode; readonly label: string }[] = [
   { key: 'intensive', label: 'Intensive' },
 ];
 
-export default function TalkScreen() {
+export interface TalkScreenProps {
+  readonly recorder?: AudioRecorderService;
+  readonly sttProvider?: SpeechToTextProvider;
+  readonly ttsProvider?: TextToSpeechProvider;
+  readonly initialMuted?: boolean;
+}
+
+export default function TalkScreen(props?: TalkScreenProps) {
   const [mode, setMode] = useState<ConversationMode>('natural');
   const [topic, setTopic] = useState<string>('');
   const [inputText, setInputText] = useState<string>('');
@@ -38,8 +51,48 @@ export default function TalkScreen() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [providerKind, setProviderKind] = useState<TalkProviderKind>('demo');
 
+  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>({
+    state: 'idle',
+    elapsedSeconds: 0,
+    recognizedTranscript: null,
+    errorMessage: null,
+    isMuted: props?.initialMuted ?? false,
+    isSpeaking: false,
+    canRecord: true,
+    canStopRecording: false,
+    canSendText: true,
+  });
+
   const sessionRef = useRef<ConversationSession | null>(null);
+  const voiceCoordinatorRef = useRef<VoiceSessionCoordinator | null>(null);
   const scrollViewRef = useRef<ScrollView | null>(null);
+
+  // Initialize or retrieve the active voice coordinator
+  const getOrCreateVoiceCoordinator = (
+    currentSession: ConversationSession,
+    currentProviderKind: TalkProviderKind
+  ): VoiceSessionCoordinator => {
+    if (!voiceCoordinatorRef.current) {
+      const coordinator = createTalkVoiceCoordinator({
+        session: currentSession,
+        providerKind: currentProviderKind,
+        isMuted: props?.initialMuted ?? false,
+        recorder: props?.recorder,
+        sttProvider: props?.sttProvider,
+        ttsProvider: props?.ttsProvider,
+      });
+      coordinator.subscribe((status) => {
+        setVoiceStatus(status);
+        if (status.errorMessage) {
+          setErrorMessage(status.errorMessage);
+        }
+      });
+      voiceCoordinatorRef.current = coordinator;
+    } else {
+      voiceCoordinatorRef.current.setSession(currentSession);
+    }
+    return voiceCoordinatorRef.current;
+  };
 
   // Initialize or retrieve the active session bundle
   const getOrCreateSession = (
@@ -53,6 +106,7 @@ export default function TalkScreen() {
       });
       sessionRef.current = bundle.session;
       setProviderKind(bundle.providerKind);
+      getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
     }
     return sessionRef.current;
   };
@@ -66,20 +120,30 @@ export default function TalkScreen() {
       });
       sessionRef.current = bundle.session;
       setProviderKind(bundle.providerKind);
+      getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
     }
   }, [mode, topic, history.length]);
+
+  // Clean up voice coordinator when component unmounts
+  useEffect(() => {
+    return () => {
+      voiceCoordinatorRef.current?.reset();
+    };
+  }, []);
 
   // Handle mode switch
   const handleSelectMode = (newMode: ConversationMode) => {
     if (newMode === mode) return;
     setMode(newMode);
     if (history.length > 0) {
+      voiceCoordinatorRef.current?.reset();
       const bundle = createTalkSession({
         mode: newMode,
         topic: topic.trim() || undefined,
       });
       sessionRef.current = bundle.session;
       setProviderKind(bundle.providerKind);
+      getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
       setHistory([]);
       setLastFeedback(null);
       setSavedWords({});
@@ -90,12 +154,14 @@ export default function TalkScreen() {
 
   // Handle New / Clear conversation
   const handleNewConversation = () => {
+    voiceCoordinatorRef.current?.reset();
     const bundle = createTalkSession({
       mode,
       topic: topic.trim() || undefined,
     });
     sessionRef.current = bundle.session;
     setProviderKind(bundle.providerKind);
+    getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
     setHistory([]);
     setLastFeedback(null);
     setSavedWords({});
@@ -113,11 +179,64 @@ export default function TalkScreen() {
     }
   };
 
-  // Handle send message with streaming
+  // Handle microphone push-to-talk press
+  const handleToggleRecording = async () => {
+    const session = getOrCreateSession(mode, topic);
+    const coordinator = getOrCreateVoiceCoordinator(session, providerKind);
+
+    if (voiceStatus.state === 'recording') {
+      setIsSending(true);
+      setStreamingText('');
+      setErrorMessage(null);
+
+      const res = await coordinator.stopRecordingAndProcess((chunk: string) => {
+        setStreamingText((prev) => (prev ?? '') + chunk);
+      });
+
+      setHistory(session.getHistory());
+      setLastFeedback(session.getLastFeedback());
+      setIsSending(false);
+      setStreamingText(null);
+
+      if (!res.ok && res.error) {
+        setErrorMessage(res.error);
+      }
+    } else if (voiceStatus.canRecord) {
+      setErrorMessage(null);
+      await coordinator.startRecording();
+    }
+  };
+
+  // Handle stop speaking
+  const handleStopSpeaking = async () => {
+    if (voiceCoordinatorRef.current) {
+      await voiceCoordinatorRef.current.stopSpeaking();
+    }
+  };
+
+  // Handle replay response aloud
+  const handleReplayResponse = async () => {
+    if (voiceCoordinatorRef.current) {
+      await voiceCoordinatorRef.current.replayLastResponse();
+    }
+  };
+
+  // Handle mute toggle
+  const handleToggleMute = () => {
+    if (voiceCoordinatorRef.current) {
+      voiceCoordinatorRef.current.toggleMute();
+    }
+  };
+
+  // Handle send message with streaming (typed)
   const handleSendMessage = async () => {
     const trimmedMessage = inputText.trim();
-    if (!trimmedMessage || isSending) {
+    if (!trimmedMessage || isSending || !voiceStatus.canSendText) {
       return;
+    }
+
+    if (voiceCoordinatorRef.current) {
+      await voiceCoordinatorRef.current.stopSpeaking();
     }
 
     setIsSending(true);
@@ -156,7 +275,8 @@ export default function TalkScreen() {
     }
   };
 
-  const isSendDisabled = inputText.trim().length === 0 || isSending;
+  const isSendDisabled =
+    inputText.trim().length === 0 || isSending || !voiceStatus.canSendText;
   const isGemini = providerKind === 'gemini';
 
   return (
@@ -181,14 +301,26 @@ export default function TalkScreen() {
             </Text>
           </View>
         </View>
-        <TouchableOpacity
-          style={styles.newChatButton}
-          onPress={handleNewConversation}
-          accessibilityLabel="New Conversation"
-          accessibilityRole="button"
-        >
-          <Text style={styles.newChatButtonText}>New Chat</Text>
-        </TouchableOpacity>
+        <View style={styles.headerButtonsGroup}>
+          <TouchableOpacity
+            style={[styles.muteButton, voiceStatus.isMuted && styles.muteButtonActive]}
+            onPress={handleToggleMute}
+            accessibilityLabel={voiceStatus.isMuted ? 'Unmute voice playback' : 'Mute voice playback'}
+            accessibilityRole="button"
+          >
+            <Text style={styles.muteButtonText}>
+              {voiceStatus.isMuted ? '🔇 Muted' : '🔊 Voice'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.newChatButton}
+            onPress={handleNewConversation}
+            accessibilityLabel="New Conversation"
+            accessibilityRole="button"
+          >
+            <Text style={styles.newChatButtonText}>New Chat</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* Config Bar */}
@@ -296,6 +428,28 @@ export default function TalkScreen() {
                       {turn.content}
                     </Text>
                   </View>
+                  {isLastAssistant && (
+                    <View style={styles.assistantVoiceActions}>
+                      <TouchableOpacity
+                        style={styles.replayButton}
+                        onPress={handleReplayResponse}
+                        accessibilityLabel="Replay tutor response aloud"
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.replayButtonText}>🔊 Replay</Text>
+                      </TouchableOpacity>
+                      {voiceStatus.isSpeaking && (
+                        <TouchableOpacity
+                          style={styles.replayStopButton}
+                          onPress={handleStopSpeaking}
+                          accessibilityLabel="Stop audio response"
+                          accessibilityRole="button"
+                        >
+                          <Text style={styles.replayStopButtonText}>■ Stop</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  )}
                 </View>
 
                 {/* Feedback Panel (rendered under the latest assistant response) */}
@@ -438,17 +592,111 @@ export default function TalkScreen() {
         )}
       </ScrollView>
 
+      {/* Voice Status Banner */}
+      {(voiceStatus.state === 'recording' ||
+        voiceStatus.state === 'transcribing' ||
+        voiceStatus.state === 'speaking' ||
+        (voiceStatus.recognizedTranscript && (voiceStatus.state === 'sending' || isSending))) && (
+        <View style={styles.voiceBanner}>
+          {voiceStatus.state === 'recording' && (
+            <View style={styles.voiceBannerRow}>
+              <View style={styles.recordingDot} />
+              <Text style={styles.voiceBannerText}>
+                Recording ({voiceStatus.elapsedSeconds}s) • Tap Mic to finish & send
+              </Text>
+            </View>
+          )}
+          {voiceStatus.state === 'transcribing' && (
+            <View style={styles.voiceBannerRow}>
+              <ActivityIndicator size="small" color="#2563EB" />
+              <Text style={styles.voiceBannerText}>Transcribing speech into English...</Text>
+            </View>
+          )}
+          {voiceStatus.state === 'speaking' && (
+            <View style={styles.voiceBannerRow}>
+              <Text style={styles.voiceBannerText}>🔊 Speaking tutor response...</Text>
+              <TouchableOpacity
+                style={styles.stopSpeakingButton}
+                onPress={handleStopSpeaking}
+                accessibilityLabel="Stop speaking"
+                accessibilityRole="button"
+              >
+                <Text style={styles.stopSpeakingButtonText}>Stop</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+          {voiceStatus.recognizedTranscript &&
+            (voiceStatus.state === 'sending' || isSending) &&
+            voiceStatus.state !== 'transcribing' &&
+            voiceStatus.state !== 'recording' && (
+              <View style={styles.voiceBannerRow}>
+                <Text style={styles.voiceBannerTranscript} numberOfLines={1}>
+                  Recognized: "{voiceStatus.recognizedTranscript}"
+                </Text>
+              </View>
+            )}
+        </View>
+      )}
+
       {/* Message Composer */}
       <View style={styles.composerContainer}>
+        <TouchableOpacity
+          style={[
+            styles.micButton,
+            voiceStatus.state === 'recording' && styles.micButtonRecording,
+            voiceStatus.state === 'transcribing' && styles.micButtonTranscribing,
+            voiceStatus.state === 'speaking' && styles.micButtonSpeaking,
+            !voiceStatus.canRecord &&
+              voiceStatus.state !== 'recording' &&
+              styles.micButtonDisabled,
+          ]}
+          onPress={handleToggleRecording}
+          disabled={!voiceStatus.canRecord && voiceStatus.state !== 'recording'}
+          accessibilityRole="button"
+          accessibilityLabel={
+            voiceStatus.state === 'recording'
+              ? 'Stop recording voice message'
+              : 'Record voice message'
+          }
+          accessibilityState={{ busy: voiceStatus.state === 'transcribing' }}
+        >
+          {voiceStatus.state === 'transcribing' ? (
+            <ActivityIndicator size="small" color="#FFFFFF" />
+          ) : (
+            <Text
+              style={[
+                styles.micButtonText,
+                voiceStatus.state === 'recording' && styles.micButtonTextRecording,
+                voiceStatus.state === 'speaking' && styles.micButtonTextSpeaking,
+              ]}
+            >
+              {voiceStatus.state === 'recording'
+                ? '⏹'
+                : voiceStatus.state === 'speaking'
+                ? '⏹'
+                : '🎤'}
+            </Text>
+          )}
+        </TouchableOpacity>
+
         <TextInput
-          style={styles.composerInput}
-          placeholder="Type your message in English..."
+          style={[
+            styles.composerInput,
+            !voiceStatus.canSendText && styles.composerInputDisabled,
+          ]}
+          placeholder={
+            voiceStatus.state === 'recording'
+              ? 'Listening to your speech...'
+              : voiceStatus.state === 'transcribing'
+              ? 'Transcribing audio...'
+              : 'Type your message in English...'
+          }
           placeholderTextColor="#9CA3AF"
           value={inputText}
           onChangeText={setInputText}
           multiline
           maxLength={1000}
-          editable={!isSending}
+          editable={!isSending && voiceStatus.canSendText}
         />
         <TouchableOpacity
           style={[
@@ -880,5 +1128,141 @@ const styles = StyleSheet.create({
   },
   sendButtonTextDisabled: {
     color: '#9CA3AF',
+  },
+  headerButtonsGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  muteButton: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 6,
+    backgroundColor: '#F3F4F6',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+  },
+  muteButtonActive: {
+    backgroundColor: '#FEF2F2',
+    borderColor: '#FECACA',
+  },
+  muteButtonText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#4B5563',
+  },
+  assistantVoiceActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 6,
+  },
+  replayButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: '#F3F4F6',
+  },
+  replayButtonText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#4B5563',
+  },
+  replayStopButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: '#FEE2E2',
+  },
+  replayStopButtonText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#DC2626',
+  },
+  voiceBanner: {
+    backgroundColor: '#EFF6FF',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#DBEAFE',
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+  },
+  voiceBannerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  voiceBannerText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#1D4ED8',
+    flex: 1,
+  },
+  voiceBannerTranscript: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#1E40AF',
+    fontStyle: 'italic',
+  },
+  recordingDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#EF4444',
+  },
+  stopSpeakingButton: {
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 4,
+    backgroundColor: '#DBEAFE',
+  },
+  stopSpeakingButtonText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#1D4ED8',
+  },
+  micButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 8,
+    backgroundColor: '#EFF6FF',
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  micButtonRecording: {
+    backgroundColor: '#DC2626',
+    borderColor: '#B91C1C',
+  },
+  micButtonTranscribing: {
+    backgroundColor: '#2563EB',
+    borderColor: '#1D4ED8',
+  },
+  micButtonSpeaking: {
+    backgroundColor: '#059669',
+    borderColor: '#047857',
+  },
+  micButtonDisabled: {
+    backgroundColor: '#F3F4F6',
+    borderColor: '#E5E7EB',
+  },
+  micButtonText: {
+    fontSize: 18,
+  },
+  micButtonTextRecording: {
+    color: '#FFFFFF',
+    fontSize: 16,
+  },
+  micButtonTextSpeaking: {
+    color: '#FFFFFF',
+    fontSize: 16,
+  },
+  composerInputDisabled: {
+    backgroundColor: '#F3F4F6',
+    color: '#6B7280',
   },
 });
