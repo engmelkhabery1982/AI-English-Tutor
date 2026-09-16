@@ -7,6 +7,7 @@
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
+  SQLiteReviewRepository,
   SQLiteUserProfileRepository,
   SQLiteVocabularyRepository,
 } from '../data/local/sqlite/repositories';
@@ -17,12 +18,14 @@ import type {
 } from '../domain/models/vocabulary';
 import type { ConversationFeedbackVocabulary } from '../providers/ai';
 import type {
+  ReviewRepository,
   UserProfileRepository,
   VocabularyRepository,
 } from '../repositories';
 
 export interface VocabularyPersistenceOptions {
   readonly vocabularyRepository?: VocabularyRepository;
+  readonly reviewRepository?: ReviewRepository;
   readonly userProfileRepository?: UserProfileRepository;
   readonly databaseAdapter?: DatabaseAdapter;
   readonly learnerId?: string;
@@ -62,6 +65,7 @@ export function createVocabularyPersistenceService(
   async function ensureDependencies(): Promise<{
     vocabRepo: VocabularyRepository;
     learnerId: string;
+    adapter?: DatabaseAdapter;
   } | null> {
     try {
       let adapter = options?.databaseAdapter;
@@ -96,6 +100,7 @@ export function createVocabularyPersistenceService(
       return {
         vocabRepo: resolvedVocabRepo,
         learnerId: resolvedLearnerId,
+        adapter,
       };
     } catch {
       return null;
@@ -161,7 +166,32 @@ export function createVocabularyPersistenceService(
           tags: ['talk-session'],
         };
 
-        return await vocabRepo.upsert(itemInput);
+        const savedItem = await vocabRepo.upsert(itemInput);
+
+        // Schedule review item for this saved word
+        if (savedItem && deps.adapter) {
+          try {
+            const reviewRepo = options?.reviewRepository ?? new SQLiteReviewRepository(deps.adapter);
+            if (reviewRepo.upsert) {
+              await reviewRepo.upsert({
+                learnerId,
+                kind: 'vocabulary',
+                referenceId: savedItem.id,
+                prompt: `What word matches this definition: "${vocab.meaning?.trim() || normalizedHeadword}"?`,
+                expectedResponse: normalizedHeadword,
+                state: 'learning',
+                dueAt: new Date().toISOString(),
+                reviewCount: 0,
+                consecutiveCorrect: 0,
+                outcomeHistory: [],
+              });
+            }
+          } catch {
+            // Review item scheduling is non-blocking
+          }
+        }
+
+        return savedItem;
       } catch {
         return null;
       }

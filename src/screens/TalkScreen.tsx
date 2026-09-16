@@ -13,6 +13,7 @@ import {
 import {
   createTalkSession,
   createTalkVoiceCoordinator,
+  createLearningPersistenceService,
   type AudioRecorderService,
   type ConversationFeedback,
   type ConversationFeedbackVocabulary,
@@ -138,6 +139,16 @@ export default function TalkScreen(props?: TalkScreenProps) {
       voiceCoordinatorRef.current?.reset();
     };
   }, []);
+
+  // Record feedback evidence in background
+  useEffect(() => {
+    if (lastFeedback) {
+      const learningPersistence = createLearningPersistenceService();
+      learningPersistence.recordFeedbackEvidence(lastFeedback).catch((err) => {
+        console.error('Failed to persist learning feedback:', err);
+      });
+    }
+  }, [lastFeedback]);
 
   // Handle mode switch
   const handleSelectMode = (newMode: ConversationMode) => {

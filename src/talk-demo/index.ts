@@ -48,12 +48,14 @@ import {
   createVocabularyPersistenceService,
   type VocabularyPersistenceOptions,
 } from './vocabulary-persistence';
-
 export { createDemoLearnerModel } from './demo-learner-model';
 export {
   createVocabularyPersistenceService,
   type VocabularyPersistenceOptions,
 } from './vocabulary-persistence';
+export {
+  createLearningPersistenceService,
+} from './learning-persistence';
 export {
   createDemoSTTProvider,
   createGeminiSTTProvider,
