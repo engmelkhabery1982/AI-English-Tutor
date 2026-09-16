@@ -18,6 +18,31 @@ import {
 import type { AIProvider } from '../providers/ai';
 import { createDemoAIProvider } from '../providers/ai/demo';
 import { createGeminiAIProvider } from '../providers/ai/gemini';
+import {
+  createDemoSTTProvider,
+  createGeminiSTTProvider,
+  type SpeechToTextProvider,
+  type STTAudioInput,
+  type STTResult,
+} from '../providers/stt';
+import {
+  createDemoTTSProvider,
+  createExpoTTSProvider,
+  sanitizeTextForTTS,
+  type TextToSpeechProvider,
+  type TTSOptions,
+} from '../providers/tts';
+import {
+  createDemoAudioRecorder,
+  createExpoAudioRecorder,
+  createVoiceSessionCoordinator,
+  VoiceSessionCoordinator,
+  type AudioRecorderService,
+  type AudioRecordingResult,
+  type VoiceState,
+  type VoiceStatus,
+  type VoiceStatusListener,
+} from '../voice';
 import { createDemoLearnerModel } from './demo-learner-model';
 import {
   createVocabularyPersistenceService,
@@ -29,6 +54,29 @@ export {
   createVocabularyPersistenceService,
   type VocabularyPersistenceOptions,
 } from './vocabulary-persistence';
+export {
+  createDemoSTTProvider,
+  createGeminiSTTProvider,
+  createDemoTTSProvider,
+  createExpoTTSProvider,
+  createDemoAudioRecorder,
+  createExpoAudioRecorder,
+  createVoiceSessionCoordinator,
+  VoiceSessionCoordinator,
+  sanitizeTextForTTS,
+};
+export type {
+  SpeechToTextProvider,
+  STTAudioInput,
+  STTResult,
+  TextToSpeechProvider,
+  TTSOptions,
+  AudioRecorderService,
+  AudioRecordingResult,
+  VoiceState,
+  VoiceStatus,
+  VoiceStatusListener,
+};
 export type {
   ConversationMode,
   ConversationSession,
@@ -53,6 +101,51 @@ export interface TalkSessionBundle {
 export interface CreateTalkSessionOptions extends VocabularyPersistenceOptions {
   readonly apiKey?: string;
   readonly fetchImpl?: typeof fetch;
+}
+
+export interface CreateVoiceCoordinatorOptions {
+  readonly session: ConversationSession;
+  readonly providerKind: TalkProviderKind;
+  readonly apiKey?: string;
+  readonly fetchImpl?: typeof fetch;
+  readonly recorder?: AudioRecorderService;
+  readonly sttProvider?: SpeechToTextProvider;
+  readonly ttsProvider?: TextToSpeechProvider;
+  readonly isMuted?: boolean;
+}
+
+/**
+ * Creates a VoiceSessionCoordinator for a ConversationSession.
+ * Wires real Gemini STT and Expo TTS/audio when in Gemini mode,
+ * or Demo providers when in Demo mode or when custom providers are supplied.
+ */
+export function createTalkVoiceCoordinator(
+  options: CreateVoiceCoordinatorOptions
+): VoiceSessionCoordinator {
+  const key = options.apiKey?.trim() || getGeminiApiKey();
+
+  let sttProvider = options.sttProvider;
+  if (!sttProvider) {
+    if (options.providerKind === 'gemini' && key) {
+      sttProvider = createGeminiSTTProvider({
+        apiKey: key,
+        fetchImpl: options.fetchImpl,
+      });
+    } else {
+      sttProvider = createDemoSTTProvider();
+    }
+  }
+
+  const ttsProvider = options.ttsProvider || createExpoTTSProvider();
+  const recorder = options.recorder || createExpoAudioRecorder();
+
+  return createVoiceSessionCoordinator({
+    session: options.session,
+    recorder,
+    sttProvider,
+    ttsProvider,
+    isMuted: options.isMuted ?? false,
+  });
 }
 
 /**
