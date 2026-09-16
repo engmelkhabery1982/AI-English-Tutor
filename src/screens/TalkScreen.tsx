@@ -166,15 +166,20 @@ export default function TalkScreen() {
         </View>
 
         <TextInput
-          style={styles.topicInput}
+          style={[styles.topicInput, history.length > 0 && styles.topicInputLocked]}
           placeholder="Optional topic (e.g. Travel, Job Interview)"
           placeholderTextColor="#9CA3AF"
           value={topic}
           onChangeText={(text) => {
             setTopic(text);
           }}
-          editable={!isSending}
+          editable={history.length === 0 && !isSending}
         />
+        {history.length > 0 && (
+          <Text style={styles.topicLockedHelperText}>
+            Start a new chat to change the topic.
+          </Text>
+        )}
       </View>
 
       {/* Chat Area */}
@@ -381,6 +386,17 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     fontSize: 13,
     color: '#111827',
+  },
+  topicInputLocked: {
+    backgroundColor: '#F3F4F6',
+    borderColor: '#E5E7EB',
+    color: '#6B7280',
+  },
+  topicLockedHelperText: {
+    fontSize: 11,
+    color: '#6B7280',
+    marginTop: -2,
+    marginHorizontal: 2,
   },
   chatScroll: {
     flex: 1,
