@@ -28,10 +28,54 @@ export interface AIUsage {
 }
 
 /**
+ * Allowed vocabulary and expression categories matching domain models.
+ */
+export type VocabularyCategory =
+  | 'word'
+  | 'phrase'
+  | 'phrasal_verb'
+  | 'idiom'
+  | 'common_expression'
+  | 'collocation'
+  | 'linking_expression'
+  | 'professional_expression';
+
+/**
+ * Structured correction feedback extracted from assistant response.
+ */
+export interface ConversationFeedbackCorrection {
+  readonly original: string;
+  readonly improved: string;
+  readonly explanation: string;
+  readonly severity: 'incorrect' | 'unnatural' | 'minor';
+}
+
+/**
+ * Structured vocabulary/expression feedback extracted from assistant response.
+ */
+export interface ConversationFeedbackVocabulary {
+  readonly headword: string;
+  readonly type: VocabularyCategory;
+  readonly meaning: string;
+  readonly example: string;
+}
+
+/**
+ * Structured coaching feedback extracted from assistant response.
+ */
+export interface ConversationFeedback {
+  readonly correction?: ConversationFeedbackCorrection | null;
+  readonly vocabulary?: ConversationFeedbackVocabulary | null;
+  readonly coachingNote?: string | null;
+}
+
+/**
  * Standard provider-neutral AI response structure.
  */
 export interface AIProviderResponse {
   readonly content: string;
+  readonly feedback?: ConversationFeedback | null;
+  readonly rawText?: string;
   readonly finishReason?: AIFinishReason;
   readonly usage?: AIUsage;
 }
@@ -72,19 +116,30 @@ export type AIProviderResult =
     };
 
 /**
+ * Callback function receiving incremental text chunks during streaming generation.
+ */
+export type AIStreamCallback = (chunk: string) => void;
+
+/**
  * Core provider-neutral AIProvider interface.
- * Implemented by concrete provider adapters in future tasks.
+ * Implemented by concrete provider adapters (e.g. Gemini, Demo).
  */
 export interface AIProvider {
   readonly id: string;
 
   generate(request: ConversationRequest): Promise<AIProviderResult>;
+  generateStream?(
+    request: ConversationRequest,
+    onChunk: AIStreamCallback
+  ): Promise<AIProviderResult>;
 }
 
 /**
  * Options for creating an AIProviderResponse.
  */
 export interface CreateAIProviderResponseOptions {
+  readonly feedback?: ConversationFeedback | null;
+  readonly rawText?: string;
   readonly finishReason?: AIFinishReason;
   readonly usage?: AIUsage;
 }

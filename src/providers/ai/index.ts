@@ -11,9 +11,14 @@ import type {
   AIProviderErrorCode,
   AIProviderResponse,
   AIProviderResult,
+  AIStreamCallback,
   AIUsage,
+  ConversationFeedback,
+  ConversationFeedbackCorrection,
+  ConversationFeedbackVocabulary,
   ConversationRequest,
   CreateAIProviderResponseOptions,
+  VocabularyCategory,
 } from './types';
 
 export type {
@@ -23,9 +28,14 @@ export type {
   AIProviderErrorCode,
   AIProviderResponse,
   AIProviderResult,
+  AIStreamCallback,
   AIUsage,
+  ConversationFeedback,
+  ConversationFeedbackCorrection,
+  ConversationFeedbackVocabulary,
   ConversationRequest,
   CreateAIProviderResponseOptions,
+  VocabularyCategory,
 };
 
 /**
@@ -33,7 +43,7 @@ export type {
  *
  * - Rejects empty or whitespace-only content.
  * - Preserves non-empty content exactly as supplied without trimming.
- * - Defensively copies optional usage metadata.
+ * - Defensively copies optional feedback and usage metadata.
  */
 export function createAIProviderResponse(
   content: string,
@@ -53,8 +63,39 @@ export function createAIProviderResponse(
     };
   }
 
+  let feedback: ConversationFeedback | null | undefined = options?.feedback;
+  if (feedback) {
+    feedback = {
+      ...(feedback.correction !== undefined && {
+        correction: feedback.correction
+          ? {
+              original: feedback.correction.original,
+              improved: feedback.correction.improved,
+              explanation: feedback.correction.explanation,
+              severity: feedback.correction.severity,
+            }
+          : null,
+      }),
+      ...(feedback.vocabulary !== undefined && {
+        vocabulary: feedback.vocabulary
+          ? {
+              headword: feedback.vocabulary.headword,
+              type: feedback.vocabulary.type,
+              meaning: feedback.vocabulary.meaning,
+              example: feedback.vocabulary.example,
+            }
+          : null,
+      }),
+      ...(feedback.coachingNote !== undefined && {
+        coachingNote: feedback.coachingNote,
+      }),
+    };
+  }
+
   return {
     content,
+    ...(feedback !== undefined && { feedback }),
+    ...(options?.rawText !== undefined && { rawText: options.rawText }),
     ...(options?.finishReason !== undefined && { finishReason: options.finishReason }),
     ...(usage !== undefined && { usage }),
   };
@@ -95,8 +136,39 @@ export function createAIProviderSuccess(response: AIProviderResponse): AIProvide
     };
   }
 
+  let feedback: ConversationFeedback | null | undefined = response.feedback;
+  if (feedback) {
+    feedback = {
+      ...(feedback.correction !== undefined && {
+        correction: feedback.correction
+          ? {
+              original: feedback.correction.original,
+              improved: feedback.correction.improved,
+              explanation: feedback.correction.explanation,
+              severity: feedback.correction.severity,
+            }
+          : null,
+      }),
+      ...(feedback.vocabulary !== undefined && {
+        vocabulary: feedback.vocabulary
+          ? {
+              headword: feedback.vocabulary.headword,
+              type: feedback.vocabulary.type,
+              meaning: feedback.vocabulary.meaning,
+              example: feedback.vocabulary.example,
+            }
+          : null,
+      }),
+      ...(feedback.coachingNote !== undefined && {
+        coachingNote: feedback.coachingNote,
+      }),
+    };
+  }
+
   const responseCopy: AIProviderResponse = {
     content: response.content,
+    ...(feedback !== undefined && { feedback }),
+    ...(response.rawText !== undefined && { rawText: response.rawText }),
     ...(response.finishReason !== undefined && { finishReason: response.finishReason }),
     ...(usage !== undefined && { usage }),
   };

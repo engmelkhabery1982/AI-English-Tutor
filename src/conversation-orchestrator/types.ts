@@ -13,6 +13,7 @@ import type {
   AIProvider,
   AIProviderError,
   AIProviderResponse,
+  AIStreamCallback,
 } from '../providers/ai';
 
 export type {
@@ -22,6 +23,7 @@ export type {
   AIProvider,
   AIProviderError,
   AIProviderResponse,
+  AIStreamCallback,
 };
 
 /**
@@ -47,5 +49,9 @@ export type ConversationExecutionResult =
 export interface ConversationOrchestrator {
   execute(
     input: ConversationRequestInput
+  ): Promise<ConversationExecutionResult>;
+  executeStream?(
+    input: ConversationRequestInput,
+    onChunk: AIStreamCallback
   ): Promise<ConversationExecutionResult>;
 }

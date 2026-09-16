@@ -14,6 +14,7 @@ import type {
   AIProviderError,
   AIProviderResponse,
   AIProviderResult,
+  AIStreamCallback,
 } from '../providers/ai';
 import type {
   ConversationExecutionResult,
@@ -29,6 +30,7 @@ export type {
   AIProvider,
   AIProviderError,
   AIProviderResponse,
+  AIStreamCallback,
 };
 
 /**
@@ -51,6 +53,37 @@ export function createConversationOrchestrator(
     async execute(input: ConversationRequestInput): Promise<ConversationExecutionResult> {
       const request: ConversationRequest = conversationEngine.buildRequest(input);
       const providerResult: AIProviderResult = await aiProvider.generate(request);
+
+      if (providerResult.ok) {
+        return {
+          ok: true,
+          request,
+          response: providerResult.response,
+        };
+      }
+
+      return {
+        ok: false,
+        request,
+        error: providerResult.error,
+      };
+    },
+
+    async executeStream(
+      input: ConversationRequestInput,
+      onChunk: AIStreamCallback
+    ): Promise<ConversationExecutionResult> {
+      const request: ConversationRequest = conversationEngine.buildRequest(input);
+
+      const providerResult: AIProviderResult =
+        typeof aiProvider.generateStream === 'function'
+          ? await aiProvider.generateStream(request, onChunk)
+          : await aiProvider.generate(request).then((res) => {
+              if (res.ok && typeof onChunk === 'function') {
+                onChunk(res.response.content);
+              }
+              return res;
+            });
 
       if (providerResult.ok) {
         return {
