@@ -6,7 +6,8 @@
  */
 
 import type { AppRepositories } from '../repositories';
-import type { AIProvider } from '../domain/providers/ai';
+import type { AIProvider } from '../providers/ai/types';
+import type { LearnerWeakness } from '../domain/models/learner';
 import type {
   EvaluationResult,
   ReviewDashboardSummary,
@@ -235,5 +236,13 @@ export class ReviewService {
       weaknessesWorsened: summary.incorrectCount > 0 ? 1 : 0,
       notes: `Adaptive review session: ${summary.correctCount} correct, ${summary.partialCount} partial, ${summary.incorrectCount} needs work.`,
     });
+  }
+
+  /**
+   * Expose legitimate method to list active weaknesses.
+   */
+  async getActiveWeaknesses(learnerId: string): Promise<readonly LearnerWeakness[]> {
+    const weaknesses = await this.repos.weaknesses.listWeaknesses(learnerId, 100);
+    return weaknesses.filter((w) => !w.resolved);
   }
 }

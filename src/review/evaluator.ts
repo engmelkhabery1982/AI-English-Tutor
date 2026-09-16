@@ -7,7 +7,7 @@
  * Strictly qualitative feedback: 'correct' | 'partial' | 'incorrect'. No numeric scores.
  */
 
-import type { AIProvider } from '../domain/providers/ai';
+import type { AIProvider } from '../providers/ai/types';
 import type { EvaluationResult, QualitativeResult, ReviewItemCandidate } from './types';
 
 /** Clean and normalize a string for deterministic comparison */
@@ -215,6 +215,7 @@ export class ReviewEvaluator {
     // 2. Open-ended items: use AI Provider if available
     if (this.aiProvider) {
       try {
+        const systemPrompt = 'You are an empathetic, expert English tutor evaluating practice exercises. Strictly return valid JSON.';
         const prompt = `You are evaluating an English learner's answer in a review session.
 Exercise type: ${candidate.exerciseType}
 Prompt: ${candidate.prompt}
@@ -231,29 +232,47 @@ Evaluate the answer. You MUST respond with ONLY a valid JSON object matching thi
 }
 Important: Do NOT include any numbers, ratings, or percentages. Only qualitative feedback.`;
 
-        const response = await this.aiProvider.chat(
-          [{ role: 'user', content: prompt }],
-          { systemPrompt: 'You are an empathetic, expert English tutor evaluating practice exercises. Strictly return valid JSON.' },
-        );
+        const request = {
+          systemPrompt,
+          messages: [
+            {
+              id: 'eval-user-turn',
+              role: 'user' as const,
+              content: prompt,
+              createdAt: new Date().toISOString(),
+            },
+          ],
+          mode: 'coach' as const,
+          topic: 'Review Evaluation',
+          coachingContext: {
+            focusArea: candidate.exerciseType,
+            weaknesses: [],
+            strengths: [],
+            recentErrors: [],
+          },
+        };
 
-        const rawText = response.text?.trim() ?? '';
-        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          const result: QualitativeResult =
-            parsed.result === 'correct' || parsed.result === 'partial'
-              ? parsed.result
-              : 'incorrect';
+        const resultObj = await this.aiProvider.generate(request as any);
+        if (resultObj.ok && resultObj.response && resultObj.response.content) {
+          const rawText = resultObj.response.content.trim();
+          const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            const resultValue: QualitativeResult =
+              parsed.result === 'correct' || parsed.result === 'partial'
+                ? parsed.result
+                : 'incorrect';
 
-          return {
-            result,
-            feedback: typeof parsed.feedback === 'string' ? parsed.feedback : 'Feedback received.',
-            explanation: typeof parsed.explanation === 'string' ? parsed.explanation : candidate.explanation,
-            suggestedCorrection:
-              typeof parsed.suggestedCorrection === 'string'
-                ? parsed.suggestedCorrection
-                : candidate.expectedAnswer,
-          };
+            return {
+              result: resultValue,
+              feedback: typeof parsed.feedback === 'string' ? parsed.feedback : 'Feedback received.',
+              explanation: typeof parsed.explanation === 'string' ? parsed.explanation : candidate.explanation,
+              suggestedCorrection:
+                typeof parsed.suggestedCorrection === 'string'
+                  ? parsed.suggestedCorrection
+                  : candidate.expectedAnswer,
+            };
+          }
         }
       } catch {
         // Fallback to local evaluation if AI fails or returns invalid format

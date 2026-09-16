@@ -8,21 +8,22 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { ReviewService } from '../review/service';
+import type { ReviewService } from '../review/service';
+import { createReviewService } from '../review/factory';
 import type { ReviewItemCandidate, EvaluationResult, ReviewDashboardSummary } from '../review/types';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { LearnerWeakness } from '../domain/models/learner';
 import {
-  SQLiteReviewRepository,
-  SQLiteMistakeRepository,
-  SQLiteWeaknessRepository,
-  SQLiteVocabularyRepository,
-  SQLiteExpressionRepository,
-  SQLiteProgressRepository,
   SQLiteUserProfileRepository,
-  SQLiteConversationRepository,
-  SQLitePronunciationRepository,
 } from '../data/local/sqlite/repositories';
+import {
+  createExpoAudioRecorder,
+  createDemoSTTProvider,
+  createGeminiSTTProvider,
+  getGeminiApiKey,
+  type AudioRecorderService,
+  type SpeechToTextProvider,
+} from '../talk-demo';
 
 // Fallback Mock items for immediate demo / offline practice out of the box
 const MOCK_ITEMS: readonly ReviewItemCandidate[] = [
@@ -107,9 +108,16 @@ const MOCK_ITEMS: readonly ReviewItemCandidate[] = [
   }
 ];
 
-export default function ReviewScreen() {
+export interface ReviewScreenProps {
+  readonly initialDemoMode?: boolean;
+  readonly recorder?: AudioRecorderService;
+  readonly sttProvider?: SpeechToTextProvider;
+}
+
+export default function ReviewScreen(props?: ReviewScreenProps) {
   const [loading, setLoading] = useState<boolean>(true);
-  const [isDemoMode, setIsDemoMode] = useState<boolean>(false);
+  const [isDemoMode, setIsDemoMode] = useState<boolean>(props?.initialDemoMode ?? false);
+  const [hasNoProfile, setHasNoProfile] = useState<boolean>(false);
   const [summary, setSummary] = useState<ReviewDashboardSummary>({
     totalDue: 0,
     dueVocabularyCount: 0,
@@ -136,6 +144,18 @@ export default function ReviewScreen() {
   const dbAdapterRef = useRef<DatabaseAdapter | null>(null);
   const startTimeRef = useRef<number>(0);
 
+  // Voice recording and STT refs and state
+  const [isRecording, setIsRecording] = useState<boolean>(false);
+  const [recorderError, setRecorderError] = useState<string | null>(null);
+  const recorderRef = useRef<AudioRecorderService | null>(null);
+  const sttRef = useRef<SpeechToTextProvider | null>(null);
+
+  useEffect(() => {
+    recorderRef.current = props?.recorder || createExpoAudioRecorder();
+    const apiKey = getGeminiApiKey();
+    sttRef.current = props?.sttProvider || (apiKey ? createGeminiSTTProvider({ apiKey }) : createDemoSTTProvider());
+  }, [props?.recorder, props?.sttProvider]);
+
   // Initialize DB Adapter and ReviewService
   useEffect(() => {
     let active = true;
@@ -147,21 +167,8 @@ export default function ReviewScreen() {
         await adapter.init();
         dbAdapterRef.current = adapter;
 
-        const repos = {
-          profile: new SQLiteUserProfileRepository(adapter),
-          conversations: new SQLiteConversationRepository(adapter),
-          mistakes: new SQLiteMistakeRepository(adapter),
-          pronunciation: new SQLitePronunciationRepository(adapter),
-          weaknesses: new SQLiteWeaknessRepository(adapter),
-          vocabulary: new SQLiteVocabularyRepository(adapter),
-          expressions: new SQLiteExpressionRepository(adapter),
-          review: new SQLiteReviewRepository(adapter),
-          lessons: { get: async () => null, list: async () => [] },
-          exercises: { get: async () => null, list: async () => [] },
-          progress: new SQLiteProgressRepository(adapter),
-        };
-
-        const service = new ReviewService(repos);
+        // Use the composition root factory instead of manually building SQLite repositories!
+        const service = createReviewService(adapter, isDemoMode);
         reviewServiceRef.current = service;
 
         if (active) {
@@ -199,19 +206,7 @@ export default function ReviewScreen() {
     if (!reviewServiceRef.current) return;
     try {
       setLoading(true);
-      const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
-      const profile = await profileRepo.get();
-      const learnerId = profile?.id ?? '00000000-0000-0000-0000-000000000001';
-
-      const dashSummary = await reviewServiceRef.current.getDashboardSummary(learnerId);
-      const weaknesses = await reviewServiceRef.current['repos'].weaknesses.listWeaknesses(learnerId);
-
-      setSummary(dashSummary);
-      setActiveWeaknesses(weaknesses.filter((w) => !w.resolved));
-
-      // If there are zero items in actual SQLite and no weaknesses, guide user to practice/demo
-      if (dashSummary.totalDue === 0 && weaknesses.length === 0) {
-        setIsDemoMode(true);
+      if (isDemoMode) {
         setSummary({
           totalDue: 5,
           dueVocabularyCount: 2,
@@ -223,13 +218,77 @@ export default function ReviewScreen() {
             { key: 'expression', label: 'Expressions & Idioms', dueCount: 1 },
           ],
         });
-      } else {
-        setIsDemoMode(false);
+        setActiveWeaknesses([]);
+        setHasNoProfile(false);
+        return;
       }
+
+      const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
+      const profile = await profileRepo.get();
+      if (!profile || !profile.id) {
+        setHasNoProfile(true);
+        return;
+      }
+      setHasNoProfile(false);
+      const learnerId = profile.id;
+
+      const dashSummary = await reviewServiceRef.current.getDashboardSummary(learnerId);
+      const weaknesses = await reviewServiceRef.current.getActiveWeaknesses(learnerId);
+
+      setSummary(dashSummary);
+      setActiveWeaknesses(weaknesses);
     } catch (err) {
       console.error('Error loading review dashboard metrics:', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleToggleRecording = async () => {
+    if (!recorderRef.current || !sttRef.current) return;
+
+    if (isRecording) {
+      try {
+        const result = await recorderRef.current.stopRecording();
+        setIsRecording(false);
+        setRecorderError(null);
+
+        const sttRes = await sttRef.current.transcribe({
+          uri: result.uri,
+          base64: result.base64,
+          mimeType: result.mimeType,
+          durationMs: result.durationMs,
+        });
+
+        if (sttRes.ok && sttRes.transcript) {
+          // Voice transcript populates answer text box only, allowing manual correction
+          setUserAnswer(sttRes.transcript);
+        } else {
+          setRecorderError(sttRes.error || 'Failed to transcribe speech.');
+        }
+      } catch (err: any) {
+        console.error('Error stopping voice recording:', err);
+        setRecorderError(err.message || 'Error transcribing audio.');
+        setIsRecording(false);
+      }
+    } else {
+      try {
+        setRecorderError(null);
+        const hasPerms = await recorderRef.current.hasPermissions();
+        if (!hasPerms) {
+          const granted = await recorderRef.current.requestPermissions();
+          if (!granted) {
+            setRecorderError('Microphone permissions denied.');
+            return;
+          }
+        }
+        await recorderRef.current.startRecording();
+        setIsRecording(true);
+      } catch (err: any) {
+        console.error('Error starting voice recording:', err);
+        setRecorderError(err.message || 'Failed to start recording.');
+        setIsRecording(false);
+      }
     }
   };
 
@@ -250,7 +309,11 @@ export default function ReviewScreen() {
       setLoading(true);
       const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
       const profile = await profileRepo.get();
-      const learnerId = profile?.id ?? '00000000-0000-0000-0000-000000000001';
+      if (!profile || !profile.id) {
+        setHasNoProfile(true);
+        return;
+      }
+      const learnerId = profile.id;
 
       const candidates = await reviewServiceRef.current.planSession(learnerId);
       if (candidates.length === 0) {
@@ -317,13 +380,14 @@ export default function ReviewScreen() {
         // Record practice result in SQLite persistence
         const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
         const profile = await profileRepo.get();
-        const learnerId = profile?.id ?? '00000000-0000-0000-0000-000000000001';
-        await reviewServiceRef.current.recordPracticeResult(
-          learnerId,
-          candidate,
-          userAnswer,
-          evalResult
-        );
+        if (profile && profile.id) {
+          await reviewServiceRef.current.recordPracticeResult(
+            profile.id,
+            candidate,
+            userAnswer,
+            evalResult
+          );
+        }
       }
 
       setEvaluation(evalResult);
@@ -356,19 +420,19 @@ export default function ReviewScreen() {
         if (!isDemoMode && reviewServiceRef.current) {
           const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
           const profile = await profileRepo.get();
-          const learnerId = profile?.id ?? '00000000-0000-0000-0000-000000000001';
-
-          await reviewServiceRef.current.completeSession(learnerId, {
-            startedAt: new Date(startTimeRef.current).toISOString(),
-            completedAt: new Date().toISOString(),
-            totalItems: sessionCandidates.length,
-            correctCount: sessionResults.correctCount,
-            partialCount: sessionResults.partialCount,
-            incorrectCount: sessionResults.incorrectCount,
-            masteredCount: sessionResults.correctCount,
-            improvedWeaknessCount: sessionResults.correctCount + sessionResults.partialCount,
-            items: [],
-          });
+          if (profile && profile.id) {
+            await reviewServiceRef.current.completeSession(profile.id, {
+              startedAt: new Date(startTimeRef.current).toISOString(),
+              completedAt: new Date().toISOString(),
+              totalItems: sessionCandidates.length,
+              correctCount: sessionResults.correctCount,
+              partialCount: sessionResults.partialCount,
+              incorrectCount: sessionResults.incorrectCount,
+              masteredCount: sessionResults.correctCount,
+              improvedWeaknessCount: sessionResults.correctCount + sessionResults.partialCount,
+              items: [],
+            });
+          }
         }
       } catch (err) {
         console.error('Error completing session in SQLite:', err);
@@ -400,6 +464,23 @@ export default function ReviewScreen() {
           <Text style={styles.subtitle}>Spaced repetition practice & weakness retraining</Text>
         </View>
 
+        {hasNoProfile && (
+          <View style={styles.demoBanner}>
+            <Text style={styles.demoBannerText}>
+              👤 No active learner profile found. Please complete a conversation first, or click below to enable Demo Mode for instant practice!
+            </Text>
+            <TouchableOpacity
+              style={[styles.startSessionButton, { marginTop: 12, backgroundColor: '#059669' }]}
+              onPress={() => {
+                setIsDemoMode(true);
+                loadDashboardMetrics();
+              }}
+            >
+              <Text style={styles.startSessionButtonText}>Enable Practice Demo Mode</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
         {isDemoMode && (
           <View style={styles.demoBanner}>
             <Text style={styles.demoBannerText}>
@@ -413,13 +494,17 @@ export default function ReviewScreen() {
           <Text style={styles.totalDueNumber}>{summary.totalDue}</Text>
           <Text style={styles.totalDueLabel}>Items Due for Retraining</Text>
           <TouchableOpacity
-            style={styles.startSessionButton}
+            style={[
+              styles.startSessionButton,
+              (hasNoProfile && !isDemoMode) && styles.startSessionButtonDisabled
+            ]}
             onPress={handleStartSession}
+            disabled={hasNoProfile && !isDemoMode}
             accessibilityRole="button"
             id="start_review_button"
           >
             <Text style={styles.startSessionButtonText}>
-              Start Practice Session ({Math.min(10, summary.totalDue || 5)} Items)
+              {(hasNoProfile && !isDemoMode) ? 'Waiting for profile...' : `Start Practice Session (${Math.min(10, summary.totalDue || 5)} Items)`}
             </Text>
           </TouchableOpacity>
         </View>
@@ -535,34 +620,62 @@ export default function ReviewScreen() {
 
           {/* Answer Input Field (when not evaluated yet) */}
           {!evaluation ? (
-            <View style={styles.inputWrapper}>
-              <TextInput
-                style={styles.answerInput}
-                placeholder="Type your answer in English..."
-                placeholderTextColor="#9CA3AF"
-                value={userAnswer}
-                onChangeText={setUserAnswer}
-                autoCorrect={false}
-                autoCapitalize="none"
-                multiline={candidate.exerciseType === 'sentence_correction' || candidate.exerciseType === 'natural_phrasing'}
-                id="answer_input_field"
-              />
-              <TouchableOpacity
-                style={[
-                  styles.submitButton,
-                  !userAnswer.trim() && styles.submitButtonDisabled,
-                ]}
-                onPress={handleSubmitAnswer}
-                disabled={!userAnswer.trim() || isEvaluating}
-                accessibilityRole="button"
-                id="submit_answer_button"
-              >
-                {isEvaluating ? (
-                  <ActivityIndicator size="small" color="#FFFFFF" />
-                ) : (
-                  <Text style={styles.submitButtonText}>Submit Answer</Text>
+            <View>
+              <View style={styles.inputWrapper}>
+                <TextInput
+                  style={styles.answerInput}
+                  placeholder="Type your answer in English..."
+                  placeholderTextColor="#9CA3AF"
+                  value={userAnswer}
+                  onChangeText={setUserAnswer}
+                  autoCorrect={false}
+                  autoCapitalize="none"
+                  multiline={candidate.exerciseType === 'sentence_correction' || candidate.exerciseType === 'natural_phrasing'}
+                  id="answer_input_field"
+                />
+                <TouchableOpacity
+                  style={[
+                    styles.submitButton,
+                    !userAnswer.trim() && styles.submitButtonDisabled,
+                  ]}
+                  onPress={handleSubmitAnswer}
+                  disabled={!userAnswer.trim() || isEvaluating}
+                  accessibilityRole="button"
+                  id="submit_answer_button"
+                >
+                  {isEvaluating ? (
+                    <ActivityIndicator size="small" color="#FFFFFF" />
+                  ) : (
+                    <Text style={styles.submitButtonText}>Submit Answer</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+
+              {/* Voice Review Answer Controls */}
+              <View style={styles.voiceSection} id="voice_section">
+                <TouchableOpacity
+                  style={[
+                    styles.micButton,
+                    isRecording && styles.micButtonRecording,
+                  ]}
+                  onPress={handleToggleRecording}
+                  accessibilityRole="button"
+                  id="toggle_recording_button"
+                >
+                  <Text style={styles.micButtonText}>
+                    {isRecording ? '🛑 Stop Recording' : '🎤 Answer with Voice'}
+                  </Text>
+                </TouchableOpacity>
+                {isRecording && (
+                  <View style={styles.recordingIndicator}>
+                    <View style={styles.pulseDot} />
+                    <Text style={styles.recordingText}>Listening... Speak your answer now.</Text>
+                  </View>
                 )}
-              </TouchableOpacity>
+                {recorderError && (
+                  <Text style={styles.recorderErrorText}>{recorderError}</Text>
+                )}
+              </View>
             </View>
           ) : (
             /* Evaluation Result State */
@@ -1118,5 +1231,54 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#6B7280',
     marginBottom: 16,
+  },
+  voiceSection: {
+    marginTop: 12,
+    alignItems: 'center',
+    gap: 8,
+  },
+  micButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F3F4F6',
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+  },
+  micButtonRecording: {
+    backgroundColor: '#FEE2E2',
+    borderColor: '#F87171',
+  },
+  micButtonText: {
+    color: '#374151',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  recordingIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 4,
+  },
+  pulseDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#EF4444',
+  },
+  recordingText: {
+    fontSize: 12,
+    color: '#EF4444',
+    fontWeight: '600',
+  },
+  recorderErrorText: {
+    fontSize: 12,
+    color: '#EF4444',
+    marginTop: 4,
+  },
+  startSessionButtonDisabled: {
+    backgroundColor: '#9CA3AF',
   },
 });

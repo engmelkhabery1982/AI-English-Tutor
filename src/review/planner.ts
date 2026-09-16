@@ -116,6 +116,10 @@ function vocabularyToCandidate(
   const meaning = item.meanings[0];
   if (!meaning) return null;
 
+  if (meaning.review?.nextReviewAt && meaning.review.nextReviewAt > nowIso) {
+    return null;
+  }
+
   const example = meaning.examples?.[0];
   const hasExample = example && example.text.toLowerCase().includes(item.headword.toLowerCase());
 
@@ -169,6 +173,10 @@ function expressionToCandidate(
   nowIso: string,
 ): ReviewItemCandidate | null {
   const meaning = item.meanings?.[0];
+  if (item.review?.nextReviewAt && item.review.nextReviewAt > nowIso) {
+    return null;
+  }
+
   return {
     id: generateId(),
     learnerId: item.learnerId,
