@@ -369,4 +369,112 @@ describe('AIProvider Abstraction Layer', () => {
       expect(result.error.message).toContain('down for maintenance');
     }
   });
+
+  it('19. A: mutating original response object after createAIProviderSuccess does not change result.response', () => {
+    const mutableResponse: {
+      content: string;
+      finishReason?: AIFinishReason;
+      usage?: AIUsage;
+    } = {
+      content: 'Original content',
+      finishReason: 'completed',
+    };
+
+    const result = createAIProviderSuccess(mutableResponse as AIProviderResponse);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.response).not.toBe(mutableResponse);
+      expect(result.response.content).toBe('Original content');
+      expect(result.response.finishReason).toBe('completed');
+
+      // Mutate caller object
+      mutableResponse.content = 'Tampered content';
+      mutableResponse.finishReason = 'cancelled';
+
+      expect(result.response.content).toBe('Original content');
+      expect(result.response.finishReason).toBe('completed');
+    }
+  });
+
+  it('20. B: mutating original nested usage object after createAIProviderSuccess does not change result.response.usage', () => {
+    const mutableUsage = {
+      inputTokens: 10,
+      outputTokens: 20,
+      totalTokens: 30,
+    };
+
+    const mutableResponse: AIProviderResponse = {
+      content: 'Output with tokens',
+      finishReason: 'completed',
+      usage: mutableUsage,
+    };
+
+    const result = createAIProviderSuccess(mutableResponse);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.response.usage).not.toBe(mutableUsage);
+      expect(result.response.usage).toEqual({
+        inputTokens: 10,
+        outputTokens: 20,
+        totalTokens: 30,
+      });
+
+      // Mutate caller nested object
+      mutableUsage.inputTokens = 9999;
+      mutableUsage.outputTokens = 8888;
+      mutableUsage.totalTokens = 18887;
+
+      expect(result.response.usage).toEqual({
+        inputTokens: 10,
+        outputTokens: 20,
+        totalTokens: 30,
+      });
+    }
+  });
+
+  it('21. C: mutating original error object after createAIProviderFailure does not change result.error', () => {
+    const mutableError: {
+      code: AIProviderErrorCode;
+      message: string;
+      retryable: boolean;
+    } = {
+      code: 'rate_limit',
+      message: 'Too many requests',
+      retryable: true,
+    };
+
+    const result = createAIProviderFailure(mutableError as AIProviderError);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).not.toBe(mutableError);
+      expect(result.error.code).toBe('rate_limit');
+      expect(result.error.message).toBe('Too many requests');
+      expect(result.error.retryable).toBe(true);
+
+      // Mutate caller error object
+      mutableError.code = 'authentication';
+      mutableError.message = 'Tampered error message';
+      mutableError.retryable = false;
+
+      expect(result.error.code).toBe('rate_limit');
+      expect(result.error.message).toBe('Too many requests');
+      expect(result.error.retryable).toBe(true);
+    }
+  });
+
+  it('22. D: optional response fields remain absent when not supplied in createAIProviderSuccess', () => {
+    const minimalResponse: AIProviderResponse = {
+      content: 'Minimal answer',
+    };
+
+    const result = createAIProviderSuccess(minimalResponse);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.response.content).toBe('Minimal answer');
+      expect(result.response.finishReason).toBeUndefined();
+      expect(result.response.usage).toBeUndefined();
+      expect('finishReason' in result.response).toBe(false);
+      expect('usage' in result.response).toBe(false);
+    }
+  });
 });

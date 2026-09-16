@@ -82,21 +82,43 @@ export function createAIProviderError(
 }
 
 /**
- * Creates a successful AIProviderResult wrapping an AIProviderResponse.
+ * Creates a successful AIProviderResult wrapping a defensive copy of AIProviderResponse.
  */
 export function createAIProviderSuccess(response: AIProviderResponse): AIProviderResult {
+  let usage: AIUsage | undefined;
+  if (response.usage) {
+    const rawUsage = response.usage;
+    usage = {
+      ...(typeof rawUsage.inputTokens === 'number' && { inputTokens: rawUsage.inputTokens }),
+      ...(typeof rawUsage.outputTokens === 'number' && { outputTokens: rawUsage.outputTokens }),
+      ...(typeof rawUsage.totalTokens === 'number' && { totalTokens: rawUsage.totalTokens }),
+    };
+  }
+
+  const responseCopy: AIProviderResponse = {
+    content: response.content,
+    ...(response.finishReason !== undefined && { finishReason: response.finishReason }),
+    ...(usage !== undefined && { usage }),
+  };
+
   return {
     ok: true,
-    response,
+    response: responseCopy,
   };
 }
 
 /**
- * Creates a failed AIProviderResult wrapping an AIProviderError.
+ * Creates a failed AIProviderResult wrapping a defensive copy of AIProviderError.
  */
 export function createAIProviderFailure(error: AIProviderError): AIProviderResult {
+  const errorCopy: AIProviderError = {
+    code: error.code,
+    message: error.message,
+    retryable: error.retryable,
+  };
+
   return {
     ok: false,
-    error,
+    error: errorCopy,
   };
 }
