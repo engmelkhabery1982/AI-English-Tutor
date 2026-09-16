@@ -31,8 +31,8 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
+    "build": "expo export --platform web",
     "lint": "eslint src",
     "test": "vitest run"
   },

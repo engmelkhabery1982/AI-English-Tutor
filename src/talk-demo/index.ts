@@ -19,8 +19,16 @@ import type { AIProvider } from '../providers/ai';
 import { createDemoAIProvider } from '../providers/ai/demo';
 import { createGeminiAIProvider } from '../providers/ai/gemini';
 import { createDemoLearnerModel } from './demo-learner-model';
+import {
+  createVocabularyPersistenceService,
+  type VocabularyPersistenceOptions,
+} from './vocabulary-persistence';
 
 export { createDemoLearnerModel } from './demo-learner-model';
+export {
+  createVocabularyPersistenceService,
+  type VocabularyPersistenceOptions,
+} from './vocabulary-persistence';
 export type {
   ConversationMode,
   ConversationSession,
@@ -40,6 +48,11 @@ export type TalkProviderKind = 'gemini' | 'demo';
 export interface TalkSessionBundle {
   readonly session: ConversationSession;
   readonly providerKind: TalkProviderKind;
+}
+
+export interface CreateTalkSessionOptions extends VocabularyPersistenceOptions {
+  readonly apiKey?: string;
+  readonly fetchImpl?: typeof fetch;
 }
 
 /**
@@ -69,11 +82,33 @@ function composeSessionWithProvider(
 /**
  * Creates an end-to-end runnable ConversationSession bundle.
  * Uses Gemini AI Provider when an API key is available, falling back to Demo AI Provider.
+ * Connects vocabulary saving to SQLite local persistence via existing repository layer.
  */
 export function createTalkSession(
   config: ConversationSessionConfig,
-  options?: { readonly apiKey?: string; readonly fetchImpl?: typeof fetch }
+  options?: CreateTalkSessionOptions
 ): TalkSessionBundle {
+  const persistenceService = createVocabularyPersistenceService({
+    vocabularyRepository: options?.vocabularyRepository,
+    userProfileRepository: options?.userProfileRepository,
+    databaseAdapter: options?.databaseAdapter,
+    learnerId: options?.learnerId,
+  });
+
+  const sessionConfig: ConversationSessionConfig = {
+    ...config,
+    onSaveVocabulary: async (vocab) => {
+      try {
+        await persistenceService.saveVocabulary(vocab);
+      } catch {
+        // Non-blocking: failure to persist must never corrupt conversation state
+      }
+      if (config.onSaveVocabulary) {
+        await config.onSaveVocabulary(vocab);
+      }
+    },
+  };
+
   const key = options?.apiKey?.trim() || getGeminiApiKey();
 
   if (key) {
@@ -82,14 +117,14 @@ export function createTalkSession(
       fetchImpl: options?.fetchImpl,
     });
     return {
-      session: composeSessionWithProvider(config, provider),
+      session: composeSessionWithProvider(sessionConfig, provider),
       providerKind: 'gemini',
     };
   }
 
   const provider = createDemoAIProvider();
   return {
-    session: composeSessionWithProvider(config, provider),
+    session: composeSessionWithProvider(sessionConfig, provider),
     providerKind: 'demo',
   };
 }
@@ -97,6 +132,7 @@ export function createTalkSession(
 /**
  * Creates a ConversationSession that ALWAYS uses the local DemoAIProvider,
  * completely independent of any environment variables, API keys, or network availability.
+ * Does not require SQLite persistence.
  */
 export function createTalkDemoSession(
   config: ConversationSessionConfig

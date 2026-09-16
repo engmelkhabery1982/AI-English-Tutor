@@ -1,8 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SqlJsAdapter } from '../data/local/sqlite/SqlJsAdapter';
+import {
+  SQLiteUserProfileRepository,
+  SQLiteVocabularyRepository,
+} from '../data/local/sqlite/repositories';
 import {
   createDemoLearnerModel,
   createTalkDemoSession,
   createTalkSession,
+  createVocabularyPersistenceService,
   getGeminiApiKey,
 } from './index';
 
@@ -23,6 +29,134 @@ describe('Talk Demo & Composition Stack', () => {
     } else {
       delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
     }
+  });
+
+  describe('Vocabulary Persistence Service', () => {
+    it('persists extracted feedback vocabulary into SQLite vocabulary repository', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+
+      const userRepo = new SQLiteUserProfileRepository(adapter);
+      const profile = await userRepo.update({
+        displayName: 'Test Learner',
+        targetLanguage: 'en',
+        currentLevel: 'B1',
+        targetLevel: 'B2',
+      });
+
+      const vocabRepo = new SQLiteVocabularyRepository(adapter);
+      const service = createVocabularyPersistenceService({
+        vocabularyRepository: vocabRepo,
+        userProfileRepository: userRepo,
+        learnerId: profile.id,
+      });
+
+      const saved = await service.saveVocabulary({
+        headword: '  serendipity  ',
+        type: 'word',
+        meaning: 'Finding good things without looking for them',
+        example: 'We met by pure serendipity.',
+      });
+
+      expect(saved).not.toBeNull();
+      expect(saved?.headword).toBe('serendipity');
+      expect(saved?.meanings).toHaveLength(1);
+      expect(saved?.meanings[0].definition).toBe('Finding good things without looking for them');
+      expect(saved?.meanings[0].examples[0].text).toBe('We met by pure serendipity.');
+
+      // Verify retrieval from SQLite
+      const found = await vocabRepo.list(profile.id);
+      expect(found).toHaveLength(1);
+      expect(found[0].headword).toBe('serendipity');
+
+      await adapter.close();
+    });
+
+    it('updates existing item on duplicate headword and type without corrupting state', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+
+      const userRepo = new SQLiteUserProfileRepository(adapter);
+      const profile = await userRepo.update({
+        displayName: 'Test Learner',
+        targetLanguage: 'en',
+        currentLevel: 'B1',
+        targetLevel: 'B2',
+      });
+
+      const vocabRepo = new SQLiteVocabularyRepository(adapter);
+      const service = createVocabularyPersistenceService({
+        vocabularyRepository: vocabRepo,
+        userProfileRepository: userRepo,
+        learnerId: profile.id,
+      });
+
+      await service.saveVocabulary({
+        headword: 'resilient',
+        type: 'word',
+        meaning: 'able to recover quickly',
+        example: 'He is resilient.',
+      });
+
+      await service.saveVocabulary({
+        headword: 'resilient',
+        type: 'word',
+        meaning: 'able to withstand or recover quickly from difficult conditions',
+        example: 'Children are remarkably resilient.',
+      });
+
+      const found = await vocabRepo.list(profile.id);
+      expect(found).toHaveLength(1);
+      expect(found[0].meanings[0].definition).toContain('withstand');
+
+      await adapter.close();
+    });
+
+    it('createTalkSession integrates vocabulary saving callback with SQLite', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+
+      const userRepo = new SQLiteUserProfileRepository(adapter);
+      const profile = await userRepo.update({
+        displayName: 'Test Learner',
+        targetLanguage: 'en',
+        currentLevel: 'B1',
+        targetLevel: 'B2',
+      });
+
+      const vocabRepo = new SQLiteVocabularyRepository(adapter);
+      const savedVocabsFromCallback: string[] = [];
+
+      const bundle = createTalkSession(
+        {
+          mode: 'coach',
+          onSaveVocabulary: async (vocab) => {
+            savedVocabsFromCallback.push(vocab.headword);
+          },
+        },
+        {
+          vocabularyRepository: vocabRepo,
+          userProfileRepository: userRepo,
+          learnerId: profile.id,
+        }
+      );
+
+      // Save via the session's onSaveVocabulary handler
+      await bundle.session.saveVocabularyItem({
+        headword: 'perseverance',
+        type: 'word',
+        meaning: 'persistence in doing something despite difficulty',
+        example: 'Success requires perseverance.',
+      });
+
+      expect(savedVocabsFromCallback).toContain('perseverance');
+
+      const found = await vocabRepo.list(profile.id);
+      expect(found).toHaveLength(1);
+      expect(found[0].headword).toBe('perseverance');
+
+      await adapter.close();
+    });
   });
 
   describe('DemoLearnerModel', () => {
