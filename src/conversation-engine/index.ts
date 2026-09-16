@@ -125,10 +125,10 @@ class DefaultConversationEngine implements ConversationEngine {
       throw new Error('User message cannot be empty or whitespace only.');
     }
 
-    // 2. Normalize optional topic (whitespace-only treated as null)
+    // 2. Normalize optional topic: whitespace-only treated as null, non-empty preserved exactly
     const topic =
       typeof input.topic === 'string' && input.topic.trim().length > 0
-        ? input.topic.trim()
+        ? input.topic
         : null;
 
     // 3. Resolve history limit and slice recent turns

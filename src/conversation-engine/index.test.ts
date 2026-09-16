@@ -346,6 +346,13 @@ describe('ConversationEngine', () => {
     const { learnerModel } = createMockLearnerModel(mockContext);
     const engine = createConversationEngine(learnerModel);
 
+    const requestUndefined = engine.buildRequest({
+      userMessage: 'Hello',
+      mode: 'natural',
+    });
+    expect(requestUndefined.topic).toBeNull();
+    expect(requestUndefined.systemPrompt).toContain('Topic Focus: Open conversation');
+
     const requestEmpty = engine.buildRequest({
       userMessage: 'Hello',
       mode: 'natural',
@@ -376,6 +383,26 @@ describe('ConversationEngine', () => {
 
     expect(request.topic).toBe('Travel and Culture');
     expect(request.systemPrompt).toContain('Topic Focus: Travel and Culture');
+  });
+
+  it('10b. non-empty topic with leading/trailing whitespace is preserved exactly without engine-side trimming', () => {
+    const mockContext = createMockCoachingContext();
+    const { learnerModel } = createMockLearnerModel(mockContext);
+    const engine = createConversationEngine(learnerModel);
+
+    const untrimmedTopic = '  Business meetings  ';
+    const request = engine.buildRequest({
+      userMessage: 'Let us prepare for our meeting',
+      mode: 'coach',
+      topic: untrimmedTopic,
+    });
+
+    // 1. Topic field preserves original string exactly
+    expect(request.topic).toBe('  Business meetings  ');
+    expect(request.topic).not.toBe('Business meetings');
+
+    // 2. System prompt receives and contains the preserved topic text without engine-side trimming
+    expect(request.systemPrompt).toContain('Topic Focus:   Business meetings  \n');
   });
 
   it('11. Natural Conversation prompt behavior', () => {
