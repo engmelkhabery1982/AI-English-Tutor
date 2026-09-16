@@ -15,7 +15,7 @@
  */
 
 /** Current schema version. Bump this when adding a migration. */
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 2;
 
 /** A single SQL step inside a migration. */
 export interface SchemaStep {
@@ -299,6 +299,15 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       { sql: `CREATE INDEX IF NOT EXISTS idx_grammar_mistakes_learner_last_seen ON grammar_mistakes(learner_id, last_seen_at)` },
       { sql: `CREATE INDEX IF NOT EXISTS idx_pronunciation_weaknesses_learner_last_seen ON pronunciation_weaknesses(learner_id, last_seen_at)` },
       { sql: `CREATE INDEX IF NOT EXISTS idx_learner_strengths_learner_type ON learner_strengths(learner_id, type)` },
+    ],
+  },
+  {
+    version: 2,
+    description: 'Add expression metadata to lexical_items',
+    steps: [
+      { sql: `ALTER TABLE lexical_items ADD COLUMN natural_alternatives TEXT NOT NULL DEFAULT '[]'` },
+      { sql: `ALTER TABLE lexical_items ADD COLUMN register TEXT` },
+      { sql: `ALTER TABLE lexical_items ADD COLUMN domain TEXT` },
     ],
   },
 ];
