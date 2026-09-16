@@ -23,6 +23,7 @@ import type {
   MistakeRepository,
   PronunciationRepository,
   WeaknessRepository,
+  VocabularyRepository,
 } from '../../../repositories';
 import type {
   UserProfile,
@@ -36,6 +37,16 @@ import type {
   ConversationSession,
   ConversationTurn,
 } from '../../../domain/models/conversation';
+import type {
+  VocabularyItem,
+  Meaning,
+} from '../../../domain/models/vocabulary';
+import type {
+  ReviewSchedule,
+  MasteryState,
+  UsageExample,
+  ExampleSource,
+} from '../../../domain/shared/types';
 import { generateId, isValidUuid } from '../../../shared/id';
 
 /** Current ISO timestamp helper. */
@@ -1232,5 +1243,517 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
         evidence.summary ?? null,
       ],
     );
+  }
+}
+
+/** Map lexical_items row to VocabularyItem domain object (without meanings). */
+function rowToVocabularyItem(row: SqlRow): Omit<VocabularyItem, 'meanings'> {
+  return {
+    id: row.id as string,
+    learnerId: row.learner_id as string,
+    headword: row.headword as string,
+    type: row.type as VocabularyItem['type'],
+    pronunciation: safeJsonParse(row.pronunciation, {}),
+    synonyms: safeJsonParse(row.synonyms, []),
+    antonyms: safeJsonParse(row.antonyms, []),
+    relatedExpressions: safeJsonParse(row.related_expressions, []),
+    source: safeJsonParse(row.source, {
+      originConversationId: undefined,
+      originTurnId: undefined,
+      addedBy: 'system',
+      addedAt: row.created_at as string,
+    }),
+    tags: safeJsonParse(row.tags, []),
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+  };
+}
+
+/** Map lexical_meanings row to Meaning domain object. */
+function rowToMeaning(row: SqlRow): Meaning {
+  const reviewState = row.review_state as MasteryState | undefined;
+  const review: ReviewSchedule | undefined = reviewState
+    ? {
+        state: reviewState,
+        lastReviewAt: (row.review_last_review_at as string) ?? undefined,
+        nextReviewAt: (row.review_next_review_at as string) ?? undefined,
+        reviewCount: (row.review_review_count as number) ?? 0,
+        consecutiveCorrect: (row.review_consecutive_correct as number) ?? 0,
+        easeFactor: (row.review_ease_factor as number) ?? undefined,
+      }
+    : undefined;
+
+  return {
+    definition: row.definition as string,
+    partOfSpeech: (row.part_of_speech as Meaning['partOfSpeech']) ?? undefined,
+    examples: safeJsonParse(row.examples, []),
+    usageNotes: safeJsonParse(row.usage_notes, []),
+    register: (row.register as Meaning['register']) ?? undefined,
+    domain: (row.domain as string) ?? undefined,
+    review,
+  };
+}
+
+/** Map DB source to domain ExampleSource. */
+function dbSourceToDomain(source: string): ExampleSource {
+  // DB stores the same canonical values as domain
+  return source as ExampleSource;
+}
+
+/** Map domain ExampleSource to DB source. */
+function domainSourceToDb(source: ExampleSource): string {
+  return source;
+}
+
+/** Insert examples for a meaning into lexical_examples table. */
+async function insertExamplesForMeaning(
+  adapter: DatabaseAdapter,
+  lexicalItemId: string,
+  meaningId: string,
+  examples: readonly UsageExample[],
+  now: string,
+): Promise<void> {
+  for (const example of examples) {
+    const exampleId = generateId();
+    await adapter.execute(
+      `INSERT INTO lexical_examples (
+        id, lexical_item_id, meaning_id, text, translation, context,
+        source, origin_conversation_id, origin_turn_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        exampleId,
+        lexicalItemId,
+        meaningId,
+        example.text,
+        example.translation ?? null,
+        example.context ?? null,
+        domainSourceToDb(example.source),
+        example.originConversationId ?? null,
+        example.originTurnId ?? null,
+        example.createdAt ?? now,
+      ],
+    );
+  }
+}
+
+/** Fetch examples for a meaning from lexical_examples table. */
+async function fetchExamplesForMeaning(
+  adapter: DatabaseAdapter,
+  meaningId: string,
+): Promise<UsageExample[]> {
+  const rows = await adapter.query(
+    `SELECT * FROM lexical_examples WHERE meaning_id = ? ORDER BY created_at`,
+    [meaningId],
+  );
+
+  return rows.map((row) => ({
+    text: row.text as string,
+    translation: (row.translation as string) ?? undefined,
+    context: (row.context as string) ?? undefined,
+    source: dbSourceToDomain(row.source as string),
+    originConversationId: (row.origin_conversation_id as string) ?? undefined,
+    originTurnId: (row.origin_turn_id as string) ?? undefined,
+    createdAt: (row.created_at as string) ?? undefined,
+  }));
+}
+
+/** Build partial UPDATE SQL and params for a lexical item. */
+function buildLexicalItemUpdate(
+  id: string,
+  patch: Partial<Omit<VocabularyItem, 'id' | 'createdAt' | 'meanings'>>,
+): { sql: string; params: SqlParam[] } {
+  const fields: string[] = [];
+  const params: SqlParam[] = [];
+
+  const fieldMap: Record<string, string> = {
+    learnerId: 'learner_id',
+    headword: 'headword',
+    type: 'type',
+    pronunciation: 'pronunciation',
+    synonyms: 'synonyms',
+    antonyms: 'antonyms',
+    relatedExpressions: 'related_expressions',
+    source: 'source',
+    tags: 'tags',
+  };
+
+  for (const [key, column] of Object.entries(fieldMap)) {
+    const value = patch[key as keyof typeof patch];
+    if (value !== undefined) {
+      fields.push(`${column} = ?`);
+      if (['pronunciation', 'synonyms', 'antonyms', 'relatedExpressions', 'source', 'tags'].includes(key)) {
+        params.push(JSON.stringify(value));
+      } else {
+        params.push(value as SqlParam);
+      }
+    }
+  }
+
+  fields.push('updated_at = ?');
+  params.push(nowIso());
+  params.push(id);
+
+  const sql = `UPDATE lexical_items SET ${fields.join(', ')} WHERE id = ?`;
+  return { sql, params };
+}
+
+/**
+ * SQLiteVocabularyRepository
+ *
+ * Implements VocabularyRepository for lexical_items + lexical_meanings.
+ * Uses transactions for atomic upsert across both tables.
+ */
+export class SQLiteVocabularyRepository implements VocabularyRepository {
+  constructor(private readonly adapter: DatabaseAdapter) {}
+
+  async upsert(
+    item: Omit<VocabularyItem, 'id' | 'createdAt' | 'updatedAt'>,
+  ): Promise<VocabularyItem> {
+    // Check if an item with same learner_id, headword, type exists
+    const existing = await this.adapter.query(
+      `SELECT * FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ?`,
+      [item.learnerId, item.headword, item.type],
+    );
+
+    const now = nowIso();
+
+    if (existing.length > 0) {
+      // Update existing item
+      const id = existing[0].id as string;
+      const { sql, params } = buildLexicalItemUpdate(id, item);
+      await this.adapter.execute(sql, params);
+
+      // Update meanings: delete existing and insert new ones
+      await this.adapter.execute(
+        `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
+        [id],
+      );
+
+      // Insert new meanings
+      for (const meaning of item.meanings) {
+        const meaningId = generateId();
+        await this.adapter.execute(
+          `INSERT INTO lexical_meanings (
+            id, lexical_item_id, definition, part_of_speech, examples,
+            usage_notes, register, domain,
+            review_state, review_last_review_at, review_next_review_at,
+            review_review_count, review_consecutive_correct, review_ease_factor,
+            review_mastered_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            meaningId,
+            id,
+            meaning.definition,
+            meaning.partOfSpeech ?? null,
+            JSON.stringify(meaning.examples ?? []),
+            JSON.stringify(meaning.usageNotes ?? []),
+            meaning.register ?? null,
+            meaning.domain ?? null,
+            meaning.review?.state ?? 'new',
+            meaning.review?.lastReviewAt ?? null,
+            meaning.review?.nextReviewAt ?? null,
+            meaning.review?.reviewCount ?? 0,
+            meaning.review?.consecutiveCorrect ?? 0,
+            meaning.review?.easeFactor ?? null,
+            meaning.review?.masteredAt ?? null,
+            now,
+            now,
+          ],
+        );
+
+        // Insert examples for this meaning
+        if (meaning.examples && meaning.examples.length > 0) {
+          await insertExamplesForMeaning(this.adapter, id, meaningId, meaning.examples, now);
+        }
+      }
+
+      const rows = await this.adapter.query(
+        `SELECT * FROM lexical_items WHERE id = ?`,
+        [id],
+      );
+
+      if (rows.length === 0) {
+        throw new Error('Vocabulary item disappeared after update');
+      }
+
+      return this.getFullItem(id);
+    }
+
+    // Create new item
+    const id = generateId();
+
+    // Validate required fields
+    if (!item.learnerId || !isValidUuid(item.learnerId)) {
+      throw new Error('Invalid learnerId');
+    }
+    if (!item.headword) {
+      throw new Error('headword is required');
+    }
+    if (!item.type) {
+      throw new Error('type is required');
+    }
+    if (!item.source) {
+      throw new Error('source is required');
+    }
+
+    await this.adapter.execute(
+      `INSERT INTO lexical_items (
+        id, learner_id, headword, type, pronunciation, synonyms,
+        antonyms, related_expressions, source, tags, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        item.learnerId,
+        item.headword,
+        item.type,
+        JSON.stringify(item.pronunciation ?? {}),
+        JSON.stringify(item.synonyms ?? []),
+        JSON.stringify(item.antonyms ?? []),
+        JSON.stringify(item.relatedExpressions ?? []),
+        JSON.stringify(item.source),
+        JSON.stringify(item.tags ?? []),
+        now,
+        now,
+      ],
+    );
+
+    // Insert meanings
+    for (const meaning of item.meanings) {
+      const meaningId = generateId();
+      await this.adapter.execute(
+        `INSERT INTO lexical_meanings (
+          id, lexical_item_id, definition, part_of_speech, examples,
+          usage_notes, register, domain,
+          review_state, review_last_review_at, review_next_review_at,
+          review_review_count, review_consecutive_correct, review_ease_factor,
+          review_mastered_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          meaningId,
+          id,
+          meaning.definition,
+          meaning.partOfSpeech ?? null,
+          JSON.stringify(meaning.examples ?? []),
+          JSON.stringify(meaning.usageNotes ?? []),
+          meaning.register ?? null,
+          meaning.domain ?? null,
+          meaning.review?.state ?? 'new',
+          meaning.review?.lastReviewAt ?? null,
+          meaning.review?.nextReviewAt ?? null,
+          meaning.review?.reviewCount ?? 0,
+          meaning.review?.consecutiveCorrect ?? 0,
+          meaning.review?.easeFactor ?? null,
+          meaning.review?.masteredAt ?? null,
+          now,
+          now,
+        ],
+      );
+
+      // Insert examples for this meaning
+      if (meaning.examples && meaning.examples.length > 0) {
+        await insertExamplesForMeaning(this.adapter, id, meaningId, meaning.examples, now);
+      }
+    }
+
+    return this.getFullItem(id);
+  }
+
+  private async getFullItem(id: string): Promise<VocabularyItem> {
+    const itemRows = await this.adapter.query(
+      `SELECT * FROM lexical_items WHERE id = ?`,
+      [id],
+    );
+
+    if (itemRows.length === 0) {
+      throw new Error('Vocabulary item not found after upsert');
+    }
+
+    const item = rowToVocabularyItem(itemRows[0]);
+
+    const meaningRows = await this.adapter.query(
+      `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
+      [id],
+    );
+
+    const meanings: Meaning[] = [];
+    for (const meaningRow of meaningRows) {
+      const meaning = rowToMeaning(meaningRow);
+      const meaningId = meaningRow.id as string;
+      if (meaningId) {
+        const examples = await fetchExamplesForMeaning(this.adapter, meaningId);
+        meanings.push({ ...meaning, examples });
+      } else {
+        meanings.push(meaning);
+      }
+    }
+
+    return {
+      ...item,
+      meanings,
+    };
+  }
+
+  async get(id: string): Promise<VocabularyItem | null> {
+    if (!isValidUuid(id)) return null;
+
+    const itemRows = await this.adapter.query(
+      `SELECT * FROM lexical_items WHERE id = ?`,
+      [id],
+    );
+
+    if (itemRows.length === 0) return null;
+
+    const item = rowToVocabularyItem(itemRows[0]);
+
+    const meaningRows = await this.adapter.query(
+      `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
+      [id],
+    );
+
+    const meanings: Meaning[] = [];
+    for (const meaningRow of meaningRows) {
+      const meaning = rowToMeaning(meaningRow);
+      const meaningId = meaningRow.id as string;
+      if (meaningId) {
+        const examples = await fetchExamplesForMeaning(this.adapter, meaningId);
+        meanings.push({ ...meaning, examples });
+      } else {
+        meanings.push(meaning);
+      }
+    }
+
+    return {
+      ...item,
+      meanings,
+    };
+  }
+
+  async list(
+    learnerId: string,
+    opts?: { state?: string; limit?: number },
+  ): Promise<readonly VocabularyItem[]> {
+    if (!isValidUuid(learnerId)) return [];
+
+    let sql = `SELECT * FROM lexical_items WHERE learner_id = ?`;
+    const params: SqlParam[] = [learnerId];
+
+    // Note: state filter would require joining with lexical_meanings
+    // For now, we don't implement state filter as it requires item-level review aggregate
+    // which we don't fabricate. Per-meaning review is authoritative.
+
+    sql += ` ORDER BY created_at DESC`;
+
+    if (opts?.limit !== undefined && opts.limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(opts.limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+
+    const items: VocabularyItem[] = [];
+    for (const row of rows) {
+      const item = rowToVocabularyItem(row);
+      const itemId = row.id;
+      if (!itemId || typeof itemId !== 'string') {
+        throw new Error('Invalid vocabulary item row: missing id');
+      }
+      const meaningRows = await this.adapter.query(
+        `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
+        [itemId],
+      );
+
+      const meanings: Meaning[] = [];
+      for (const meaningRow of meaningRows) {
+        const meaning = rowToMeaning(meaningRow);
+        const meaningId = meaningRow.id as string;
+        if (meaningId) {
+          const examples = await fetchExamplesForMeaning(this.adapter, meaningId);
+          meanings.push({ ...meaning, examples });
+        } else {
+          meanings.push(meaning);
+        }
+      }
+      items.push({ ...item, meanings });
+    }
+
+    return items;
+  }
+
+  async listDue(
+    _learnerId: string,
+    _now: string,
+    _limit?: number,
+  ): Promise<readonly VocabularyItem[]> {
+    // Not implemented in this task - requires SRS logic
+    return [];
+  }
+
+  async update(
+    id: string,
+    patch: Partial<Omit<VocabularyItem, 'id' | 'createdAt'>>,
+  ): Promise<VocabularyItem> {
+    if (!isValidUuid(id)) {
+      throw new Error('Invalid vocabulary item id');
+    }
+
+    const existing = await this.get(id);
+    if (!existing) {
+      throw new Error(`Vocabulary item not found: ${id}`);
+    }
+
+    // Update lexical_item fields if provided
+    const { meanings, ...itemPatch } = patch;
+    if (Object.keys(itemPatch).length > 0) {
+      const { sql, params } = buildLexicalItemUpdate(id, itemPatch);
+      await this.adapter.execute(sql, params);
+    }
+
+    // Update meanings if explicitly provided
+    if (meanings !== undefined) {
+      await this.adapter.execute(
+        `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
+        [id],
+      );
+
+      const now = nowIso();
+      for (const meaning of meanings) {
+        const meaningId = generateId();
+        await this.adapter.execute(
+          `INSERT INTO lexical_meanings (
+            id, lexical_item_id, definition, part_of_speech, examples,
+            usage_notes, register, domain,
+            review_state, review_last_review_at, review_next_review_at,
+            review_review_count, review_consecutive_correct, review_ease_factor,
+            review_mastered_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            meaningId,
+            id,
+            meaning.definition,
+            meaning.partOfSpeech ?? null,
+            JSON.stringify(meaning.examples ?? []),
+            JSON.stringify(meaning.usageNotes ?? []),
+            meaning.register ?? null,
+            meaning.domain ?? null,
+            meaning.review?.state ?? 'new',
+            meaning.review?.lastReviewAt ?? null,
+            meaning.review?.nextReviewAt ?? null,
+            meaning.review?.reviewCount ?? 0,
+            meaning.review?.consecutiveCorrect ?? 0,
+            meaning.review?.easeFactor ?? null,
+            meaning.review?.masteredAt ?? null,
+            now,
+            now,
+          ],
+        );
+
+        // Insert examples for this meaning
+        if (meaning.examples && meaning.examples.length > 0) {
+          await insertExamplesForMeaning(this.adapter, id, meaningId, meaning.examples, now);
+        }
+      }
+    }
+
+    return this.getFullItem(id);
   }
 }

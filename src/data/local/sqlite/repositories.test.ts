@@ -17,9 +17,10 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { SqlJsAdapter } from './SqlJsAdapter';
-import { SQLiteUserProfileRepository, SQLiteConversationRepository, SQLiteMistakeRepository, SQLitePronunciationRepository, SQLiteWeaknessRepository } from './repositories';
-import type { CefrLevelInput, ConversationMode } from '../../../domain/shared/types';
+import { SQLiteUserProfileRepository, SQLiteConversationRepository, SQLiteMistakeRepository, SQLitePronunciationRepository, SQLiteWeaknessRepository, SQLiteVocabularyRepository } from './repositories';
+import type { CefrLevelInput, ConversationMode, ExampleSource } from '../../../domain/shared/types';
 import type { ConversationTurn } from '../../../domain/models/conversation';
+import type { VocabularySource } from '../../../domain/shared/types';
 
 describe('SQLite repositories (sql.js)', () => {
   let adapter: SqlJsAdapter;
@@ -1475,6 +1476,609 @@ describe('SQLite repositories (sql.js)', () => {
       expect(weaknesses[0].referenceId).toBe('ref-newest');
       expect(weaknesses[1].referenceId).toBe('ref-middle');
       expect(weaknesses[2].referenceId).toBe('ref-oldest');
+    });
+  });
+
+  describe('VocabularyRepository (lexical_items + lexical_meanings)', () => {
+    let learnerId: string;
+    let vocabRepo: SQLiteVocabularyRepository;
+
+    beforeEach(async () => {
+      await createProfile();
+      learnerId = await getLearnerId();
+      vocabRepo = new SQLiteVocabularyRepository(adapter);
+    });
+
+    const createSource = (): VocabularySource => ({
+      originConversationId: undefined,
+      originTurnId: undefined,
+      addedBy: 'system',
+      addedAt: new Date().toISOString(),
+    });
+
+    it('basic round-trip: word with one meaning persists and hydrates', async () => {
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'run',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'to move quickly on foot',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+        ],
+        pronunciation: { ipa: '/rʌn/' },
+        synonyms: ['sprint', 'dash'],
+        antonyms: ['walk'],
+        relatedExpressions: [],
+        source: createSource(),
+        tags: ['A1', 'common'],
+      });
+
+      expect(item.id).toBeDefined();
+      expect(item.learnerId).toBe(learnerId);
+      expect(item.headword).toBe('run');
+      expect(item.type).toBe('word');
+      expect(item.pronunciation?.ipa).toBe('/rʌn/');
+      expect(item.synonyms).toEqual(['sprint', 'dash']);
+      expect(item.antonyms).toEqual(['walk']);
+      expect(item.tags).toEqual(['A1', 'common']);
+      expect(item.meanings).toHaveLength(1);
+      expect(item.meanings[0].definition).toBe('to move quickly on foot');
+      expect(item.meanings[0].partOfSpeech).toBe('verb');
+      expect(item.meanings[0].review?.state).toBe('new');
+
+      // Round-trip via get()
+      const retrieved = await vocabRepo.get(item.id);
+      expect(retrieved).not.toBeNull();
+      expect(retrieved!.headword).toBe('run');
+      expect(retrieved!.type).toBe('word');
+      expect(retrieved!.learnerId).toBe(learnerId);
+      expect(retrieved!.meanings).toHaveLength(1);
+      expect(retrieved!.meanings[0].definition).toBe('to move quickly on foot');
+    });
+
+    it('unknown get returns null', async () => {
+      const result = await vocabRepo.get('550e8400-e29b-41d4-a716-446655440000');
+      expect(result).toBeNull();
+    });
+
+    it('learner filtering prevents cross-learner leakage', async () => {
+      // Create another learner
+      const otherAdapter = new SqlJsAdapter(':memory:');
+      await otherAdapter.init();
+      const otherProfileRepo = new SQLiteUserProfileRepository(otherAdapter);
+      await otherProfileRepo.update({
+        displayName: 'Other Learner',
+        targetLanguage: 'en',
+        targetLevel: 'A1',
+        currentLevel: 'A1',
+        learningGoals: [],
+        preferredModes: ['natural'],
+      });
+      const otherLearnerId = (await otherProfileRepo.get()).id;
+      const otherVocabRepo = new SQLiteVocabularyRepository(otherAdapter);
+
+      // Create vocabulary for both learners
+      await vocabRepo.upsert({
+        learnerId,
+        headword: 'my-word',
+        type: 'word',
+        meanings: [{ definition: 'my definition', partOfSpeech: 'noun', examples: [], usageNotes: [], register: 'neutral', domain: 'everyday', review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 } }],
+        source: createSource(),
+        tags: [],
+      });
+
+      await otherVocabRepo.upsert({
+        learnerId: otherLearnerId,
+        headword: 'other-word',
+        type: 'word',
+        meanings: [{ definition: 'other definition', partOfSpeech: 'noun', examples: [], usageNotes: [], register: 'neutral', domain: 'everyday', review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 } }],
+        source: createSource(),
+        tags: [],
+      });
+
+      // Each learner should only see their own vocabulary
+      const myItems = await vocabRepo.list(learnerId);
+      expect(myItems).toHaveLength(1);
+      expect(myItems[0].headword).toBe('my-word');
+
+      const otherItems = await otherVocabRepo.list(otherLearnerId);
+      expect(otherItems).toHaveLength(1);
+      expect(otherItems[0].headword).toBe('other-word');
+    });
+
+    it('partial update preserves omitted fields and meanings', async () => {
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'original',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'meaning 1',
+            partOfSpeech: 'noun',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'learning', reviewCount: 2, consecutiveCorrect: 1 },
+          },
+        ],
+        pronunciation: { ipa: '/ɒrɪdʒɪnəl/' },
+        synonyms: ['first'],
+        antonyms: ['last'],
+        relatedExpressions: [],
+        source: createSource(),
+        tags: ['tag1'],
+      });
+
+      const originalId = item.id;
+      const originalCreatedAt = item.createdAt;
+
+      // Update only headword and tags
+      const updated = await vocabRepo.update(item.id, {
+        headword: 'updated',
+        tags: ['tag1', 'tag2'],
+      });
+
+      expect(updated.id).toBe(originalId);
+      expect(updated.createdAt).toBe(originalCreatedAt);
+      expect(updated.headword).toBe('updated');
+      expect(updated.tags).toEqual(['tag1', 'tag2']);
+      // Unspecified fields preserved
+      expect(updated.type).toBe('word');
+      expect(updated.pronunciation?.ipa).toBe('/ɒrɪdʒɪnəl/');
+      expect(updated.synonyms).toEqual(['first']);
+      expect(updated.antonyms).toEqual(['last']);
+      // Meanings preserved (not lost because omitted from patch)
+      expect(updated.meanings).toHaveLength(1);
+      expect(updated.meanings[0].definition).toBe('meaning 1');
+      expect(updated.meanings[0].review?.state).toBe('learning');
+      expect(updated.meanings[0].review?.reviewCount).toBe(2);
+    });
+
+    it('multiple meanings round-trip: all meanings persist and hydrate', async () => {
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'run',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'to move quickly on foot',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+          {
+            definition: 'to manage or operate a company',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'professional',
+            domain: 'business',
+            review: { state: 'learning', reviewCount: 3, consecutiveCorrect: 2 },
+          },
+          {
+            definition: 'to operate a machine or system',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'professional',
+            domain: 'engineering',
+            review: { state: 'mastered', reviewCount: 10, consecutiveCorrect: 8 },
+          },
+        ],
+        pronunciation: { ipa: '/rʌn/' },
+        synonyms: ['sprint', 'manage', 'operate'],
+        antonyms: ['walk'],
+        relatedExpressions: [],
+        source: createSource(),
+        tags: ['A1', 'polysemous'],
+      });
+
+      expect(item.meanings).toHaveLength(3);
+
+      // Round-trip via get()
+      const retrieved = await vocabRepo.get(item.id);
+      expect(retrieved).not.toBeNull();
+      expect(retrieved!.meanings).toHaveLength(3);
+
+      const definitions = retrieved!.meanings.map(m => m.definition).sort();
+      expect(definitions).toEqual([
+        'to manage or operate a company',
+        'to move quickly on foot',
+        'to operate a machine or system',
+      ].sort());
+    });
+
+    it('independent review state: each meaning retains its own mastery data', async () => {
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'run',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'to move quickly on foot',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'mastered', reviewCount: 15, consecutiveCorrect: 12, nextReviewAt: '2026-12-01T00:00:00.000Z' },
+          },
+          {
+            definition: 'to manage or operate a company',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'professional',
+            domain: 'business',
+            review: { state: 'learning', reviewCount: 3, consecutiveCorrect: 2, nextReviewAt: '2026-09-20T00:00:00.000Z' },
+          },
+          {
+            definition: 'to operate a machine or system',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'professional',
+            domain: 'engineering',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      const retrieved = await vocabRepo.get(item.id);
+      expect(retrieved).not.toBeNull();
+      expect(retrieved!.meanings).toHaveLength(3);
+
+      // Find each meaning by definition and verify independent review state
+      const meaning1 = retrieved!.meanings.find(m => m.definition === 'to move quickly on foot');
+      const meaning2 = retrieved!.meanings.find(m => m.definition === 'to manage or operate a company');
+      const meaning3 = retrieved!.meanings.find(m => m.definition === 'to operate a machine or system');
+
+      expect(meaning1).toBeDefined();
+      expect(meaning1!.review?.state).toBe('mastered');
+      expect(meaning1!.review?.reviewCount).toBe(15);
+      expect(meaning1!.review?.consecutiveCorrect).toBe(12);
+      expect(meaning1!.review?.nextReviewAt).toBe('2026-12-01T00:00:00.000Z');
+
+      expect(meaning2).toBeDefined();
+      expect(meaning2!.review?.state).toBe('learning');
+      expect(meaning2!.review?.reviewCount).toBe(3);
+      expect(meaning2!.review?.consecutiveCorrect).toBe(2);
+      expect(meaning2!.review?.nextReviewAt).toBe('2026-09-20T00:00:00.000Z');
+
+      expect(meaning3).toBeDefined();
+      expect(meaning3!.review?.state).toBe('new');
+      expect(meaning3!.review?.reviewCount).toBe(0);
+      expect(meaning3!.review?.consecutiveCorrect).toBe(0);
+      expect(meaning3!.review?.nextReviewAt).toBeUndefined();
+
+      // Verify VocabularyItem.review is not fabricated
+      expect(retrieved!.review).toBeUndefined();
+    });
+
+    it('meaning update: change one meaning review state without affecting others', async () => {
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'run',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'to move quickly on foot',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'learning', reviewCount: 5, consecutiveCorrect: 3 },
+          },
+          {
+            definition: 'to manage or operate a company',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'professional',
+            domain: 'business',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      // Update only the first meaning's review state
+      const updated = await vocabRepo.update(item.id, {
+        meanings: [
+          {
+            definition: 'to move quickly on foot',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'mastered', reviewCount: 20, consecutiveCorrect: 18 },
+          },
+          {
+            definition: 'to manage or operate a company',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'professional',
+            domain: 'business',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+        ],
+      });
+
+      expect(updated.meanings).toHaveLength(2);
+
+      const meaning1 = updated.meanings.find(m => m.definition === 'to move quickly on foot');
+      const meaning2 = updated.meanings.find(m => m.definition === 'to manage or operate a company');
+
+      expect(meaning1).toBeDefined();
+      expect(meaning1!.review?.state).toBe('mastered');
+      expect(meaning1!.review?.reviewCount).toBe(20);
+      expect(meaning1!.review?.consecutiveCorrect).toBe(18);
+
+      expect(meaning2).toBeDefined();
+      expect(meaning2!.review?.state).toBe('new');
+      expect(meaning2!.review?.reviewCount).toBe(0);
+
+      // Lexical item not duplicated
+      const allItems = await vocabRepo.list(learnerId);
+      const runItems = allItems.filter(i => i.headword === 'run' && i.type === 'word');
+      expect(runItems).toHaveLength(1);
+    });
+
+    it('empty meanings: item with zero meanings round-trips safely', async () => {
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'placeholder',
+        type: 'word',
+        meanings: [],
+        source: createSource(),
+        tags: ['empty'],
+      });
+
+      expect(item.meanings).toHaveLength(0);
+
+      const retrieved = await vocabRepo.get(item.id);
+      expect(retrieved).not.toBeNull();
+      expect(retrieved!.meanings).toHaveLength(0);
+      expect(retrieved!.headword).toBe('placeholder');
+    });
+
+    it('one meaning with one example round-trips', async () => {
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'run',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'to move quickly on foot',
+            partOfSpeech: 'verb',
+            examples: [
+              {
+                text: 'I run every morning.',
+                translation: 'Corro ogni mattina.',
+                context: 'daily routine',
+                source: 'original-conversation',
+                originConversationId: 'conv-1',
+                originTurnId: 'turn-1',
+              },
+            ],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      const retrieved = await vocabRepo.get(item.id);
+      expect(retrieved).not.toBeNull();
+      expect(retrieved!.meanings).toHaveLength(1);
+      expect(retrieved!.meanings[0].examples).toHaveLength(1);
+      const example = retrieved!.meanings[0].examples[0];
+      expect(example.text).toBe('I run every morning.');
+      expect(example.translation).toBe('Corro ogni mattina.');
+      expect(example.context).toBe('daily routine');
+      expect(example.source).toBe('original-conversation');
+      expect(example.originConversationId).toBe('conv-1');
+      expect(example.originTurnId).toBe('turn-1');
+    });
+
+    it('two meanings keep their examples correctly separated', async () => {
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'run',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'to move quickly on foot',
+            partOfSpeech: 'verb',
+            examples: [
+              { text: 'He runs fast.', source: 'original-conversation' },
+            ],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+          {
+            definition: 'to manage a business',
+            partOfSpeech: 'verb',
+            examples: [
+              { text: 'She runs a company.', source: 'ai-generated' },
+            ],
+            usageNotes: [],
+            register: 'professional',
+            domain: 'business',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      const retrieved = await vocabRepo.get(item.id);
+      expect(retrieved).not.toBeNull();
+      expect(retrieved!.meanings).toHaveLength(2);
+
+      const meaning1 = retrieved!.meanings.find(m => m.definition === 'to move quickly on foot');
+      const meaning2 = retrieved!.meanings.find(m => m.definition === 'to manage a business');
+
+      expect(meaning1).toBeDefined();
+      expect(meaning1!.examples).toHaveLength(1);
+      expect(meaning1!.examples[0].text).toBe('He runs fast.');
+      expect(meaning1!.examples[0].source).toBe('original-conversation');
+
+      expect(meaning2).toBeDefined();
+      expect(meaning2!.examples).toHaveLength(1);
+      expect(meaning2!.examples[0].text).toBe('She runs a company.');
+      expect(meaning2!.examples[0].source).toBe('ai-generated');
+
+      // Examples must not leak between meanings
+      expect(meaning1!.examples[0].text).not.toBe('She runs a company.');
+      expect(meaning2!.examples[0].text).not.toBe('He runs fast.');
+    });
+
+    it('source values such as learner-created and ai-generated survive round-trip', async () => {
+      const sources: ExampleSource[] = ['learner-created', 'ai-generated', 'curated', 'lesson', 'manual'];
+
+      for (const source of sources) {
+        const item = await vocabRepo.upsert({
+          learnerId,
+          headword: `test-${source}`,
+          type: 'word',
+          meanings: [
+            {
+              definition: 'test definition',
+              partOfSpeech: 'noun',
+              examples: [
+                { text: `Example for ${source}`, source },
+              ],
+              usageNotes: [],
+              register: 'neutral',
+              domain: 'everyday',
+              review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+            },
+          ],
+          source: createSource(),
+          tags: [],
+        });
+
+        const retrieved = await vocabRepo.get(item.id);
+        expect(retrieved).not.toBeNull();
+        expect(retrieved!.meanings[0].examples[0].source).toBe(source);
+      }
+    });
+
+    it('optional translation/context/origin fields survive round-trip', async () => {
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'test',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'test definition',
+            partOfSpeech: 'noun',
+            examples: [
+              {
+                text: 'Full example with all fields.',
+                translation: 'Traduzione completa.',
+                context: 'formal writing',
+                source: 'curated',
+                originConversationId: 'conv-123',
+                originTurnId: 'turn-456',
+              },
+            ],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      const retrieved = await vocabRepo.get(item.id);
+      expect(retrieved).not.toBeNull();
+      const example = retrieved!.meanings[0].examples[0];
+      expect(example.text).toBe('Full example with all fields.');
+      expect(example.translation).toBe('Traduzione completa.');
+      expect(example.context).toBe('formal writing');
+      expect(example.source).toBe('curated');
+      expect(example.originConversationId).toBe('conv-123');
+      expect(example.originTurnId).toBe('turn-456');
+    });
+
+    it('repeated upsert does not duplicate the same persisted examples', async () => {
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'run',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'to move quickly on foot',
+            partOfSpeech: 'verb',
+            examples: [
+              { text: 'I run daily.', source: 'original-conversation' },
+            ],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      // Upsert again with same data
+      const item2 = await vocabRepo.upsert({
+        learnerId,
+        headword: 'run',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'to move quickly on foot',
+            partOfSpeech: 'verb',
+            examples: [
+              { text: 'I run daily.', source: 'original-conversation' },
+            ],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'new', reviewCount: 0, consecutiveCorrect: 0 },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      // Should be the same item (no duplicate lexical_items)
+      expect(item2.id).toBe(item.id);
+
+      // Examples should not be duplicated
+      const retrieved = await vocabRepo.get(item.id);
+      expect(retrieved).not.toBeNull();
+      expect(retrieved!.meanings[0].examples).toHaveLength(1);
+      expect(retrieved!.meanings[0].examples[0].text).toBe('I run daily.');
     });
   });
 });

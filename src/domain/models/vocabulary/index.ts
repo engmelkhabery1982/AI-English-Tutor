@@ -29,14 +29,14 @@ export interface VocabularyItem {
   readonly id: Uuid;
   readonly learnerId: Uuid;
   readonly headword: string; // e.g. "run"
-  readonly type: 'word' | 'phrase' | 'phrasal-verb' | 'idiom' | 'expression' | 'collocation';
+  readonly type: 'word' | 'phrase' | 'phrasal_verb' | 'idiom' | 'common_expression' | 'collocation' | 'linking_expression' | 'professional_expression';
   readonly meanings: readonly Meaning[];
   readonly pronunciation?: PronunciationMetadata;
   readonly synonyms?: readonly string[];
   readonly antonyms?: readonly string[];
   readonly relatedExpressions?: readonly Uuid[]; // links to other VocabularyItem ids
   /** Convenience aggregate. Per-meaning review is authoritative. */
-  readonly review: ReviewSchedule;
+  readonly review?: ReviewSchedule;
   readonly source: VocabularySource;
   readonly tags?: readonly string[]; // e.g. "business", "travel", "A2"
   readonly createdAt: IsoDate;
@@ -48,14 +48,14 @@ export interface ExpressionItem {
   readonly id: Uuid;
   readonly learnerId: Uuid;
   readonly expression: string; // e.g. "hit the nail on the head"
-  readonly type: 'idiom' | 'collocation' | 'everyday-phrase' | 'professional-phrase' | 'linking-expression' | 'phrasal-verb';
+  readonly type: 'idiom' | 'collocation' | 'common_expression' | 'professional_expression' | 'linking_expression' | 'phrasal_verb';
   readonly meanings: readonly Meaning[];
   readonly pronunciation?: PronunciationMetadata;
   readonly naturalAlternatives?: readonly string[]; // textbook alternatives
   readonly register?: 'formal' | 'informal' | 'neutral' | 'professional';
   readonly domain?: string;
   /** Convenience aggregate. Per-meaning review is authoritative. */
-  readonly review: ReviewSchedule;
+  readonly review?: ReviewSchedule;
   readonly source: VocabularySource;
   readonly tags?: readonly string[];
   readonly createdAt: IsoDate;
