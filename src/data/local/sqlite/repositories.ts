@@ -54,6 +54,16 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/** Generate a timestamp strictly greater than the given previous timestamp. */
+function generateMonotonicTimestamp(previous: string): string {
+  const prev = new Date(previous).getTime();
+  const now = Date.now();
+  if (now <= prev) {
+    return new Date(prev + 1).toISOString();
+  }
+  return new Date(now).toISOString();
+}
+
 /** Safely parse JSON, returning default on failure. */
 function safeJsonParse<T>(value: unknown, fallback: T): T {
   if (typeof value !== 'string') return fallback;
@@ -606,51 +616,6 @@ function buildGrammarMistakeUpdate(
   return { sql, params };
 }
 
-/** Build partial UPDATE SQL and params for a pronunciation weakness. */
-function buildPronunciationWeaknessUpdate(
-  id: string,
-  patch: Partial<Omit<PronunciationWeakness, 'id' | 'createdAt'>>,
-): { sql: string; params: SqlParam[] } {
-  const fields: string[] = [];
-  const params: SqlParam[] = [];
-
-  const fieldMap: Record<string, string> = {
-    learnerId: 'learner_id',
-    targetSound: 'target_sound',
-    wordExamples: 'word_examples',
-    occurrenceCount: 'occurrence_count',
-    lastSeenAt: 'last_seen_at',
-    firstSeenAt: 'first_seen_at',
-    contexts: 'contexts',
-    exampleTurnIds: 'example_turn_ids',
-    originSessionId: 'origin_session_id',
-    originTurnId: 'origin_turn_id',
-    resolved: 'resolved',
-    notes: 'notes',
-  };
-
-  for (const [key, column] of Object.entries(fieldMap)) {
-    const value = patch[key as keyof typeof patch];
-    if (value !== undefined) {
-      fields.push(`${column} = ?`);
-      if (key === 'wordExamples' || key === 'contexts' || key === 'exampleTurnIds') {
-        params.push(JSON.stringify(value));
-      } else if (key === 'resolved') {
-        params.push(value ? 1 : 0);
-      } else {
-        params.push(value as SqlParam);
-      }
-    }
-  }
-
-  fields.push('updated_at = ?');
-  params.push(nowIso());
-  params.push(id);
-
-  const sql = `UPDATE pronunciation_weaknesses SET ${fields.join(', ')} WHERE id = ?`;
-  return { sql, params };
-}
-
 /** Build partial UPDATE SQL and params for a learner weakness. */
 function buildLearnerWeaknessUpdate(
   id: string,
@@ -974,8 +939,13 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
       throw new Error(`Pronunciation weakness not found: ${id}`);
     }
 
-    const { sql, params } = buildPronunciationWeaknessUpdate(id, { resolved });
-    await this.adapter.execute(sql, params);
+    const previousUpdatedAt = existing[0].updated_at as string;
+    const newUpdatedAt = generateMonotonicTimestamp(previousUpdatedAt);
+
+    await this.adapter.execute(
+      `UPDATE pronunciation_weaknesses SET resolved = ?, updated_at = ? WHERE id = ?`,
+      [resolved ? 1 : 0, newUpdatedAt, id],
+    );
 
     const rows = await this.adapter.query(
       `SELECT * FROM pronunciation_weaknesses WHERE id = ?`,
