@@ -1790,12 +1790,20 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
 
   async list(
     learnerId: string,
-    opts?: { state?: string; limit?: number },
+    opts?: { state?: string; limit?: number; types?: readonly VocabularyItem['type'][] },
   ): Promise<readonly VocabularyItem[]> {
     if (!isValidUuid(learnerId)) return [];
 
     let sql = `SELECT * FROM lexical_items WHERE learner_id = ?`;
     const params: SqlParam[] = [learnerId];
+
+    // Optional type filter (e.g. vocabulary dashboard reads only word/phrase
+    // rows; expression rows live in the same table under different types).
+    if (opts?.types !== undefined && opts.types.length > 0) {
+      const placeholders = opts.types.map(() => '?').join(', ');
+      sql += ` AND type IN (${placeholders})`;
+      params.push(...opts.types);
+    }
 
     // Note: state filter would require joining with lexical_meanings
     // For now, we don't implement state filter as it requires item-level review aggregate

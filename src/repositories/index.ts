@@ -76,7 +76,7 @@ export interface WeaknessRepository {
 export interface VocabularyRepository {
   upsert(item: Omit<VocabularyItem, 'id' | 'createdAt' | 'updatedAt'>): Promise<VocabularyItem>;
   get(id: string): Promise<VocabularyItem | null>;
-  list(learnerId: string, opts?: { state?: string; limit?: number }): Promise<readonly VocabularyItem[]>;
+  list(learnerId: string, opts?: { state?: string; limit?: number; types?: readonly VocabularyItem['type'][] }): Promise<readonly VocabularyItem[]>;
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly VocabularyItem[]>;
   update(id: string, patch: Partial<Omit<VocabularyItem, 'id' | 'createdAt'>>): Promise<VocabularyItem>;
   /**
@@ -111,6 +111,11 @@ export interface ReviewRepository {
   upsert?(
     item: Omit<ReviewItem, 'id' | 'createdAt'> & { id?: string },
   ): Promise<ReviewItem>;
+  /**
+   * List review items for a learner, due-first. Read helper for
+   * dashboards; optional — backends may omit it.
+   */
+  list?(learnerId: string, limit?: number): Promise<readonly ReviewItem[]>;
   /**
    * Delete review rows that point at a given domain object, restricted to
    * one item kind. Used e.g. when removing a vocabulary item: its pending
