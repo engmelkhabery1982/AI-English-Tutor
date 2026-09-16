@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   createDemoLearnerModel,
   createTalkDemoSession,
+  createTalkSession,
 } from './index';
 
-describe('Talk Demo Stack Integration', () => {
+describe('Talk Demo & Composition Stack', () => {
   describe('DemoLearnerModel', () => {
     it('provides deterministic profile and coaching context', async () => {
       const model = createDemoLearnerModel();
@@ -39,8 +40,117 @@ describe('Talk Demo Stack Integration', () => {
     });
   });
 
+  describe('createTalkSession provider selection', () => {
+    it('selects Demo provider when no API key is provided', () => {
+      const originalEnv = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+      delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+
+      const bundle = createTalkSession({ mode: 'natural' });
+      expect(bundle.providerKind).toBe('demo');
+      expect(typeof bundle.session.send).toBe('function');
+
+      if (originalEnv !== undefined) {
+        process.env.EXPO_PUBLIC_GEMINI_API_KEY = originalEnv;
+      }
+    });
+
+    it('selects Gemini provider when API key is provided', () => {
+      const bundle = createTalkSession(
+        { mode: 'coach', topic: 'Travel' },
+        { apiKey: 'explicit-test-api-key' }
+      );
+      expect(bundle.providerKind).toBe('gemini');
+      expect(typeof bundle.session.send).toBe('function');
+      expect(bundle.session.getConfig().mode).toBe('coach');
+      expect(bundle.session.getConfig().topic).toBe('Travel');
+    });
+
+    it('executes end-to-end multi-turn session with mocked Gemini provider', async () => {
+      const mockCalls: { url: string; body: Record<string, unknown> }[] = [];
+
+      const mockFetch: typeof fetch = vi.fn(async (input, init) => {
+        const body = JSON.parse((init?.body as string) || '{}');
+        mockCalls.push({ url: input.toString(), body });
+
+        const isSecondTurn = mockCalls.length === 2;
+        const textReply = isSecondTurn
+          ? 'Traveling is wonderful! Where did you go on your last trip?'
+          : 'Hello! I am ready to help you with English.';
+
+        return new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [{ text: textReply }],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: {
+              promptTokenCount: 20,
+              candidatesTokenCount: 15,
+              totalTokenCount: 35,
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      });
+
+      const bundle = createTalkSession(
+        { mode: 'natural', topic: 'Vacation' },
+        { apiKey: 'mock-gemini-key', fetchImpl: mockFetch }
+      );
+
+      expect(bundle.providerKind).toBe('gemini');
+
+      // Turn 1
+      const turn1Result = await bundle.session.send({ userMessage: 'Hello Gemini!' });
+      expect(turn1Result.ok).toBe(true);
+      if (turn1Result.ok) {
+        expect(turn1Result.response.content).toBe(
+          'Hello! I am ready to help you with English.'
+        );
+        expect(turn1Result.history).toHaveLength(2);
+      }
+
+      expect(mockCalls).toHaveLength(1);
+      const firstCallContents = mockCalls[0].body.contents as {
+        role: string;
+        parts: { text: string }[];
+      }[];
+      expect(firstCallContents).toEqual([
+        { role: 'user', parts: [{ text: 'Hello Gemini!' }] },
+      ]);
+
+      // Turn 2
+      const turn2Result = await bundle.session.send({
+        userMessage: 'I love traveling in summer.',
+      });
+      expect(turn2Result.ok).toBe(true);
+      if (turn2Result.ok) {
+        expect(turn2Result.response.content).toContain('Where did you go on your last trip?');
+        expect(turn2Result.history).toHaveLength(4);
+      }
+
+      expect(mockCalls).toHaveLength(2);
+      const secondCallContents = mockCalls[1].body.contents as {
+        role: string;
+        parts: { text: string }[];
+      }[];
+      expect(secondCallContents).toEqual([
+        { role: 'user', parts: [{ text: 'Hello Gemini!' }] },
+        {
+          role: 'model',
+          parts: [{ text: 'Hello! I am ready to help you with English.' }],
+        },
+        { role: 'user', parts: [{ text: 'I love traveling in summer.' }] },
+      ]);
+    });
+  });
+
   describe('createTalkDemoSession', () => {
-    it('creates an end-to-end working ConversationSession', async () => {
+    it('creates an end-to-end working ConversationSession with demo provider', async () => {
       const session = createTalkDemoSession({
         mode: 'natural',
         topic: 'Travel',
