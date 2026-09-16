@@ -10,6 +10,7 @@ import type {
   AIProvider,
   AIProviderErrorCode,
   AIProviderResult,
+  AIStreamCallback,
   AIUsage,
   ConversationRequest,
 } from '../types';
@@ -19,6 +20,7 @@ import {
   createAIProviderResponse,
   createAIProviderSuccess,
 } from '../index';
+import { FeedbackStreamFilter, parseFeedbackAndContent } from '../feedback';
 import {
   DEFAULT_GEMINI_MODEL,
   DEFAULT_GEMINI_TIMEOUT_MS,
@@ -167,11 +169,11 @@ class GeminiAIProvider implements AIProvider {
 
       // Extract parts text
       const parts = candidate.content?.parts;
-      const text = Array.isArray(parts)
+      const rawText = Array.isArray(parts)
         ? parts.map((p: { text?: string }) => p.text || '').join('')
         : '';
 
-      if (!text || text.trim().length === 0) {
+      if (!rawText || rawText.trim().length === 0) {
         return createAIProviderFailure(
           createAIProviderError(
             'unknown',
@@ -199,9 +201,220 @@ class GeminiAIProvider implements AIProvider {
         }
       }
 
-      const aiResponse = createAIProviderResponse(text, {
+      const parsedOutput = parseFeedbackAndContent(rawText);
+
+      const aiResponse = createAIProviderResponse(parsedOutput.content, {
+        feedback: parsedOutput.feedback,
+        rawText: parsedOutput.rawText,
         finishReason,
         usage,
+      });
+
+      return createAIProviderSuccess(aiResponse);
+    } catch (err: unknown) {
+      return this.handleNetworkException(err);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  async generateStream(
+    request: ConversationRequest,
+    onChunk: AIStreamCallback
+  ): Promise<AIProviderResult> {
+    if (!request || !Array.isArray(request.messages) || request.messages.length === 0) {
+      return createAIProviderFailure(
+        createAIProviderError(
+          'invalid_request',
+          'Gemini provider requires a valid ConversationRequest with non-empty messages.',
+          false
+        )
+      );
+    }
+
+    const url = `${this.endpointBaseUrl}/models/${encodeURIComponent(this.model)}:streamGenerateContent?alt=sse`;
+
+    const contents = request.messages.map((turn) => ({
+      role: turn.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: turn.content }],
+    }));
+
+    const bodyPayload: Record<string, unknown> = {
+      contents,
+      generationConfig: {
+        maxOutputTokens: 1000,
+      },
+    };
+
+    if (request.systemPrompt && request.systemPrompt.trim().length > 0) {
+      bodyPayload.systemInstruction = {
+        parts: [{ text: request.systemPrompt }],
+      };
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, this.timeoutMs);
+
+    const filter = new FeedbackStreamFilter(onChunk);
+    let lastFinishReason: AIFinishReason | undefined;
+    let lastUsage: AIUsage | undefined;
+
+    try {
+      const response = await this.fetchImpl(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': this.apiKey,
+          Accept: 'text/event-stream, application/json',
+        },
+        body: JSON.stringify(bodyPayload),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        return this.handleHttpError(response.status, await this.safeReadText(response));
+      }
+
+      // Check if response has readable stream body
+      const body = response.body;
+      if (body && typeof (body as { getReader?: unknown }).getReader === 'function') {
+        const reader = (body as ReadableStream<Uint8Array>).getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const rawLine of lines) {
+            const line = rawLine.trim();
+            if (line.startsWith('data:')) {
+              const jsonStr = line.slice(5).trim();
+              if (jsonStr) {
+                try {
+                  const parsed = JSON.parse(jsonStr);
+                  const candidate = parsed.candidates?.[0];
+                  if (candidate) {
+                    if (candidate.finishReason) {
+                      lastFinishReason = mapFinishReason(candidate.finishReason);
+                    }
+                    const parts = candidate.content?.parts;
+                    if (Array.isArray(parts)) {
+                      for (const part of parts) {
+                        if (typeof part.text === 'string' && part.text.length > 0) {
+                          filter.push(part.text);
+                        }
+                      }
+                    }
+                  }
+                  if (parsed.usageMetadata) {
+                    const u = parsed.usageMetadata;
+                    lastUsage = {
+                      ...(typeof u.promptTokenCount === 'number' && { inputTokens: u.promptTokenCount }),
+                      ...(typeof u.candidatesTokenCount === 'number' && { outputTokens: u.candidatesTokenCount }),
+                      ...(typeof u.totalTokenCount === 'number' && { totalTokens: u.totalTokenCount }),
+                    };
+                  }
+                } catch {
+                  // Ignore JSON parse error on partial chunks
+                }
+              }
+            }
+          }
+        }
+
+        if (buffer.trim().length > 0) {
+          const line = buffer.trim();
+          if (line.startsWith('data:')) {
+            const jsonStr = line.slice(5).trim();
+            if (jsonStr) {
+              try {
+                const parsed = JSON.parse(jsonStr);
+                const candidate = parsed.candidates?.[0];
+                if (candidate?.content?.parts && Array.isArray(candidate.content.parts)) {
+                  for (const part of candidate.content.parts) {
+                    if (part.text) filter.push(part.text);
+                  }
+                }
+              } catch {
+                // Ignore trailing parse error
+              }
+            }
+          }
+        }
+      } else {
+        // Fallback for non-stream / mock environments
+        const fullText = await this.safeReadText(response);
+        if (fullText.startsWith('[') || fullText.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(fullText);
+            const arrayPayload = Array.isArray(parsed) ? parsed : [parsed];
+            for (const item of arrayPayload) {
+              const candidate = item.candidates?.[0];
+              if (candidate) {
+                if (candidate.finishReason) {
+                  lastFinishReason = mapFinishReason(candidate.finishReason);
+                }
+                const parts = candidate.content?.parts;
+                if (Array.isArray(parts)) {
+                  for (const part of parts) {
+                    if (typeof part.text === 'string') {
+                      filter.push(part.text);
+                    }
+                  }
+                }
+              }
+            }
+          } catch {
+            filter.push(fullText);
+          }
+        } else {
+          // Plain text lines or SSE text fallback
+          const lines = fullText.split('\n');
+          for (const rawLine of lines) {
+            const line = rawLine.trim();
+            if (line.startsWith('data:')) {
+              const jsonStr = line.slice(5).trim();
+              if (jsonStr) {
+                try {
+                  const parsed = JSON.parse(jsonStr);
+                  const candidate = parsed.candidates?.[0];
+                  if (candidate?.content?.parts && Array.isArray(candidate.content.parts)) {
+                    for (const part of candidate.content.parts) {
+                      if (part.text) filter.push(part.text);
+                    }
+                  }
+                } catch {
+                  // ignore
+                }
+              }
+            }
+          }
+        }
+      }
+
+      const parsedOutput = filter.finish();
+
+      if (!parsedOutput.content && !parsedOutput.rawText) {
+        return createAIProviderFailure(
+          createAIProviderError(
+            'unknown',
+            'Gemini candidate contains no text content.',
+            false
+          )
+        );
+      }
+
+      const aiResponse = createAIProviderResponse(parsedOutput.content, {
+        feedback: parsedOutput.feedback,
+        rawText: parsedOutput.rawText,
+        finishReason: lastFinishReason || 'completed',
+        usage: lastUsage,
       });
 
       return createAIProviderSuccess(aiResponse);

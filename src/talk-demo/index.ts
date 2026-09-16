@@ -29,6 +29,12 @@ export type {
   ConversationTurn,
 };
 
+export type {
+  ConversationFeedback,
+  ConversationFeedbackCorrection,
+  ConversationFeedbackVocabulary,
+} from '../providers/ai';
+
 export type TalkProviderKind = 'gemini' | 'demo';
 
 export interface TalkSessionBundle {

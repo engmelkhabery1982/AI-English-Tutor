@@ -12,6 +12,8 @@ import {
 } from 'react-native';
 import {
   createTalkSession,
+  type ConversationFeedback,
+  type ConversationFeedbackVocabulary,
   type ConversationMode,
   type ConversationSession,
   type ConversationTurn,
@@ -30,6 +32,9 @@ export default function TalkScreen() {
   const [inputText, setInputText] = useState<string>('');
   const [history, setHistory] = useState<readonly ConversationTurn[]>([]);
   const [isSending, setIsSending] = useState<boolean>(false);
+  const [streamingText, setStreamingText] = useState<string | null>(null);
+  const [lastFeedback, setLastFeedback] = useState<ConversationFeedback | null>(null);
+  const [savedWords, setSavedWords] = useState<Record<string, boolean>>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [providerKind, setProviderKind] = useState<TalkProviderKind>('demo');
 
@@ -76,6 +81,9 @@ export default function TalkScreen() {
       sessionRef.current = bundle.session;
       setProviderKind(bundle.providerKind);
       setHistory([]);
+      setLastFeedback(null);
+      setSavedWords({});
+      setStreamingText(null);
       setErrorMessage(null);
     }
   };
@@ -89,11 +97,21 @@ export default function TalkScreen() {
     sessionRef.current = bundle.session;
     setProviderKind(bundle.providerKind);
     setHistory([]);
+    setLastFeedback(null);
+    setSavedWords({});
+    setStreamingText(null);
     setInputText('');
     setErrorMessage(null);
   };
 
-  // Handle send message
+  // Handle save vocabulary item
+  const handleSaveVocabulary = async (vocab: ConversationFeedbackVocabulary) => {
+    if (!sessionRef.current || !vocab.headword) return;
+    await sessionRef.current.saveVocabularyItem(vocab);
+    setSavedWords((prev) => ({ ...prev, [vocab.headword.toLowerCase()]: true }));
+  };
+
+  // Handle send message with streaming
   const handleSendMessage = async () => {
     const trimmedMessage = inputText.trim();
     if (!trimmedMessage || isSending) {
@@ -103,12 +121,23 @@ export default function TalkScreen() {
     setIsSending(true);
     setErrorMessage(null);
     setInputText('');
+    setStreamingText('');
+
+    // Optimistically add user message to history
+    const userTurn: ConversationTurn = { role: 'user', content: trimmedMessage };
+    setHistory((prev) => [...prev, userTurn]);
 
     try {
       const session = getOrCreateSession(mode, topic);
-      const result = await session.send({ userMessage: trimmedMessage });
+      const result = await session.send(
+        { userMessage: trimmedMessage },
+        (chunk: string) => {
+          setStreamingText((prev) => (prev ?? '') + chunk);
+        }
+      );
 
       setHistory(session.getHistory());
+      setLastFeedback(session.getLastFeedback());
 
       if (!result.ok) {
         setErrorMessage(
@@ -121,6 +150,7 @@ export default function TalkScreen() {
       setErrorMessage(message);
     } finally {
       setIsSending(false);
+      setStreamingText(null);
     }
   };
 
@@ -235,44 +265,166 @@ export default function TalkScreen() {
         ) : (
           history.map((turn, index) => {
             const isUser = turn.role === 'user';
+            const isLastTurn = index === history.length - 1;
+            const isLastAssistant = !isUser && isLastTurn;
+
             return (
-              <View
-                key={`${index}-${turn.role}`}
-                style={[
-                  styles.messageWrapper,
-                  isUser ? styles.userMessageWrapper : styles.assistantMessageWrapper,
-                ]}
-              >
-                <Text style={styles.roleLabel}>
-                  {isUser ? 'You' : isGemini ? 'Gemini Tutor' : 'AI Tutor (Demo)'}
-                </Text>
+              <View key={`${index}-${turn.role}`} style={styles.turnContainer}>
                 <View
                   style={[
-                    styles.bubble,
-                    isUser ? styles.userBubble : styles.assistantBubble,
+                    styles.messageWrapper,
+                    isUser ? styles.userMessageWrapper : styles.assistantMessageWrapper,
                   ]}
                 >
-                  <Text
+                  <Text style={styles.roleLabel}>
+                    {isUser ? 'You' : isGemini ? 'Gemini Tutor' : 'AI Tutor (Demo)'}
+                  </Text>
+                  <View
                     style={[
-                      styles.messageText,
-                      isUser ? styles.userMessageText : styles.assistantMessageText,
+                      styles.bubble,
+                      isUser ? styles.userBubble : styles.assistantBubble,
                     ]}
                   >
-                    {turn.content}
-                  </Text>
+                    <Text
+                      style={[
+                        styles.messageText,
+                        isUser ? styles.userMessageText : styles.assistantMessageText,
+                      ]}
+                    >
+                      {turn.content}
+                    </Text>
+                  </View>
                 </View>
+
+                {/* Feedback Panel (rendered under the latest assistant response) */}
+                {isLastAssistant && lastFeedback && (
+                  <View style={styles.feedbackContainer}>
+                    {/* Correction Card */}
+                    {lastFeedback.correction && (
+                      <View style={styles.feedbackCard}>
+                        <View style={styles.feedbackCardHeader}>
+                          <Text style={styles.feedbackCardTitle}>Grammar & Phrasing</Text>
+                          <View
+                            style={[
+                              styles.severityPill,
+                              lastFeedback.correction.severity === 'incorrect'
+                                ? styles.severityPillIncorrect
+                                : styles.severityPillMinor,
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                styles.severityPillText,
+                                lastFeedback.correction.severity === 'incorrect'
+                                  ? styles.severityPillTextIncorrect
+                                  : styles.severityPillTextMinor,
+                              ]}
+                            >
+                              {lastFeedback.correction.severity}
+                            </Text>
+                          </View>
+                        </View>
+                        <Text style={styles.feedbackOriginalText}>
+                          "{lastFeedback.correction.original}"
+                        </Text>
+                        <Text style={styles.feedbackImprovedText}>
+                          → {lastFeedback.correction.improved}
+                        </Text>
+                        <Text style={styles.feedbackExplanationText}>
+                          {lastFeedback.correction.explanation}
+                        </Text>
+                      </View>
+                    )}
+
+                    {/* Vocabulary Card */}
+                    {lastFeedback.vocabulary && (
+                      <View style={styles.feedbackCard}>
+                        <View style={styles.feedbackCardHeader}>
+                          <View style={styles.vocabHeaderLeft}>
+                            <Text style={styles.feedbackCardTitle}>Key Vocabulary</Text>
+                            <View style={styles.categoryPill}>
+                              <Text style={styles.categoryPillText}>
+                                {lastFeedback.vocabulary.type.replace(/_/g, ' ')}
+                              </Text>
+                            </View>
+                          </View>
+                          <TouchableOpacity
+                            style={[
+                              styles.saveVocabButton,
+                              savedWords[lastFeedback.vocabulary.headword.toLowerCase()] &&
+                                styles.saveVocabButtonSaved,
+                            ]}
+                            onPress={() =>
+                              lastFeedback.vocabulary &&
+                              handleSaveVocabulary(lastFeedback.vocabulary)
+                            }
+                            accessibilityRole="button"
+                          >
+                            <Text
+                              style={[
+                                styles.saveVocabButtonText,
+                                savedWords[lastFeedback.vocabulary.headword.toLowerCase()] &&
+                                  styles.saveVocabButtonTextSaved,
+                              ]}
+                            >
+                              {savedWords[lastFeedback.vocabulary.headword.toLowerCase()]
+                                ? '✓ Saved'
+                                : '+ Save Word'}
+                            </Text>
+                          </TouchableOpacity>
+                        </View>
+                        <Text style={styles.vocabHeadword}>
+                          {lastFeedback.vocabulary.headword}
+                        </Text>
+                        <Text style={styles.vocabMeaning}>
+                          {lastFeedback.vocabulary.meaning}
+                        </Text>
+                        {lastFeedback.vocabulary.example ? (
+                          <Text style={styles.vocabExample}>
+                            "{lastFeedback.vocabulary.example}"
+                          </Text>
+                        ) : null}
+                      </View>
+                    )}
+
+                    {/* Coaching Note */}
+                    {lastFeedback.coachingNote && (
+                      <View style={styles.coachingNoteCard}>
+                        <Text style={styles.coachingNoteLabel}>Tutor Tip</Text>
+                        <Text style={styles.coachingNoteText}>
+                          {lastFeedback.coachingNote}
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+                )}
               </View>
             );
           })
         )}
 
-        {/* Loading Indicator */}
+        {/* In-flight streaming message bubble */}
         {isSending && (
-          <View style={styles.loadingContainer}>
-            <ActivityIndicator size="small" color="#2563EB" />
-            <Text style={styles.loadingText}>
-              {isGemini ? 'Gemini is thinking...' : 'Tutor is typing...'}
-            </Text>
+          <View style={styles.turnContainer}>
+            <View style={[styles.messageWrapper, styles.assistantMessageWrapper]}>
+              <Text style={styles.roleLabel}>
+                {isGemini ? 'Gemini Tutor' : 'AI Tutor (Demo)'}
+              </Text>
+              <View style={[styles.bubble, styles.assistantBubble]}>
+                {streamingText && streamingText.length > 0 ? (
+                  <Text style={[styles.messageText, styles.assistantMessageText]}>
+                    {streamingText}
+                  </Text>
+                ) : (
+                  <View style={styles.loadingContainer}>
+                    <ActivityIndicator size="small" color="#2563EB" />
+                    <Text style={styles.loadingText}>
+                      {isGemini ? 'Gemini is thinking...' : 'Tutor is typing...'}
+                    </Text>
+                  </View>
+                )}
+              </View>
+            </View>
           </View>
         )}
 
@@ -482,9 +634,13 @@ const styles = StyleSheet.create({
     color: '#2563EB',
     fontWeight: '500',
   },
+  turnContainer: {
+    marginBottom: 8,
+    width: '100%',
+  },
   messageWrapper: {
     marginBottom: 4,
-    maxWidth: '82%',
+    maxWidth: '85%',
   },
   userMessageWrapper: {
     alignSelf: 'flex-end',
@@ -525,17 +681,146 @@ const styles = StyleSheet.create({
   assistantMessageText: {
     color: '#1F2937',
   },
+  feedbackContainer: {
+    marginTop: 8,
+    gap: 8,
+    width: '100%',
+  },
+  feedbackCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    padding: 12,
+  },
+  feedbackCardHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  feedbackCardTitle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#374151',
+  },
+  severityPill: {
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 12,
+  },
+  severityPillIncorrect: {
+    backgroundColor: '#FEE2E2',
+  },
+  severityPillMinor: {
+    backgroundColor: '#FEF3C7',
+  },
+  severityPillText: {
+    fontSize: 11,
+    fontWeight: '600',
+    textTransform: 'capitalize',
+  },
+  severityPillTextIncorrect: {
+    color: '#DC2626',
+  },
+  severityPillTextMinor: {
+    color: '#D97706',
+  },
+  feedbackOriginalText: {
+    fontSize: 13,
+    color: '#9CA3AF',
+    textDecorationLine: 'line-through',
+    marginBottom: 2,
+  },
+  feedbackImprovedText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#059669',
+    marginBottom: 4,
+  },
+  feedbackExplanationText: {
+    fontSize: 12,
+    color: '#6B7280',
+    lineHeight: 17,
+  },
+  vocabHeaderLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  categoryPill: {
+    backgroundColor: '#F3F4F6',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  categoryPillText: {
+    fontSize: 11,
+    color: '#4B5563',
+    textTransform: 'capitalize',
+  },
+  saveVocabButton: {
+    backgroundColor: '#EFF6FF',
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  saveVocabButtonSaved: {
+    backgroundColor: '#ECFDF5',
+    borderColor: '#A7F3D0',
+  },
+  saveVocabButtonText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#1D4ED8',
+  },
+  saveVocabButtonTextSaved: {
+    color: '#059669',
+  },
+  vocabHeadword: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#111827',
+    marginBottom: 2,
+  },
+  vocabMeaning: {
+    fontSize: 13,
+    color: '#374151',
+    lineHeight: 18,
+    marginBottom: 4,
+  },
+  vocabExample: {
+    fontSize: 12,
+    fontStyle: 'italic',
+    color: '#6B7280',
+  },
+  coachingNoteCard: {
+    backgroundColor: '#F8FAFC',
+    borderRadius: 8,
+    borderLeftWidth: 3,
+    borderLeftColor: '#3B82F6',
+    padding: 10,
+  },
+  coachingNoteLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#2563EB',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 2,
+  },
+  coachingNoteText: {
+    fontSize: 13,
+    color: '#334155',
+    lineHeight: 18,
+  },
   loadingContainer: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    alignSelf: 'flex-start',
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
+    paddingVertical: 4,
   },
   loadingText: {
     fontSize: 13,

@@ -16,6 +16,9 @@ import type {
 import type {
   AIProviderError,
   AIProviderResponse,
+  AIStreamCallback,
+  ConversationFeedback,
+  ConversationFeedbackVocabulary,
 } from '../providers/ai';
 
 export type {
@@ -26,6 +29,9 @@ export type {
   ConversationExecutionResult,
   AIProviderResponse,
   AIProviderError,
+  AIStreamCallback,
+  ConversationFeedback,
+  ConversationFeedbackVocabulary,
 };
 
 /**
@@ -35,6 +41,9 @@ export interface ConversationSessionConfig {
   readonly mode: ConversationMode;
   readonly topic?: string | null;
   readonly historyLimit?: number;
+  readonly onSaveVocabulary?: (
+    vocab: ConversationFeedbackVocabulary
+  ) => Promise<void> | void;
 }
 
 /**
@@ -54,22 +63,38 @@ export type ConversationSessionResult =
       readonly ok: true;
       readonly response: AIProviderResponse;
       readonly history: readonly ConversationTurn[];
+      readonly feedback?: ConversationFeedback | null;
     }
   | {
       readonly ok: false;
       readonly error: AIProviderError;
       readonly history: readonly ConversationTurn[];
+      readonly feedback?: null;
     };
 
 /**
- * In-memory Conversation Session managing multi-turn conversation state.
+ * In-memory Conversation Session managing multi-turn conversation state and session feedback.
  */
 export interface ConversationSession {
   send(
-    input: ConversationSessionSendInput
+    input: ConversationSessionSendInput,
+    onChunk?: AIStreamCallback
+  ): Promise<ConversationSessionResult>;
+
+  sendStream?(
+    input: ConversationSessionSendInput,
+    onChunk: AIStreamCallback
   ): Promise<ConversationSessionResult>;
 
   getHistory(): readonly ConversationTurn[];
+
+  getLastFeedback(): ConversationFeedback | null;
+
+  saveVocabularyItem(vocab: ConversationFeedbackVocabulary): Promise<boolean>;
+
+  isVocabularySaved(headword: string): boolean;
+
+  getSavedVocabulary(): readonly ConversationFeedbackVocabulary[];
 
   clear(): void;
 

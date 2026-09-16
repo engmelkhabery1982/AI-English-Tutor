@@ -16,6 +16,9 @@ import type {
 import type {
   AIProviderError,
   AIProviderResponse,
+  AIStreamCallback,
+  ConversationFeedback,
+  ConversationFeedbackVocabulary,
 } from '../providers/ai';
 import type {
   ConversationSession,
@@ -32,6 +35,9 @@ export type {
   ConversationExecutionResult,
   AIProviderResponse,
   AIProviderError,
+  AIStreamCallback,
+  ConversationFeedback,
+  ConversationFeedbackVocabulary,
   ConversationSessionConfig,
   ConversationSessionSendInput,
   ConversationSessionResult,
@@ -69,54 +75,133 @@ export function createConversationSession(
     mode: config.mode,
     ...(config.topic !== undefined && { topic: config.topic }),
     ...(typeof config.historyLimit === 'number' && { historyLimit: config.historyLimit }),
+    ...(typeof config.onSaveVocabulary === 'function' && {
+      onSaveVocabulary: config.onSaveVocabulary,
+    }),
   };
 
   const history: ConversationTurn[] = [];
+  const savedVocabularyMap = new Map<string, ConversationFeedbackVocabulary>();
+  let lastFeedback: ConversationFeedback | null = null;
 
-  return {
-    async send(input: ConversationSessionSendInput): Promise<ConversationSessionResult> {
-      const requestInput: ConversationRequestInput = {
-        mode: sessionConfig.mode,
-        ...(typeof sessionConfig.topic === 'string' && { topic: sessionConfig.topic }),
-        ...(typeof sessionConfig.historyLimit === 'number' && {
-          historyLimit: sessionConfig.historyLimit,
-        }),
-        history: cloneHistory(history),
-        userMessage: input.userMessage,
-      };
+  async function executeTurn(
+    input: ConversationSessionSendInput,
+    onChunk?: AIStreamCallback
+  ): Promise<ConversationSessionResult> {
+    const requestInput: ConversationRequestInput = {
+      mode: sessionConfig.mode,
+      ...(typeof sessionConfig.topic === 'string' && { topic: sessionConfig.topic }),
+      ...(typeof sessionConfig.historyLimit === 'number' && {
+        historyLimit: sessionConfig.historyLimit,
+      }),
+      history: cloneHistory(history),
+      userMessage: input.userMessage,
+    };
 
-      const result = await orchestrator.execute(requestInput);
+    let result: ConversationExecutionResult;
+    if (onChunk && typeof orchestrator.executeStream === 'function') {
+      result = await orchestrator.executeStream(requestInput, onChunk);
+    } else {
+      result = await orchestrator.execute(requestInput);
+      if (result.ok && onChunk) {
+        onChunk(result.response.content);
+      }
+    }
 
-      if (result.ok) {
-        history.push({
-          role: 'user',
-          content: input.userMessage,
-        });
-        history.push({
-          role: 'assistant',
-          content: result.response.content,
-        });
+    if (result.ok) {
+      history.push({
+        role: 'user',
+        content: input.userMessage,
+      });
+      history.push({
+        role: 'assistant',
+        content: result.response.content,
+      });
 
-        return {
-          ok: true,
-          response: result.response,
-          history: cloneHistory(history),
-        };
+      lastFeedback = result.response.feedback || null;
+
+      // If feedback contains vocabulary and an onSaveVocabulary handler is present, auto-persist
+      if (lastFeedback?.vocabulary && sessionConfig.onSaveVocabulary) {
+        try {
+          await sessionConfig.onSaveVocabulary(lastFeedback.vocabulary);
+          savedVocabularyMap.set(
+            lastFeedback.vocabulary.headword.toLowerCase(),
+            lastFeedback.vocabulary
+          );
+        } catch {
+          // Non-blocking auto-save
+        }
       }
 
       return {
-        ok: false,
-        error: result.error,
+        ok: true,
+        response: result.response,
         history: cloneHistory(history),
+        feedback: lastFeedback,
       };
+    }
+
+    return {
+      ok: false,
+      error: result.error,
+      history: cloneHistory(history),
+      feedback: null,
+    };
+  }
+
+  return {
+    async send(
+      input: ConversationSessionSendInput,
+      onChunk?: AIStreamCallback
+    ): Promise<ConversationSessionResult> {
+      return executeTurn(input, onChunk);
+    },
+
+    async sendStream(
+      input: ConversationSessionSendInput,
+      onChunk: AIStreamCallback
+    ): Promise<ConversationSessionResult> {
+      return executeTurn(input, onChunk);
     },
 
     getHistory(): readonly ConversationTurn[] {
       return cloneHistory(history);
     },
 
+    getLastFeedback(): ConversationFeedback | null {
+      return lastFeedback;
+    },
+
+    async saveVocabularyItem(vocab: ConversationFeedbackVocabulary): Promise<boolean> {
+      if (!vocab || !vocab.headword) return false;
+      savedVocabularyMap.set(vocab.headword.toLowerCase(), {
+        headword: vocab.headword,
+        type: vocab.type,
+        meaning: vocab.meaning,
+        example: vocab.example,
+      });
+      if (sessionConfig.onSaveVocabulary) {
+        try {
+          await sessionConfig.onSaveVocabulary(vocab);
+        } catch {
+          // Ignore
+        }
+      }
+      return true;
+    },
+
+    isVocabularySaved(headword: string): boolean {
+      if (!headword) return false;
+      return savedVocabularyMap.has(headword.toLowerCase());
+    },
+
+    getSavedVocabulary(): readonly ConversationFeedbackVocabulary[] {
+      return Array.from(savedVocabularyMap.values());
+    },
+
     clear(): void {
       history.length = 0;
+      lastFeedback = null;
     },
 
     getConfig(): ConversationSessionConfig {
@@ -125,6 +210,9 @@ export function createConversationSession(
         ...(sessionConfig.topic !== undefined && { topic: sessionConfig.topic }),
         ...(typeof sessionConfig.historyLimit === 'number' && {
           historyLimit: sessionConfig.historyLimit,
+        }),
+        ...(sessionConfig.onSaveVocabulary !== undefined && {
+          onSaveVocabulary: sessionConfig.onSaveVocabulary,
         }),
       };
     },
