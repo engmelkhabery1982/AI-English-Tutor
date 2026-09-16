@@ -1,7 +1,7 @@
 /**
  * src/learner-model/index.ts
  *
- * Concrete read-only LearnerModel implementation and factory.
+ * Concrete read-only LearnerModel implementation and factory with query API.
  */
 
 import type {
@@ -38,6 +38,42 @@ export interface LearnerModel {
 
   /** Subscribe to model change events. */
   subscribe(listener: () => void): () => void;
+
+  /**
+   * Active weaknesses query:
+   * Returns current active weaknesses excluding resolved and mastered states.
+   */
+  getActiveWeaknesses(): readonly LearnerWeakness[];
+
+  /**
+   * Strengths query:
+   * Returns current persisted strength snapshot.
+   */
+  getStrengths(): readonly LearnerStrength[];
+
+  /**
+   * Saved vocabulary query:
+   * Returns current vocabulary snapshot.
+   */
+  getSavedVocabulary(): readonly VocabularyItem[];
+
+  /**
+   * Due review queue query:
+   * Returns the reviewQueue already loaded during refresh without recalculation.
+   */
+  getDueReview(): readonly ReviewItem[];
+
+  /**
+   * Recent progress query:
+   * Deterministic ordering by recordedAt newest-first with optional positive limit.
+   */
+  getRecentProgress(limit?: number): readonly ProgressRecord[];
+
+  /**
+   * Latest progress query:
+   * Returns exactly the currently loaded latestProgress snapshot.
+   */
+  getLatestProgress(): ProgressRecord | null;
 }
 
 /** Factory signature for creating a LearnerModel bound to repositories. */
@@ -127,6 +163,38 @@ class ReadOnlyLearnerModel implements LearnerModel {
   }
 
   get latestProgress(): ProgressRecord | null {
+    return this.snapshot.latestProgress;
+  }
+
+  getActiveWeaknesses(): readonly LearnerWeakness[] {
+    return this.snapshot.weaknesses.filter(
+      (w) => !w.resolved && w.status !== 'mastered',
+    );
+  }
+
+  getStrengths(): readonly LearnerStrength[] {
+    return [...this.snapshot.strengths];
+  }
+
+  getSavedVocabulary(): readonly VocabularyItem[] {
+    return [...this.snapshot.vocabulary];
+  }
+
+  getDueReview(): readonly ReviewItem[] {
+    return [...this.snapshot.reviewQueue];
+  }
+
+  getRecentProgress(limit?: number): readonly ProgressRecord[] {
+    const sorted = [...this.snapshot.progress].sort(
+      (a, b) => new Date(b.recordedAt).getTime() - new Date(a.recordedAt).getTime(),
+    );
+    if (typeof limit === 'number' && limit >= 0) {
+      return sorted.slice(0, limit);
+    }
+    return sorted;
+  }
+
+  getLatestProgress(): ProgressRecord | null {
     return this.snapshot.latestProgress;
   }
 
