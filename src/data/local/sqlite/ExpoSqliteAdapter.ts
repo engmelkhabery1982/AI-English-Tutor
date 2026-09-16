@@ -16,8 +16,7 @@ import type {
   SqlRow,
   SqlStep,
 } from './DatabaseAdapter';
-
-const SCHEMA_TABLE = 'schema_migrations';
+import { runMigrations } from './schema';
 
 /** Options for creating an adapter. */
 export interface ExpoSqliteAdapterOptions {
@@ -25,10 +24,18 @@ export interface ExpoSqliteAdapterOptions {
   readonly databaseDirectory?: string;
 }
 
+function toMutableParams(params?: readonly SqlParam[]): SqlParam[] {
+  return (params ?? []) as SqlParam[];
+}
+
 export class ExpoSqliteAdapter implements DatabaseAdapter {
   readonly backend = 'expo-sqlite' as const;
   readonly path: string;
-  readonly connected: boolean = false;
+  private _connected = false;
+
+  get connected(): boolean {
+    return this._connected;
+  }
 
   private db: SQLite.SQLiteDatabase | null = null;
   private readonly options: ExpoSqliteAdapterOptions;
@@ -40,15 +47,16 @@ export class ExpoSqliteAdapter implements DatabaseAdapter {
 
   async init(): Promise<void> {
     if (this.db) return;
-    this.db = SQLite.openDatabase(this.options.databaseName);
-    this.connected = true;
+    this.db = SQLite.openDatabaseSync(this.options.databaseName);
+    this._connected = true;
+    await runMigrations(this);
   }
 
   async execute(sql: string, params?: readonly SqlParam[]): Promise<SqlExecuteResult> {
     this.ensureOpen();
     const statement = await this.db!.prepareAsync(sql);
     try {
-      const result = await statement.executeAsync<SqlRow>(params ?? []);
+      const result = await statement.executeAsync(toMutableParams(params));
       return {
         rowsAffected: result.changes ?? 0,
         insertId: result.lastInsertRowId ?? undefined,
@@ -62,8 +70,9 @@ export class ExpoSqliteAdapter implements DatabaseAdapter {
     this.ensureOpen();
     const statement = await this.db!.prepareAsync(sql);
     try {
-      const result = await statement.executeAsync<SqlRow>(params ?? []);
-      return result.getAllAsync() ?? [];
+      const result = await statement.executeAsync(toMutableParams(params));
+      const rows = await result.getAllAsync();
+      return (rows ?? []) as readonly SqlRow[];
     } finally {
       await statement.finalizeAsync();
     }
@@ -72,11 +81,11 @@ export class ExpoSqliteAdapter implements DatabaseAdapter {
   async transaction(steps: readonly SqlStep[]): Promise<readonly SqlExecuteResult[]> {
     this.ensureOpen();
     const results: SqlExecuteResult[] = [];
-    await this.db!.withTransactionAsync(async (tx) => {
+    await this.db!.withTransactionAsync(async () => {
       for (const step of steps) {
-        const statement = await tx.prepareAsync(step.sql);
+        const statement = await this.db!.prepareAsync(step.sql);
         try {
-          const result = await statement.executeAsync<SqlRow>(step.params ?? []);
+          const result = await statement.executeAsync(toMutableParams(step.params));
           results.push({
             rowsAffected: result.changes ?? 0,
             insertId: result.lastInsertRowId ?? undefined,
@@ -94,7 +103,7 @@ export class ExpoSqliteAdapter implements DatabaseAdapter {
       await this.db.closeAsync();
       this.db = null;
     }
-    this.connected = false;
+    this._connected = false;
   }
 
   private ensureOpen(): SQLite.SQLiteDatabase {

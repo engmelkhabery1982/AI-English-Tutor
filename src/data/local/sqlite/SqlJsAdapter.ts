@@ -18,7 +18,9 @@ import type {
   SqlRow,
   SqlStep,
 } from './DatabaseAdapter';
+import { runMigrations } from './schema';
 
+// sql.js types (minimal subset we need)
 type SqlJsDatabase = {
   exec(sql: string, params?: unknown[]): { columns: string[]; values: unknown[][] }[];
   run(sql: string, params?: unknown[]): void;
@@ -43,17 +45,24 @@ let cachedModule: SqlJsModule | null = null;
 
 async function loadSqlJs(): Promise<SqlJsModule> {
   if (cachedModule) return cachedModule;
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
   const mod = await import('sql.js');
   const create = (mod as unknown as { default: () => Promise<SqlJsModule> }).default;
   cachedModule = await create();
   return cachedModule;
 }
 
+function toUnknownArray(params?: readonly SqlParam[]): unknown[] {
+  return (params ?? []) as unknown[];
+}
+
 export class SqlJsAdapter implements DatabaseAdapter {
   readonly backend = 'sql.js' as const;
   readonly path: string;
-  readonly connected: boolean = false;
+  private _connected = false;
+
+  get connected(): boolean {
+    return this._connected;
+  }
 
   private db: SqlJsDatabase | null = null;
   private readonly databaseName: string;
@@ -67,13 +76,14 @@ export class SqlJsAdapter implements DatabaseAdapter {
     if (this.db) return;
     const mod = await loadSqlJs();
     this.db = new mod.Database();
-    this.connected = true;
+    this._connected = true;
+    await runMigrations(this);
   }
 
   async execute(sql: string, params?: readonly SqlParam[]): Promise<SqlExecuteResult> {
     this.ensureOpen();
     const before = this.db!.getRowsModified();
-    this.db!.run(sql, params ?? []);
+    this.db!.run(sql, toUnknownArray(params));
     const after = this.db!.getRowsModified();
     return {
       rowsAffected: Math.max(0, after - before),
@@ -83,13 +93,14 @@ export class SqlJsAdapter implements DatabaseAdapter {
 
   async query(sql: string, params?: readonly SqlParam[]): Promise<readonly SqlRow[]> {
     this.ensureOpen();
-    const rows = this.db!.exec(sql, params ?? []);
+    const rows = this.db!.exec(sql, toUnknownArray(params));
     if (!rows || rows.length === 0) return [];
     const { columns, values } = rows[0];
     return values.map((row) => {
       const obj: SqlRow = {};
       for (let i = 0; i < columns.length; i++) {
-        obj[columns[i]] = row[i];
+        const val = row[i];
+        obj[columns[i]] = val as SqlParam | undefined;
       }
       return obj;
     });
@@ -104,7 +115,7 @@ export class SqlJsAdapter implements DatabaseAdapter {
     try {
       for (const step of steps) {
         const before = this.db!.getRowsModified();
-        this.db!.run(step.sql, step.params ?? []);
+        this.db!.run(step.sql, toUnknownArray(step.params));
         const after = this.db!.getRowsModified();
         results.push({
           rowsAffected: Math.max(0, after - before),
@@ -128,7 +139,7 @@ export class SqlJsAdapter implements DatabaseAdapter {
       this.db.close();
       this.db = null;
     }
-    this.connected = false;
+    this._connected = false;
   }
 
   private ensureOpen(): SqlJsDatabase {
