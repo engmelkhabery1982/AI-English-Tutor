@@ -2080,5 +2080,236 @@ describe('SQLite repositories (sql.js)', () => {
       expect(retrieved!.meanings[0].examples).toHaveLength(1);
       expect(retrieved!.meanings[0].examples[0].text).toBe('I run daily.');
     });
+
+    it('listDue: item with past nextReviewAt is returned', async () => {
+      const past = new Date(Date.now() - 86400000).toISOString(); // 1 day ago
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'due-word',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'test definition',
+            partOfSpeech: 'noun',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'learning', reviewCount: 2, consecutiveCorrect: 1, nextReviewAt: past },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      const due = await vocabRepo.listDue(learnerId, new Date().toISOString());
+      expect(due).toHaveLength(1);
+      expect(due[0].id).toBe(item.id);
+      expect(due[0].headword).toBe('due-word');
+    });
+
+    it('listDue: item with future nextReviewAt is not returned', async () => {
+      const future = new Date(Date.now() + 86400000).toISOString(); // 1 day from now
+      await vocabRepo.upsert({
+        learnerId,
+        headword: 'future-word',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'test definition',
+            partOfSpeech: 'noun',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'learning', reviewCount: 2, consecutiveCorrect: 1, nextReviewAt: future },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      const due = await vocabRepo.listDue(learnerId, new Date().toISOString());
+      expect(due).toHaveLength(0);
+    });
+
+    it('listDue: item with several meanings is returned only once', async () => {
+      const past = new Date(Date.now() - 86400000).toISOString();
+      const item = await vocabRepo.upsert({
+        learnerId,
+        headword: 'multi-meaning',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'meaning 1',
+            partOfSpeech: 'noun',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'learning', reviewCount: 1, consecutiveCorrect: 1, nextReviewAt: past },
+          },
+          {
+            definition: 'meaning 2',
+            partOfSpeech: 'verb',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'learning', reviewCount: 1, consecutiveCorrect: 1, nextReviewAt: past },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      const due = await vocabRepo.listDue(learnerId, new Date().toISOString());
+      expect(due).toHaveLength(1);
+      expect(due[0].id).toBe(item.id);
+      expect(due[0].meanings).toHaveLength(2);
+    });
+
+    it('listDue: two due items ordered by earliest due meaning', async () => {
+      const earlier = new Date(Date.now() - 172800000).toISOString(); // 2 days ago
+      const later = new Date(Date.now() - 86400000).toISOString(); // 1 day ago
+
+      const item1 = await vocabRepo.upsert({
+        learnerId,
+        headword: 'earlier-word',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'meaning',
+            partOfSpeech: 'noun',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'learning', reviewCount: 1, consecutiveCorrect: 1, nextReviewAt: later },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      const item2 = await vocabRepo.upsert({
+        learnerId,
+        headword: 'later-word',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'meaning',
+            partOfSpeech: 'noun',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'learning', reviewCount: 1, consecutiveCorrect: 1, nextReviewAt: earlier },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      const due = await vocabRepo.listDue(learnerId, new Date().toISOString());
+      expect(due).toHaveLength(2);
+      // Earlier due date should come first
+      expect(due[0].id).toBe(item2.id);
+      expect(due[1].id).toBe(item1.id);
+    });
+
+    it('listDue: learner filtering prevents cross-learner leakage', async () => {
+      const past = new Date(Date.now() - 86400000).toISOString();
+
+      // Create another learner
+      const otherAdapter = new SqlJsAdapter(':memory:');
+      await otherAdapter.init();
+      const otherProfileRepo = new SQLiteUserProfileRepository(otherAdapter);
+      await otherProfileRepo.update({
+        displayName: 'Other Learner',
+        targetLanguage: 'en',
+        targetLevel: 'A1',
+        currentLevel: 'A1',
+        learningGoals: [],
+        preferredModes: ['natural'],
+      });
+      const otherLearnerId = (await otherProfileRepo.get()).id;
+      const otherVocabRepo = new SQLiteVocabularyRepository(otherAdapter);
+
+      // Create due items for both learners
+      await vocabRepo.upsert({
+        learnerId,
+        headword: 'my-due-word',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'my meaning',
+            partOfSpeech: 'noun',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'learning', reviewCount: 1, consecutiveCorrect: 1, nextReviewAt: past },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      await otherVocabRepo.upsert({
+        learnerId: otherLearnerId,
+        headword: 'other-due-word',
+        type: 'word',
+        meanings: [
+          {
+            definition: 'other meaning',
+            partOfSpeech: 'noun',
+            examples: [],
+            usageNotes: [],
+            register: 'neutral',
+            domain: 'everyday',
+            review: { state: 'learning', reviewCount: 1, consecutiveCorrect: 1, nextReviewAt: past },
+          },
+        ],
+        source: createSource(),
+        tags: [],
+      });
+
+      const myDue = await vocabRepo.listDue(learnerId, new Date().toISOString());
+      expect(myDue).toHaveLength(1);
+      expect(myDue[0].headword).toBe('my-due-word');
+
+      const otherDue = await otherVocabRepo.listDue(otherLearnerId, new Date().toISOString());
+      expect(otherDue).toHaveLength(1);
+      expect(otherDue[0].headword).toBe('other-due-word');
+    });
+
+    it('listDue: optional limit works', async () => {
+      const past = new Date(Date.now() - 86400000).toISOString();
+
+      for (let i = 0; i < 5; i++) {
+        await vocabRepo.upsert({
+          learnerId,
+          headword: `due-word-${i}`,
+          type: 'word',
+          meanings: [
+            {
+              definition: `meaning ${i}`,
+              partOfSpeech: 'noun',
+              examples: [],
+              usageNotes: [],
+              register: 'neutral',
+              domain: 'everyday',
+              review: { state: 'learning', reviewCount: 1, consecutiveCorrect: 1, nextReviewAt: past },
+            },
+          ],
+          source: createSource(),
+          tags: [],
+        });
+      }
+
+      const limited = await vocabRepo.listDue(learnerId, new Date().toISOString(), 3);
+      expect(limited).toHaveLength(3);
+    });
   });
 });

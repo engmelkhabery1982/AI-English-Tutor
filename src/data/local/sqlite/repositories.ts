@@ -1680,12 +1680,58 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
   }
 
   async listDue(
-    _learnerId: string,
-    _now: string,
-    _limit?: number,
+    learnerId: string,
+    now: string,
+    limit?: number,
   ): Promise<readonly VocabularyItem[]> {
-    // Not implemented in this task - requires SRS logic
-    return [];
+    if (!isValidUuid(learnerId)) return [];
+
+    // Find lexical items that have at least one meaning with review_next_review_at <= now
+    // Use a subquery to get distinct lexical_item_ids with due meanings
+    let sql = `
+      SELECT DISTINCT li.* FROM lexical_items li
+      INNER JOIN lexical_meanings lm ON lm.lexical_item_id = li.id
+      WHERE li.learner_id = ?
+        AND lm.review_next_review_at IS NOT NULL
+        AND lm.review_next_review_at <= ?
+      ORDER BY lm.review_next_review_at ASC
+    `;
+    const params: SqlParam[] = [learnerId, now];
+
+    if (limit !== undefined && limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(limit);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+
+    const items: VocabularyItem[] = [];
+    for (const row of rows) {
+      const item = rowToVocabularyItem(row);
+      const itemId = row.id;
+      if (!itemId || typeof itemId !== 'string') {
+        throw new Error('Invalid vocabulary item row: missing id');
+      }
+      const meaningRows = await this.adapter.query(
+        `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
+        [itemId],
+      );
+
+      const meanings: Meaning[] = [];
+      for (const meaningRow of meaningRows) {
+        const meaning = rowToMeaning(meaningRow);
+        const meaningId = meaningRow.id as string;
+        if (meaningId) {
+          const examples = await fetchExamplesForMeaning(this.adapter, meaningId);
+          meanings.push({ ...meaning, examples });
+        } else {
+          meanings.push(meaning);
+        }
+      }
+      items.push({ ...item, meanings });
+    }
+
+    return items;
   }
 
   async update(
