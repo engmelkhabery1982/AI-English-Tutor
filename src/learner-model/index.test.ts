@@ -1,7 +1,7 @@
 /**
  * src/learner-model/index.test.ts
  *
- * Unit tests for the read-only LearnerModel facade using mock AppRepositories.
+ * Unit tests for the read-only LearnerModel facade and query API using mock AppRepositories.
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -371,5 +371,274 @@ describe('LearnerModel facade', () => {
     await expect(model.refresh()).resolves.toBeUndefined();
     expect(failingListener).toHaveBeenCalledTimes(1);
     expect(succeedingListener).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('LearnerModel query API', () => {
+  function makeWeakness(id: string, status: LearnerWeakness['status'], resolved: boolean): LearnerWeakness {
+    return {
+      id,
+      learnerId: 'learner-123',
+      type: 'grammar',
+      referenceId: `ref-${id}`,
+      status,
+      severity: 0.5,
+      occurrenceCount: 2,
+      lastSeenAt: '2026-09-01T00:00:00.000Z',
+      firstSeenAt: '2026-08-01T00:00:00.000Z',
+      contexts: ['chat'],
+      evidence: [],
+      resolved,
+      createdAt: '2026-08-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+  }
+
+  it('1. active weaknesses excludes resolved', async () => {
+    const repos = createMockRepositories();
+    const wActive = makeWeakness('w-1', 'confirmed', false);
+    const wResolved = makeWeakness('w-2', 'confirmed', true);
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([wActive, wResolved]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const active = model.getActiveWeaknesses();
+    expect(active).toHaveLength(1);
+    expect(active[0].id).toBe('w-1');
+  });
+
+  it('2. active weaknesses excludes mastered', async () => {
+    const repos = createMockRepositories();
+    const wObserved = makeWeakness('w-1', 'observed', false);
+    const wMastered = makeWeakness('w-2', 'mastered', false);
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([wObserved, wMastered]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const active = model.getActiveWeaknesses();
+    expect(active).toHaveLength(1);
+    expect(active[0].id).toBe('w-1');
+  });
+
+  it('3. relapsed weakness remains active', async () => {
+    const repos = createMockRepositories();
+    const wRelapsed = makeWeakness('w-relapsed', 'relapsed', false);
+    vi.mocked(repos.weaknesses.listWeaknesses).mockResolvedValue([wRelapsed]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const active = model.getActiveWeaknesses();
+    expect(active).toHaveLength(1);
+    expect(active[0].id).toBe('w-relapsed');
+    expect(active[0].status).toBe('relapsed');
+  });
+
+  it('4. getStrengths returns refreshed strengths', async () => {
+    const repos = createMockRepositories();
+    const strength: LearnerStrength = {
+      id: 's-10',
+      learnerId: 'learner-123',
+      type: 'vocabulary',
+      referenceId: 'ref-10',
+      confidence: 0.85,
+      lastSeenAt: '2026-09-01T00:00:00.000Z',
+      firstSeenAt: '2026-08-01T00:00:00.000Z',
+      contexts: ['reading'],
+      evidence: [],
+      createdAt: '2026-08-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.weaknesses.listStrengths).mockResolvedValue([strength]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    expect(model.getStrengths()).toEqual([strength]);
+  });
+
+  it('5. getSavedVocabulary returns refreshed vocabulary', async () => {
+    const repos = createMockRepositories();
+    const vocab: VocabularyItem = {
+      id: 'v-10',
+      learnerId: 'learner-123',
+      headword: 'resilient',
+      type: 'word',
+      meanings: [],
+      source: {
+        addedBy: 'learner-created',
+        addedAt: '2026-09-01T00:00:00.000Z',
+      },
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    expect(model.getSavedVocabulary()).toEqual([vocab]);
+  });
+
+  it('6. getDueReview returns loaded review queue without recalculation', async () => {
+    const repos = createMockRepositories();
+    const reviewItem: ReviewItem = {
+      id: 'rev-1',
+      learnerId: 'learner-123',
+      kind: 'expression',
+      referenceId: 'exp-1',
+      prompt: 'bite the bullet',
+      state: 'learning',
+      dueAt: '2026-09-15T12:00:00.000Z',
+      createdAt: '2026-09-01T00:00:00.000Z',
+      reviewCount: 2,
+      consecutiveCorrect: 1,
+      outcomeHistory: [],
+    };
+    vi.mocked(repos.review.listDue).mockResolvedValue([reviewItem]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const due = model.getDueReview();
+    expect(due).toEqual([reviewItem]);
+    expect(due[0].dueAt).toBe('2026-09-15T12:00:00.000Z');
+  });
+
+  it('7. recent progress is newest first', async () => {
+    const repos = createMockRepositories();
+    const p1: ProgressRecord = {
+      id: 'p-old',
+      learnerId: 'learner-123',
+      recordedAt: '2026-08-01T10:00:00.000Z',
+      windowStart: '2026-07-25T00:00:00.000Z',
+      windowEnd: '2026-08-01T00:00:00.000Z',
+      sessionsCompleted: 1,
+      turnsCompleted: 10,
+      newWordsLearned: 2,
+      weaknessesImproved: 0,
+      weaknessesWorsened: 0,
+    };
+    const p2: ProgressRecord = {
+      id: 'p-new',
+      learnerId: 'learner-123',
+      recordedAt: '2026-09-01T10:00:00.000Z',
+      windowStart: '2026-08-25T00:00:00.000Z',
+      windowEnd: '2026-09-01T00:00:00.000Z',
+      sessionsCompleted: 3,
+      turnsCompleted: 30,
+      newWordsLearned: 5,
+      weaknessesImproved: 1,
+      weaknessesWorsened: 0,
+    };
+    // List returns unsorted (old first)
+    vi.mocked(repos.progress.list).mockResolvedValue([p1, p2]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const recent = model.getRecentProgress();
+    expect(recent).toHaveLength(2);
+    expect(recent[0].id).toBe('p-new');
+    expect(recent[1].id).toBe('p-old');
+  });
+
+  it('8. recent progress limit works', async () => {
+    const repos = createMockRepositories();
+    const p1: ProgressRecord = {
+      id: 'p-1',
+      learnerId: 'learner-123',
+      recordedAt: '2026-08-01T00:00:00.000Z',
+      windowStart: '2026-07-25T00:00:00.000Z',
+      windowEnd: '2026-08-01T00:00:00.000Z',
+      sessionsCompleted: 1,
+      turnsCompleted: 10,
+      newWordsLearned: 1,
+      weaknessesImproved: 0,
+      weaknessesWorsened: 0,
+    };
+    const p2: ProgressRecord = {
+      id: 'p-2',
+      learnerId: 'learner-123',
+      recordedAt: '2026-08-15T00:00:00.000Z',
+      windowStart: '2026-08-08T00:00:00.000Z',
+      windowEnd: '2026-08-15T00:00:00.000Z',
+      sessionsCompleted: 2,
+      turnsCompleted: 20,
+      newWordsLearned: 3,
+      weaknessesImproved: 0,
+      weaknessesWorsened: 0,
+    };
+    const p3: ProgressRecord = {
+      id: 'p-3',
+      learnerId: 'learner-123',
+      recordedAt: '2026-09-01T00:00:00.000Z',
+      windowStart: '2026-08-25T00:00:00.000Z',
+      windowEnd: '2026-09-01T00:00:00.000Z',
+      sessionsCompleted: 3,
+      turnsCompleted: 30,
+      newWordsLearned: 5,
+      weaknessesImproved: 1,
+      weaknessesWorsened: 0,
+    };
+    vi.mocked(repos.progress.list).mockResolvedValue([p1, p2, p3]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const limited = model.getRecentProgress(2);
+    expect(limited).toHaveLength(2);
+    expect(limited[0].id).toBe('p-3');
+    expect(limited[1].id).toBe('p-2');
+  });
+
+  it('9. queries before first refresh return safe empty/default results', () => {
+    const repos = createMockRepositories();
+    const model = createLearnerModel(repos);
+
+    expect(model.getActiveWeaknesses()).toEqual([]);
+    expect(model.getStrengths()).toEqual([]);
+    expect(model.getSavedVocabulary()).toEqual([]);
+    expect(model.getDueReview()).toEqual([]);
+    expect(model.getRecentProgress()).toEqual([]);
+    expect(model.getLatestProgress()).toBeNull();
+    expect(model.profile.id).toBe('');
+  });
+
+  it('10. returned query collection cannot mutate internal snapshot behavior', async () => {
+    const repos = createMockRepositories();
+    const vocab: VocabularyItem = {
+      id: 'v-1',
+      learnerId: 'learner-123',
+      headword: 'safe',
+      type: 'word',
+      meanings: [],
+      source: {
+        addedBy: 'system',
+        addedAt: '2026-09-01T00:00:00.000Z',
+      },
+      createdAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
+    };
+    vi.mocked(repos.vocabulary.list).mockResolvedValue([vocab]);
+
+    const model = createLearnerModel(repos);
+    await model.refresh();
+
+    const savedVocab = model.getSavedVocabulary() as VocabularyItem[];
+    expect(savedVocab).toHaveLength(1);
+
+    // Mutate the returned array
+    savedVocab.push({
+      ...vocab,
+      id: 'v-mutated',
+      headword: 'mutated',
+    });
+
+    // Internal model snapshot must remain unchanged
+    expect(model.getSavedVocabulary()).toHaveLength(1);
+    expect(model.vocabulary).toHaveLength(1);
   });
 });
