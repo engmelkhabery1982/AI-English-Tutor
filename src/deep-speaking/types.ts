@@ -20,7 +20,6 @@
 import type {
   ConversationMode,
   IsoDate,
-  Uuid,
   WeaknessStatus,
 } from '../domain/shared/types';
 import type { LearnerWeakness } from '../domain/models/learner';
@@ -124,10 +123,7 @@ export interface SpeakingPracticePlan {
   readonly hardMaxTurns: number;
   readonly turnGoals: readonly SpeakingTurnGoal[];
   readonly recentMemoryNote?: string;
-  readonly seedFromAdaptiveLesson?: {
-    readonly stepId: string;
-    readonly targetText: string;
-  };
+  readonly seedFromAdaptiveLesson?: SpeakingPracticeSeed;
 }
 
 export type SpeakingPracticePlanResult =
@@ -144,15 +140,29 @@ export interface SpeakingPlanningInput {
   readonly hasProfile: boolean;
   readonly recentConversations: readonly CoachingRecentConversation[];
   readonly now: IsoDate;
+  /**
+   * False only when the supplied learner state is NOT real stored evidence
+   * (e.g. the deterministic demo learner model). Such a plan is NEVER labeled
+   * `personalized`/`mixed`: it degrades to honest general practice and carries
+   * no learner-specific focus, targets or memory note.
+   */
+  readonly evidenceIsReal?: boolean;
+}
+
+/**
+ * Optional seed handed over from an EXISTING Adaptive Lesson speaking step.
+ * It only names the existing step and its real target text — it never carries
+ * learner evidence of its own.
+ */
+export interface SpeakingPracticeSeed {
+  readonly stepId: string;
+  readonly targetText: string;
+  readonly prompt?: string;
 }
 
 export interface SpeakingPlannerOptions {
   readonly practiceType?: SpeakingPracticeType;
-  readonly seed?: {
-    readonly stepId: string;
-    readonly targetText: string;
-    readonly prompt?: string;
-  };
+  readonly seed?: SpeakingPracticeSeed;
   readonly targetTurns?: number;
 }
 

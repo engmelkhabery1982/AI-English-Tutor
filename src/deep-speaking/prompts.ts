@@ -13,7 +13,6 @@ import type { ConversationMode } from '../domain/shared/types';
 import type {
   SpeakingPracticePlan,
   SpeakingPracticeType,
-  SpeakingTargetExpression,
   SpeakingTurnGoal,
   SpeakingTurnGoalKind,
 } from './types';
@@ -26,9 +25,6 @@ export interface SpeakingScenario {
   readonly topic: string;
   readonly scenarioPrompt: string;
 }
-
-const DEFAULT_SCENARIO_PROMPT =
-  'Start a speaking practice session. Open with one short question to get the learner talking.';
 
 const SCENARIOS: Readonly<Record<SpeakingPracticeType, readonly SpeakingScenario[]>> = {
   free_conversation: [
@@ -166,9 +162,9 @@ export const TURN_GOAL_INSTRUCTIONS: Readonly<Record<SpeakingTurnGoalKind, strin
   follow_up:
     'Ask a natural follow-up question based on what the learner just said. Keep the conversation flowing.',
   expand:
-    'The learner\'s previous answer was short. Ask ONE focused follow-up that requires elaboration — a reason, an example, or "what happened next". Do not move to a new topic yet.',
+    'The learner\'s previous answer was short. Ask ONE focused follow-up that requires elaboration — a reason, an example, the result, what happened next, an alternative, or an explanation. Do not move to a new topic yet.',
   reformulate:
-    'Ask the learner to reformulate their previous answer more naturally. Do not provide the final answer before they try. Keep it encouraging.',
+    'Ask the learner to reformulate their previous answer more naturally. Do not provide the answer before they try. Keep it encouraging.',
   target_expression:
     'If it fits naturally, invite the learner to use a target expression in their next answer. Do not force it if the context does not fit.',
   weakness_retraining:

@@ -103,33 +103,99 @@ function weaknessReason(w: CoachingActiveWeakness): string {
  * Target expression selection
  * ------------------------------------------------------------------ */
 
+interface TargetCandidate {
+  readonly itemId: string;
+  readonly label: string;
+  readonly meaningDefinition: string;
+  readonly reviewState: string | null;
+  readonly nextReviewAt: string | null;
+}
+
+/** True only for a real stored item that is actually due at `now`. */
+function isDue(candidate: TargetCandidate, now: string): boolean {
+  if (!candidate.nextReviewAt) return false;
+  const dueAt = Date.parse(candidate.nextReviewAt);
+  const at = Date.parse(now);
+  if (!Number.isFinite(dueAt) || !Number.isFinite(at)) return false;
+  return dueAt <= at;
+}
+
+/**
+ * Deterministic ordering: due items first, then the stored order. Nothing is
+ * invented — mastered items are dropped, never reordered around a score.
+ */
+function dueFirst(
+  candidates: readonly TargetCandidate[],
+  now: string,
+): readonly TargetCandidate[] {
+  const due: TargetCandidate[] = [];
+  const notDue: TargetCandidate[] = [];
+  for (const candidate of candidates) {
+    if (candidate.reviewState === 'mastered') continue;
+    (isDue(candidate, now) ? due : notDue).push(candidate);
+  }
+  return [...due, ...notDue];
+}
+
+/** Honest provenance reason. A stored item is never called "due" unless it is. */
+function targetReason(kind: 'expression' | 'word', due: boolean): string {
+  const noun = kind === 'expression' ? 'expression' : 'word';
+  return due
+    ? `Due for review from your saved ${noun}s.`
+    : `From your saved ${noun}s — not mastered yet.`;
+}
+
+/**
+ * Target expressions from EXISTING stored vocabulary/expression data only.
+ * Meanings are copied from `meaningDefinition` verbatim (never invented).
+ * Expressions are preferred over single words, and due items come first.
+ */
 function selectTargetExpressions(
-  vocabularyFocus: readonly { itemId: string; headword: string; meaningDefinition: string; reviewState: string | null }[],
-  expressionFocus: readonly { itemId: string; expression: string; meaningDefinition: string; reviewState: string | null }[],
+  vocabularyFocus: readonly { itemId: string; headword: string; meaningDefinition: string; reviewState: string | null; nextReviewAt: string | null }[],
+  expressionFocus: readonly { itemId: string; expression: string; meaningDefinition: string; reviewState: string | null; nextReviewAt: string | null }[],
   maxCount: number,
+  now: string,
 ): readonly SpeakingTargetExpression[] {
   const candidates: SpeakingTargetExpression[] = [];
 
   // Prefer expressions (richer for speaking) over single words.
-  for (const expr of expressionFocus) {
+  const expressions = dueFirst(
+    expressionFocus.map((expr) => ({
+      itemId: expr.itemId,
+      label: expr.expression,
+      meaningDefinition: expr.meaningDefinition,
+      reviewState: expr.reviewState,
+      nextReviewAt: expr.nextReviewAt,
+    })),
+    now,
+  );
+  for (const expr of expressions) {
     if (candidates.length >= maxCount) break;
-    if (expr.reviewState === 'mastered') continue;
     candidates.push({
       itemId: expr.itemId,
-      headword: expr.expression,
+      headword: expr.label,
       meaning: expr.meaningDefinition,
-      reason: 'Due expression from your saved list.',
+      reason: targetReason('expression', isDue(expr, now)),
     });
   }
 
-  for (const vocab of vocabularyFocus) {
+  const vocabulary = dueFirst(
+    vocabularyFocus.map((vocab) => ({
+      itemId: vocab.itemId,
+      label: vocab.headword,
+      meaningDefinition: vocab.meaningDefinition,
+      reviewState: vocab.reviewState,
+      nextReviewAt: vocab.nextReviewAt,
+    })),
+    now,
+  );
+  for (const vocab of vocabulary) {
     if (candidates.length >= maxCount) break;
-    if (vocab.reviewState === 'mastered') continue;
     candidates.push({
       itemId: vocab.itemId,
-      headword: vocab.headword,
+      headword: vocab.label,
       meaning: vocab.meaningDefinition,
-      reason: 'Due word from your saved vocabulary.',
+      reason: targetReason('word', isDue(vocab, now)),
     });
   }
 
@@ -161,6 +227,12 @@ function buildFocusAreas(
     focus.push({
       area: 'Expressions',
       detail: `${expressions.length} target expression${expressions.length === 1 ? '' : 's'}`,
+    });
+  } else if (dueExprCount > 0) {
+    focus.push({
+      area: 'Expressions',
+      detail: `${dueExprCount} expression${dueExprCount === 1 ? '' : 's'} due for review`,
+      count: dueExprCount,
     });
   }
 
@@ -307,10 +379,14 @@ function determineTurnGoal(
 function buildRecentMemoryNote(
   recentConversations: readonly { mode: string; topic: string | null; turnCount: number }[],
 ): string | undefined {
-  if (recentConversations.length === 0) return undefined;
-  const conv = recentConversations[0];
-  const topicLabel = conv.topic ? `"${conv.topic}"` : 'an open topic';
-  return `You previously practiced ${topicLabel} in ${conv.mode} mode (${conv.turnCount} turns).`;
+  // Bounded: at most MAX_RECENT_CONVERSATIONS stored summaries, newest first.
+  const bounded = recentConversations.slice(0, MAX_RECENT_CONVERSATIONS);
+  if (bounded.length === 0) return undefined;
+  const parts = bounded.map((conv) => {
+    const topicLabel = conv.topic ? `"${conv.topic}"` : 'an open topic';
+    return `${topicLabel} in ${conv.mode} mode (${conv.turnCount} turns)`;
+  });
+  return `You previously practiced ${parts.join('; ')}.`;
 }
 
 /* ------------------------------------------------------------------ *
@@ -320,12 +396,16 @@ function buildRecentMemoryNote(
 function resolvePracticeType(
   options: SpeakingPlannerOptions | undefined,
   coaching: SpeakingPlanningInput['coaching'],
+  evidenceIsReal: boolean,
 ): SpeakingPracticeType {
   if (options?.practiceType) return options.practiceType;
 
   if (options?.seed) {
     return 'target_expression_practice';
   }
+
+  // Demo/unknown learner state must not shape the plan: honest general default.
+  if (!evidenceIsReal) return 'guided_topic';
 
   const firstGoal = coaching.profile.learningGoals.find((g) => g.trim().length > 0);
   if (firstGoal) {
@@ -396,6 +476,9 @@ export function planSpeakingPractice(
   options?: SpeakingPlannerOptions,
 ): SpeakingPracticePlanResult {
   const { coaching, hasProfile, recentConversations, now } = input;
+  // Real stored evidence only. Anything else can never be presented as
+  // personalization (demo learner data included).
+  const evidenceIsReal = input.evidenceIsReal !== false;
 
   if (!hasProfile || !coaching.profile.learnerId) {
     return {
@@ -406,29 +489,31 @@ export function planSpeakingPractice(
   }
 
   const learnerId = coaching.profile.learnerId;
-  const practiceType = resolvePracticeType(options, coaching);
+  const practiceType = resolvePracticeType(options, coaching, evidenceIsReal);
   const scenario = selectScenario(practiceType, learnerId, now);
 
-  // Weakness targets
-  const weaknessTargets = selectWeaknessTargets(
-    coaching.activeWeaknesses,
-    MAX_WEAKNESS_TARGETS,
-  );
+  // Weakness targets (real evidence only)
+  const weaknessTargets = evidenceIsReal
+    ? selectWeaknessTargets(coaching.activeWeaknesses, MAX_WEAKNESS_TARGETS)
+    : [];
 
-  // Target expressions
-  const targetExpressions = selectTargetExpressions(
-    coaching.vocabularyFocus,
-    coaching.expressionFocus,
-    MAX_TARGET_EXPRESSIONS,
-  );
+  // Target expressions (real evidence only)
+  const targetExpressions = evidenceIsReal
+    ? selectTargetExpressions(
+        coaching.vocabularyFocus,
+        coaching.expressionFocus,
+        MAX_TARGET_EXPRESSIONS,
+        now,
+      )
+    : [];
 
-  // Focus areas
-  const dueVocabCount = coaching.vocabularyFocus.filter(
-    (v) => v.reviewState !== 'mastered',
-  ).length;
-  const dueExprCount = coaching.expressionFocus.filter(
-    (e) => e.reviewState !== 'mastered',
-  ).length;
+  // Focus areas — from real evidence only.
+  const dueVocabCount = evidenceIsReal
+    ? coaching.vocabularyFocus.filter((v) => v.reviewState !== 'mastered').length
+    : 0;
+  const dueExprCount = evidenceIsReal
+    ? coaching.expressionFocus.filter((e) => e.reviewState !== 'mastered').length
+    : 0;
   const focusAreas = buildFocusAreas(
     weaknessTargets,
     targetExpressions,
@@ -436,19 +521,24 @@ export function planSpeakingPractice(
     dueExprCount,
   );
 
-  // Recent memory (bounded)
-  const boundedRecent = recentConversations.slice(0, MAX_RECENT_CONVERSATIONS);
+  // Recent memory (bounded; real persisted conversations only)
+  const boundedRecent = evidenceIsReal
+    ? recentConversations.slice(0, MAX_RECENT_CONVERSATIONS)
+    : [];
   const recentMemoryNote = buildRecentMemoryNote(boundedRecent);
 
   // Source
-  const hasGoals = coaching.profile.learningGoals.some((g) => g.trim().length > 0);
-  const source = determineSource(
-    weaknessTargets,
-    targetExpressions,
-    hasGoals,
-    Boolean(recentMemoryNote),
-    practiceType,
-  );
+  const hasGoals =
+    evidenceIsReal && coaching.profile.learningGoals.some((g) => g.trim().length > 0);
+  const source = evidenceIsReal
+    ? determineSource(
+        weaknessTargets,
+        targetExpressions,
+        hasGoals,
+        Boolean(recentMemoryNote),
+        practiceType,
+      )
+    : 'general';
 
   // Coaching mode
   const coachingMode = defaultCoachingModeForType(

@@ -59,6 +59,8 @@ import type {
   AdaptiveTodayPractice,
 } from '../adaptive-lessons';
 import { createDefaultAdaptiveLessonService } from '../adaptive-lessons';
+import { useNavigation } from '@react-navigation/native';
+import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 import {
   createAdaptiveLessonVoiceController,
   isAdaptiveVoiceWorkActive,
@@ -117,6 +119,7 @@ const VOICE_NOT_READY_NOTICE =
   'Voice answers are not available right now. You can type your answer instead.';
 
 export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) {
+  const navigation = useNavigation<NavigationProp<ParamListBase>>();
   const [phase, setPhase] = useState<Phase>('loading');
   const [practice, setPractice] = useState<AdaptiveTodayPractice | null>(null);
   const [session, setSession] = useState<AdaptiveLessonSession | null>(null);
@@ -976,6 +979,30 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     );
   };
 
+  /**
+   * OPTIONAL deeper path: start a full Deep Speaking practice on THIS speaking
+   * step's own material. The inline speaking step above is unchanged and still
+   * works on its own — including when Deep Speaking is unavailable.
+   */
+  const openFullSpeakingPractice = useCallback(() => {
+    if (material?.kind !== 'speaking') return;
+    try {
+      navigation.navigate('DeepSpeaking', {
+        seed: {
+          stepId: material.step.id,
+          targetText: material.step.title,
+          prompt: material.prompt,
+        },
+      });
+      setNotice(null);
+    } catch {
+      // No Deep Speaking route in this composition: the inline step stays usable.
+      setNotice(
+        'Full speaking practice is not available here. You can keep practising in this step.',
+      );
+    }
+  }, [material, navigation]);
+
   const renderSpeakingMaterial = () => {
     if (material?.kind !== 'speaking') return null;
     return (
@@ -992,6 +1019,16 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
           editable={!itemFeedback}
           multiline
         />
+        <TouchableOpacity
+          style={styles.secondaryButton}
+          onPress={openFullSpeakingPractice}
+          disabled={itemFeedback !== null}
+        >
+          <Text style={styles.secondaryButtonText}>Start full speaking practice</Text>
+        </TouchableOpacity>
+        <Text style={styles.honestNote}>
+          A longer voice-first session with the speaking coach. This step also works on its own.
+        </Text>
       </View>
     );
   };

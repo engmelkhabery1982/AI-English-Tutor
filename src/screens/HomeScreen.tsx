@@ -106,6 +106,15 @@ export default function HomeScreen(props?: HomeScreenProps) {
     navigation.navigate('AdaptiveLesson');
   };
 
+  /**
+   * Speaking practice entry: a voice-first session with the Deep Speaking coach.
+   * Home stays an entry point — it never builds the plan or the conversation
+   * itself, and it makes no claim about the learner's speaking level.
+   */
+  const openSpeakingPractice = () => {
+    navigation.navigate('DeepSpeaking');
+  };
+
   const renderReady = (today: Extract<AdaptiveTodayPractice, { status: 'ready' }>) => {
     const plan = today.plan;
     const modeLabel =
@@ -229,6 +238,22 @@ export default function HomeScreen(props?: HomeScreenProps) {
           </TouchableOpacity>
         </View>
       ) : null}
+
+      <View style={styles.card}>
+        <View style={styles.cardHeader}>
+          <Text style={styles.cardTitle}>Speaking practice</Text>
+          <View style={styles.pill}>
+            <Text style={styles.pillText}>Voice</Text>
+          </View>
+        </View>
+        <Text style={styles.body}>
+          A longer, voice-first conversation with a speaking coach, built from your own practice
+          history. You can stop at any time.
+        </Text>
+        <TouchableOpacity style={styles.primaryButton} onPress={openSpeakingPractice}>
+          <Text style={styles.primaryButtonText}>Start speaking practice</Text>
+        </TouchableOpacity>
+      </View>
 
       {isLoading ? (
         <View style={styles.loadingBox}>

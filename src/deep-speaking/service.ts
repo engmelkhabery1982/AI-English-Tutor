@@ -39,17 +39,17 @@ import type {
   AIProvider,
   ConversationFeedback,
 } from '../providers/ai/types';
-import type { ConversationRequest } from '../conversation-engine/types';
 import type { ConversationEngine } from '../conversation-engine';
 import type {
   ConversationSession,
   ConversationSessionConfig,
   ConversationSessionResult,
 } from '../conversation-session';
-import type { CoachingContext, CoachingRecentConversation } from '../learner-model';
+import type { CoachingRecentConversation } from '../learner-model';
 import type { LearnerModel } from '../learner-model';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { IsoDate } from '../domain/shared/types';
+import type { ProgressRecord } from '../domain/models/learning';
 
 import { createConversationEngine } from '../conversation-engine';
 import { createConversationOrchestrator } from '../conversation-orchestrator';
@@ -73,7 +73,6 @@ import {
 } from '../talk-demo/vocabulary-persistence';
 import {
   getGeminiApiKey,
-  resolveTalkCoaching,
   type TalkProviderKind,
 } from '../talk-demo';
 import { generateId } from '../shared/id';
@@ -81,6 +80,7 @@ import { nowIso } from '../shared/time';
 
 import { planSpeakingPractice } from './planner';
 import {
+  TURN_GOAL_INSTRUCTIONS,
   buildSpeakingCoachingPrompt,
   buildTutorOpeningMessage,
   isShortAnswer,
@@ -95,7 +95,6 @@ import type {
   SpeakingPlannerOptions,
   SpeakingSummarySection,
   SpeakingTurnGoal,
-  SpeakingTurnGoalKind,
 } from './types';
 
 /* ------------------------------------------------------------------ *
@@ -156,8 +155,14 @@ interface SpeakingSessionHandle {
   reformulationsUsed: number;
   /** Finalization lock: prevents complete/dispose from double-finalizing. */
   finalizationLock: Promise<SpeakingPracticeSummary> | null;
+  /** Re-entrancy guard: a finalization is running right now. */
+  finalizing: boolean;
   finalized: boolean;
   abandoned: boolean;
+  /** The learner turn that is currently in flight (if any). */
+  pendingTurn: Promise<ConversationSessionResult> | null;
+  /** The (single) finalized summary, returned by repeated completePractice(). */
+  summary: SpeakingPracticeSummary | null;
   /** Set of feedback object identities already persisted (dedup). */
   persistedFeedback: WeakSet<ConversationFeedback>;
 }
@@ -166,6 +171,15 @@ interface SpeakingSessionHandle {
  * Service
  * ------------------------------------------------------------------ */
 
+/**
+ * The EXISTING progress store, injected by composition (never opened here).
+ * Only real counts are recorded: one completed session, the real number of
+ * learner turns, and a descriptive note. No speaking score is ever written.
+ */
+export interface SpeakingProgressPort {
+  record(record: Omit<ProgressRecord, 'id'>): Promise<ProgressRecord>;
+}
+
 export interface SpeakingPracticeServiceDeps {
   readonly learnerModel: LearnerModel;
   readonly databaseAdapter?: DatabaseAdapter;
@@ -173,15 +187,31 @@ export interface SpeakingPracticeServiceDeps {
   readonly disableAI?: boolean;
   readonly memoryService?: ConversationMemoryService;
   readonly learningPersistence?: LearningPersistenceService;
+  /** EXISTING progress store (optional; injected by composition). */
+  readonly progress?: SpeakingProgressPort;
+  /**
+   * False when `learnerModel` is the deterministic demo model rather than real
+   * persisted learner state. Such a plan is never labeled personalized.
+   */
+  readonly evidenceIsReal?: boolean;
   readonly now?: () => IsoDate;
 }
 
 export class SpeakingPracticeService {
   private readonly deps: SpeakingPracticeServiceDeps;
   private handle: SpeakingSessionHandle | null = null;
+  /**
+   * The last finalized summary. Kept so completePractice() stays idempotent
+   * even after dispose() released the session (the callers can race).
+   */
+  private lastSummary: SpeakingPracticeSummary | null = null;
 
   constructor(deps: SpeakingPracticeServiceDeps) {
     this.deps = deps;
+  }
+
+  private now(): IsoDate {
+    return this.deps.now?.() ?? nowIso();
   }
 
   /* ----------------------------- planning ----------------------------- */
@@ -189,6 +219,15 @@ export class SpeakingPracticeService {
   async planPractice(
     options?: SpeakingPlannerOptions,
   ): Promise<SpeakingPracticePlanResult> {
+    // Refresh the persisted snapshot first (best effort) so the plan is built
+    // from CURRENT real evidence — never from a stale in-memory snapshot.
+    try {
+      await this.deps.learnerModel.refresh();
+    } catch {
+      // A refresh failure is not fatal: planning continues on the last
+      // successfully loaded snapshot.
+    }
+
     const coaching = this.deps.learnerModel.getCoachingContext();
     const learnerId = coaching.profile.learnerId;
     if (!learnerId) {
@@ -211,7 +250,8 @@ export class SpeakingPracticeService {
         coaching,
         hasProfile: true,
         recentConversations,
-        now: this.deps.now?.() ?? nowIso(),
+        now: this.now(),
+        ...(this.deps.evidenceIsReal === false ? { evidenceIsReal: false } : {}),
       },
       options,
     );
@@ -227,28 +267,37 @@ export class SpeakingPracticeService {
     readonly providerKind: TalkProviderKind;
     readonly isRealAI: boolean;
   }> {
-    if (this.handle) {
+    const existing = this.handle;
+    if (existing && !existing.finalized && !existing.abandoned) {
+      // An ACTIVE practice is still running: it is never silently replaced.
       throw new Error('A speaking practice session is already in progress.');
     }
+    // A finished/abandoned handle (or a previously disposed one) is replaced.
+    this.handle = null;
+    this.lastSummary = null;
 
-    const now = this.deps.now?.() ?? nowIso();
+    const now = this.now();
     const aiProvider = this.resolveAIProvider();
     const isRealAI = aiProvider !== null && !this.deps.disableAI;
     const providerKind: TalkProviderKind = isRealAI ? 'gemini' : 'demo';
     const resolvedProvider = aiProvider ?? createDemoAIProvider();
 
-    // Mutable turn-goal state — the decorator reads this on every buildRequest.
-    let currentTurnGoal: SpeakingTurnGoal = plan.turnGoals[0] ?? {
-      turnIndex: 0,
-      goal: 'open',
-      instruction: 'Open the conversation.',
+    // Mutable turn-goal state. The decorator and the service share ONE box, so
+    // every buildRequest sees the CURRENT goal and a goal change is impossible
+    // to miss (a captured primitive would silently freeze the opening goal).
+    const turnGoal: { current: SpeakingTurnGoal } = {
+      current: plan.turnGoals[0] ?? {
+        turnIndex: 0,
+        goal: 'open',
+        instruction: TURN_GOAL_INSTRUCTIONS.open,
+      },
     };
 
     // EXISTING engine → decorator → orchestrator → session
     const innerEngine = createConversationEngine(this.deps.learnerModel);
     const engine = createSpeakingEngineDecorator(innerEngine, {
       plan,
-      getCurrentTurnGoal: () => currentTurnGoal,
+      getCurrentTurnGoal: () => turnGoal.current,
     });
     const orchestrator = createConversationOrchestrator(engine, resolvedProvider);
 
@@ -305,11 +354,20 @@ export class SpeakingPracticeService {
       learningPersistence,
       isRealAI,
       providerKind,
-      currentTurnGoal,
+      // Same box the decorator reads: reads and writes stay in sync.
+      get currentTurnGoal(): SpeakingTurnGoal {
+        return turnGoal.current;
+      },
+      set currentTurnGoal(next: SpeakingTurnGoal) {
+        turnGoal.current = next;
+      },
       reformulationsUsed: 0,
       finalizationLock: null,
+      finalizing: false,
       finalized: false,
       abandoned: false,
+      pendingTurn: null,
+      summary: null,
       persistedFeedback: new WeakSet<ConversationFeedback>(),
     };
 
@@ -326,14 +384,25 @@ export class SpeakingPracticeService {
     onChunk?: (chunk: string) => void,
   ): Promise<ConversationSessionResult> {
     const handle = this.requireActiveHandle();
-    const openingMessage = buildTutorOpeningMessage(handle.session.plan);
-    const result = await handle.conversationSession.openConversation!(
-      { userMessage: openingMessage },
-      onChunk,
+    const openConversation = handle.conversationSession.openConversation?.bind(
+      handle.conversationSession,
     );
-    // Note feedback from the opening (vocabulary suggestions, etc.)
+    if (!openConversation) {
+      throw new Error('The conversation session cannot open a conversation.');
+    }
+    const openingMessage = buildTutorOpeningMessage(handle.session.plan);
+    // The opening is a TUTOR turn only: it is never counted as learner work and
+    // its (non-existent) feedback is never attributed to the learner. Its goal
+    // is the plan's opening goal; once it is delivered, the goal advances to
+    // the reply that will follow the learner's first answer.
+    const result = await openConversation({ userMessage: openingMessage }, onChunk);
     if (result.ok) {
-      handle.recorder.noteFeedback(handle.conversationSession.getLastFeedback());
+      handle.currentTurnGoal =
+        this.plannedGoalFor(handle, handle.session.learnerTurnCount + 1) ?? {
+          turnIndex: handle.session.learnerTurnCount + 1,
+          goal: 'follow_up',
+          instruction: TURN_GOAL_INSTRUCTIONS.follow_up,
+        };
     }
     return result;
   }
@@ -358,14 +427,56 @@ export class SpeakingPracticeService {
     onChunk?: (chunk: string) => void,
   ): Promise<ConversationSessionResult> {
     const handle = this.requireActiveHandle();
+    this.assertTurnAllowed(handle);
+
+    // One learner turn at a time: a double submit can never be counted twice.
+    const turn = this.performLearnerTurn(handle, message, onChunk);
+    handle.pendingTurn = turn;
+    try {
+      return await turn;
+    } finally {
+      if (handle.pendingTurn === turn) handle.pendingTurn = null;
+    }
+  }
+
+  /** Synchronous refusal rules shared by every learner-turn entry point. */
+  private assertTurnAllowed(handle: SpeakingSessionHandle): void {
     if (handle.abandoned) {
       throw new Error('This speaking practice session has been closed.');
     }
-    if (handle.finalized || handle.finalizationLock) {
+    if (handle.finalized || handle.finalizationLock || handle.finalizing) {
       throw new Error('This speaking practice session is already complete.');
+    }
+    if (handle.pendingTurn) {
+      throw new Error('A learner turn is already being processed.');
     }
     if (handle.session.learnerTurnCount >= handle.session.plan.hardMaxTurns) {
       throw new Error('The maximum number of turns for this session has been reached.');
+    }
+  }
+
+  /**
+   * The actual turn. Counting, evidence persistence and goal adaptation happen
+   * ONLY for a turn the EXISTING session really committed.
+   */
+  private async performLearnerTurn(
+    handle: SpeakingSessionHandle,
+    message: string,
+    onChunk?: (chunk: string) => void,
+  ): Promise<ConversationSessionResult> {
+    // Deterministic pre-call goal: the learner's message is known BEFORE the
+    // request is built, so a short answer receives ONE focused elaboration
+    // follow-up in the tutor reply to that very answer. A pending
+    // reformulation request (from real correction evidence) keeps priority.
+    if (
+      handle.currentTurnGoal.goal !== 'reformulate' &&
+      isShortAnswer(message)
+    ) {
+      handle.currentTurnGoal = {
+        turnIndex: handle.session.learnerTurnCount + 1,
+        goal: 'expand',
+        instruction: TURN_GOAL_INSTRUCTIONS.expand,
+      };
     }
 
     const result = await handle.conversationSession.send(
@@ -374,7 +485,8 @@ export class SpeakingPracticeService {
     );
 
     if (!result.ok) {
-      // AI failure: do not increment, do not persist, do not note feedback.
+      // AI failure (or a turn refused by a closed session): do not increment,
+      // do not persist, do not note feedback.
       return result;
     }
 
@@ -394,8 +506,8 @@ export class SpeakingPracticeService {
       this.persistFeedbackOnce(handle, feedback);
     }
 
-    // Update the turn goal for the NEXT tutor reply based on this answer.
-    this.updateTurnGoal(handle, message, feedback);
+    // Update the turn goal for the NEXT tutor reply based on this evidence.
+    this.updateTurnGoal(handle, feedback);
 
     return result;
   }
@@ -403,15 +515,19 @@ export class SpeakingPracticeService {
   /* ---------------------- turn-goal adaptation ------------------------ */
 
   /**
-   * Update the current turn goal for the next tutor reply based on the
-   * learner's answer and any real correction evidence.
+   * Choose the goal for the NEXT tutor reply from the evidence of the turn that
+   * was just committed:
+   * - real incorrect/unnatural correction → one reformulation request,
+   * - otherwise → the plan's goal for the next reply (fallback: follow-up).
+   *
+   * Correction evidence only exists AFTER the reply to that turn, so the
+   * reformulation request necessarily rides on the following reply — the same
+   * single-request-per-turn pipeline, never an extra AI call.
    */
   private updateTurnGoal(
     handle: SpeakingSessionHandle,
-    learnerAnswer: string,
     feedback: ConversationFeedback | null,
   ): void {
-    const plan = handle.session.plan;
     const nextTurnIndex = handle.session.learnerTurnCount + 1;
 
     // Check reformulation (only with real correction evidence)
@@ -427,33 +543,27 @@ export class SpeakingPracticeService {
       handle.currentTurnGoal = {
         turnIndex: nextTurnIndex,
         goal: 'reformulate',
-        instruction:
-          'Ask the learner to reformulate their previous answer more naturally. ' +
-          'Do not provide the final answer before they try.',
+        instruction: TURN_GOAL_INSTRUCTIONS.reformulate,
       };
       return;
     }
 
-    // Check expansion (qualitative short-answer heuristic)
-    if (isShortAnswer(learnerAnswer)) {
-      handle.currentTurnGoal = {
-        turnIndex: nextTurnIndex,
-        goal: 'expand',
-        instruction:
-          'The learner\'s previous answer was short. Ask ONE focused follow-up ' +
-          'that requires elaboration — a reason, an example, or "what happened next".',
-      };
-      return;
-    }
-
-    // Otherwise, use the planner's predetermined turn goal for this index.
-    const plannedGoal = plan.turnGoals.find(
-      (g) => g.turnIndex === nextTurnIndex,
-    );
+    // Otherwise, use the planner's predetermined goal for the next reply.
     handle.currentTurnGoal =
-      plannedGoal ??
-      plan.turnGoals.find((g) => g.goal === 'follow_up') ??
-      handle.currentTurnGoal;
+      this.plannedGoalFor(handle, nextTurnIndex) ?? handle.currentTurnGoal;
+  }
+
+  /** The planned goal of the tutor reply to learner turn `turnIndex`. */
+  private plannedGoalFor(
+    handle: SpeakingSessionHandle,
+    turnIndex: number,
+  ): SpeakingTurnGoal | null {
+    const goals = handle.session.plan.turnGoals;
+    return (
+      goals.find((goal) => goal.turnIndex === turnIndex) ??
+      goals.find((goal) => goal.goal === 'follow_up') ??
+      null
+    );
   }
 
   /* ------------------------- feedback persist ------------------------- */
@@ -503,39 +613,64 @@ export class SpeakingPracticeService {
   /* --------------------------- complete ------------------------------- */
 
   /**
-   * Finalize the speaking practice session. Idempotent: calling twice
-   * returns the same summary. Racing with dispose() cannot duplicate
-   * memory finalization (shared finalizationLock).
+   * Finalize the speaking practice session.
+   *
+   * Idempotent: repeated calls (including one that races dispose()) return the
+   * SAME summary and finalize conversation memory exactly once. An in-flight
+   * learner turn is awaited first, so a turn that is already committed is never
+   * lost from the summary and a failed turn is never counted.
    */
   async completePractice(): Promise<SpeakingPracticeSummary> {
     const handle = this.handle;
     if (!handle) {
+      // Already disposed (or finalized by disposal): the same summary is
+      // returned instead of failing the caller.
+      if (this.lastSummary) return this.lastSummary;
       throw new Error('No active speaking practice session.');
     }
     if (handle.finalizationLock) {
       return handle.finalizationLock;
     }
+    if (handle.finalized && handle.summary) {
+      return handle.summary;
+    }
 
-    const promise = this.finalizeInternal(handle);
+    // The lock is assigned SYNCHRONOUSLY (before any await below), so a
+    // concurrent dispose()/completePractice() can never start a second
+    // finalization.
+    const promise = (async (): Promise<SpeakingPracticeSummary> => {
+      const pending = handle.pendingTurn;
+      if (pending) {
+        try {
+          await pending;
+        } catch {
+          // A failed turn is not evidence; finalization continues.
+        }
+      }
+      return this.finalizeInternal(handle);
+    })();
     handle.finalizationLock = promise;
     try {
       return await promise;
-    } finally {
-      // Keep the lock resolved so repeated calls return the same promise.
-      // The `finalized` flag prevents re-entry into finalizeInternal.
+    } catch (error) {
+      // A finalization that failed may be retried; a successful one keeps its lock.
+      if (handle.finalizationLock === promise) handle.finalizationLock = null;
+      throw error;
     }
   }
 
   private async finalizeInternal(
     handle: SpeakingSessionHandle,
   ): Promise<SpeakingPracticeSummary> {
-    if (handle.finalized) {
-      // Should not reach here because finalizationLock guards entry,
-      // but defensive: never finalize twice.
+    if (handle.finalizing || handle.finalized) {
+      // Defensive: never finalize twice, even if a caller bypassed the lock.
+      if (handle.summary) return handle.summary;
       throw new Error('Session already finalized.');
     }
+    handle.finalizing = true;
 
-    handle.session = { ...handle.session, completed: true, endedAt: nowIso() };
+    const endedAt = this.now();
+    handle.session = { ...handle.session, completed: true, endedAt };
 
     // Finalize conversation memory through the EXISTING exactly-once path.
     let persistence: FinalizeConversationResult;
@@ -544,6 +679,7 @@ export class SpeakingPracticeService {
         session: handle.conversationSession,
         recorder: handle.recorder,
         isRealAI: handle.isRealAI,
+        ...(endedAt ? { endedAt } : {}),
         service: handle.memoryService,
       });
       persistence = review.persistence;
@@ -555,10 +691,59 @@ export class SpeakingPracticeService {
       };
     }
 
-    handle.finalized = true;
+    let summary: SpeakingPracticeSummary;
+    try {
+      summary = this.buildSummary(handle, persistence, endedAt);
+    } catch (error) {
+      // A failed finalization releases the re-entrancy guard so the caller can
+      // retry it; nothing was marked finalized.
+      handle.finalizing = false;
+      throw error;
+    }
 
-    const summary = this.buildSummary(handle, persistence);
+    handle.summary = summary;
+    this.lastSummary = summary;
+    handle.finalized = true;
+    handle.finalizing = false;
+    // ONE honest progress record, only for a real AI session with real learner
+    // turns. It is written behind the same finalization lock, so it can never be
+    // recorded twice, and it never carries a speaking score.
+    await this.recordProgressOnce(handle, summary);
     return summary;
+  }
+
+  /**
+   * Records real, existing-supported counts through the EXISTING progress store.
+   * No score, percentage, level change or gamification field is ever written.
+   */
+  private async recordProgressOnce(
+    handle: SpeakingSessionHandle,
+    summary: SpeakingPracticeSummary,
+  ): Promise<void> {
+    const progress = this.deps.progress;
+    if (!progress) return;
+    // Demo/offline sessions are not real learner practice.
+    if (!handle.isRealAI) return;
+    if (summary.learnerTurns <= 0) return;
+    try {
+      await progress.record({
+        learnerId: handle.session.plan.learnerId,
+        recordedAt: summary.generatedAt,
+        windowStart: handle.session.startedAt,
+        windowEnd: summary.generatedAt,
+        sessionsCompleted: 1,
+        turnsCompleted: summary.learnerTurns,
+        // Owned by the other existing engines — never claimed here.
+        newWordsLearned: 0,
+        weaknessesImproved: 0,
+        weaknessesWorsened: 0,
+        notes: `Speaking practice (${handle.session.plan.practiceType}, ${handle.session.plan.source}): ${summary.learnerTurns} learner turn${
+          summary.learnerTurns === 1 ? '' : 's'
+        } with the tutor.`,
+      });
+    } catch {
+      // Progress persistence must never fail the completed practice session.
+    }
   }
 
   /* ----------------------------- dispose ------------------------------ */
@@ -570,33 +755,39 @@ export class SpeakingPracticeService {
    */
   async dispose(): Promise<void> {
     const handle = this.handle;
-    if (!handle) return;
+    if (!handle) return; // Already disposed: idempotent.
+
+    // SYNCHRONOUS refusal first: the handle stops accepting turns in this tick,
+    // before the first await, so a late AI/STT result can never start new work.
+    this.handle = null;
     handle.abandoned = true;
 
-    // Abandon the conversation session first (prevents late commits).
+    // Abandon the conversation session (discards in-flight work).
     handle.conversationSession.abandon?.();
 
-    // If not already finalized and there were real learner turns, finalize once.
-    if (!handle.finalized && !handle.finalizationLock) {
-      if (handle.recorder.hasCommittedLearnerTurn(handle.conversationSession)) {
-        const promise = this.finalizeInternal(handle).catch(() => undefined as unknown as SpeakingPracticeSummary);
-        handle.finalizationLock = promise as Promise<SpeakingPracticeSummary>;
-        try {
-          await promise;
-        } catch {
-          // Disposal failures are non-destructive.
-        }
-      }
-    } else if (handle.finalizationLock) {
-      // A completion is in flight: wait for it to settle.
+    // A completion that is already running owns finalization: just wait.
+    if (handle.finalizationLock) {
       try {
         await handle.finalizationLock;
       } catch {
-        // Ignore.
+        // A completion failure is reported to its own caller.
       }
+      return;
     }
 
-    this.handle = null;
+    if (handle.finalized) return;
+
+    // Nothing was practiced: there is nothing to finalize or persist.
+    if (!handle.recorder.hasCommittedLearnerTurn(handle.conversationSession)) return;
+
+    // Real learner turns exist: finalize them exactly once.
+    const promise = this.finalizeInternal(handle);
+    handle.finalizationLock = promise;
+    try {
+      await promise;
+    } catch {
+      // Disposal failures are non-destructive.
+    }
   }
 
   /* --------------------------- summary build -------------------------- */
@@ -604,6 +795,7 @@ export class SpeakingPracticeService {
   private buildSummary(
     handle: SpeakingSessionHandle,
     persistence: FinalizeConversationResult,
+    endedAt: IsoDate,
   ): SpeakingPracticeSummary {
     const history = handle.conversationSession.getHistory();
     const learnerTurns = history.filter((t) => t.role === 'user').length;
@@ -723,7 +915,7 @@ export class SpeakingPracticeService {
       isDemo,
       notice,
       persistence,
-      generatedAt: nowIso(),
+      generatedAt: endedAt,
     };
   }
 
@@ -752,18 +944,26 @@ export class SpeakingPracticeService {
  * Compose a SpeakingPracticeService on the existing learner model + adapter.
  * Same canonical database as Talk/Adaptive Lessons/Listening/etc.
  */
+export interface SpeakingPracticeServiceOptions {
+  readonly aiProvider?: AIProvider;
+  readonly disableAI?: boolean;
+  /** EXISTING progress store, composed by the caller (never opened here). */
+  readonly progress?: SpeakingProgressPort;
+  /** False when the learner model is the demo model (never personalized). */
+  readonly evidenceIsReal?: boolean;
+}
+
 export function createSpeakingPracticeService(
   learnerModel: LearnerModel,
   adapter?: DatabaseAdapter,
-  options?: {
-    readonly aiProvider?: AIProvider;
-    readonly disableAI?: boolean;
-  },
+  options?: SpeakingPracticeServiceOptions,
 ): SpeakingPracticeService {
   return new SpeakingPracticeService({
     learnerModel,
     ...(adapter ? { databaseAdapter: adapter } : {}),
     ...(options?.aiProvider ? { aiProvider: options.aiProvider } : {}),
     ...(options?.disableAI ? { disableAI: true } : {}),
+    ...(options?.progress ? { progress: options.progress } : {}),
+    ...(options?.evidenceIsReal === false ? { evidenceIsReal: false } : {}),
   });
 }
