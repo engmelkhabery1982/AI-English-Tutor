@@ -20,6 +20,9 @@ import type {
 import type {
   UserProfileRepository,
   ConversationRepository,
+  ConversationActivityStats,
+  LexicalBucketCounts,
+  WeaknessStatusCounts,
   MistakeRepository,
   PronunciationRepository,
   WeaknessRepository,
@@ -35,7 +38,7 @@ import type {
   LearnerWeakness,
   LearnerStrength,
 } from '../../../domain/models/learner';
-import type { EvidenceRef } from '../../../domain/shared/types';
+import type { EvidenceRef, WeaknessStatus } from '../../../domain/shared/types';
 import type {
   ConversationSession,
   ConversationTurn,
@@ -492,6 +495,42 @@ export class SQLiteConversationRepository implements ConversationRepository {
     );
 
     return rows.map(rowToConversationTurn);
+  }
+
+  /**
+   * Exact aggregate counts over persisted sessions (optionally bounded to a
+   * started-at range). Single GROUP-free aggregate query — never loads rows.
+   */
+  async getActivityStats(
+    learnerId: string,
+    opts?: { startedAfter?: string; startedUntil?: string },
+  ): Promise<ConversationActivityStats> {
+    if (!isValidUuid(learnerId)) {
+      return { sessionsTotal: 0, sessionsCompleted: 0, turnsTotal: 0 };
+    }
+
+    let sql = `SELECT
+        COUNT(*) AS sessions_total,
+        COALESCE(SUM(CASE WHEN status IN ('completed', 'summarized') THEN 1 ELSE 0 END), 0) AS sessions_completed,
+        COALESCE(SUM(turn_count), 0) AS turns_total
+      FROM conversation_sessions WHERE learner_id = ?`;
+    const params: SqlParam[] = [learnerId];
+    if (opts?.startedAfter !== undefined) {
+      sql += ` AND started_at >= ?`;
+      params.push(opts.startedAfter);
+    }
+    if (opts?.startedUntil !== undefined) {
+      sql += ` AND started_at < ?`;
+      params.push(opts.startedUntil);
+    }
+
+    const rows = await this.adapter.query(sql, params);
+    const row = rows[0] ?? {};
+    return {
+      sessionsTotal: Number(row.sessions_total ?? 0),
+      sessionsCompleted: Number(row.sessions_completed ?? 0),
+      turnsTotal: Number(row.turns_total ?? 0),
+    };
   }
 }
 
@@ -1255,6 +1294,74 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
       ],
     );
   }
+
+  /** Exact unresolved-weakness counts grouped by persisted lifecycle state. */
+  async getUnresolvedStatusCounts(learnerId: string): Promise<WeaknessStatusCounts> {
+    if (!isValidUuid(learnerId)) {
+      return { unresolved: 0, byStatus: {} };
+    }
+
+    const rows = await this.adapter.query(
+      `SELECT status, COUNT(*) AS c FROM learner_weaknesses
+       WHERE learner_id = ? AND resolved = 0 GROUP BY status`,
+      [learnerId],
+    );
+
+    const byStatus: Partial<Record<WeaknessStatus, number>> = {};
+    let unresolved = 0;
+    for (const row of rows) {
+      const status = row.status as WeaknessStatus;
+      const count = Number(row.c ?? 0);
+      byStatus[status] = count;
+      unresolved += count;
+    }
+    return { unresolved, byStatus };
+  }
+
+  /** Exact count of unresolved weaknesses first seen in an optional range. */
+  async countUnresolved(
+    learnerId: string,
+    opts?: { firstSeenAfter?: string; firstSeenUntil?: string },
+  ): Promise<number> {
+    if (!isValidUuid(learnerId)) return 0;
+
+    let sql = `SELECT COUNT(*) AS c FROM learner_weaknesses WHERE learner_id = ? AND resolved = 0`;
+    const params: SqlParam[] = [learnerId];
+    if (opts?.firstSeenAfter !== undefined) {
+      sql += ` AND first_seen_at >= ?`;
+      params.push(opts.firstSeenAfter);
+    }
+    if (opts?.firstSeenUntil !== undefined) {
+      sql += ` AND first_seen_at < ?`;
+      params.push(opts.firstSeenUntil);
+    }
+    const rows = await this.adapter.query(sql, params);
+    return Number(rows[0]?.c ?? 0);
+  }
+
+  /** Exact count of persisted weakness-evidence rows in an optional range. */
+  async countEvidence(
+    learnerId: string,
+    opts?: { atAfter?: string; atUntil?: string },
+  ): Promise<number> {
+    if (!isValidUuid(learnerId)) return 0;
+
+    let sql = `SELECT COUNT(*) AS c
+      FROM weakness_evidence e
+      INNER JOIN learner_weaknesses w ON e.weakness_id = w.id
+      WHERE w.learner_id = ?`;
+    const params: SqlParam[] = [learnerId];
+    if (opts?.atAfter !== undefined) {
+      sql += ` AND e.at >= ?`;
+      params.push(opts.atAfter);
+    }
+    if (opts?.atUntil !== undefined) {
+      sql += ` AND e.at < ?`;
+      params.push(opts.atUntil);
+    }
+    const rows = await this.adapter.query(sql, params);
+    return Number(rows[0]?.c ?? 0);
+  }
 }
 
 /** Map lexical_items row to VocabularyItem domain object (without meanings). */
@@ -1515,6 +1622,92 @@ async function deleteLexicalItemWithReviews(
   ]);
 
   return true;
+}
+
+/**
+ * Exact review-bucket counts for lexical rows of the given types (or all
+ * types when null), computed fully in SQL from the authoritative
+ * per-meaning review columns. Bucket semantics match the shared
+ * deriveReviewBucket helper in vocabulary-workspace:
+ *   due      — any meaning with nextReviewAt <= now
+ *   mastered — not due, >=1 reviewed meaning, all reviewed mastered/retired
+ *   familiar — not due, >=1 reviewed meaning, all reviewed familiar or better
+ *   learning — everything else (includes never-reviewed items)
+ */
+async function lexicalBucketCounts(
+  adapter: DatabaseAdapter,
+  learnerId: string,
+  types: readonly string[] | null,
+  now: string,
+): Promise<LexicalBucketCounts> {
+  if (!isValidUuid(learnerId)) {
+    return { total: 0, due: 0, learning: 0, familiar: 0, mastered: 0 };
+  }
+
+  const typeFilter = types && types.length > 0
+    ? ` AND li.type IN (${types.map(() => '?').join(', ')})`
+    : '';
+  const params: SqlParam[] = [now, learnerId, ...(types && types.length > 0 ? types : [])];
+
+  const rows = await adapter.query(
+    `SELECT
+      COUNT(*) AS total,
+      COALESCE(SUM(q.has_due), 0) AS due,
+      COALESCE(SUM(CASE WHEN q.has_due = 0 AND q.reviewed_count = 0 THEN 1 ELSE 0 END), 0) AS learning_new,
+      COALESCE(SUM(CASE WHEN q.has_due = 0 AND q.reviewed_count > 0 AND q.mastered_count >= q.reviewed_count THEN 1 ELSE 0 END), 0) AS mastered,
+      COALESCE(SUM(CASE WHEN q.has_due = 0 AND q.reviewed_count > 0 AND q.mastered_count < q.reviewed_count AND q.familiar_or_better >= q.reviewed_count THEN 1 ELSE 0 END), 0) AS familiar,
+      COALESCE(SUM(CASE WHEN q.has_due = 0 AND (q.reviewed_count = 0 OR q.familiar_or_better < q.reviewed_count) THEN 1 ELSE 0 END), 0) AS learning_rest
+    FROM (
+      SELECT li.id AS id,
+        MAX(CASE WHEN lm.review_next_review_at IS NOT NULL AND lm.review_next_review_at <= ? THEN 1 ELSE 0 END) AS has_due,
+        COUNT(lm.review_state) AS reviewed_count,
+        COALESCE(SUM(CASE WHEN lm.review_state IN ('mastered', 'retired') THEN 1 ELSE 0 END), 0) AS mastered_count,
+        COALESCE(SUM(CASE WHEN lm.review_state IN ('familiar', 'mastered', 'retired') THEN 1 ELSE 0 END), 0) AS familiar_or_better
+      FROM lexical_items li
+      LEFT JOIN lexical_meanings lm ON lm.lexical_item_id = li.id
+      WHERE li.learner_id = ?${typeFilter}
+      GROUP BY li.id
+    ) q`,
+    params,
+  );
+
+  const row = rows[0] ?? {};
+  const learning = Number(row.learning_new ?? 0) + Number(row.learning_rest ?? 0);
+  return {
+    total: Number(row.total ?? 0),
+    due: Number(row.due ?? 0),
+    learning,
+    familiar: Number(row.familiar ?? 0),
+    mastered: Number(row.mastered ?? 0),
+  };
+}
+
+/** Exact count of lexical rows created in an optional range (optionally by type). */
+async function countLexicalCreated(
+  adapter: DatabaseAdapter,
+  learnerId: string,
+  types: readonly string[] | null,
+  opts?: { createdAfter?: string; createdUntil?: string },
+): Promise<number> {
+  if (!isValidUuid(learnerId)) return 0;
+
+  let sql = `SELECT COUNT(*) AS c FROM lexical_items WHERE learner_id = ?`;
+  const params: SqlParam[] = [learnerId];
+  if (opts?.createdAfter !== undefined) {
+    sql += ` AND created_at >= ?`;
+    params.push(opts.createdAfter);
+  }
+  if (opts?.createdUntil !== undefined) {
+    sql += ` AND created_at < ?`;
+    params.push(opts.createdUntil);
+  }
+  if (types && types.length > 0) {
+    sql += ` AND type IN (${types.map(() => '?').join(', ')})`;
+    params.push(...types);
+  }
+
+  const rows = await adapter.query(sql, params);
+  return Number(rows[0]?.c ?? 0);
 }
 
 /** Build partial UPDATE SQL and params for a lexical item. */
@@ -1790,12 +1983,20 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
 
   async list(
     learnerId: string,
-    opts?: { state?: string; limit?: number },
+    opts?: { state?: string; limit?: number; types?: readonly VocabularyItem['type'][] },
   ): Promise<readonly VocabularyItem[]> {
     if (!isValidUuid(learnerId)) return [];
 
     let sql = `SELECT * FROM lexical_items WHERE learner_id = ?`;
     const params: SqlParam[] = [learnerId];
+
+    // Optional type filter (e.g. vocabulary dashboard reads only word/phrase
+    // rows; expression rows live in the same table under different types).
+    if (opts?.types !== undefined && opts.types.length > 0) {
+      const placeholders = opts.types.map(() => '?').join(', ');
+      sql += ` AND type IN (${placeholders})`;
+      params.push(...opts.types);
+    }
 
     // Note: state filter would require joining with lexical_meanings
     // For now, we don't implement state filter as it requires item-level review aggregate
@@ -1969,6 +2170,27 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
    */
   async delete(id: string): Promise<boolean> {
     return deleteLexicalItemCompletely(this.adapter, id);
+  }
+
+  /**
+   * Exact review-bucket counts over word/phrase rows, computed in SQL.
+   * Defaults to the vocabulary-type rows when no type filter is given.
+   */
+  async getBucketCounts(
+    learnerId: string,
+    opts: { now: string; types?: readonly VocabularyItem['type'][] },
+  ): Promise<LexicalBucketCounts> {
+    const types = opts.types && opts.types.length > 0 ? opts.types : ['word', 'phrase'];
+    return lexicalBucketCounts(this.adapter, learnerId, types, opts.now);
+  }
+
+  /** Exact count of vocabulary rows created in an optional range. */
+  async countCreated(
+    learnerId: string,
+    opts?: { createdAfter?: string; createdUntil?: string; types?: readonly VocabularyItem['type'][] },
+  ): Promise<number> {
+    const types = opts?.types && opts.types.length > 0 ? opts.types : ['word', 'phrase'];
+    return countLexicalCreated(this.adapter, learnerId, types, opts);
   }
 }
 
@@ -2288,6 +2510,38 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
   async delete(id: string): Promise<boolean> {
     return deleteLexicalItemCompletely(this.adapter, id);
   }
+
+  /** Exact review-bucket counts over expression-type rows, computed in SQL. */
+  async getBucketCounts(
+    learnerId: string,
+    opts: { now: string },
+  ): Promise<LexicalBucketCounts> {
+    const types: readonly string[] = [
+      'idiom',
+      'collocation',
+      'common_expression',
+      'professional_expression',
+      'linking_expression',
+      'phrasal_verb',
+    ];
+    return lexicalBucketCounts(this.adapter, learnerId, types, opts.now);
+  }
+
+  /** Exact count of expression rows created in an optional range. */
+  async countCreated(
+    learnerId: string,
+    opts?: { createdAfter?: string; createdUntil?: string },
+  ): Promise<number> {
+    const types: readonly string[] = [
+      'idiom',
+      'collocation',
+      'common_expression',
+      'professional_expression',
+      'linking_expression',
+      'phrasal_verb',
+    ];
+    return countLexicalCreated(this.adapter, learnerId, types, opts);
+  }
 }
 
 /** Map review_items row to ReviewItem domain object. */
@@ -2579,6 +2833,39 @@ export class SQLiteReviewRepository implements ReviewRepository {
     );
     return result.rowsAffected;
   }
+
+  /** Exact count of reviews due at `now` — single aggregate query. */
+  async countDue(learnerId: string, now: string): Promise<number> {
+    if (!isValidUuid(learnerId)) return 0;
+
+    const rows = await this.adapter.query(
+      `SELECT COUNT(*) AS c FROM review_items WHERE learner_id = ? AND due_at <= ?`,
+      [learnerId, now],
+    );
+    return Number(rows[0]?.c ?? 0);
+  }
+
+  /** Exact count of reviews completed in an optional last-review range. */
+  async countReviewed(
+    learnerId: string,
+    opts?: { lastReviewAfter?: string; lastReviewUntil?: string },
+  ): Promise<number> {
+    if (!isValidUuid(learnerId)) return 0;
+
+    let sql = `SELECT COUNT(*) AS c FROM review_items
+       WHERE learner_id = ? AND last_review_at IS NOT NULL`;
+    const params: SqlParam[] = [learnerId];
+    if (opts?.lastReviewAfter !== undefined) {
+      sql += ` AND last_review_at >= ?`;
+      params.push(opts.lastReviewAfter);
+    }
+    if (opts?.lastReviewUntil !== undefined) {
+      sql += ` AND last_review_at < ?`;
+      params.push(opts.lastReviewUntil);
+    }
+    const rows = await this.adapter.query(sql, params);
+    return Number(rows[0]?.c ?? 0);
+  }
 }
 
 /** Map progress_records row to ProgressRecord domain object. */
@@ -2687,6 +2974,27 @@ export class SQLiteProgressRepository implements ProgressRepository {
       [learnerId],
     );
     return rows.length > 0 ? rowToProgressRecord(rows[0]) : null;
+  }
+
+  /** Exact count of persisted progress records in an optional range. */
+  async countRecords(
+    learnerId: string,
+    opts?: { recordedAfter?: string; recordedUntil?: string },
+  ): Promise<number> {
+    if (!isValidUuid(learnerId)) return 0;
+
+    let sql = `SELECT COUNT(*) AS c FROM progress_records WHERE learner_id = ?`;
+    const params: SqlParam[] = [learnerId];
+    if (opts?.recordedAfter !== undefined) {
+      sql += ` AND recorded_at >= ?`;
+      params.push(opts.recordedAfter);
+    }
+    if (opts?.recordedUntil !== undefined) {
+      sql += ` AND recorded_at < ?`;
+      params.push(opts.recordedUntil);
+    }
+    const rows = await this.adapter.query(sql, params);
+    return Number(rows[0]?.c ?? 0);
   }
 }
 
