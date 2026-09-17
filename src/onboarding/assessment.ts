@@ -100,9 +100,14 @@ function selectRealEvidence(evidence: DiagnosticEvidence): RealEvidence {
  * A short Phase-1 diagnostic NEVER claims C1/C2 (its evidence cannot support
  * them) and never claims A1, so the ceiling is deliberately B2.
  *
- * Sufficiency (anything less → 'insufficient'):
- *   real conversation with >= 3 learner turns AND (real language use OR listening)
- *   OR real language use AND listening (no conversation available).
+ * Sufficiency (anything less → 'insufficient'): REAL SPEAKING IS REQUIRED.
+ *   - a real conversation with >= 3 substantive learner turns, AND
+ *   - at least one other real dimension (the language-use task or the listening
+ *     task).
+ * A short speaking sample plus one language-use item and one listening item is
+ * NOT enough for a working level: listening and language use COMPLEMENT real
+ * speaking, they never replace it. Demo or too-short speaking → insufficient
+ * (the learner keeps their existing/self-reported level).
  */
 export function estimateWorkingLevel(evidence: DiagnosticEvidence): DiagnosticLevelEstimate {
   const real = selectRealEvidence(evidence);
@@ -113,21 +118,22 @@ export function estimateWorkingLevel(evidence: DiagnosticEvidence): DiagnosticLe
 
   const speakingSufficient =
     speaking !== null && speaking.committedLearnerTurns >= MIN_SPEAKING_TURNS_FOR_ESTIMATE;
-  const languageUseSufficient = languageUse !== null && languageUse.answered >= 1;
-  const listeningSufficient = listening !== null && listening.answered >= 1;
+  const hasOtherRealDimension =
+    (languageUse !== null && languageUse.answered >= 1) ||
+    (listening !== null && listening.answered >= 1);
 
-  const sufficient =
-    (speakingSufficient && (languageUseSufficient || listeningSufficient)) ||
-    (!speakingSufficient && languageUseSufficient && listeningSufficient);
+  // Real speaking evidence is REQUIRED: the other parts complement it.
+  const sufficient = speakingSufficient && hasOtherRealDimension;
 
   if (!sufficient) {
     if (!real.hasRealDimension) {
       basis.push('No real assessment evidence was collected yet.');
-    } else if (!speakingSufficient && speaking) {
-      basis.push('The conversation was too short to judge connected speech.');
-    }
-    if (speaking && speaking.committedLearnerTurns >= MIN_SPEAKING_TURNS_FOR_ESTIMATE) {
-      basis.push('Only one part of the diagnostic was completed.');
+    } else if (!speaking) {
+      basis.push('No real speaking evidence was collected in this session.');
+    } else if (!speakingSufficient) {
+      basis.push('The speaking sample was too short to judge connected speech.');
+    } else {
+      basis.push('Only the conversation was completed, so the level stays provisional.');
     }
     return { status: 'insufficient', level: 'unknown', confidence: 'limited', basis };
   }

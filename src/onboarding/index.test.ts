@@ -36,6 +36,7 @@ import { createDemoAudioRecorder } from '../voice/recorder';
 import { createVoiceSessionCoordinator } from '../voice';
 import { createDemoTTSProvider } from '../providers/tts/demo';
 import { createDemoSTTProvider } from '../providers/stt';
+import type { STTResult } from '../providers/stt';
 import { createDemoLearnerModel } from '../talk-demo/demo-learner-model';
 import {
   createDiagnosticSession,
@@ -201,6 +202,11 @@ function evidence(overrides: Partial<DiagnosticEvidence> = {}): DiagnosticEviden
     pronunciation: null,
     ...overrides,
   };
+}
+
+/** The single existing profile's learner id (the real composition source). */
+async function learnerIdOf(adapter: SqlJsAdapter): Promise<string> {
+  return (await new SQLiteUserProfileRepository(adapter).get()).id;
 }
 
 async function seedProfile(adapter: SqlJsAdapter, patch: Record<string, unknown> = {}) {
@@ -1942,10 +1948,19 @@ describe('Onboarding — integration with the rest of the app', () => {
     expect(screen).toContain('micInFlightRef');
     expect(screen).toContain('answerInFlightRef');
     expect(screen).toContain('continueInFlightRef');
-    // Advancing is refused while the current step's voice work is in flight.
-    expect(screen).toContain('voice?.isProcessing');
-    expect(screen).toContain('voice?.isSwitching');
-    expect(screen).toContain('Stop the recording first, then continue.');
+    // Advancing is refused while ANY voice work for the current step is active.
+    for (const check of [
+      'voice.isProcessing',
+      'voice.isSwitching',
+      "voice.state === 'requesting_permission'",
+      "voice.state === 'recording'",
+      "voice.state === 'transcribing'",
+      "voice.state === 'sending'",
+      "voice.state === 'speaking'",
+    ]) {
+      expect(screen).toContain(check);
+    }
+    expect(screen).toContain('Wait for your answer to finish before continuing.');
     // The purpose of a voice turn is captured when the microphone OPENS.
     expect(screen).toContain('pendingPurposeRef');
     // Leaving the screen abandons the diagnostic before disposing voice work.
@@ -1964,6 +1979,342 @@ describe('Onboarding — integration with the rest of the app', () => {
     // …and the pronunciation voice path uses the dedicated target comparison.
     expect(screen).toContain('recordPronunciation(');
     expect(screen).toContain('handle.pronunciationTask.sentence,');
+  });
+
+  describe('Pronunciation recording is transcription-only', () => {
+    it('68. a pronunciation repeat never calls ConversationSession.send()', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      await seedProfile(adapter);
+      const persistedTranscripts: string[] = [];
+      const engineCalls: { transcript: string; expectedText?: string }[] = [];
+      const service = createOnboardingService({
+        adapter,
+        learnerModel: createTalkLearnerModel(adapter)!,
+        profileRepository: new SQLiteUserProfileRepository(adapter),
+        pronunciation: {
+          analyzeSpokenTurn: async (input: { transcript: string; expectedText?: string }) => {
+            engineCalls.push({ transcript: input.transcript, expectedText: input.expectedText });
+            return {
+              analysis: {
+                learnerId: 'x',
+                observations: [],
+                weakPoints: [],
+                strengths: [],
+                analyzedAt: NOW,
+              },
+              feedbackLines: ['The final sound in "walked" was softened.'],
+              unavailable: false,
+            } as never;
+          },
+        },
+        now: () => NOW,
+      });
+      const handle = await service.beginDiagnostic();
+      const session = handle.conversation;
+
+      // The pronunciation repeat goes through the TRANSCRIPTION-ONLY path.
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider({ defaultTranscript: 'I usually walk to work.' }),
+        ttsProvider: createDemoTTSProvider(),
+      });
+      await coordinator.startRecording();
+      const outcome = await coordinator.stopRecordingAndTranscribe();
+      expect(outcome.ok).toBe(true);
+      expect(outcome.transcript).toBe('I usually walk to work.');
+
+      // …the ConversationSession is completely untouched by that repeat.
+      expect(session.getHistory()).toEqual([]); // no learner turn, no tutor reply
+      expect(session.getLastFeedback()).toBeNull(); // no conversation feedback
+      const learnerId = await learnerIdOf(adapter);
+      expect(await new SQLiteMistakeRepository(adapter).listMistakes(learnerId)).toEqual([]);
+      expect(await new SQLiteWeaknessRepository(adapter).listWeaknesses(learnerId)).toEqual([]);
+      expect(session.getSavedVocabulary()).toEqual([]); // no vocabulary side effect
+      persistedTranscripts.push(outcome.transcript ?? '');
+
+      // Only the EXISTING pronunciation engine saw it, with the known target.
+      engineCalls.length = 0;
+      for (let index = 0; index < 4; index += 1) handle.session.advance();
+      const observed = await service.recordPronunciation(
+        handle,
+        outcome.transcript!,
+        handle.pronunciationTask.sentence,
+      );
+      expect(observed.observed).toBe(true);
+      expect(engineCalls).toEqual([
+        { transcript: 'I usually walk to work.', expectedText: handle.pronunciationTask.sentence },
+      ]);
+    });
+
+    it('69. the conversational path still submits exactly one turn (voice paths unchanged)', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      await seedProfile(adapter);
+      const session = buildSpeakingSession(createStubProvider(['A tutor reply.']), 'coach');
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider({ defaultTranscript: 'I manage a small team.' }),
+        ttsProvider: createDemoTTSProvider(),
+      });
+
+      await coordinator.startRecording();
+      const outcome = await coordinator.stopRecordingAndProcess();
+
+      expect(outcome.ok).toBe(true);
+      // The normal path still commits the learner turn AND the tutor reply.
+      expect(session.getHistory().map((turn) => turn.role)).toEqual(['user', 'assistant']);
+    });
+
+    it('70. a duplicate stop is refused on the transcription-only path', async () => {
+      const session = buildSpeakingSession(createStubProvider(['Reply.']));
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider({ defaultTranscript: 'One utterance only.' }),
+        ttsProvider: createDemoTTSProvider(),
+      });
+
+      await coordinator.startRecording();
+      const first = await coordinator.stopRecordingAndTranscribe();
+      const second = await coordinator.stopRecordingAndTranscribe();
+
+      expect(first.ok).toBe(true);
+      expect(second.ok).toBe(false);
+      expect(second.transcript).toBeUndefined();
+      expect(session.getHistory()).toEqual([]);
+    });
+
+    it('71. dispose invalidates a late transcription-only STT result', async () => {
+      let release: ((result: STTResult) => void) | null = null;
+      const sttProvider = {
+        id: 'gated-stt',
+        async transcribe(): Promise<STTResult> {
+          return new Promise<STTResult>((resolve) => {
+            release = resolve;
+          });
+        },
+      };
+      const releaseTranscript = (transcript: string) => {
+        const resolver = release;
+        release = null;
+        resolver?.({ ok: true, transcript });
+      };
+      const session = buildSpeakingSession(createStubProvider(['Reply.']));
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider,
+        ttsProvider: createDemoTTSProvider(),
+      });
+
+      await coordinator.startRecording();
+      const pending = coordinator.stopRecordingAndTranscribe();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      // The screen goes away while STT is still running.
+      await coordinator.dispose();
+      releaseTranscript('A late unmount transcript.');
+      const outcome = await pending;
+
+      expect(outcome.ok).toBe(false);
+      expect(session.getHistory()).toEqual([]);
+      expect(await coordinator.startRecording()).toBe(false);
+    });
+
+    it('72. a session switch invalidates a late transcription-only STT result', async () => {
+      let release: ((result: STTResult) => void) | null = null;
+      const session = buildSpeakingSession(createStubProvider(['Reply.']));
+      const sttProvider = {
+        id: 'gated-stt',
+        async transcribe(): Promise<STTResult> {
+          return new Promise<STTResult>((resolve) => {
+            release = resolve;
+          });
+        },
+      };
+      const releaseTranscript = (transcript: string) => {
+        const resolver = release;
+        release = null;
+        resolver?.({ ok: true, transcript });
+      };
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider,
+        ttsProvider: createDemoTTSProvider(),
+      });
+
+      await coordinator.startRecording();
+      const pending = coordinator.stopRecordingAndTranscribe();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      const replacement = buildSpeakingSession(createStubProvider(['New session reply.']));
+      await coordinator.switchSession(replacement);
+      releaseTranscript('A stale transcript from the old session.');
+      const outcome = await pending;
+
+      expect(outcome.ok).toBe(false);
+      expect(session.getHistory()).toEqual([]);
+      expect(replacement.getHistory()).toEqual([]);
+    });
+
+    it('73. a late pronunciation transcript is discarded when the step advanced', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      await seedProfile(adapter);
+      let engineCalls = 0;
+      const service = createOnboardingService({
+        adapter,
+        learnerModel: createTalkLearnerModel(adapter)!,
+        profileRepository: new SQLiteUserProfileRepository(adapter),
+        pronunciation: {
+          analyzeSpokenTurn: async () => {
+            engineCalls += 1;
+            return {
+              analysis: { learnerId: 'x', observations: [], weakPoints: [], strengths: [], analyzedAt: NOW },
+              feedbackLines: ['Late pronunciation note.'],
+              unavailable: false,
+            } as never;
+          },
+        },
+        now: () => NOW,
+      });
+      const handle = await service.beginDiagnostic();
+      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+      for (let index = 0; index < 4; index += 1) handle.session.advance();
+      expect(handle.session.getCurrentStepId()).toBe('pronunciation');
+
+      // The recording started against THIS step token…
+      const capturedToken = handle.session.getCurrentStepToken();
+      // …but the learner moved on while STT was still running.
+      handle.session.advance();
+      expect(handle.session.getCurrentStepId()).toBe('summary');
+
+      const late = await service.recordPronunciation(
+        handle,
+        'I usually walk to work.',
+        handle.pronunciationTask.sentence,
+        { stepToken: capturedToken },
+      );
+
+      expect(late.observed).toBe(false);
+      expect(engineCalls).toBe(0); // the wrong-step transcript never reached the engine
+      expect(handle.session.snapshot().evidence.pronunciation).toBeNull();
+    });
+
+    it('74. the pronunciation screen path is transcription-only and token-bound', () => {
+      const screen = readFileSync(join(__dirname, '..', 'screens', 'OnboardingScreen.tsx'), 'utf8');
+      const pronunciationBranch = screen.slice(
+        screen.indexOf("if (purpose === 'pronunciation')"),
+        screen.indexOf('// The EXISTING coordinator committed the turn'),
+      );
+      // The pronunciation repeat uses the transcription-only coordinator method…
+      expect(pronunciationBranch).toContain('stopRecordingAndTranscribe()');
+      expect(pronunciationBranch).not.toContain('stopRecordingAndProcess');
+      // …and passes the captured step token, not the token current at completion.
+      expect(pronunciationBranch).toContain('stepToken');
+      expect(pronunciationBranch).toContain('recordPronunciation');
+      // The conversational branch is untouched.
+      expect(screen).toContain('const outcome = await coordinator.stopRecordingAndProcess();');
+    });
+  });
+
+  describe('Level sufficiency requires real speaking evidence', () => {
+    const listeningOk = {
+      answered: 1,
+      understood: 1,
+      mostlyUnderstood: 0,
+      partial: 0,
+      missedKeyMeaning: 0,
+      evaluatedBy: 'local' as const,
+    };
+
+    it('75. one speaking turn + language use + listening is insufficient', () => {
+      const estimate = estimateWorkingLevel(
+        evidence({
+          speaking: speakingEvidence({ committedLearnerTurns: 1, naturalTurns: 1 }),
+          languageUse: languageUseEvidence({ natural: 1 }),
+          listening: listeningOk,
+        }),
+      );
+      expect(estimate.status).toBe('insufficient');
+      expect(estimate.level).toBe('unknown');
+    });
+
+    it('76. two speaking turns + language use + listening is insufficient', () => {
+      const estimate = estimateWorkingLevel(
+        evidence({
+          speaking: speakingEvidence({ committedLearnerTurns: 2, naturalTurns: 2 }),
+          languageUse: languageUseEvidence({ natural: 1 }),
+          listening: listeningOk,
+        }),
+      );
+      expect(estimate.status).toBe('insufficient');
+      expect(estimate.level).toBe('unknown');
+    });
+
+    it('77. three substantive real turns plus another real dimension is eligible', () => {
+      const withLanguageUse = estimateWorkingLevel(
+        evidence({
+          speaking: speakingEvidence({ committedLearnerTurns: 3 }),
+          languageUse: languageUseEvidence({ natural: 0, unnatural: 0, incorrect: 0 }),
+        }),
+      );
+      expect(withLanguageUse.status).toBe('estimated');
+      expect(['A2', 'B1', 'B2']).toContain(withLanguageUse.level);
+
+      const withListening = estimateWorkingLevel(
+        evidence({
+          speaking: speakingEvidence({ committedLearnerTurns: 3 }),
+          listening: listeningOk,
+        }),
+      );
+      expect(withListening.status).toBe('estimated');
+    });
+
+    it('78. speaking alone (no other real dimension) is insufficient', () => {
+      const estimate = estimateWorkingLevel(
+        evidence({
+          speaking: speakingEvidence({ committedLearnerTurns: 8 }),
+        }),
+      );
+      expect(estimate.status).toBe('insufficient');
+      expect(estimate.level).toBe('unknown');
+    });
+
+    it('79. demo or missing speaking never satisfies the requirement', () => {
+      const demo = estimateWorkingLevel(
+        evidence({
+          speaking: speakingEvidence({ provenance: 'demo', committedLearnerTurns: 8 }),
+          languageUse: languageUseEvidence({ natural: 1 }),
+          listening: listeningOk,
+        }),
+      );
+      expect(demo.status).toBe('insufficient');
+      expect(demo.level).toBe('unknown');
+
+      const noSpeaking = estimateWorkingLevel(
+        evidence({ languageUse: languageUseEvidence(), listening: listeningOk }),
+      );
+      expect(noSpeaking.status).toBe('insufficient');
+      expect(noSpeaking.level).toBe('unknown');
+    });
+
+    it('80. the B2 ceiling still holds with the strongest realistic evidence', () => {
+      const strongest = estimateWorkingLevel(
+        evidence({
+          speaking: speakingEvidence({ committedLearnerTurns: 10 }),
+          languageUse: languageUseEvidence(),
+          listening: listeningOk,
+        }),
+      );
+      expect(strongest.status).toBe('estimated');
+      expect(strongest.level).toBe('B2');
+      expect(strongest.confidence).toBe('strong');
+    });
   });
 
   it('43. the onboarding screens and entry points are wired without new navigation architecture', () => {

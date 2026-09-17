@@ -17,6 +17,11 @@
  * - One learner utterance produces at most ONE submitted conversational turn:
  *   the transcribing state is entered before the recorder is stopped, and a
  *   re-entrant call is refused.
+ * - `stopRecordingAndTranscribe()` reuses the SAME recorder/STT lifecycle but
+ *   stops after transcription: it never submits a turn, never generates a tutor
+ *   reply and never plays conversational TTS, so evidence-only tasks (such as
+ *   repeating a known sentence for the pronunciation engine) cannot pollute a
+ *   conversation.
  * - Interruption is ordered: any TTS playback is stopped and awaited BEFORE the
  *   microphone opens, so TTS and recording never run concurrently.
  */
@@ -591,6 +596,106 @@ export class VoiceSessionCoordinator {
       }
       return { ok: false, transcript, error: message };
     }
+  }
+
+  /**
+   * TRANSCRIPTION-ONLY stop: the same recorder + STT lifecycle as
+   * `stopRecordingAndProcess()`, but it deliberately STOPS after a successful
+   * transcription.
+   *
+   * It never calls `session.send()`, never generates a tutor reply, never plays
+   * conversational TTS and therefore never commits a conversation turn, feedback
+   * or vocabulary. It exists for tasks that need the learner's real speech as
+   * evidence only (e.g. repeating a known sentence so the EXISTING pronunciation
+   * engine can compare it with the expected text).
+   *
+   * Lifecycle integrity is identical to the conversational path: one utterance
+   * is transcribed at most once, a duplicate stop is refused, and a replaced or
+   * disposed session invalidates the late STT result.
+   */
+  async stopRecordingAndTranscribe(): Promise<{
+    ok: boolean;
+    transcript?: string;
+    error?: string;
+  }> {
+    if (this.disposed) return { ok: false, error: VOICE_DISPOSED_MESSAGE };
+    if (this.switching) return { ok: false, error: VOICE_SWITCHING_MESSAGE };
+    // One utterance = at most one transcription: this guard (plus the immediate
+    // state change below) makes a re-entrant/duplicate stop impossible.
+    if (this.processing || this.state !== 'recording') {
+      return { ok: false, error: 'Not currently recording.' };
+    }
+
+    // Bind the operation to the session that is active right now.
+    const session = this.session;
+    const generation = this.generation;
+    this.processing = true;
+
+    if (this.timerHandle) {
+      clearInterval(this.timerHandle);
+      this.timerHandle = null;
+    }
+
+    // Move out of `recording` BEFORE the await so a concurrent stop is refused.
+    this.state = 'transcribing';
+    this.notifyListeners();
+
+    let audio;
+    try {
+      audio = await this.recorder.stopRecording();
+    } catch (err: unknown) {
+      this.processing = false;
+      const message = err instanceof Error ? err.message : 'Failed to stop audio recording.';
+      this.setStateIfCurrent(session, generation, 'error', message);
+      return { ok: false, error: message };
+    }
+
+    if (!this.isCurrent(session, generation)) {
+      // The session was replaced while the audio was captured: it belongs to a
+      // previous conversation and is not transcribed.
+      this.processing = false;
+      return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
+    }
+
+    let sttResult;
+    try {
+      sttResult = await this.sttProvider.transcribe(audio);
+    } catch (err: unknown) {
+      this.processing = false;
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Could not recognize speech. Please try speaking again.';
+      this.setStateIfCurrent(session, generation, 'error', message);
+      return { ok: false, error: message };
+    }
+
+    if (!this.isCurrent(session, generation)) {
+      // A late STT result must never be handed to a replaced/disposed caller.
+      this.processing = false;
+      return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
+    }
+
+    if (!sttResult.ok || !sttResult.transcript || sttResult.transcript.trim().length === 0) {
+      this.processing = false;
+      const errorMsg = sttResult.error || 'Could not recognize speech. Please try speaking again.';
+      this.setStateIfCurrent(session, generation, 'error', errorMsg);
+      // CRITICAL: no conversation turn, no feedback and no vocabulary — nothing
+      // was submitted anywhere.
+      return { ok: false, error: errorMsg };
+    }
+
+    // STOP HERE (the whole point of this operation): return the real transcript
+    // to the caller. Nothing is submitted to the ConversationSession, nothing is
+    // spoken, and the coordinator returns to a calm idle state.
+    const transcript = sttResult.transcript.trim();
+    this.recognizedTranscript = transcript;
+    this.processing = false;
+    if (this.isCurrent(session, generation)) {
+      this.state = 'idle';
+      this.notifyListeners();
+    }
+    return { ok: true, transcript };
   }
 
   /**

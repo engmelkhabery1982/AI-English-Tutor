@@ -106,6 +106,8 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
    * the step that is current by then.
    */
   const pendingPurposeRef = useRef<'speaking' | 'language_use' | 'pronunciation'>('speaking');
+  /** The diagnostic step TOKEN captured when that recording started. */
+  const pendingStepTokenRef = useRef<number | null>(null);
   /** Re-entrancy guards: a double press can never submit/advance twice. */
   const micInFlightRef = useRef<boolean>(false);
   const answerInFlightRef = useRef<boolean>(false);
@@ -270,46 +272,56 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       if (status.state === 'recording') {
         setBusy(true);
         try {
-          // The purpose was captured when this recording STARTED, so a result
-          // that arrives after the flow advanced is still attributed correctly.
+          // Purpose AND step token were captured when this recording STARTED.
           const purpose = pendingPurposeRef.current;
-          const outcome = await coordinator.stopRecordingAndProcess();
-          if (!mountedRef.current) return; // left the screen: nothing is recorded
-          const transcript = outcome.transcript ?? '';
+          const stepToken = pendingStepTokenRef.current;
 
           if (purpose === 'pronunciation') {
-            // Dedicated task: the real transcript is compared with the known
+            // TRANSCRIPTION-ONLY: the repeat never enters the ConversationSession
+            // (no learner turn, no tutor reply, no feedback, no vocabulary, no
+            // conversational TTS). The real transcript is compared with the known
             // target sentence by the EXISTING PronunciationEngine.
+            const result = await coordinator.stopRecordingAndTranscribe();
+            if (!mountedRef.current) return; // left the screen: discard the transcript
+            if (!result.ok || !result.transcript) {
+              setTurnError(result.error ?? 'That sentence could not be transcribed. Nothing was recorded.');
+              return;
+            }
             await serviceRef.current?.recordPronunciation(
               handle,
-              transcript,
+              result.transcript,
               handle.pronunciationTask.sentence,
+              stepToken === null ? undefined : { stepToken },
             );
           } else {
             // The EXISTING coordinator committed the turn through the EXISTING
             // session; the diagnostic only absorbs what was really committed,
             // and records it against the step the turn was STARTED in.
+            const outcome = await coordinator.stopRecordingAndProcess();
+            if (!mountedRef.current) return;
             handle.speaking.observeCommittedHistory({ purpose });
-            const token = handle.session.getCurrentStepToken();
+            const token = stepToken ?? handle.session.getCurrentStepToken();
             if (purpose === 'language_use') {
               handle.session.recordLanguageUse(handle.speaking.getLanguageUseEvidence(), token);
             } else {
               handle.session.recordSpeaking(handle.speaking.getSpeakingEvidence(), token);
             }
+            if (!outcome.ok) {
+              setTurnError(outcome.error ?? 'That turn could not be completed. Nothing was recorded.');
+            }
           }
+
           setTurns(handle.conversation.getHistory().length);
-          if (!outcome.ok) {
-            setTurnError(outcome.error ?? 'That turn could not be completed. Nothing was recorded.');
-          }
         } finally {
           setBusy(false);
         }
         return;
       }
-      // Capture the purpose BEFORE the microphone opens.
+      // Capture the purpose AND the step token BEFORE the microphone opens.
       const step = handle.session.getCurrentStepId();
       pendingPurposeRef.current =
         step === 'pronunciation' ? 'pronunciation' : step === 'language_use' ? 'language_use' : 'speaking';
+      pendingStepTokenRef.current = handle.session.getCurrentStepToken();
       await coordinator.startRecording();
     } finally {
       micInFlightRef.current = false;
@@ -353,13 +365,20 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     if (!handle || !service || continueInFlightRef.current) return;
     setTurnError(null);
 
+    // Any current voice work for this step blocks navigation: permission prompt,
+    // recording, transcription, the tutor thinking, or the tutor speaking.
     const voice = coordinatorRef.current?.getStatus();
-    if (voice?.isProcessing || voice?.isSwitching) {
+    if (
+      voice &&
+      (voice.isProcessing ||
+        voice.isSwitching ||
+        voice.state === 'requesting_permission' ||
+        voice.state === 'recording' ||
+        voice.state === 'transcribing' ||
+        voice.state === 'sending' ||
+        voice.state === 'speaking')
+    ) {
       setTurnError('Wait for your answer to finish before continuing.');
-      return;
-    }
-    if (voice?.state === 'recording') {
-      setTurnError('Stop the recording first, then continue.');
       return;
     }
 

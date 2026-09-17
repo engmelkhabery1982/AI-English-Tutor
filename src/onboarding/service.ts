@@ -157,6 +157,12 @@ export interface OnboardingService {
     handle: DiagnosticHandle,
     transcript: string,
     expectedText?: string,
+    /**
+     * The step token captured when the recording STARTED. Evidence is recorded
+     * only against that step: if the diagnostic moved on in the meantime, the
+     * late transcript is discarded instead of being attached to another step.
+     */
+    options?: { readonly stepToken?: number },
   ): Promise<{ readonly observed: boolean }>;
 
   /** Finalizes the diagnostic ONLY when required steps are resolved. */
@@ -516,8 +522,15 @@ export function createOnboardingService(deps: OnboardingServiceDeps = {}): Onboa
       return { ok: true, message: evaluation.feedbackLines[0] ?? 'Listening task completed.' };
     },
 
-    async recordPronunciation(handle, transcript, expectedText) {
-      const token = handle.session.getCurrentStepToken();
+    async recordPronunciation(handle, transcript, expectedText, options) {
+      // The CALLER's captured token wins: a transcript that arrives after the
+      // flow advanced is refused by the state machine instead of being recorded
+      // against whatever step happens to be current now.
+      const token = options?.stepToken ?? handle.session.getCurrentStepToken();
+      if (handle.session.getCurrentStepId() !== 'pronunciation') {
+        // The step is no longer the pronunciation step: discard, record nothing.
+        return { observed: false };
+      }
       const target = (expectedText ?? handle.pronunciationTask.sentence).trim();
       const spoken = transcript.trim();
       // Phase-1 pronunciation is transcript/evidence based: it needs BOTH the
