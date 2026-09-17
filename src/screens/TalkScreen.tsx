@@ -1,4 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import type { LearnerModel } from '../learner-model';
 import type { PronunciationEngine } from '../pronunciation';
 import { createDefaultPronunciationEngine } from '../pronunciation';
 import {
@@ -13,9 +15,12 @@ import {
   View,
 } from 'react-native';
 import {
+  createTalkLearnerModel,
   createTalkSession,
   createTalkVoiceCoordinator,
   createLearningPersistenceService,
+  TALK_REAL_AI_UNAVAILABLE_MESSAGE,
+  describeVoiceTurn,
   type AudioRecorderService,
   type ConversationFeedback,
   type ConversationFeedbackVocabulary,
@@ -23,11 +28,16 @@ import {
   type ConversationSession,
   type ConversationTurn,
   type SpeechToTextProvider,
+  type TalkProviderInfo,
   type TalkProviderKind,
+  type VoiceTurnPhase,
   type TextToSpeechProvider,
   type VoiceSessionCoordinator,
   type VoiceStatus,
 } from '../talk-demo';
+
+/** Short pause before the tutor opens, so a topic being typed is not cut off. */
+const TUTOR_OPENING_DELAY_MS = 400;
 
 const MODES: { readonly key: ConversationMode; readonly label: string }[] = [
   { key: 'natural', label: 'Natural' },
@@ -42,6 +52,23 @@ export interface TalkScreenProps {
   readonly initialMuted?: boolean;
   /** Injectable pronunciation engine (defaults to the real composition). */
   readonly pronunciationEngine?: PronunciationEngine;
+  /**
+   * Optional local database adapter used to compose the REAL learner model so
+   * the existing ConversationEngine can adapt to persisted coaching context.
+   */
+  readonly databaseAdapter?: DatabaseAdapter;
+}
+
+/**
+ * Instruction sent through the EXISTING conversation path to obtain a real
+ * tutor opening turn. It is never committed as a learner turn and is never
+ * shown or spoken to the learner — only the tutor's real reply is.
+ */
+export function buildTutorOpeningMessage(topic: string): string {
+  const trimmed = topic.trim();
+  return trimmed
+    ? `Begin the conversation now inside the topic "${trimmed}": greet me briefly and ask one natural question to get me talking.`
+    : 'Begin the conversation now: greet me briefly and open one natural everyday topic with a single question to get me talking.';
 }
 
 export default function TalkScreen(props?: TalkScreenProps) {
@@ -55,6 +82,10 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const [savedWords, setSavedWords] = useState<Record<string, boolean>>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [providerKind, setProviderKind] = useState<TalkProviderKind>('demo');
+  const [providerInfo, setProviderInfo] = useState<TalkProviderInfo | null>(null);
+  const [isOpening, setIsOpening] = useState<boolean>(false);
+  /** Incremented for every new conversation identity (drives the tutor opening). */
+  const [conversationEpoch, setConversationEpoch] = useState<number>(0);
 
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>({
     state: 'idle',
@@ -72,6 +103,14 @@ export default function TalkScreen(props?: TalkScreenProps) {
 
   const sessionRef = useRef<ConversationSession | null>(null);
   const voiceCoordinatorRef = useRef<VoiceSessionCoordinator | null>(null);
+  const providerInfoRef = useRef<TalkProviderInfo | null>(null);
+  /** Real learner model (existing system) + its persisted-context refresh. */
+  const learnerModelRef = useRef<LearnerModel | null>(null);
+  const learnerRefreshRef = useRef<Promise<void> | null>(null);
+  /** Invalidates in-flight opening attempts when the conversation changes. */
+  const openingTokenRef = useRef<number>(0);
+  /** Mode+topic identity of the conversation currently composed. */
+  const conversationIdentityRef = useRef<string>('');
   const pronunciationEngineRef = useRef<PronunciationEngine | null>(
     props?.pronunciationEngine ?? null,
   );
@@ -114,33 +153,129 @@ export default function TalkScreen(props?: TalkScreenProps) {
   };
 
   // Initialize or retrieve the active voice coordinator
-  const getOrCreateVoiceCoordinator = (
-    currentSession: ConversationSession,
-    currentProviderKind: TalkProviderKind
-  ): VoiceSessionCoordinator => {
-    if (!voiceCoordinatorRef.current) {
-      const coordinator = createTalkVoiceCoordinator({
-        session: currentSession,
-        providerKind: currentProviderKind,
-        isMuted: props?.initialMuted ?? false,
-        recorder: props?.recorder,
-        sttProvider: props?.sttProvider,
-        ttsProvider: props?.ttsProvider,
-      });
-      coordinator.subscribe((status) => {
-        setVoiceStatus(status);
-        if (status.errorMessage) {
-          setErrorMessage(status.errorMessage);
-        }
-      });
-      voiceCoordinatorRef.current = coordinator;
-    }
-    return voiceCoordinatorRef.current;
-  };
+  const getOrCreateVoiceCoordinator = useCallback(
+    (
+      currentSession: ConversationSession,
+      currentProviderKind: TalkProviderKind
+    ): VoiceSessionCoordinator => {
+      if (!voiceCoordinatorRef.current) {
+        const coordinator = createTalkVoiceCoordinator({
+          session: currentSession,
+          providerKind: currentProviderKind,
+          isMuted: props?.initialMuted ?? false,
+          recorder: props?.recorder,
+          sttProvider: props?.sttProvider,
+          ttsProvider: props?.ttsProvider,
+        });
+        coordinator.subscribe((status) => {
+          setVoiceStatus(status);
+          if (status.errorMessage) {
+            setErrorMessage(status.errorMessage);
+          }
+          if (status.state === 'speaking') {
+            // The reply is committed and now only being played: the pending
+            // "turn" is finished, so the learner can interrupt and speak.
+            setIsSending(false);
+            setStreamingText(null);
+          }
+        });
+        voiceCoordinatorRef.current = coordinator;
+      }
+      return voiceCoordinatorRef.current;
+    },
+    [
+      props?.initialMuted,
+      props?.recorder,
+      props?.sttProvider,
+      props?.ttsProvider,
+    ],
+  );
 
-  const updateCoordinatorSession = (newSession: ConversationSession) => {
-    if (voiceCoordinatorRef.current) {
-      voiceCoordinatorRef.current.setSession(newSession);
+  /**
+   * Starts a NEW conversation identity: cancels any active voice work (recording
+   * / in-flight STT or AI work / playback), builds the session stack for the
+   * requested mode+topic, and resets all conversation state.
+   *
+   * Cancelling first is what makes mode changes and New Chat safe: the old
+   * session's late results are invalidated by the coordinator generation and by
+   * the opening token below, so they can never land in the replacement session.
+   */
+  const startConversation = useCallback(
+    (targetMode: ConversationMode, targetTopic: string): ConversationSession => {
+      openingTokenRef.current += 1;
+      conversationIdentityRef.current = `${targetMode}::${targetTopic.trim()}`;
+      setConversationEpoch((prev) => prev + 1);
+      const coordinator = voiceCoordinatorRef.current;
+      if (coordinator) {
+        void coordinator.reset();
+      }
+
+      // Compose the EXISTING learner model once per conversation and refresh its
+      // persisted coaching context (weaknesses, due vocabulary/expressions,
+      // level, goals, progress) so the existing ConversationEngine can adapt to
+      // real evidence. Absent an adapter, the demo model stays in use and no
+      // personalization is claimed.
+      const adapter = props?.databaseAdapter;
+      if (adapter && !learnerModelRef.current) {
+        learnerModelRef.current = createTalkLearnerModel(adapter);
+      }
+      if (!adapter) {
+        learnerModelRef.current = null;
+      }
+      const learnerModel = learnerModelRef.current;
+      if (learnerModel) {
+        learnerRefreshRef.current = learnerModel.refresh().catch(() => undefined);
+      } else {
+        learnerRefreshRef.current = null;
+      }
+
+      const bundle = createTalkSession(
+        {
+          mode: targetMode,
+          topic: targetTopic.trim() || undefined,
+        },
+        {
+          databaseAdapter: adapter,
+          learnerModel: learnerModel ?? undefined,
+        },
+      );
+      sessionRef.current = bundle.session;
+      providerInfoRef.current = bundle.providerInfo;
+      setProviderKind(bundle.providerKind);
+      setProviderInfo(bundle.providerInfo);
+
+      if (coordinator) {
+        coordinator.setSession(bundle.session);
+      } else {
+        getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+      }
+
+      setHistory([]);
+      setLastFeedback(null);
+      setSavedWords({});
+      setStreamingText(null);
+      setInputText('');
+      setErrorMessage(null);
+      setPronunciationLines(null);
+      setIsSending(false);
+
+      return bundle.session;
+    },
+    [getOrCreateVoiceCoordinator, props?.databaseAdapter],
+  );
+
+  /**
+   * Best-effort wait for the persisted coaching context refresh so the very
+   * first turn already sees real learner evidence. Never blocks the turn on
+   * failure: the conversation always proceeds.
+   */
+  const ensureLearnerContext = async (): Promise<void> => {
+    const pending = learnerRefreshRef.current;
+    if (!pending) return;
+    try {
+      await pending;
+    } catch {
+      // Refresh is best-effort; the conversation continues regardless.
     }
   };
 
@@ -150,38 +285,120 @@ export default function TalkScreen(props?: TalkScreenProps) {
     targetTopic: string
   ): ConversationSession => {
     if (!sessionRef.current) {
-      const bundle = createTalkSession({
-        mode: targetMode,
-        topic: targetTopic.trim() || undefined,
-      });
-      sessionRef.current = bundle.session;
-      setProviderKind(bundle.providerKind);
-      getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+      return startConversation(targetMode, targetTopic);
     }
     return sessionRef.current;
   };
 
-  // Recreates session when mode/topic change while history is empty
+  // Fresh conversation whenever the mode or the (empty-history) topic changes —
+  // the same rule as before, funnelled through startConversation so the previous
+  // voice work is always cancelled safely. The identity guard keeps a single
+  // composition per identity (no duplicate session/opening).
   useEffect(() => {
-    if (history.length === 0) {
-      const bundle = createTalkSession({
-        mode,
-        topic: topic.trim() || undefined,
-      });
-      sessionRef.current = bundle.session;
-      setProviderKind(bundle.providerKind);
-      if (voiceCoordinatorRef.current) {
-        updateCoordinatorSession(bundle.session);
-      } else {
-        getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
-      }
+    const identity = `${mode}::${topic.trim()}`;
+    if (history.length === 0 && conversationIdentityRef.current !== identity) {
+      startConversation(mode, topic);
     }
-  }, [mode, topic, history.length]);
+  }, [mode, topic, history.length, startConversation]);
 
-  // Clean up voice coordinator when component unmounts
+  const topicEditable = history.length === 0 && !isSending && !isOpening;
+
+  // Tutor-led opening turn: obtained through the EXISTING conversation/AI path.
+  // Only attempted when a REAL AI provider is answering; offline demo mode never
+  // fabricates a personalized opening.
+  useEffect(() => {
+    const session = sessionRef.current;
+    const openConversation = session?.openConversation?.bind(session);
+    if (!session || !openConversation || session.getHistory().length > 0) {
+      return;
+    }
+    if (!providerInfoRef.current?.allowsPersonalizedFeedback) {
+      setIsOpening(false);
+      return;
+    }
+
+    const token = openingTokenRef.current;
+    let cancelled = false;
+
+    const runOpening = async (): Promise<void> => {
+      // Stale guard: the learner kept editing the topic, or the conversation was
+      // replaced — this opening must not run at all.
+      if (cancelled || openingTokenRef.current !== token || sessionRef.current !== session) {
+        return;
+      }
+      // The learner already started talking or typing: their turn leads.
+      const voiceState = voiceCoordinatorRef.current?.getStatus().state;
+      if (voiceState && voiceState !== 'idle' && voiceState !== 'error' && voiceState !== 'speaking') {
+        return;
+      }
+      if (session.getHistory().length > 0) {
+        return;
+      }
+
+      setIsOpening(true);
+      setStreamingText('');
+
+      try {
+        await ensureLearnerContext();
+        const result = await openConversation(
+          { userMessage: buildTutorOpeningMessage(topic) },
+          (chunk: string) => {
+            if (openingTokenRef.current === token && sessionRef.current === session) {
+              setStreamingText((prev) => (prev ?? '') + chunk);
+            }
+          },
+        );
+
+        // Stale guard: a replaced session must never receive this opening.
+        if (cancelled || openingTokenRef.current !== token || sessionRef.current !== session) {
+          return;
+        }
+
+        setHistory(session.getHistory());
+        setIsOpening(false);
+        setStreamingText(null);
+
+        if (!result.ok) {
+          setErrorMessage(
+            result.error.message ||
+              'The tutor could not start the conversation. Please try again.',
+          );
+          return;
+        }
+
+        const openingText = session.getHistory().at(-1)?.content ?? '';
+        const coordinator = voiceCoordinatorRef.current;
+        if (openingText.trim().length > 0 && coordinator && !coordinator.getStatus().isMuted) {
+          // Speak the real tutor turn. Never auto-opens the microphone.
+          void coordinator.speakResponse(openingText);
+        }
+      } catch {
+        if (cancelled || openingTokenRef.current !== token || sessionRef.current !== session) {
+          return;
+        }
+        setIsOpening(false);
+        setStreamingText(null);
+        setErrorMessage('The tutor could not start the conversation. Please try again.');
+      }
+    };
+
+    // Short debounce so the tutor does not greet the learner mid-typing while
+    // they are still entering a topic.
+    const timer = setTimeout(() => {
+      void runOpening();
+    }, TUTOR_OPENING_DELAY_MS);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [conversationEpoch]);
+
+  // Clean up voice coordinator when component unmounts: stops the recorder and
+  // any playback, and discards late voice results.
   useEffect(() => {
     return () => {
-      voiceCoordinatorRef.current?.reset();
+      void voiceCoordinatorRef.current?.dispose();
     };
   }, []);
 
@@ -195,51 +412,26 @@ export default function TalkScreen(props?: TalkScreenProps) {
     }
   }, [lastFeedback]);
 
-  // Handle mode switch
+  // Handle mode switch: drops the current conversation state; the conversation
+  // effect then composes a fresh session in the new mode, which cancels any
+  // active recording/playback and starts the tutor's opening turn.
   const handleSelectMode = (newMode: ConversationMode) => {
     if (newMode === mode) return;
+    setIsOpening(false);
     setMode(newMode);
-    if (history.length > 0) {
-      voiceCoordinatorRef.current?.reset();
-      const bundle = createTalkSession({
-        mode: newMode,
-        topic: topic.trim() || undefined,
-      });
-      sessionRef.current = bundle.session;
-      setProviderKind(bundle.providerKind);
-      if (voiceCoordinatorRef.current) {
-        updateCoordinatorSession(bundle.session);
-      } else {
-        getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
-      }
-      setHistory([]);
-      setLastFeedback(null);
-      setSavedWords({});
-      setStreamingText(null);
-      setErrorMessage(null);
-    }
-  };
-
-  // Handle New / Clear conversation
-  const handleNewConversation = () => {
-    voiceCoordinatorRef.current?.reset();
-    const bundle = createTalkSession({
-      mode,
-      topic: topic.trim() || undefined,
-    });
-    sessionRef.current = bundle.session;
-    setProviderKind(bundle.providerKind);
-    if (voiceCoordinatorRef.current) {
-      updateCoordinatorSession(bundle.session);
-    } else {
-      getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
-    }
-    setHistory([]);
     setLastFeedback(null);
     setSavedWords({});
     setStreamingText(null);
-    setInputText('');
     setErrorMessage(null);
+    setPronunciationLines(null);
+    setHistory([]);
+  };
+
+  // Handle New / Clear conversation: cancels active voice work, then starts a
+  // brand-new conversation with the tutor's real opening turn.
+  const handleNewConversation = () => {
+    setIsOpening(false);
+    startConversation(mode, topic);
   };
 
   // Handle save vocabulary item
@@ -251,8 +443,13 @@ export default function TalkScreen(props?: TalkScreenProps) {
     }
   };
 
-  // Handle microphone push-to-talk press
+  // Handle microphone press — the single primary action of a turn.
   const handleToggleRecording = async () => {
+    if (isOpening || isSending) {
+      // The tutor is opening the conversation / composing a reply: nothing to
+      // record yet. The learner stays in control once the turn completes.
+      return;
+    }
     const session = getOrCreateSession(mode, topic);
     const coordinator = getOrCreateVoiceCoordinator(session, providerKind);
 
@@ -261,9 +458,20 @@ export default function TalkScreen(props?: TalkScreenProps) {
       setStreamingText('');
       setErrorMessage(null);
 
+      // One utterance = at most one submitted turn: the coordinator guards this
+      // internally as well, so a double tap cannot send the audio twice.
+      await ensureLearnerContext();
       const res = await coordinator.stopRecordingAndProcess((chunk: string) => {
         setStreamingText((prev) => (prev ?? '') + chunk);
       });
+
+      // A late result from a session that has since been replaced must never
+      // touch the replacement conversation.
+      if (sessionRef.current !== session) {
+        setIsSending(false);
+        setStreamingText(null);
+        return;
+      }
 
       setHistory(session.getHistory());
       setLastFeedback(session.getLastFeedback());
@@ -278,6 +486,8 @@ export default function TalkScreen(props?: TalkScreenProps) {
       await runPronunciationAnalysis();
     } else if (voiceStatus.canRecord) {
       setErrorMessage(null);
+      // Barge-in: the coordinator stops and awaits tutor playback internally
+      // before the microphone opens.
       await coordinator.startRecording();
     }
   };
@@ -324,18 +534,30 @@ export default function TalkScreen(props?: TalkScreenProps) {
     setHistory((prev) => [...prev, userTurn]);
 
     try {
+      await ensureLearnerContext();
       const session = getOrCreateSession(mode, topic);
       const result = await session.send(
         { userMessage: trimmedMessage },
         (chunk: string) => {
-          setStreamingText((prev) => (prev ?? '') + chunk);
+          if (sessionRef.current === session) {
+            setStreamingText((prev) => (prev ?? '') + chunk);
+          }
         }
       );
+
+      // Stale guard: a replaced session's result must not appear in the new one.
+      if (sessionRef.current !== session) {
+        return;
+      }
 
       setHistory(session.getHistory());
       setLastFeedback(session.getLastFeedback());
 
       if (!result.ok) {
+        // The turn was not accepted: nothing was added to the conversation, so
+        // the learner keeps their text and can retry.
+        setHistory(session.getHistory());
+        setInputText(trimmedMessage);
         setErrorMessage(
           result.error.message || 'The tutor returned an error. Please try again.'
         );
@@ -343,6 +565,11 @@ export default function TalkScreen(props?: TalkScreenProps) {
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : 'An unexpected error occurred while sending.';
+      const session = sessionRef.current;
+      if (session) {
+        setHistory(session.getHistory());
+      }
+      setInputText(trimmedMessage);
       setErrorMessage(message);
     } finally {
       setIsSending(false);
@@ -353,6 +580,19 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const isSendDisabled =
     inputText.trim().length === 0 || isSending || !voiceStatus.canSendText;
   const isGemini = providerKind === 'gemini';
+  const isRealAI = providerInfo?.isRealAI ?? isGemini;
+  const providerLabel = providerInfo?.label ?? (isGemini ? 'Gemini • Online' : 'Local Demo • Offline');
+
+  // Learner-facing turn phase, derived from the EXISTING voice status model.
+  const turnView = describeVoiceTurn(voiceStatus, isSending || isOpening);
+  const isOfflineDemo = !isRealAI;
+  const turnPhase: VoiceTurnPhase = turnView.phase;
+  const micLabel =
+    turnPhase === 'recording'
+      ? 'Stop recording and send your turn'
+      : turnPhase === 'speaking'
+      ? 'Interrupt the tutor and speak'
+      : 'Tap to speak';
 
   return (
     <KeyboardAvoidingView
@@ -368,12 +608,10 @@ export default function TalkScreen(props?: TalkScreenProps) {
             <View
               style={[
                 styles.statusDot,
-                isGemini ? styles.statusDotGemini : styles.statusDotDemo,
+                isRealAI ? styles.statusDotGemini : styles.statusDotDemo,
               ]}
             />
-            <Text style={styles.subtitle}>
-              {isGemini ? 'Gemini • Online' : 'Local Demo • Offline'}
-            </Text>
+            <Text style={styles.subtitle}>{providerLabel}</Text>
           </View>
         </View>
         <View style={styles.headerButtonsGroup}>
@@ -425,19 +663,32 @@ export default function TalkScreen(props?: TalkScreenProps) {
         </View>
 
         <TextInput
-          style={[styles.topicInput, history.length > 0 && styles.topicInputLocked]}
+          style={[styles.topicInput, !topicEditable && styles.topicInputLocked]}
           placeholder="Optional topic (e.g. Travel, Job Interview)"
           placeholderTextColor="#9CA3AF"
           value={topic}
           onChangeText={(text) => {
             setTopic(text);
           }}
-          editable={history.length === 0 && !isSending}
+          editable={topicEditable}
         />
         {history.length > 0 && (
           <Text style={styles.topicLockedHelperText}>
             Start a new chat to change the topic.
           </Text>
+        )}
+
+        {/*
+          Provider honesty: offline demo output is never presented as real AI
+          tutoring. The notice is explicit and stays visible for the whole
+          conversation.
+        */}
+        {isOfflineDemo && (
+          <View style={styles.offlineNotice}>
+            <Text style={styles.offlineNoticeText}>
+              {TALK_REAL_AI_UNAVAILABLE_MESSAGE}
+            </Text>
+          </View>
         )}
       </View>
 
@@ -452,9 +703,20 @@ export default function TalkScreen(props?: TalkScreenProps) {
       >
         {history.length === 0 ? (
           <View style={styles.emptyState}>
-            <Text style={styles.emptyStateTitle}>Start practicing English</Text>
+            {isOpening ? (
+              <View style={styles.openingContainer}>
+                <ActivityIndicator size="small" color="#2563EB" />
+                <Text style={styles.emptyStateTitle}>Your tutor is starting…</Text>
+              </View>
+            ) : (
+              <Text style={styles.emptyStateTitle}>
+                {isOfflineDemo ? 'Offline demo conversation' : 'Your tutor will start'}
+              </Text>
+            )}
             <Text style={styles.emptyStateDescription}>
-              Select a coaching mode, optionally specify a topic, and type a message below.
+              {isOfflineDemo
+                ? 'No real AI tutor is available, so replies come from the offline demo script. You can still try the flow, but nothing here is real AI conversation or personalized feedback.'
+                : 'Pick a mode and an optional topic — your tutor opens the conversation. Then just tap the microphone and talk naturally.'}
             </Text>
             <View style={styles.suggestionsContainer}>
               <TouchableOpacity
@@ -486,7 +748,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
                   ]}
                 >
                   <Text style={styles.roleLabel}>
-                    {isUser ? 'You' : isGemini ? 'Gemini Tutor' : 'AI Tutor (Demo)'}
+                    {isUser ? 'You' : isRealAI ? 'AI Tutor' : 'Offline Demo (not real AI)'}
                   </Text>
                   <View
                     style={[
@@ -651,7 +913,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
           <View style={styles.turnContainer}>
             <View style={[styles.messageWrapper, styles.assistantMessageWrapper]}>
               <Text style={styles.roleLabel}>
-                {isGemini ? 'Gemini Tutor' : 'AI Tutor (Demo)'}
+                {isRealAI ? 'AI Tutor' : 'Offline Demo (not real AI)'}
               </Text>
               <View style={[styles.bubble, styles.assistantBubble]}>
                 {streamingText && streamingText.length > 0 ? (
@@ -661,9 +923,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
                 ) : (
                   <View style={styles.loadingContainer}>
                     <ActivityIndicator size="small" color="#2563EB" />
-                    <Text style={styles.loadingText}>
-                      {isGemini ? 'Gemini is thinking...' : 'Tutor is typing...'}
-                    </Text>
+                    <Text style={styles.loadingText}>Thinking…</Text>
                   </View>
                 )}
               </View>
@@ -679,51 +939,55 @@ export default function TalkScreen(props?: TalkScreenProps) {
         )}
       </ScrollView>
 
-      {/* Voice Status Banner */}
-      {(voiceStatus.state === 'recording' ||
-        voiceStatus.state === 'transcribing' ||
-        voiceStatus.state === 'speaking' ||
-        (voiceStatus.recognizedTranscript && (voiceStatus.state === 'sending' || isSending))) && (
-        <View style={styles.voiceBanner}>
-          {voiceStatus.state === 'recording' && (
-            <View style={styles.voiceBannerRow}>
-              <View style={styles.recordingDot} />
-              <Text style={styles.voiceBannerText}>
-                Recording ({voiceStatus.elapsedSeconds}s) • Tap Mic to finish & send
-              </Text>
-            </View>
+      {/*
+        Voice-first turn status: one obvious phase (Your turn / Listening… /
+        Transcribing… / Thinking… / Tutor speaking…) plus the primary action.
+        No hidden state, no extra control management.
+      */}
+      <View style={styles.turnStatusBar} accessibilityLiveRegion="polite">
+        <View style={styles.turnStatusLeft}>
+          {turnPhase === 'recording' && <View style={styles.recordingDot} />}
+          {(turnPhase === 'transcribing' || turnPhase === 'thinking') && (
+            <ActivityIndicator size="small" color="#2563EB" />
           )}
-          {voiceStatus.state === 'transcribing' && (
-            <View style={styles.voiceBannerRow}>
-              <ActivityIndicator size="small" color="#2563EB" />
-              <Text style={styles.voiceBannerText}>Transcribing speech into English...</Text>
-            </View>
-          )}
-          {voiceStatus.state === 'speaking' && (
-            <View style={styles.voiceBannerRow}>
-              <Text style={styles.voiceBannerText}>🔊 Speaking tutor response...</Text>
-              <TouchableOpacity
-                style={styles.stopSpeakingButton}
-                onPress={handleStopSpeaking}
-                accessibilityLabel="Stop speaking"
-                accessibilityRole="button"
-              >
-                <Text style={styles.stopSpeakingButtonText}>Stop</Text>
-              </TouchableOpacity>
-            </View>
-          )}
-          {voiceStatus.recognizedTranscript &&
-            (voiceStatus.state === 'sending' || isSending) &&
-            voiceStatus.state !== 'transcribing' &&
-            voiceStatus.state !== 'recording' && (
-              <View style={styles.voiceBannerRow}>
-                <Text style={styles.voiceBannerTranscript} numberOfLines={1}>
-                  Recognized: "{voiceStatus.recognizedTranscript}"
-                </Text>
-              </View>
-            )}
+          {turnPhase === 'speaking' && <Text style={styles.turnStatusIcon}>🔊</Text>}
+          {turnPhase === 'ready' && <Text style={styles.turnStatusIcon}>🎤</Text>}
+          {turnPhase === 'error' && <Text style={styles.turnStatusIcon}>⚠️</Text>}
+          <Text
+            style={[
+              styles.turnStatusLabel,
+              turnPhase === 'recording' && styles.turnStatusLabelActive,
+              turnPhase === 'error' && styles.turnStatusLabelError,
+            ]}
+            numberOfLines={2}
+          >
+            {turnPhase === 'recording'
+              ? `${turnView.label} (${voiceStatus.elapsedSeconds}s)`
+              : turnView.label}
+          </Text>
         </View>
-      )}
+        {turnPhase === 'speaking' && (
+          <TouchableOpacity
+            style={styles.stopSpeakingButton}
+            onPress={handleStopSpeaking}
+            accessibilityLabel="Stop speaking"
+            accessibilityRole="button"
+          >
+            <Text style={styles.stopSpeakingButtonText}>Stop</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+      <Text style={styles.turnHint}>{turnView.hint}</Text>
+      {voiceStatus.recognizedTranscript &&
+        (voiceStatus.state === 'sending' ||
+          turnPhase === 'speaking' ||
+          voiceStatus.state === 'idle') &&
+        voiceStatus.state !== 'transcribing' &&
+        voiceStatus.state !== 'recording' && (
+          <Text style={styles.voiceBannerTranscript} numberOfLines={1}>
+            You said: "{voiceStatus.recognizedTranscript}"
+          </Text>
+        )}
 
       {/* Message Composer */}
       <View style={styles.composerContainer}>
@@ -738,16 +1002,17 @@ export default function TalkScreen(props?: TalkScreenProps) {
               styles.micButtonDisabled,
           ]}
           onPress={handleToggleRecording}
-          disabled={!voiceStatus.canRecord && voiceStatus.state !== 'recording'}
-          accessibilityRole="button"
-          accessibilityLabel={
-            voiceStatus.state === 'recording'
-              ? 'Stop recording voice message'
-              : 'Record voice message'
+          disabled={
+            isOpening ||
+            isSending ||
+            (!voiceStatus.canRecord && voiceStatus.state !== 'recording')
           }
-          accessibilityState={{ busy: voiceStatus.state === 'transcribing' }}
+          accessibilityRole="button"
+          accessibilityLabel={micLabel}
+          accessibilityHint={turnView.hint}
+          accessibilityState={{ busy: turnPhase === 'transcribing' || turnPhase === 'thinking' }}
         >
-          {voiceStatus.state === 'transcribing' ? (
+          {turnPhase === 'transcribing' || turnPhase === 'thinking' ? (
             <ActivityIndicator size="small" color="#FFFFFF" />
           ) : (
             <Text
@@ -757,11 +1022,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
                 voiceStatus.state === 'speaking' && styles.micButtonTextSpeaking,
               ]}
             >
-              {voiceStatus.state === 'recording'
-                ? '⏹'
-                : voiceStatus.state === 'speaking'
-                ? '⏹'
-                : '🎤'}
+              {turnPhase === 'recording' || turnPhase === 'speaking' ? '⏹' : '🎤'}
             </Text>
           )}
         </TouchableOpacity>
@@ -772,18 +1033,20 @@ export default function TalkScreen(props?: TalkScreenProps) {
             !voiceStatus.canSendText && styles.composerInputDisabled,
           ]}
           placeholder={
-            voiceStatus.state === 'recording'
-              ? 'Listening to your speech...'
-              : voiceStatus.state === 'transcribing'
-              ? 'Transcribing audio...'
-              : 'Type your message in English...'
+            turnPhase === 'recording'
+              ? 'Listening to your speech…'
+              : turnPhase === 'transcribing'
+              ? 'Transcribing audio…'
+              : isOfflineDemo
+              ? 'Type a message (offline demo, not real AI)…'
+              : 'Or type your reply in English…'
           }
           placeholderTextColor="#9CA3AF"
           value={inputText}
           onChangeText={setInputText}
           multiline
           maxLength={1000}
-          editable={!isSending && voiceStatus.canSendText}
+          editable={!isSending && !isOpening && voiceStatus.canSendText}
         />
         <TouchableOpacity
           style={[
@@ -813,6 +1076,65 @@ const styles = StyleSheet.create({
   screen: {
     flex: 1,
     backgroundColor: '#F9FAFB',
+  },
+  offlineNotice: {
+    marginTop: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: '#FEF3C7',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+  },
+  offlineNoticeText: {
+    fontSize: 12,
+    lineHeight: 17,
+    color: '#92400E',
+    fontWeight: '500',
+  },
+  openingContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  turnStatusBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 2,
+    backgroundColor: '#FFFFFF',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#E5E7EB',
+  },
+  turnStatusLeft: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  turnStatusIcon: {
+    fontSize: 14,
+  },
+  turnStatusLabel: {
+    flex: 1,
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#111827',
+  },
+  turnStatusLabelActive: {
+    color: '#DC2626',
+  },
+  turnStatusLabelError: {
+    color: '#B91C1C',
+  },
+  turnHint: {
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+    fontSize: 12,
+    color: '#6B7280',
+    backgroundColor: '#FFFFFF',
   },
   header: {
     flexDirection: 'row',

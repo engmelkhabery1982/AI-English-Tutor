@@ -81,6 +81,16 @@ export interface ConversationSession {
     onChunk?: AIStreamCallback
   ): Promise<ConversationSessionResult>;
 
+  /**
+   * Tutor-led opening turn. Runs through the normal engine/orchestrator path but
+   * commits only the tutor's reply: the instruction itself is never stored as a
+   * learner turn. Optional so existing sessions/providers stay compatible.
+   */
+  openConversation?(
+    input: ConversationSessionSendInput,
+    onChunk?: AIStreamCallback
+  ): Promise<ConversationSessionResult>;
+
   sendStream?(
     input: ConversationSessionSendInput,
     onChunk: AIStreamCallback

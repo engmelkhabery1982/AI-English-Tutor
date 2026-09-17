@@ -149,12 +149,85 @@ export function createConversationSession(
     };
   }
 
+  /**
+   * Produces the tutor's opening turn through the SAME engine/orchestrator path
+   * as a normal turn, but commits only the tutor's reply.
+   *
+   * The instruction handed to the engine is not learner speech, so it is never
+   * appended to the conversation history, never persisted as a learner turn and
+   * never attributed to the learner. If the AI call fails, history stays empty
+   * and the caller must surface the failure honestly instead of inventing an
+   * opening.
+   */
+  async function executeOpening(
+    input: ConversationSessionSendInput,
+    onChunk?: AIStreamCallback
+  ): Promise<ConversationSessionResult> {
+    if (history.length > 0) {
+      return {
+        ok: false,
+        error: {
+          code: 'unavailable',
+          message: 'A conversation is already in progress.',
+          retryable: false,
+        },
+        history: cloneHistory(history),
+      };
+    }
+
+    const requestInput: ConversationRequestInput = {
+      mode: sessionConfig.mode,
+      ...(typeof sessionConfig.topic === 'string' && { topic: sessionConfig.topic }),
+      ...(typeof sessionConfig.historyLimit === 'number' && {
+        historyLimit: sessionConfig.historyLimit,
+      }),
+      history: [],
+      userMessage: input.userMessage,
+    };
+
+    let result: ConversationExecutionResult;
+    if (onChunk && typeof orchestrator.executeStream === 'function') {
+      result = await orchestrator.executeStream(requestInput, onChunk);
+    } else {
+      result = await orchestrator.execute(requestInput);
+      if (result.ok && onChunk) {
+        onChunk(result.response.content);
+      }
+    }
+
+    if (!result.ok) {
+      // No fabricated assistant history: the learner sees an honest error.
+      return {
+        ok: false,
+        error: result.error,
+        history: cloneHistory(history),
+        feedback: null,
+      };
+    }
+
+    history.push({ role: 'assistant', content: result.response.content });
+
+    return {
+      ok: true,
+      response: result.response,
+      history: cloneHistory(history),
+      feedback: null,
+    };
+  }
+
   return {
     async send(
       input: ConversationSessionSendInput,
       onChunk?: AIStreamCallback
     ): Promise<ConversationSessionResult> {
       return executeTurn(input, onChunk);
+    },
+
+    async openConversation(
+      input: ConversationSessionSendInput,
+      onChunk?: AIStreamCallback
+    ): Promise<ConversationSessionResult> {
+      return executeOpening(input, onChunk);
     },
 
     async sendStream(
