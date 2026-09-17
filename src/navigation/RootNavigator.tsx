@@ -8,6 +8,7 @@ import TalkScreen from '../screens/TalkScreen';
 import VocabularyScreen from '../screens/VocabularyScreen';
 import ReviewScreen from '../screens/ReviewScreen';
 import ProgressScreen from '../screens/ProgressScreen';
+import ListeningScreen from '../screens/ListeningScreen';
 import SettingsScreen from '../screens/SettingsScreen';
 
 /**
@@ -16,7 +17,7 @@ import SettingsScreen from '../screens/SettingsScreen';
  * STRUCTURAL PLACEHOLDER ONLY.
  *
  * Tab layout:
- *   Home | Talk | Vocabulary | Review | Progress | Settings
+ *   Home | Talk | Listening | Vocabulary | Review | Progress | Settings
  *
  * The Talk tab will eventually host the full Conversation Engine stack.
  * No deep navigation or feature routing is implemented yet.
@@ -35,6 +36,7 @@ export default function RootNavigator() {
       >
         <Tab.Screen name="Home" component={HomeScreen} />
         <Tab.Screen name="Talk" component={TalkScreen} />
+        <Tab.Screen name="Listening" component={ListeningScreen} />
         <Tab.Screen name="Vocabulary" component={VocabularyScreen} />
         <Tab.Screen name="Review" component={ReviewScreen} />
         <Tab.Screen name="Progress" component={ProgressScreen} />

@@ -237,6 +237,9 @@ function reviewItemToCandidate(item: ReviewItem): ReviewItemCandidate {
   } else if (item.kind === 'pronunciation') {
     // Pronunciation review items always practice as repeat tasks.
     exerciseType = 'pronunciation_repeat';
+  } else if (item.kind === 'listening') {
+    // Listening review items are re-listen-and-recognize tasks.
+    exerciseType = 'listening_practice';
   } else if (item.prompt.includes('___') || (item.contextTopic && item.contextTopic.includes('gap'))) {
     exerciseType = 'fill_the_gap';
   }

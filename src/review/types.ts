@@ -20,7 +20,13 @@ export type ReviewExerciseType =
    * attempt and evaluation stays qualitative (transcript comparison —
    * never an acoustic score).
    */
-  | 'pronunciation_repeat';
+  | 'pronunciation_repeat'
+  /**
+   * Phase 1 listening retraining: the item is played through the EXISTING
+   * TTS and the learner answers (type / choose / identify); evaluation
+   * stays qualitative — never a comprehension score.
+   */
+  | 'listening_practice';
 
 /** Qualitative evaluation result (no numeric scores) */
 export type QualitativeResult = 'correct' | 'partial' | 'incorrect';
