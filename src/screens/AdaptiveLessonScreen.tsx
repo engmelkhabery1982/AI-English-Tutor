@@ -532,13 +532,26 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
 
   /* ------------------------------ rendering ----------------------------- */
 
-  const renderBadge = (step: AdaptiveLessonStep) => (
-    <View style={[styles.pill, step.personalized ? styles.pillPersonal : styles.pillGeneral]}>
-      <Text style={styles.pillText}>
-        {step.personalized ? 'From your history' : 'General practice'}
-      </Text>
-    </View>
-  );
+  /**
+   * Provenance chip. A step planned from one persisted weakness may only claim
+   * "From your history" while the item actually served is that target; when the
+   * service honestly degraded the step, the chip says so instead.
+   */
+  const renderBadge = (step: AdaptiveLessonStep) => {
+    const degraded = material?.kind === 'review' && material.targetMatched === false;
+    const fromHistory = step.personalized && !degraded;
+    return (
+      <View style={[styles.pill, fromHistory ? styles.pillPersonal : styles.pillGeneral]}>
+        <Text style={styles.pillText}>
+          {fromHistory
+            ? 'From your history'
+            : degraded
+              ? 'Other real practice'
+              : 'General practice'}
+        </Text>
+      </View>
+    );
+  };
 
   const renderOverview = () => {
     if (!practice || practice.status !== 'ready') {
@@ -622,6 +635,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
         <Text style={styles.itemCounter}>
           Item {itemIndex + 1} of {material.candidates.length}
         </Text>
+        {material.note ? <Text style={styles.honestNote}>{material.note}</Text> : null}
         <Text style={styles.prompt}>{candidate.prompt}</Text>
         {candidate.contextSentence ? (
           <Text style={styles.context}>&ldquo;{candidate.contextSentence}&rdquo;</Text>
@@ -776,7 +790,10 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
       ? session.plan.steps.findIndex((step) => step.id === currentStep.id) + 1
       : 1;
     const totalSteps = session?.plan.steps.length ?? 0;
-    const showSkip = currentStep.type !== 'wrap_up' && !itemFeedback;
+    // An unavailable step has nothing to practice, so it is not "skipped"
+    // either: it keeps its honest unavailable status.
+    const showSkip =
+      currentStep.type !== 'wrap_up' && !itemFeedback && material.kind !== 'unavailable';
 
     return (
       <View>
@@ -810,7 +827,8 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
             <View>
               <Text style={styles.body}>{material.message}</Text>
               <Text style={styles.honestNote}>
-                Nothing was counted for this step — continue when you are ready.
+                Nothing was counted for this step. Continuing only moves you to
+                the next step — it is not recorded as completed practice.
               </Text>
             </View>
           ) : null}
@@ -890,9 +908,10 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
             • {line}
           </Text>
         ))}
-        {summary && !summary.persistedProgress && summary.stepsCompleted > 0 ? (
+        {summary && !summary.persistedProgress && summary.itemsPracticed > 0 ? (
           <Text style={styles.honestNote}>
-            The lesson summary could not be saved to your progress history right now.
+            Your practice could not be saved to your progress history right now.
+            The practice itself was still recorded by each engine.
           </Text>
         ) : null}
       </View>

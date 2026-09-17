@@ -57,8 +57,10 @@ import type { WeaknessStatus } from '../domain/shared/types';
 
 import {
   AdaptiveLessonService,
+  candidateMatchesWeakness,
   describePronunciationTarget,
   describeWeaknessTarget,
+  reviewPoolSizeFor,
 } from './service';
 import type { AdaptiveLessonModelPort } from './service';
 import {
@@ -1809,7 +1811,14 @@ describe('Service — skip, completion and progress integrity', () => {
       await service.completeStep(step.id);
     }
     const finished = await service.completeLesson();
-    expect(finished?.summary.stepsCompleted).toBe(session.plan.steps.length);
+    // Every step is accounted for exactly once, and a step the owning engine
+    // could not serve is never rewritten as completed (see hardening test 69).
+    const summary = finished!.summary;
+    expect(
+      summary.stepsCompleted + summary.stepsSkipped + summary.stepsUnavailable,
+    ).toBe(session.plan.steps.length);
+    expect(summary.stepsCompleted).toBeGreaterThan(0);
+    expect(summary.itemsPracticed).toBeGreaterThan(0);
 
     const stored = await ctx.vocabulary.get(vocabularyItem.id);
     const review = stored?.meanings[0]?.review;
@@ -2291,5 +2300,774 @@ describe('Adaptive lessons — architecture, composition and UI wiring', () => {
 
     const empty = await withProvider.evaluate({ prompt: 'Talk.', answer: '   ', mode: 'intensive' });
     expect(empty.evaluatedBy).toBe('unavailable');
+  });
+});
+
+/* ========================================================================= *
+ * 8. Hardening regressions — review findings 1 to 5
+ * ========================================================================= */
+
+function brokenReviewPort(): ReviewPort {
+  return {
+    planSession: async () => {
+      throw new Error('review offline');
+    },
+    evaluateAnswer: async () => {
+      throw new Error('review offline');
+    },
+    recordPracticeResult: async () => {
+      throw new Error('review offline');
+    },
+  };
+}
+
+function brokenListeningPort(): ListeningPort {
+  return {
+    startSession: async () => {
+      throw new Error('listening offline');
+    },
+    evaluateAnswer: async () => {
+      throw new Error('listening offline');
+    },
+  };
+}
+
+/** A real persisted grammar mistake (the source row a weakness points at). */
+async function seedGrammarMistake(ctx: TestContext, pattern: string, correction: string) {
+  return ctx.repos.mistakes.recordMistake({
+    learnerId: ctx.learnerId,
+    category: 'for-vs-since',
+    pattern,
+    correction,
+    explanation: 'Use the present perfect with "since".',
+    severity: 'major',
+    occurrenceCount: 2,
+    lastSeenAt: NOW,
+    firstSeenAt: NOW,
+    contexts: ['conversation-turn'],
+    exampleTurnIds: [],
+    resolved: false,
+  });
+}
+
+/** Put a practiced review item back into the due queue (next-lesson checks). */
+async function makeReviewDueAgain(ctx: TestContext, item: ReviewItem): Promise<void> {
+  const upsert = ctx.review.upsert;
+  if (!upsert) throw new Error('review.upsert is required by this test');
+  const stored = (await ctx.review.get(item.id)) ?? item;
+  await upsert.call(ctx.review, {
+    ...stored,
+    id: item.id,
+    state: 'learning',
+    dueAt: DUE_AT,
+    consecutiveCorrect: 0,
+  });
+}
+
+/** Seed a lesson whose review-family demand spans three specialized steps. */
+async function seedMixedReviewQueue(ctx: TestContext): Promise<void> {
+  await seedReviewItem(ctx, { kind: 'grammar', prompt: 'Correct this sentence' });
+  await seedReviewItem(ctx, { kind: 'vocabulary', prompt: 'Recall this saved word' });
+  await seedReviewItem(ctx, { kind: 'expression', prompt: 'Use this saved expression' });
+  await seedVocabulary(ctx, 'agenda', 'a list of items to discuss');
+  await seedExpression(ctx, 'follow up', 'to check something again later');
+}
+
+describe('Hardening — an unavailable step never becomes completed', () => {
+  it('69. continuing past an unavailable step keeps it unavailable and counts nothing', async () => {
+    const ctx = await createContext();
+    await seedReviewItem(ctx, { kind: 'vocabulary', expectedResponse: 'deadline' });
+    const service = createLessonService(ctx, { review: brokenReviewPort() });
+    const session = (await service.startLesson()).session!;
+    const reviewSteps = session.plan.steps.filter(
+      (step) => step.capability === 'review-service',
+    );
+    expect(reviewSteps.length).toBeGreaterThan(0);
+
+    for (const step of reviewSteps) {
+      const material = await service.prepareStep(step.id);
+      expect(material?.kind).toBe('unavailable');
+    }
+
+    const beforeProgress = service.getProgress()!;
+    expect(beforeProgress.completedSteps).toBe(0);
+    expect(beforeProgress.unavailableSteps).toBe(reviewSteps.length);
+
+    // The UI shows "Continue" here: it may only advance the lesson.
+    const target = reviewSteps[0];
+    const targetIndex = session.plan.steps.indexOf(target);
+    const after = await service.completeStep(target.id);
+    const state = after?.steps.find((entry) => entry.stepId === target.id);
+    expect(state?.status).toBe('unavailable');
+    expect(state?.practicedItems).toBe(0);
+    expect(state?.completedAt).toBeUndefined();
+    expect(after?.currentIndex).toBe(
+      Math.min(targetIndex + 1, session.plan.steps.length - 1),
+    );
+
+    const progress = service.getProgress()!;
+    expect(progress.completedSteps).toBe(0);
+    expect(progress.unavailableSteps).toBe(reviewSteps.length);
+    expect(progress.practicedItems).toBe(0);
+    expect(progress.label).toContain('without material');
+
+    // Finishing the rest of the lesson never launders the unavailable steps.
+    for (const step of session.plan.steps) await service.completeStep(step.id);
+    const finished = await service.completeLesson();
+    const summary = finished!.summary;
+    expect(summary.stepsUnavailable).toBe(reviewSteps.length);
+    expect(summary.stepsCompleted).toBe(session.plan.steps.length - reviewSteps.length);
+    expect(summary.itemsPracticed).toBe(0);
+    expect(summary.persistedProgress).toBe(false);
+    expect(
+      finished!.session.steps.filter((entry) => entry.status === 'unavailable'),
+    ).toHaveLength(reviewSteps.length);
+    expect(await ctx.progress.list(ctx.learnerId, 50)).toHaveLength(0);
+  });
+
+  it('70. skipping an unavailable step keeps its honest status and zero counts', async () => {
+    const ctx = await createContext();
+    await seedReviewItem(ctx, { kind: 'vocabulary', expectedResponse: 'deadline' });
+    const service = createLessonService(ctx, { review: brokenReviewPort() });
+    const session = (await service.startLesson()).session!;
+    const target = session.plan.steps.find(
+      (step) => step.capability === 'review-service',
+    )!;
+    const material = await service.prepareStep(target.id);
+    expect(material?.kind).toBe('unavailable');
+
+    const after = await service.skipStep(target.id);
+    const state = after?.steps.find((entry) => entry.stepId === target.id);
+    // There was nothing to practice, so this is not a learner skip either.
+    expect(state?.status).toBe('unavailable');
+    expect(state?.practicedItems).toBe(0);
+    expect(state?.note?.toLowerCase()).not.toContain('skipped');
+
+    const progress = service.getProgress()!;
+    expect(progress.skippedSteps).toBe(0);
+    expect(progress.unavailableSteps).toBeGreaterThanOrEqual(1);
+    expect(progress.practicedItems).toBe(0);
+  });
+
+  it('71. a lesson with no servable practice persists nothing, even with wrap-up done', async () => {
+    const ctx = await createContext();
+    await seedReviewItem(ctx, { kind: 'vocabulary' });
+    const service = createLessonService(ctx, {
+      review: brokenReviewPort(),
+      listening: brokenListeningPort(),
+    });
+    const session = (await service.startLesson()).session!;
+    for (const step of session.plan.steps) {
+      await service.prepareStep(step.id);
+      await service.completeStep(step.id);
+    }
+
+    const finished = await service.completeLesson();
+    const summary = finished!.summary;
+    expect(summary.itemsPracticed).toBe(0);
+    expect(summary.practiceStepsCompleted).toBe(0);
+    expect(summary.persistedProgress).toBe(false);
+    expect(summary.stepsUnavailable).toBeGreaterThan(0);
+    // Every real-activity counter stays at zero — nothing is claimed for a
+    // step the owning engine could not serve.
+    expect(summary.reviewItemsPracticed).toBe(0);
+    expect(summary.listeningExercisesPracticed).toBe(0);
+    expect(summary.speakingPromptsAnswered).toBe(0);
+    expect(summary.pronunciationTargetsPracticed).toBe(0);
+    expect(summary.lexicalItemsPracticed).toBe(0);
+    expect(await ctx.progress.list(ctx.learnerId, 50)).toHaveLength(0);
+
+    // Only a step where a real item was practiced may be counted as completed
+    // practice — a prompt that was merely continued past counts for nothing.
+    const completedWithPractice = finished!.session.steps.filter(
+      (entry, index) =>
+        entry.status === 'completed' &&
+        entry.practicedItems > 0 &&
+        finished!.session.plan.steps[index].type !== 'wrap_up',
+    );
+    expect(completedWithPractice).toHaveLength(summary.practiceStepsCompleted);
+    expect(summary.practiceStepsCompleted).toBe(0);
+    expect(
+      finished!.session.steps
+        .filter((entry) => entry.status === 'unavailable')
+        .every((entry) => entry.practicedItems === 0),
+    ).toBe(true);
+
+    const text = summary.lines.join(' ').toLowerCase();
+    expect(text).toContain('nothing was saved');
+    expect(text).not.toContain('saved to your progress history');
+  });
+});
+
+describe('Hardening — a weakness-targeted step serves its real target', () => {
+  it('72. a vocabulary weakness step serves the candidate linked to that weakness', async () => {
+    const ctx = await createContext();
+    const targetItem = await seedVocabulary(ctx, 'invoice', 'a bill listing charges');
+    const weakness = await seedWeakness(ctx, {
+      type: 'vocabulary',
+      status: 'confirmed',
+      referenceId: targetItem.id,
+      notes: 'invoice',
+      occurrenceCount: 3,
+    });
+    // Unrelated due vocabulary that must never be presented as the target.
+    await seedVocabulary(ctx, 'agenda', 'a list of items to discuss');
+
+    const service = createLessonService(ctx);
+    const session = (await service.startLesson()).session!;
+    const step = session.plan.steps.find(
+      (entry) => entry.capability === 'review-service' && entry.target.id === weakness.id,
+    );
+    expect(step).toBeTruthy();
+
+    const material = await service.prepareStep(step!.id);
+    expect(material?.kind).toBe('review');
+    if (material?.kind !== 'review') throw new Error('expected review material');
+    expect(material.targetMatched).toBe(true);
+    // The genuinely linked candidate is served FIRST, matched by persisted id.
+    expect(material.candidates[0].referenceId).toBe(targetItem.id);
+    expect(material.candidates[0].kind).toBe('vocabulary');
+    expect(candidateMatchesWeakness(material.candidates[0], weakness)).toBe(true);
+  });
+
+  it('73. a grammar weakness step serves the candidate linked to that weakness', async () => {
+    const ctx = await createContext();
+    const mistake = await seedGrammarMistake(
+      ctx,
+      'I live here since 2020',
+      'I have lived here since 2020',
+    );
+    const weakness = await seedWeakness(ctx, {
+      type: 'grammar',
+      status: 'relapsed',
+      referenceId: mistake.id,
+      notes: 'I live here since 2020',
+      occurrenceCount: 4,
+    });
+    // An unrelated due grammar item of the SAME kind.
+    await seedReviewItem(ctx, { kind: 'grammar', prompt: 'Correct this unrelated sentence' });
+
+    const service = createLessonService(ctx);
+    const session = (await service.startLesson()).session!;
+    const step = session.plan.steps.find(
+      (entry) => entry.capability === 'review-service' && entry.target.id === weakness.id,
+    );
+    expect(step).toBeTruthy();
+
+    const material = await service.prepareStep(step!.id);
+    expect(material?.kind).toBe('review');
+    if (material?.kind !== 'review') throw new Error('expected review material');
+    expect(material.targetMatched).toBe(true);
+    expect(material.candidates[0].contextSentence).toBe('I live here since 2020');
+    expect(material.candidates[0].expectedAnswer).toBe('I have lived here since 2020');
+    // The link is the persisted weakness / mistake identity, not loose text.
+    expect([weakness.id, mistake.id]).toContain(material.candidates[0].referenceId);
+    expect(candidateMatchesWeakness(material.candidates[0], weakness)).toBe(true);
+  });
+
+  it('74. an unrelated same-kind item can never masquerade as the targeted weakness', async () => {
+    const ctx = await createContext();
+    const weakness = await seedWeakness(ctx, {
+      type: 'vocabulary',
+      status: 'confirmed',
+      // The underlying item left the due queue after planning.
+      referenceId: uid(777),
+      notes: 'itinerary',
+      occurrenceCount: 3,
+    });
+    await seedVocabulary(ctx, 'agenda', 'a list of items to discuss');
+
+    const service = createLessonService(ctx);
+    const session = (await service.startLesson()).session!;
+    const step = session.plan.steps.find(
+      (entry) => entry.capability === 'review-service' && entry.target.id === weakness.id,
+    );
+    expect(step).toBeTruthy();
+
+    const material = await service.prepareStep(step!.id);
+    expect(material?.kind).toBe('review');
+    if (material?.kind !== 'review') throw new Error('expected review material');
+    // Honest degradation: real practice, explicitly NOT the targeted item.
+    expect(material.targetMatched).toBe(false);
+    expect(material.note?.toLowerCase()).toContain('not that targeted item');
+    expect(
+      material.candidates.every((candidate) => !candidateMatchesWeakness(candidate, weakness)),
+    ).toBe(true);
+
+    // The session state carries the same honest note.
+    const state = service.getCurrentSession()?.steps.find((entry) => entry.stepId === step!.id);
+    expect(state?.note?.toLowerCase()).toContain('no longer in your due queue');
+
+    // The UI stops claiming the learner's history for a degraded step.
+    const screen = readFileSync(
+      join(__dirname, '../screens/AdaptiveLessonScreen.tsx'),
+      'utf8',
+    );
+    expect(screen).toContain('targetMatched === false');
+    expect(screen).toContain('Other real practice');
+  });
+});
+
+describe('Hardening — one bounded pool cannot starve planned steps', () => {
+  it('75. Quick Review, Vocabulary and Expression are all served from ONE pool', async () => {
+    const ctx = await createContext();
+    await seedMixedReviewQueue(ctx);
+
+    const calls = { plan: 0, evaluate: 0, record: 0 };
+    const service = createLessonService(ctx, {
+      review: countingReview(new ReviewService(ctx.repos), calls),
+    });
+    const session = (await service.startLesson()).session!;
+    const reviewSteps = session.plan.steps.filter(
+      (step) => step.capability === 'review-service',
+    );
+    expect(reviewSteps.find((step) => step.type === 'vocabulary')).toBeTruthy();
+    expect(reviewSteps.find((step) => step.type === 'expression')).toBeTruthy();
+    expect(reviewSteps.find((step) => !step.reviewKindFilter)).toBeTruthy();
+
+    const servedIds: string[] = [];
+    // Prepared in PLAN ORDER: the generic Review step comes first and must not
+    // consume candidates the specialized steps were planned around.
+    for (const step of reviewSteps) {
+      const material = await service.prepareStep(step.id);
+      expect(material?.kind).toBe('review');
+      if (material?.kind !== 'review') continue;
+      expect(material.candidates.length).toBeGreaterThan(0);
+      expect(material.candidates.length).toBeLessThanOrEqual(step.bounds.maxItems);
+      if (step.reviewKindFilter) {
+        for (const candidate of material.candidates) {
+          expect(candidate.kind).toBe(step.reviewKindFilter);
+        }
+      }
+      for (const candidate of material.candidates) servedIds.push(candidate.id);
+    }
+
+    // Disjoint allocation: no candidate is served (or practiced) twice.
+    expect(new Set(servedIds).size).toBe(servedIds.length);
+    expect(servedIds.length).toBeGreaterThan(2);
+    // Still exactly ONE bounded pool read for the whole lesson.
+    expect(calls.plan).toBe(1);
+  });
+
+  it('76. the bounded pool is sized from the planned review-family demand', async () => {
+    const ctx = await createContext();
+    await seedMixedReviewQueue(ctx);
+
+    const seen: { minItems?: number; maxItems?: number; targetItems?: number }[] = [];
+    const inner: ReviewPort = new ReviewService(ctx.repos);
+    const service = createLessonService(ctx, {
+      review: {
+        planSession: (learnerId, opts) => {
+          seen.push({
+            minItems: opts?.minItems,
+            maxItems: opts?.maxItems,
+            targetItems: opts?.targetItems,
+          });
+          return inner.planSession(learnerId, opts);
+        },
+        evaluateAnswer: (candidate, userAnswer, coachingContext) =>
+          inner.evaluateAnswer(candidate, userAnswer, coachingContext),
+        recordPracticeResult: (learnerId, candidate, userAnswer, evaluation) =>
+          inner.recordPracticeResult(learnerId, candidate, userAnswer, evaluation),
+      },
+    });
+
+    const session = (await service.startLesson()).session!;
+    const reviewSteps = session.plan.steps.filter(
+      (step) => step.capability === 'review-service',
+    );
+    for (const step of reviewSteps) await service.prepareStep(step.id);
+
+    const demand = reviewSteps.reduce(
+      (sum, step) => sum + Math.max(1, step.bounds.maxItems),
+      0,
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0].maxItems).toBe(reviewPoolSizeFor(session.plan));
+    // Large enough for every legitimately planned review step …
+    expect(seen[0].maxItems).toBeGreaterThanOrEqual(demand);
+    // … and still a small bounded read (never an arbitrary oversized scan).
+    expect(seen[0].maxItems).toBeLessThanOrEqual(12);
+    expect(seen[0].minItems).toBe(1);
+  });
+
+  it('77. candidate allocation is deterministic across identical lessons', async () => {
+    const signatures: string[] = [];
+    for (let run = 0; run < 2; run += 1) {
+      const ctx = await createContext();
+      await seedMixedReviewQueue(ctx);
+      const service = createLessonService(ctx);
+      const session = (await service.startLesson()).session!;
+      const reviewSteps = session.plan.steps.filter(
+        (step) => step.capability === 'review-service',
+      );
+      const signature: string[] = [];
+      for (const step of reviewSteps) {
+        const material = await service.prepareStep(step.id);
+        signature.push(
+          `${step.type}/${step.reviewKindFilter ?? 'any'}:` +
+            (material?.kind === 'review'
+              ? material.candidates
+                  .map((candidate) => `${candidate.kind}|${candidate.prompt}`)
+                  .join(',')
+              : 'unavailable'),
+        );
+      }
+      signatures.push(signature.join(' ;; '));
+    }
+    expect(signatures[0]).toBe(signatures[1]);
+    expect(signatures[0]).not.toContain('unavailable');
+  });
+});
+
+describe('Hardening — wrap-up is structure, never practice', () => {
+  it('78. skipping every practice step and completing wrap-up saves no progress', async () => {
+    const ctx = await createContext();
+    await seedReviewItem(ctx, { kind: 'vocabulary', expectedResponse: 'deadline' });
+    const service = createLessonService(ctx);
+    const session = (await service.startLesson()).session!;
+
+    for (const step of session.plan.steps) {
+      await service.prepareStep(step.id);
+      if (step.type === 'wrap_up') await service.completeStep(step.id);
+      else await service.skipStep(step.id);
+    }
+
+    const finished = await service.completeLesson();
+    const summary = finished!.summary;
+    expect(summary.stepsCompleted).toBe(1); // the structural wrap-up only
+    expect(summary.practiceStepsCompleted).toBe(0);
+    expect(summary.totalPracticeSteps).toBe(session.plan.steps.length - 1);
+    expect(summary.itemsPracticed).toBe(0);
+    expect(summary.persistedProgress).toBe(false);
+    expect(await ctx.progress.list(ctx.learnerId, 50)).toHaveLength(0);
+
+    const text = summary.lines.join(' ').toLowerCase();
+    expect(text).toContain('skipped');
+    expect(text).toContain('nothing was saved');
+    expect(text).not.toContain('saved to your progress history');
+  });
+
+  it('79. one genuine practice item writes exactly one record with real counts', async () => {
+    const ctx = await createContext();
+    await seedReviewItem(ctx, { kind: 'vocabulary', expectedResponse: 'deadline' });
+    const service = createLessonService(ctx);
+    const session = (await service.startLesson()).session!;
+
+    const reviewStep = session.plan.steps.find(
+      (step) => step.capability === 'review-service',
+    )!;
+    const material = await service.prepareStep(reviewStep.id);
+    if (material?.kind !== 'review') throw new Error('expected review material');
+    const outcome = await service.submitReviewAnswer(
+      material.candidates[0].id,
+      'deadline',
+      reviewStep.id,
+    );
+    expect(outcome?.result.kind).toBe('review');
+
+    // Every step is finished, including the structural wrap-up.
+    for (const step of session.plan.steps) await service.completeStep(step.id);
+    const finished = await service.completeLesson();
+    const summary = finished!.summary;
+    expect(summary.itemsPracticed).toBe(1);
+    expect(summary.practiceStepsCompleted).toBe(1);
+    expect(summary.totalPracticeSteps).toBe(session.plan.steps.length - 1);
+    expect(summary.stepsCompleted).toBe(session.plan.steps.length);
+    expect(summary.persistedProgress).toBe(true);
+
+    const records = await ctx.progress.list(ctx.learnerId, 50);
+    expect(records).toHaveLength(1);
+    expect(records[0].sessionsCompleted).toBe(1);
+    // Wrap-up completion contributes nothing: turns are real practiced items.
+    expect(records[0].turnsCompleted).toBe(1);
+    expect(records[0].turnsCompleted).toBe(summary.itemsPracticed);
+    expect(records[0].notes).toContain('1 practice item');
+    expect(records[0].notes).toContain('Adaptive lesson');
+    expect((records[0].notes ?? '').toLowerCase()).not.toContain('wrap');
+  });
+});
+
+describe('Hardening — duplicate submissions cannot inflate evidence', () => {
+  it('80. the same review candidate and listening exercise count once', async () => {
+    const ctx = await createContext();
+    await seedReviewItem(ctx, { kind: 'vocabulary', expectedResponse: 'deadline' });
+    await seedWeakness(ctx, {
+      type: 'listening',
+      status: 'confirmed',
+      referenceId: stableReferenceId('word_recognition:deadline'),
+      notes: 'word_recognition:deadline',
+      occurrenceCount: 3,
+    });
+
+    const reviewCalls = { plan: 0, evaluate: 0, record: 0 };
+    const listeningCalls = { start: 0, evaluate: 0 };
+    const service = createLessonService(ctx, {
+      review: countingReview(new ReviewService(ctx.repos), reviewCalls),
+      listening: countingListening(createListeningService(ctx.adapter), listeningCalls),
+    });
+    const session = (await service.startLesson()).session!;
+
+    // --- review: the same candidate submitted twice (double tap / retry) ---
+    const reviewStep = session.plan.steps.find(
+      (step) => step.capability === 'review-service',
+    )!;
+    const reviewMaterial = await service.prepareStep(reviewStep.id);
+    if (reviewMaterial?.kind !== 'review') throw new Error('expected review material');
+    const candidate = reviewMaterial.candidates[0];
+
+    const first = await service.submitReviewAnswer(candidate.id, 'deadline', reviewStep.id);
+    expect(first?.result.kind).toBe('review');
+    if (first?.result.kind === 'review') expect(first.result.duplicate).toBeUndefined();
+
+    const second = await service.submitReviewAnswer(candidate.id, 'deadline', reviewStep.id);
+    expect(second?.result.kind).toBe('review');
+    if (second?.result.kind === 'review') expect(second.result.duplicate).toBe(true);
+
+    expect(reviewCalls.evaluate).toBe(1);
+    expect(reviewCalls.record).toBe(1);
+    const reviewState = service
+      .getCurrentSession()
+      ?.steps.find((entry) => entry.stepId === reviewStep.id);
+    expect(reviewState?.practicedItems).toBe(1);
+
+    // --- listening: the same exercise submitted twice ---
+    const listeningStep = session.plan.steps.find((step) => step.type === 'listening')!;
+    const listeningMaterial = await service.prepareStep(listeningStep.id);
+    if (listeningMaterial?.kind !== 'listening') throw new Error('expected listening material');
+    const exercise = listeningMaterial.exercises[0];
+
+    const firstListening = await service.submitListeningAnswer(
+      exercise.id,
+      exercise.expectedAnswer,
+      listeningStep.id,
+    );
+    expect(firstListening?.result.kind).toBe('listening');
+    const secondListening = await service.submitListeningAnswer(
+      exercise.id,
+      exercise.expectedAnswer,
+      listeningStep.id,
+    );
+    expect(secondListening?.result.kind).toBe('listening');
+    if (secondListening?.result.kind === 'listening') {
+      expect(secondListening.result.duplicate).toBe(true);
+    }
+    expect(listeningCalls.evaluate).toBe(1);
+    const listeningState = service
+      .getCurrentSession()
+      ?.steps.find((entry) => entry.stepId === listeningStep.id);
+    expect(listeningState?.practicedItems).toBe(1);
+
+    // The existing review history was written exactly once for that item.
+    const storedItems = await ctx.review.list(ctx.learnerId, 50);
+    expect(storedItems.filter((entry) => entry.reviewCount === 1)).toHaveLength(1);
+    expect(storedItems.every((entry) => entry.reviewCount <= 1)).toBe(true);
+  });
+
+  it('81. a repeated identical pronunciation transcript is not counted twice', async () => {
+    const ctx = await createContext();
+    const row = await ctx.pronunciation.recordWeakness({
+      learnerId: ctx.learnerId,
+      targetSound: 'word_stress:development',
+      wordExamples: ['development'],
+      occurrenceCount: 2,
+      lastSeenAt: NOW,
+      firstSeenAt: NOW,
+      contexts: [],
+      exampleTurnIds: [],
+      resolved: false,
+      notes: 'word_stress:development',
+    });
+
+    let engineCalls = 0;
+    const engine = createPronunciationEngine(ctx.adapter);
+    const service = createLessonService(ctx, {
+      pronunciation: {
+        analyzeSpokenTurn: async (input) => {
+          engineCalls += 1;
+          return engine.analyzeSpokenTurn(input);
+        },
+      },
+    });
+    const session = (await service.startLesson()).session!;
+    const step = session.plan.steps.find((entry) => entry.type === 'pronunciation')!;
+    await service.prepareStep(step.id);
+
+    const first = await service.submitPronunciationAttempt('devlopment', step.id);
+    expect(first?.result.kind).toBe('pronunciation');
+    if (first?.result.kind === 'pronunciation') expect(first.result.duplicate).toBeUndefined();
+
+    // Double tap / re-render: the engine is not asked again and nothing inflates.
+    const repeat = await service.submitPronunciationAttempt('devlopment', step.id);
+    if (repeat?.result.kind !== 'pronunciation') throw new Error('expected pronunciation');
+    expect(repeat.result.duplicate).toBe(true);
+    expect(engineCalls).toBe(1);
+    const stateAfterRepeat = service
+      .getCurrentSession()
+      ?.steps.find((entry) => entry.stepId === step.id);
+    expect(stateAfterRepeat?.practicedItems).toBe(1);
+
+    // A genuinely different attempt is still accepted and judged.
+    const different = await service.submitPronunciationAttempt('development', step.id);
+    if (different?.result.kind !== 'pronunciation') throw new Error('expected pronunciation');
+    expect(different.result.duplicate).toBeUndefined();
+    expect(engineCalls).toBe(2);
+    const stateAfterSecond = service
+      .getCurrentSession()
+      ?.steps.find((entry) => entry.stepId === step.id);
+    expect(stateAfterSecond?.practicedItems).toBe(2);
+
+    // Occurrence counts stay owned by the engine and never regress.
+    const rows = await ctx.pronunciation.listWeaknesses(ctx.learnerId, { limit: 50 });
+    const original = rows.find((entry) => entry.id === row.id);
+    expect(original).toBeTruthy();
+    expect(original!.occurrenceCount).toBeGreaterThanOrEqual(2);
+  });
+
+  it('82. the guard is lesson-scoped and never blocks distinct items', async () => {
+    const ctx = await createContext();
+    const vocabularyItem = await seedReviewItem(ctx, {
+      kind: 'vocabulary',
+      prompt: 'Recall this saved word',
+      expectedResponse: 'deadline',
+    });
+    await seedReviewItem(ctx, {
+      kind: 'grammar',
+      prompt: 'Correct this sentence',
+      expectedResponse: 'I have lived here since 2020',
+    });
+
+    const calls = { plan: 0, evaluate: 0, record: 0 };
+    const service = createLessonService(ctx, {
+      review: countingReview(new ReviewService(ctx.repos), calls),
+    });
+    const session = (await service.startLesson()).session!;
+    const step = session.plan.steps.find(
+      (entry) => entry.capability === 'review-service',
+    )!;
+    const material = await service.prepareStep(step.id);
+    if (material?.kind !== 'review') throw new Error('expected review material');
+    expect(material.candidates.length).toBeGreaterThanOrEqual(2);
+
+    // Distinct candidates in the same step all keep working.
+    for (const candidate of material.candidates) {
+      const outcome = await service.submitReviewAnswer(
+        candidate.id,
+        candidate.expectedAnswer,
+        step.id,
+      );
+      expect(outcome?.result.kind).toBe('review');
+      if (outcome?.result.kind === 'review') expect(outcome.result.duplicate).toBeUndefined();
+    }
+    expect(calls.record).toBe(material.candidates.length);
+    const state = service.getCurrentSession()?.steps.find((entry) => entry.stepId === step.id);
+    expect(state?.practicedItems).toBe(material.candidates.length);
+
+    // The next lesson may legitimately serve and persist the same item again:
+    // the guard is scoped to one lesson, never to the learner's lifetime.
+    await makeReviewDueAgain(ctx, vocabularyItem);
+    for (const planStep of session.plan.steps) await service.completeStep(planStep.id);
+    await service.completeLesson();
+
+    const second = (await service.startLesson()).session!;
+    const secondStep = second.plan.steps.find(
+      (entry) => entry.capability === 'review-service',
+    );
+    expect(secondStep).toBeTruthy();
+    const secondMaterial = await service.prepareStep(secondStep!.id);
+    expect(secondMaterial?.kind).toBe('review');
+    if (secondMaterial?.kind !== 'review') throw new Error('expected review material');
+
+    const before = calls.record;
+    const outcome = await service.submitReviewAnswer(
+      secondMaterial.candidates[0].id,
+      secondMaterial.candidates[0].expectedAnswer,
+      secondStep!.id,
+    );
+    expect(outcome?.result.kind).toBe('review');
+    if (outcome?.result.kind === 'review') expect(outcome.result.duplicate).toBeUndefined();
+    expect(calls.record).toBe(before + 1);
+  });
+});
+
+describe('Hardening — provenance is claimed from persisted identities only', () => {
+  const candidateBase = {
+    id: uid(900),
+    learnerId: PLAN_LEARNER,
+    kind: 'grammar' as const,
+    exerciseType: 'sentence_correction' as const,
+    prompt: 'Correct the grammatical error in this sentence:',
+    expectedAnswer: 'I have lived here since 2020',
+    dueAt: DUE_AT,
+    consecutiveCorrect: 0,
+    reviewCount: 1,
+  };
+
+  it('83. review target matching uses persisted ids, never loose text', () => {
+    const weakness = {
+      id: uid(901),
+      learnerId: PLAN_LEARNER,
+      type: 'grammar' as const,
+      // The persisted source row (a grammar mistake) this weakness points at.
+      referenceId: uid(902),
+      severity: 0.8,
+      status: 'confirmed' as WeaknessStatus,
+      lastSeenAt: NOW,
+      firstSeenAt: NOW,
+      occurrenceCount: 3,
+      contexts: [],
+      // The learner's own phrase: identical text must NOT create a match.
+      notes: 'I live here since 2020',
+      evidence: [{ id: uid(902), kind: 'turn' as const, at: NOW, summary: 'observed' }],
+      exampleTurnIds: [],
+      resolved: false,
+      createdAt: NOW,
+      updatedAt: NOW,
+    } as unknown as LearnerWeakness;
+
+    // Linked by the weakness id (how the existing review planner tags mistakes).
+    expect(
+      candidateMatchesWeakness({ ...candidateBase, referenceId: weakness.id }, weakness),
+    ).toBe(true);
+    // Linked by the same persisted source row.
+    expect(
+      candidateMatchesWeakness({ ...candidateBase, referenceId: weakness.referenceId }, weakness),
+    ).toBe(true);
+    // An unrelated item that merely repeats the same words is NOT the target.
+    expect(
+      candidateMatchesWeakness(
+        {
+          ...candidateBase,
+          referenceId: uid(903),
+          prompt: 'I live here since 2020 — express this more naturally',
+          contextSentence: 'I live here since 2020',
+        },
+        weakness,
+      ),
+    ).toBe(false);
+    // No persisted weakness → no targeted claim at all.
+    expect(candidateMatchesWeakness({ ...candidateBase, referenceId: weakness.id }, null)).toBe(
+      false,
+    );
+    expect(
+      candidateMatchesWeakness({ ...candidateBase, referenceId: weakness.id }, undefined),
+    ).toBe(false);
+  });
+
+  it('84. listening provenance is claimed only for a persisted-identity match', () => {
+    const serviceSrc = readFileSync(join(__dirname, 'service.ts'), 'utf8');
+    // Identity is resolved first …
+    expect(serviceSrc).toContain('const identityMatch = exercises.findIndex');
+    expect(serviceSrc).toContain('exercise.weaknessReferenceId === row.referenceId');
+    // … and a text-only match still carries the honest "not the target" note.
+    expect(serviceSrc).toContain('NOT_TARGETED_NOTE');
+    const honestBranches = serviceSrc.split('identityMatch < 0').length - 1;
+    expect(honestBranches).toBeGreaterThanOrEqual(2);
+    // Review-family provenance has no text-matching branch at all.
+    const start = serviceSrc.indexOf('export function candidateMatchesWeakness');
+    const body = serviceSrc.slice(start, serviceSrc.indexOf('\n}', start));
+    expect(body).toContain('candidate.referenceId === weakness.id');
+    expect(body).toContain('candidate.referenceId === weakness.referenceId');
+    expect(body).not.toMatch(/toLowerCase\(|\.includes\(|\.indexOf\(/);
   });
 });

@@ -41,6 +41,7 @@ import type { EvaluationResult, ReviewItemCandidate, ReviewService } from '../re
 import { planAdaptiveLesson } from './planner';
 import { buildSpeakingPrompt, SPEAKING_FEEDBACK_UNAVAILABLE_NOTE } from './prompts';
 import type {
+  AdaptiveLessonAnswerResult,
   AdaptiveLessonPlan,
   AdaptiveLessonPlanningInput,
   AdaptiveLessonPlannerOptions,
@@ -71,8 +72,14 @@ const LEXICAL_LIMIT = 12;
 const PRONUNCIATION_TARGET_LIMIT = 8;
 /** Due review rows inspected for the "including …" breakdown. */
 const DUE_REVIEW_BREAKDOWN_LIMIT = 20;
-/** ONE bounded review pool per lesson, sliced across review-family steps. */
-const REVIEW_POOL_ITEMS = 6;
+/**
+ * Clamp bounds for the ONE review pool fetched per lesson. The real size is
+ * DERIVED from the planned review-family demand (`reviewPoolSizeFor`), so the
+ * pool is always large enough for every legitimately planned review step while
+ * every read stays bounded — never an arbitrary oversized scan.
+ */
+const MIN_REVIEW_POOL_ITEMS = 3;
+const MAX_REVIEW_POOL_ITEMS = 12;
 /** Plans are reused briefly so Home → Lesson does not plan twice. */
 const PLAN_CACHE_MS = 5 * 60 * 1000;
 
@@ -92,6 +99,9 @@ const KNOWN_IDENTITY_KINDS: ReadonlySet<string> = new Set([
   'intelligibility',
   'other',
 ]);
+
+/** Note used for a step the owning system could not serve. */
+const UNAVAILABLE_STEP_NOTE = 'Nothing was available to practice for this step.';
 
 const NO_PROFILE_MESSAGE =
   'No learner profile yet. Start a Talk session or open Settings to create one, and your lessons will adapt to you.';
@@ -258,6 +268,59 @@ function reviewKindLabel(kind: ReviewItem['kind'] | undefined): string {
   }
 }
 
+/** True for steps executed by the EXISTING review pipeline. */
+function isReviewFamilyStep(step: AdaptiveLessonStep): boolean {
+  return step.capability === 'review-service';
+}
+
+/**
+ * Bounded pool size for ONE lesson, derived from the lesson that was actually
+ * planned: the sum of the review-family steps' item bounds, clamped. This
+ * guarantees the pool can satisfy the maximum legitimate review-family demand
+ * of this lesson (no step is starved by design) without ever reading more than
+ * a small bounded number of rows.
+ */
+export function reviewPoolSizeFor(plan: AdaptiveLessonPlan): number {
+  const demand = plan.steps
+    .filter(isReviewFamilyStep)
+    .reduce((sum, step) => sum + Math.max(1, step.bounds.maxItems), 0);
+  return Math.min(MAX_REVIEW_POOL_ITEMS, Math.max(MIN_REVIEW_POOL_ITEMS, demand));
+}
+
+/**
+ * Identity link between a served review candidate and the persisted weakness a
+ * step was planned from. Mirrors the EXISTING ReviewService rule
+ * (`w.id === candidate.referenceId || w.referenceId === candidate.referenceId`)
+ * and also accepts the weakness evidence rows, which store the id of the source
+ * mistake/pronunciation weakness. Deliberately id/reference based: loose text
+ * matching is never used when a persisted reference exists.
+ */
+export function candidateMatchesWeakness(
+  candidate: ReviewItemCandidate,
+  weakness: LearnerWeakness | null | undefined,
+): boolean {
+  if (!weakness) return false;
+  if (candidate.referenceId === weakness.id) return true;
+  if (weakness.referenceId && candidate.referenceId === weakness.referenceId) return true;
+  return (weakness.evidence ?? []).some((entry) => entry.id === candidate.referenceId);
+}
+
+/**
+ * Flag a cached answer result as a repeated submission. Only variants that can
+ * carry the flag are touched; a rejection is returned unchanged.
+ */
+function markDuplicate(result: AdaptiveLessonAnswerResult): AdaptiveLessonAnswerResult {
+  switch (result.kind) {
+    case 'review':
+    case 'listening':
+    case 'speaking':
+    case 'pronunciation':
+      return { ...result, duplicate: true };
+    default:
+      return result;
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * Service
  * ------------------------------------------------------------------ */
@@ -280,7 +343,18 @@ export class AdaptiveLessonService {
   /** ONE bounded review pool per lesson, shared by all review-family steps. */
   private reviewPool: readonly ReviewItemCandidate[] | null = null;
   private reviewPoolNote: string | null = null;
-  private readonly consumedReviewIds = new Set<string>();
+  /**
+   * Deterministic reservation of the single bounded pool: which candidates
+   * belong to which planned review-family step. Computed once per lesson.
+   */
+  private reviewAllocation: Map<string, readonly ReviewItemCandidate[]> | null = null;
+  /**
+   * Session-scoped idempotency for submissions that were accepted as practice.
+   * Protects review history, listening evidence, pronunciation occurrences and
+   * the step counters from UI retries / re-renders / double taps. Cleared with
+   * the lesson, so it never blocks legitimate future retraining.
+   */
+  private readonly answeredSubmissions = new Map<string, AdaptiveLessonAnswerResult>();
   private readonly materialCache = new Map<string, AdaptiveLessonStepMaterial>();
 
   constructor(deps: AdaptiveLessonServiceDeps) {
@@ -469,7 +543,8 @@ export class AdaptiveLessonService {
     this.lastSummary = null;
     this.reviewPool = null;
     this.reviewPoolNote = null;
-    this.consumedReviewIds.clear();
+    this.reviewAllocation = null;
+    this.answeredSubmissions.clear();
     this.materialCache.clear();
 
     return { status: 'started', session: this.snapshot(this.session), resumed: false };
@@ -491,18 +566,38 @@ export class AdaptiveLessonService {
     this.session = null;
     this.materialCache.clear();
     this.reviewPool = null;
-    this.consumedReviewIds.clear();
+    this.reviewPoolNote = null;
+    this.reviewAllocation = null;
+    this.answeredSubmissions.clear();
   }
 
   private buildProgress(session: MutableSession): AdaptiveLessonProgress {
     const totalSteps = session.plan.steps.length;
     const completedSteps = session.steps.filter((s) => s.status === 'completed').length;
     const skippedSteps = session.steps.filter((s) => s.status === 'skipped').length;
+    // An unavailable step is never rewritten as completed (see completeStep),
+    // so it can only ever be counted here.
     const unavailableSteps = session.steps.filter((s) => s.status === 'unavailable').length;
     const finished = completedSteps + skippedSteps + unavailableSteps;
     const practicedItems = session.steps.reduce((sum, s) => sum + s.practicedItems, 0);
+
+    // The structural wrap-up step is part of the lesson but is NOT practice:
+    // completing it must never look like practiced content.
+    const practiceIndexes = session.plan.steps
+      .map((step, index) => ({ step, index }))
+      .filter((entry) => entry.step.type !== 'wrap_up');
+    const totalPracticeSteps = practiceIndexes.length;
+    // A practice step counts as completed only when the learner really
+    // practiced something in it: tapping "Continue" on a step that served no
+    // item (or on a prompt answered with nothing) is not practice.
+    const practiceStepsCompleted = practiceIndexes.filter((entry) => {
+      const state = session.steps[entry.index];
+      return state?.status === 'completed' && state.practicedItems > 0;
+    }).length;
+
     const parts = [`${finished} of ${totalSteps} lesson steps`];
     if (skippedSteps > 0) parts.push(`${skippedSteps} skipped`);
+    if (unavailableSteps > 0) parts.push(`${unavailableSteps} without material`);
     if (practicedItems > 0) parts.push(`${practicedItems} practice items`);
     return {
       totalSteps,
@@ -511,6 +606,8 @@ export class AdaptiveLessonService {
       unavailableSteps,
       remainingSteps: Math.max(0, totalSteps - finished),
       practicedItems,
+      totalPracticeSteps,
+      practiceStepsCompleted,
       label: parts.join(' · '),
       isComplete: finished >= totalSteps,
     };
@@ -601,47 +698,129 @@ export class AdaptiveLessonService {
     }
   }
 
-  /** ONE bounded review pool per lesson, sliced disjointly across steps. */
-  private async ensureReviewPool(learnerId: string): Promise<void> {
+  /**
+   * ONE bounded review pool per lesson (fetched once), sized from the real
+   * planned demand, then deterministically reserved per planned step.
+   */
+  private async ensureReviewPool(session: MutableSession): Promise<void> {
     if (this.reviewPool) return;
     const review = this.deps.review;
     if (!review) {
       this.reviewPool = [];
       this.reviewPoolNote = 'Review practice is not available in this build.';
+      this.reviewAllocation = new Map();
       return;
     }
+    const poolSize = reviewPoolSizeFor(session.plan);
     try {
-      const candidates = await review.planSession(learnerId, {
+      const candidates = await review.planSession(session.learnerId, {
         minItems: 1,
-        maxItems: REVIEW_POOL_ITEMS,
-        targetItems: REVIEW_POOL_ITEMS,
+        maxItems: poolSize,
+        targetItems: poolSize,
         now: this.now(),
       });
       this.reviewPool = candidates;
       this.reviewPoolNote = null;
+      this.reviewAllocation = this.allocateReviewPool(session, candidates);
     } catch {
       this.reviewPool = [];
       this.reviewPoolNote = 'Review practice is unavailable right now. Nothing was changed.';
+      this.reviewAllocation = new Map();
     }
+  }
+
+  /** The persisted weakness row a step was planned from, when there is one. */
+  private weaknessRowForStep(
+    session: MutableSession,
+    step: AdaptiveLessonStep,
+  ): LearnerWeakness | null {
+    if (step.target.kind !== 'learner_weakness' || !step.target.id) return null;
+    return session.weaknessRows.find((row) => row.id === step.target.id) ?? null;
+  }
+
+  /**
+   * Reserve candidates from the single bounded pool for each planned
+   * review-family step, deterministically and disjointly.
+   *
+   * Order of precedence (this is what stops starvation):
+   *  1. steps aimed at ONE persisted weakness get their exactly linked
+   *     candidate first (identity match, never text matching);
+   *  2. those steps, then other kind-specialized steps (vocabulary /
+   *     expression / grammar), fill their remaining capacity from candidates
+   *     of their own kind;
+   *  3. a generic Review step only ever uses what is genuinely left, so it can
+   *     never consume items a later specialized step was planned around;
+   *  4. leftovers are offered back to specialized steps that still have room.
+   *
+   * Every candidate is allocated at most once, so no item can be practiced
+   * twice in one lesson, and the whole computation is a pure function of the
+   * (deterministic) pool order and the plan.
+   */
+  private allocateReviewPool(
+    session: MutableSession,
+    pool: readonly ReviewItemCandidate[],
+  ): Map<string, readonly ReviewItemCandidate[]> {
+    const allocation = new Map<string, ReviewItemCandidate[]>();
+    const taken = new Set<string>();
+    const reviewSteps = session.plan.steps.filter(isReviewFamilyStep);
+    for (const step of reviewSteps) allocation.set(step.id, []);
+
+    const available = (step: AdaptiveLessonStep): readonly ReviewItemCandidate[] =>
+      pool.filter(
+        (candidate) =>
+          !taken.has(candidate.id) &&
+          (!step.reviewKindFilter || candidate.kind === step.reviewKindFilter),
+      );
+
+    const take = (
+      step: AdaptiveLessonStep,
+      candidates: readonly ReviewItemCandidate[],
+    ): void => {
+      const bucket = allocation.get(step.id);
+      if (!bucket) return;
+      const limit = Math.max(1, step.bounds.maxItems);
+      for (const candidate of candidates) {
+        if (bucket.length >= limit) return;
+        if (taken.has(candidate.id)) continue;
+        taken.add(candidate.id);
+        bucket.push(candidate);
+      }
+    };
+
+    const targeted = reviewSteps.filter((step) => this.weaknessRowForStep(session, step) !== null);
+    const specialized = reviewSteps.filter(
+      (step) => Boolean(step.reviewKindFilter) && !targeted.includes(step),
+    );
+    const generic = reviewSteps.filter(
+      (step) => !step.reviewKindFilter && !targeted.includes(step),
+    );
+
+    for (const step of targeted) {
+      const weakness = this.weaknessRowForStep(session, step);
+      take(
+        step,
+        available(step).filter((candidate) => candidateMatchesWeakness(candidate, weakness)),
+      );
+    }
+    for (const step of [...targeted, ...specialized]) take(step, available(step));
+    for (const step of generic) take(step, available(step));
+    for (const step of [...targeted, ...specialized]) take(step, available(step));
+
+    return allocation;
   }
 
   private async prepareReviewMaterial(
     session: MutableSession,
     step: AdaptiveLessonStep,
   ): Promise<AdaptiveLessonStepMaterial> {
-    await this.ensureReviewPool(session.learnerId);
+    await this.ensureReviewPool(session);
     if (this.reviewPoolNote) {
       return { kind: 'unavailable', step, message: this.reviewPoolNote };
     }
     const pool = this.reviewPool ?? [];
-    const selectable = pool.filter(
-      (candidate) =>
-        !this.consumedReviewIds.has(candidate.id) &&
-        (!step.reviewKindFilter || candidate.kind === step.reviewKindFilter),
-    );
-    const candidates = selectable.slice(0, Math.max(1, step.bounds.maxItems));
+    const candidates = this.reviewAllocation?.get(step.id) ?? [];
+    const label = step.reviewKindFilter ? reviewKindLabel(step.reviewKindFilter) : 'review';
     if (candidates.length === 0) {
-      const label = step.reviewKindFilter ? reviewKindLabel(step.reviewKindFilter) : 'review';
       return {
         kind: 'unavailable',
         step,
@@ -651,15 +830,40 @@ export class AdaptiveLessonService {
             : `No ${label} items were left for this lesson.`,
       };
     }
-    for (const candidate of candidates) this.consumedReviewIds.add(candidate.id);
-    return {
-      kind: 'review',
-      step,
-      candidates,
-      ...(step.bounds.maxItems < candidates.length
-        ? { note: `Showing ${candidates.length} of the items due.` }
-        : {}),
-    };
+
+    // Provenance: a step planned from ONE persisted weakness may only claim
+    // that weakness when a genuinely linked candidate is being served.
+    const weakness = this.weaknessRowForStep(session, step);
+    if (!weakness) {
+      return { kind: 'review', step, candidates };
+    }
+
+    const targetMatched = candidates.some((candidate) =>
+      candidateMatchesWeakness(candidate, weakness),
+    );
+    const state = session.steps[session.plan.steps.indexOf(step)];
+    if (targetMatched) {
+      const note =
+        candidates.length > 1
+          ? 'Starts with the item from your history; the others are also due for review.'
+          : undefined;
+      return {
+        kind: 'review',
+        step,
+        candidates,
+        targetMatched: true,
+        ...(note ? { note } : {}),
+      };
+    }
+
+    // The exact target is no longer servable (its state changed after
+    // planning). Degrade honestly instead of letting an unrelated same-kind
+    // item masquerade as the targeted weakness.
+    const note = `The specific ${label} item from your history is no longer in your due queue, so this is other real ${label} practice — not that targeted item.`;
+    if (state && state.status !== 'skipped' && state.status !== 'unavailable') {
+      state.note = note;
+    }
+    return { kind: 'review', step, candidates, targetMatched: false, note };
   }
 
   private async prepareListeningMaterial(
@@ -695,29 +899,49 @@ export class AdaptiveLessonService {
         return { kind: 'listening', step, exercises, sourceNote: planned.sourceNote };
       }
 
-      // Prefer the exercise that really retrains this step's target.
+      // Prefer the exercise that really retrains this step's target, matched by
+      // the PERSISTED reference first — never by loose text when an id exists.
       const row = session.weaknessRows.find((weakness) => weakness.id === step.target.id);
-      const label = (step.targetText ?? row?.notes ?? '').toLowerCase();
-      const matchIndex = exercises.findIndex((exercise) => {
+      const identityMatch = exercises.findIndex((exercise) => {
         if (row && exercise.weaknessReferenceId === row.referenceId) return true;
-        if (exercise.weaknessReferenceId && exercise.weaknessReferenceId === step.target.id) {
-          return true;
-        }
         return Boolean(
-          label && exercise.keyItems.some((item) => item.toLowerCase() === label),
+          exercise.weaknessReferenceId && exercise.weaknessReferenceId === step.target.id,
         );
       });
+      const label = (step.targetText ?? row?.notes ?? '').toLowerCase();
+      const textMatch =
+        identityMatch >= 0
+          ? -1
+          : exercises.findIndex((exercise) =>
+              exercise.keyItems.some((item) => item.toLowerCase() === label),
+            );
+      const matchIndex = identityMatch >= 0 ? identityMatch : textMatch;
+      const NOT_TARGETED_NOTE =
+        'The exact item from your history was not available, so this is other real listening practice.';
 
       if (matchIndex > 0) {
         return {
           kind: 'listening',
           step,
           exercises: [exercises[matchIndex], ...exercises.filter((_, i) => i !== matchIndex)],
-          sourceNote: planned.sourceNote,
+          // A text-only match may reorder the queue but must not claim the
+          // persisted target: provenance stays truthful.
+          sourceNote:
+            identityMatch < 0
+              ? `${planned.sourceNote} ${NOT_TARGETED_NOTE}`
+              : planned.sourceNote,
         };
       }
       if (matchIndex === 0) {
-        return { kind: 'listening', step, exercises, sourceNote: planned.sourceNote };
+        return {
+          kind: 'listening',
+          step,
+          exercises,
+          sourceNote:
+            identityMatch < 0
+              ? `${planned.sourceNote} ${NOT_TARGETED_NOTE}`
+              : planned.sourceNote,
+        };
       }
 
       // The exact target was not served (state changed since planning):
@@ -726,7 +950,7 @@ export class AdaptiveLessonService {
         kind: 'listening',
         step,
         exercises,
-        sourceNote: `${planned.sourceNote} The exact item from your history was not available, so this is other real listening practice.`,
+        sourceNote: `${planned.sourceNote} ${NOT_TARGETED_NOTE}`,
       };
     } catch {
       return {
@@ -798,21 +1022,28 @@ export class AdaptiveLessonService {
       };
     }
 
+    const submissionKey = `${step.id}::pronunciation::${trimmed.toLowerCase()}`;
+    const repeated = this.answeredSubmissions.get(submissionKey);
+    if (repeated) {
+      // Identical repeat resubmitted for the same step: the engine is not asked
+      // again, so occurrence counts cannot inflate from a double tap.
+      return { session: this.snapshot(session), result: markDuplicate(repeated) };
+    }
+
     this.markStarted(state);
     const engine = this.deps.pronunciation;
     if (!engine || !target) {
       // Honest degradation: the attempt is real practice, but nothing was judged.
       state.practicedItems += 1;
       state.pronunciationTargets += 1;
-      return {
-        session: this.snapshot(session),
-        result: {
-          kind: 'pronunciation',
-          lines: ['Pronunciation analysis was not available for this attempt.'],
-          unavailable: true,
-          observationsDetected: 0,
-        },
+      const result: AdaptiveLessonAnswerResult = {
+        kind: 'pronunciation',
+        lines: ['Pronunciation analysis was not available for this attempt.'],
+        unavailable: true,
+        observationsDetected: 0,
       };
+      this.answeredSubmissions.set(submissionKey, result);
+      return { session: this.snapshot(session), result };
     }
 
     try {
@@ -825,32 +1056,21 @@ export class AdaptiveLessonService {
       });
       state.practicedItems += 1;
       state.pronunciationTargets += 1;
-      if (!outcome) {
-        return {
-          session: this.snapshot(session),
-          result: {
-            kind: 'pronunciation',
-            lines: ['Pronunciation analysis was skipped for this attempt.'],
-            unavailable: true,
-            observationsDetected: 0,
-          },
-        };
-      }
-      const lines =
-        outcome.feedbackLines.length > 0
+      const lines = !outcome
+        ? ['Pronunciation analysis was skipped for this attempt.']
+        : outcome.feedbackLines.length > 0
           ? outcome.feedbackLines
           : outcome.unavailable
             ? ['Pronunciation analysis was unavailable for this attempt.']
             : ['Your repeat was recorded; no specific issue was detected.'];
-      return {
-        session: this.snapshot(session),
-        result: {
-          kind: 'pronunciation',
-          lines,
-          unavailable: outcome.unavailable,
-          observationsDetected: outcome.analysis.observations.length,
-        },
+      const result: AdaptiveLessonAnswerResult = {
+        kind: 'pronunciation',
+        lines,
+        unavailable: outcome ? outcome.unavailable : true,
+        observationsDetected: outcome ? outcome.analysis.observations.length : 0,
       };
+      this.answeredSubmissions.set(submissionKey, result);
+      return { session: this.snapshot(session), result };
     } catch {
       return {
         session: this.snapshot(session),
@@ -879,12 +1099,18 @@ export class AdaptiveLessonService {
   private buildWrapUpLines(session: MutableSession): readonly string[] {
     const progress = this.buildProgress(session);
     const lines: string[] = [];
-    const doneSteps = progress.completedSteps;
+    // Wrap-up is a structural closing step, never practice: every number the
+    // learner reads here describes real practice only.
     lines.push(
-      doneSteps === 0
-        ? 'No steps were completed in this lesson.'
-        : `${doneSteps} of ${progress.totalSteps} lesson steps completed.`,
+      progress.practiceStepsCompleted === 0
+        ? 'No practice step was completed in this lesson.'
+        : `${progress.practiceStepsCompleted} of ${progress.totalPracticeSteps} practice steps completed.`,
     );
+    if (progress.practicedItems === 0) {
+      lines.push(
+        'No practice items were completed, so nothing will be saved to your progress history.',
+      );
+    }
     if (progress.skippedSteps > 0) {
       lines.push(
         `${progress.skippedSteps} ${progress.skippedSteps === 1 ? 'step was' : 'steps were'} skipped — skipped practice is not counted as done.`,
@@ -974,6 +1200,14 @@ export class AdaptiveLessonService {
       };
     }
 
+    const submissionKey = `${step.id}::review::${candidate.id}`;
+    const repeated = this.answeredSubmissions.get(submissionKey);
+    if (repeated) {
+      // Retry / re-render / double tap: this item was already evaluated and
+      // persisted once in this lesson. Nothing is written or counted again.
+      return { session: this.snapshot(session), result: markDuplicate(repeated) };
+    }
+
     this.markStarted(state);
     let evaluation: EvaluationResult;
     try {
@@ -1006,10 +1240,15 @@ export class AdaptiveLessonService {
     }
     if (candidate.kind === 'pronunciation') state.pronunciationTargets += 1;
 
-    return {
-      session: this.snapshot(session),
-      result: { kind: 'review', evaluation, persisted, persistenceError },
+    const result: AdaptiveLessonAnswerResult = {
+      kind: 'review',
+      evaluation,
+      persisted,
+      persistenceError,
     };
+    // Guarded exactly because it counted as practice (see answeredSubmissions).
+    this.answeredSubmissions.set(submissionKey, result);
+    return { session: this.snapshot(session), result };
   }
 
   /**
@@ -1051,6 +1290,13 @@ export class AdaptiveLessonService {
       };
     }
 
+    const submissionKey = `${step.id}::listening::${exercise.id}`;
+    const repeated = this.answeredSubmissions.get(submissionKey);
+    if (repeated) {
+      // The same exercise was already judged and its evidence persisted once.
+      return { session: this.snapshot(session), result: markDuplicate(repeated) };
+    }
+
     this.markStarted(state);
     try {
       const { evaluation, persistenceError } = await listening.evaluateAnswer(
@@ -1061,10 +1307,13 @@ export class AdaptiveLessonService {
       );
       state.practicedItems += 1;
       state.listeningExercises += 1;
-      return {
-        session: this.snapshot(session),
-        result: { kind: 'listening', evaluation, persistenceError },
+      const result: AdaptiveLessonAnswerResult = {
+        kind: 'listening',
+        evaluation,
+        persistenceError,
       };
+      this.answeredSubmissions.set(submissionKey, result);
+      return { session: this.snapshot(session), result };
     } catch {
       return {
         session: this.snapshot(session),
@@ -1102,6 +1351,14 @@ export class AdaptiveLessonService {
       };
     }
 
+    const submissionKey = `${step.id}::speaking::${trimmed.toLowerCase()}`;
+    const repeated = this.answeredSubmissions.get(submissionKey);
+    if (repeated) {
+      // Same answer resubmitted in the same step (double tap / retry): the
+      // provider is not called again and the counters do not inflate.
+      return { session: this.snapshot(session), result: markDuplicate(repeated) };
+    }
+
     this.markStarted(state);
     const speaking = this.deps.speaking;
     const feedback = speaking
@@ -1130,7 +1387,9 @@ export class AdaptiveLessonService {
     state.practicedItems += 1;
     state.speakingAnswers += 1;
 
-    return { session: this.snapshot(session), result: { kind: 'speaking', feedback } };
+    const result: AdaptiveLessonAnswerResult = { kind: 'speaking', feedback };
+    this.answeredSubmissions.set(submissionKey, result);
+    return { session: this.snapshot(session), result };
   }
 
   private safeCoachingContext() {
@@ -1156,14 +1415,23 @@ export class AdaptiveLessonService {
     const state = this.stepState(session, index);
     if (!state) return null;
 
+    if (state.status === 'unavailable') {
+      // The owning system had nothing real to serve for this step. Continuing
+      // past it ONLY advances the lesson: an unavailable step must never be
+      // rewritten as completed, and it contributes zero practice of any kind
+      // (so completedSteps, the summary and persisted progress stay honest).
+      this.resetPracticeCounters(state);
+      if (!state.note) state.note = UNAVAILABLE_STEP_NOTE;
+      this.advanceFrom(session, index);
+      return this.snapshot(session);
+    }
+
     if (state.status !== 'skipped') {
       state.status = 'completed';
       state.completedAt = this.now();
       if (!state.note) state.note = 'Completed by learner';
     }
-    if (index === session.currentIndex) {
-      session.currentIndex = Math.min(index + 1, session.plan.steps.length - 1);
-    }
+    this.advanceFrom(session, index);
     return this.snapshot(session);
   }
 
@@ -1178,19 +1446,38 @@ export class AdaptiveLessonService {
     const state = this.stepState(session, index);
     if (!state) return null;
 
+    if (state.status === 'unavailable') {
+      // There was nothing to practice, so this is not a learner skip: the step
+      // keeps its honest unavailable status (and still counts as zero).
+      this.resetPracticeCounters(state);
+      if (!state.note) state.note = UNAVAILABLE_STEP_NOTE;
+      this.advanceFrom(session, index);
+      return this.snapshot(session);
+    }
+
     state.status = 'skipped';
     state.completedAt = this.now();
+    this.resetPracticeCounters(state);
+    state.note = 'Skipped by learner — not counted as practice';
+    this.advanceFrom(session, index);
+    return this.snapshot(session);
+  }
+
+  /** Zero every real-activity counter for a step that must not claim practice. */
+  private resetPracticeCounters(state: MutableStepState): void {
     state.practicedItems = 0;
     state.reviewItems = 0;
     state.listeningExercises = 0;
     state.speakingAnswers = 0;
     state.pronunciationTargets = 0;
     state.lexicalItems = 0;
-    state.note = 'Skipped by learner — not counted as practice';
+  }
+
+  /** Move past `index` when the learner is currently on it. */
+  private advanceFrom(session: MutableSession, index: number): void {
     if (index === session.currentIndex) {
       session.currentIndex = Math.min(index + 1, session.plan.steps.length - 1);
     }
-    return this.snapshot(session);
   }
 
   /** Move to the next step without changing any status. */
@@ -1221,8 +1508,12 @@ export class AdaptiveLessonService {
     const progress = this.buildProgress(session);
     const counters = this.aggregateCounters(session);
 
+    // Progress is earned by REAL practice only. Completing the structural
+    // wrap-up step — or any step without practicing an item — never produces a
+    // session record; that would inflate sessionsCompleted / turnsCompleted.
+    const hasRealPractice = progress.practicedItems > 0;
     let persistedProgress = false;
-    if (progress.completedSteps > 0 && this.deps.progress) {
+    if (hasRealPractice && this.deps.progress) {
       try {
         await this.deps.progress.record({
           learnerId: session.learnerId,
@@ -1237,8 +1528,14 @@ export class AdaptiveLessonService {
           newWordsLearned: 0,
           weaknessesImproved: 0,
           weaknessesWorsened: 0,
-          notes: `Adaptive lesson (${session.plan.sourceMode}): ${progress.completedSteps} of ${progress.totalSteps} steps completed${
+          notes: `Adaptive lesson (${session.plan.sourceMode}): ${progress.practicedItems} practice ${
+            progress.practicedItems === 1 ? 'item' : 'items'
+          } across ${progress.practiceStepsCompleted} of ${progress.totalPracticeSteps} practice steps${
             progress.skippedSteps > 0 ? `, ${progress.skippedSteps} skipped` : ''
+          }${
+            progress.unavailableSteps > 0
+              ? `, ${progress.unavailableSteps} without material`
+              : ''
           }.`,
         });
         persistedProgress = true;
@@ -1250,11 +1547,19 @@ export class AdaptiveLessonService {
     session.completedAt = completedAt;
     session.currentIndex = session.plan.steps.length - 1;
 
+    const structuralSteps = progress.totalSteps - progress.totalPracticeSteps;
     const lines: string[] = [
-      progress.completedSteps === 0
-        ? 'You finished the lesson without completing a step.'
-        : `${progress.completedSteps} of ${progress.totalSteps} lesson steps completed.`,
+      hasRealPractice
+        ? `${progress.practicedItems} ${
+            progress.practicedItems === 1 ? 'practice item' : 'practice items'
+          } completed across ${progress.practiceStepsCompleted} of ${progress.totalPracticeSteps} practice steps.`
+        : 'No practice items were completed in this lesson.',
     ];
+    lines.push(
+      `${progress.completedSteps} of ${progress.totalSteps} lesson steps finished${
+        structuralSteps > 0 ? ' (the closing wrap-up is a summary step, not practice)' : ''
+      }.`,
+    );
     if (progress.skippedSteps > 0) lines.push(`${progress.skippedSteps} steps skipped.`);
     if (counters.reviewItems > 0) lines.push(`${counters.reviewItems} review items practiced.`);
     if (counters.listeningExercises > 0) {
@@ -1267,9 +1572,9 @@ export class AdaptiveLessonService {
     lines.push(
       persistedProgress
         ? 'Saved to your progress history as one adaptive lesson session.'
-        : progress.completedSteps === 0
-          ? 'Nothing was saved — no step was completed.'
-          : 'Progress could not be saved right now. Your practice itself was still recorded by each engine.',
+        : hasRealPractice
+          ? 'Progress could not be saved right now. Your practice itself was still recorded by each engine.'
+          : 'Nothing was saved to your progress — no real practice was completed in this lesson.',
     );
 
     const summary: AdaptiveLessonSummary = {
@@ -1279,6 +1584,8 @@ export class AdaptiveLessonService {
       stepsSkipped: progress.skippedSteps,
       stepsUnavailable: progress.unavailableSteps,
       totalSteps: progress.totalSteps,
+      totalPracticeSteps: progress.totalPracticeSteps,
+      practiceStepsCompleted: progress.practiceStepsCompleted,
       itemsPracticed: progress.practicedItems,
       reviewItemsPracticed: counters.reviewItems,
       listeningExercisesPracticed: counters.listeningExercises,
@@ -1295,7 +1602,11 @@ export class AdaptiveLessonService {
     this.planCache = null;
     this.materialCache.clear();
     this.reviewPool = null;
-    this.consumedReviewIds.clear();
+    this.reviewPoolNote = null;
+    this.reviewAllocation = null;
+    // Idempotency guards are lesson-scoped: the next lesson may legitimately
+    // serve (and persist) the same item again as fresh retraining.
+    this.answeredSubmissions.clear();
 
     return { session: this.snapshot(session), summary };
   }

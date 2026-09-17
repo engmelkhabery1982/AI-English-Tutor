@@ -359,6 +359,16 @@ export interface AdaptiveLessonProgress {
   readonly remainingSteps: number;
   /** Real number of underlying practice items completed across steps. */
   readonly practicedItems: number;
+  /**
+   * Practice steps in this lesson — the structural `wrap_up` step excluded.
+   * Completing wrap-up is never practice and never inflates progress.
+   */
+  readonly totalPracticeSteps: number;
+  /**
+   * Completed PRACTICE steps: wrap-up excluded, unavailable steps excluded,
+   * and only steps where at least one real item was practiced.
+   */
+  readonly practiceStepsCompleted: number;
   readonly label: string;
   readonly isComplete: boolean;
 }
@@ -371,6 +381,13 @@ export interface AdaptiveLessonSummary {
   readonly stepsSkipped: number;
   readonly stepsUnavailable: number;
   readonly totalSteps: number;
+  /** Practice steps in the lesson (structural wrap-up excluded). */
+  readonly totalPracticeSteps: number;
+  /**
+   * Completed practice steps only — wrap-up never counts as practice, and a
+   * step with zero practiced items never counts either.
+   */
+  readonly practiceStepsCompleted: number;
   readonly itemsPracticed: number;
   readonly reviewItemsPracticed: number;
   readonly listeningExercisesPracticed: number;
@@ -391,6 +408,15 @@ export type AdaptiveLessonStepMaterial =
       readonly step: AdaptiveLessonStep;
       readonly candidates: readonly ReviewItemCandidate[];
       readonly note?: string;
+      /**
+       * Provenance for a weakness-targeted step. `true` only when a served
+       * candidate is genuinely linked (by persisted id/reference) to the
+       * weakness that created the step. `false` means the step honestly
+       * degraded to other real practice and must NOT be presented as the
+       * targeted item from the learner's history. Absent for steps that were
+       * never targeted at one specific weakness.
+       */
+      readonly targetMatched?: boolean;
     }
   | {
       readonly kind: 'listening';
@@ -549,15 +575,25 @@ export type AdaptiveLessonAnswerResult =
       readonly evaluation: EvaluationResult;
       readonly persisted: boolean;
       readonly persistenceError: boolean;
+      /**
+       * True when this is a repeated submission of an item already answered in
+       * this lesson: the cached first result is returned and NOTHING was
+       * persisted or counted a second time.
+       */
+      readonly duplicate?: boolean;
     }
   | {
       readonly kind: 'listening';
       readonly evaluation: ListeningEvaluation;
       readonly persistenceError: boolean;
+      /** True for a repeated submission — nothing was evaluated or counted again. */
+      readonly duplicate?: boolean;
     }
   | {
       readonly kind: 'speaking';
       readonly feedback: AdaptiveSpeakingFeedback;
+      /** True for a repeated submission — the provider was not called again. */
+      readonly duplicate?: boolean;
     }
   | {
       readonly kind: 'pronunciation';
@@ -567,6 +603,8 @@ export type AdaptiveLessonAnswerResult =
       readonly unavailable: boolean;
       /** Real number of observations detected in this attempt. */
       readonly observationsDetected: number;
+      /** True for a repeated submission — the engine was not called again. */
+      readonly duplicate?: boolean;
     }
   | {
       readonly kind: 'none';
