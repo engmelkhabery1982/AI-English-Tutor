@@ -16,7 +16,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // @ts-ignore -- node built-ins are available in the vitest runtime; the app tsconfig targets Expo.
 import { readFileSync } from 'node:fs';
 // @ts-ignore -- see above.
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+// @ts-ignore -- see above.
+import { fileURLToPath } from 'node:url';
 
 import { SqlJsAdapter } from '../data/local/sqlite/SqlJsAdapter';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
@@ -39,6 +41,11 @@ import { SQLiteExpressionRepository } from '../data/local/sqlite/repositories';
 import { ReviewEvaluator } from '../review/evaluator';
 import { ProgressDashboardService } from '../progress-dashboard/service';
 import type { VocabularyItem } from '../domain/models/vocabulary';
+
+// Cross-platform equivalent of the CommonJS __dirname (Windows-safe:
+// fileURLToPath handles drive letters and percent-encoded segments that
+// URL.pathname mangles).
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const NOW = '2026-09-17T12:00:00.000Z';
 
@@ -581,10 +588,7 @@ describe('Review integration', () => {
   it('21. voice answers reuse the existing recorder/STT flow and evaluate qualitatively', async () => {
     // Structural: ReviewScreen still wires the existing recorder + STT and
     // only fills the answer box from the transcript (no silent auto-submit).
-    const source = readFileSync(
-      join(new URL('.', import.meta.url).pathname, '../screens/ReviewScreen.tsx'),
-      'utf8',
-    );
+    const source = readFileSync(join(__dirname, '../screens/ReviewScreen.tsx'), 'utf8');
     expect(source).toContain('createExpoAudioRecorder');
     expect(source).toContain('setUserAnswer(sttRes.transcript)');
     expect(source).not.toMatch(/setUserAnswer\(sttRes\.transcript\)[^;]*;[^]*?handleSubmitAnswer\(\)/);
