@@ -12,6 +12,7 @@ import ProgressScreen from '../screens/ProgressScreen';
 import ListeningScreen from '../screens/ListeningScreen';
 import SettingsScreen from '../screens/SettingsScreen';
 import AdaptiveLessonScreen from '../screens/AdaptiveLessonScreen';
+import OnboardingScreen from '../screens/OnboardingScreen';
 
 /**
  * RootNavigator
@@ -21,7 +22,8 @@ import AdaptiveLessonScreen from '../screens/AdaptiveLessonScreen';
  *   └── Root stack
  *       ├── MainTabs (the EXISTING bottom-tab layout, unchanged)
  *       │     Home | Talk | Listening | Vocabulary | Review | Progress | Settings
- *       └── AdaptiveLesson  ← pushed from Home → "Today's Practice"
+ *       ├── AdaptiveLesson  ← pushed from Home → "Today's Practice"
+ *       └── Onboarding      ← pushed from Home/Settings → diagnostic assessment
  *
  * The stack exists so an adaptive lesson is a pushed destination (with a real
  * back action) rather than an eighth tab. It uses @react-navigation/stack,
@@ -38,6 +40,8 @@ const Stack = createStackNavigator();
 export type RootStackParamList = {
   MainTabs: undefined;
   AdaptiveLesson: undefined;
+  /** Personalized onboarding + diagnostic assessment (pushed from Home/Settings). */
+  Onboarding: undefined;
 };
 
 /** The existing bottom-tab layout, now hosted inside the root stack. */
@@ -77,6 +81,11 @@ export default function RootNavigator() {
           name="AdaptiveLesson"
           component={AdaptiveLessonScreen}
           options={{ title: "Today's Practice", headerBackTitle: 'Home' }}
+        />
+        <Stack.Screen
+          name="Onboarding"
+          component={OnboardingScreen}
+          options={{ title: 'Assess my English', headerBackTitle: 'Back' }}
         />
       </Stack.Navigator>
     </NavigationContainer>
