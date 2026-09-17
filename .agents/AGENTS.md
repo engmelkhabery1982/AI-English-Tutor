@@ -1,4 +1,4 @@
-﻿# AI English Tutor — Agent Repository Rules
+# AI English Tutor — Agent Repository Rules
 
 This repository is an existing React Native + Expo + TypeScript application.
 
