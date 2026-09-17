@@ -575,6 +575,7 @@ function rowToPronunciationWeakness(row: SqlRow): PronunciationWeakness {
     originTurnId: (row.origin_turn_id as string) ?? undefined,
     resolved: (row.resolved as number) === 1,
     notes: (row.notes as string) ?? undefined,
+    evidenceLog: safeJsonParse(row.evidence_log, []),
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
   };
@@ -948,9 +949,9 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
       `INSERT INTO pronunciation_weaknesses (
         id, learner_id, target_sound, word_examples, occurrence_count,
         last_seen_at, first_seen_at, contexts, example_turn_ids,
-        origin_session_id, origin_turn_id, resolved, notes,
+        origin_session_id, origin_turn_id, resolved, notes, evidence_log,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         weakness.learnerId,
@@ -965,6 +966,7 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
         weakness.originTurnId ?? null,
         weakness.resolved ? 1 : 0,
         weakness.notes ?? null,
+        JSON.stringify(weakness.evidenceLog ?? []),
         now,
         now,
       ],
@@ -1061,6 +1063,18 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
       [input.learnerId, input.identity],
     );
 
+    if (!input.evidenceSource) {
+      throw new Error('evidenceSource is required');
+    }
+
+    // Evidence entry for THIS occurrence (what/when/source — no scores).
+    const evidenceEntry = {
+      at: input.at,
+      source: input.evidenceSource,
+      ...(input.confidence ? { confidence: input.confidence } : {}),
+      ...(input.exampleText ? { observed: input.exampleText } : {}),
+    };
+
     if (existingRows.length > 0) {
       const id = existingRows[0].id as string;
       const current = rowToPronunciationWeakness(
@@ -1075,6 +1089,8 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
       const contexts = Array.from(
         new Set([...(input.context ? [input.context] : []), ...current.contexts]),
       ).slice(0, 10);
+      // Append (never reset) the evidence log, bounded to the most recent 20.
+      const evidenceLog = [...(current.evidenceLog ?? []), evidenceEntry].slice(-20);
 
       await this.adapter.execute(
         `UPDATE pronunciation_weaknesses SET
@@ -1082,9 +1098,17 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
           last_seen_at = ?,
           word_examples = ?,
           contexts = ?,
+          evidence_log = ?,
           updated_at = ?
         WHERE id = ?`,
-        [input.at, JSON.stringify(wordExamples), JSON.stringify(contexts), input.at, id],
+        [
+          input.at,
+          JSON.stringify(wordExamples),
+          JSON.stringify(contexts),
+          JSON.stringify(evidenceLog),
+          input.at,
+          id,
+        ],
       );
 
       const updatedRows = await this.adapter.query(
@@ -1105,6 +1129,7 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
       exampleTurnIds: [],
       resolved: false,
       notes: input.target,
+      evidenceLog: [evidenceEntry],
     });
     return { weakness: created, created: true };
   }
@@ -1118,6 +1143,27 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
  */
 export class SQLiteWeaknessRepository implements WeaknessRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
+
+  /**
+   * Exact lookup by (learnerId, type, referenceId). A single-row SELECT —
+   * immune to any list cap, so lifecycle identity can never be lost just
+   * because a learner has many weaknesses.
+   */
+  async getWeaknessByReference(
+    learnerId: string,
+    type: LearnerWeakness['type'],
+    referenceId: string,
+  ): Promise<LearnerWeakness | null> {
+    if (!isValidUuid(learnerId) || !type || !referenceId) return null;
+    const rows = await this.adapter.query(
+      `SELECT * FROM learner_weaknesses
+       WHERE learner_id = ? AND type = ? AND reference_id = ?
+       ORDER BY created_at ASC
+       LIMIT 1`,
+      [learnerId, type, referenceId],
+    );
+    return rows.length > 0 ? rowToLearnerWeakness(rows[0]) : null;
+  }
 
   async listWeaknesses(learnerId: string, limit?: number): Promise<readonly LearnerWeakness[]> {
     if (!isValidUuid(learnerId)) return [];
@@ -2673,6 +2719,28 @@ export class SQLiteReviewRepository implements ReviewRepository {
     const rows = await this.adapter.query(
       `SELECT * FROM review_items WHERE id = ?`,
       [id],
+    );
+    return rows.length > 0 ? rowToReviewItem(rows[0]) : null;
+  }
+
+  /**
+   * Exact existence lookup by (learnerId, kind, referenceId). Unlike
+   * listDue, this also finds items scheduled for the FUTURE, so callers
+   * can avoid resetting already-practiced reviews. Retired items are not
+   * considered existing (re-observing may schedule them again).
+   */
+  async getByReference(
+    learnerId: string,
+    kind: ReviewItem['kind'],
+    referenceId: string,
+  ): Promise<ReviewItem | null> {
+    if (!isValidUuid(learnerId) || !kind || !referenceId) return null;
+    const rows = await this.adapter.query(
+      `SELECT * FROM review_items
+       WHERE learner_id = ? AND kind = ? AND reference_id = ? AND state != 'retired'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [learnerId, kind, referenceId],
     );
     return rows.length > 0 ? rowToReviewItem(rows[0]) : null;
   }

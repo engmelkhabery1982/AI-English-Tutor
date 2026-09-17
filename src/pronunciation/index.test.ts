@@ -688,3 +688,266 @@ describe('Vocabulary & Progress integration', () => {
     expect(serialized).not.toMatch(/"(pronunciationScore|speakingScore|accuracy)"/);
   });
 });
+// ---------------------------------------------------------------------------
+// Integrity fixes: review history preservation, evidence persistence,
+// exact lifecycle lookup (post-Phase-1 hardening)
+// ---------------------------------------------------------------------------
+describe('Review history preservation (integrity)', () => {
+  it('A. re-observing a practiced issue preserves the full review history and schedule', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(ctx, fakeProvider({ observations: [wordObservation()] }));
+
+    // First observation → creates the initial review item.
+    await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: NOW,
+    });
+    const [weakness] = await ctx.weaknesses.listWeaknesses(ctx.learnerId, 100);
+    const created = await ctx.review.getByReference(ctx.learnerId, 'pronunciation', weakness.id);
+    expect(created).not.toBeNull();
+
+    // Practice it once: reviewCount/history/lastReviewAt update, dueAt moves to the future.
+    const practiced = await ctx.review.markReviewed(created!.id, 'correct', 'nice attempt');
+    expect(practiced.reviewCount).toBe(1);
+    expect(practiced.outcomeHistory).toHaveLength(1);
+    expect(practiced.lastReviewAt).toBe(NOW);
+    expect(new Date(practiced.dueAt).getTime()).toBeGreaterThan(new Date(NOW).getTime());
+    const snapshot = practiced;
+
+    // The SAME pronunciation issue is observed again (future-scheduled item!).
+    await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: '2026-09-17T13:00:00.000Z',
+    });
+
+    const afterRepeat = await ctx.review.get(created!.id);
+    expect(afterRepeat).not.toBeNull();
+    expect(afterRepeat!.reviewCount).toBe(snapshot.reviewCount); // unchanged (1)
+    expect(afterRepeat!.outcomeHistory).toEqual(snapshot.outcomeHistory); // unchanged
+    expect(afterRepeat!.lastReviewAt).toBe(snapshot.lastReviewAt); // unchanged
+    expect(afterRepeat!.dueAt).toBe(snapshot.dueAt); // future schedule preserved
+    expect(afterRepeat!.consecutiveCorrect).toBe(snapshot.consecutiveCorrect);
+
+    // And still exactly ONE review row for this issue.
+    const all = await ctx.review.list(ctx.learnerId, 100);
+    expect(all.filter((r) => r.kind === 'pronunciation')).toHaveLength(1);
+  });
+
+  it('B. the first observation creates the initial review item', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(ctx, fakeProvider({ observations: [wordObservation()] }));
+    await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: NOW,
+    });
+    const all = await ctx.review.list(ctx.learnerId, 100);
+    const pronunciationItems = all.filter((r) => r.kind === 'pronunciation');
+    expect(pronunciationItems).toHaveLength(1);
+    expect(pronunciationItems[0].reviewCount).toBe(0);
+    expect(pronunciationItems[0].outcomeHistory).toEqual([]);
+  });
+
+  it('C. repeated observations never create duplicate review rows', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(ctx, fakeProvider({ observations: [wordObservation()] }));
+    const input = { transcript: 'comf-ta-ble', expectedText: 'comfortable' };
+    await engine.analyzeSpokenTurn({ ...input, now: '2026-09-17T10:00:00.000Z' });
+    await engine.analyzeSpokenTurn({ ...input, now: '2026-09-17T11:00:00.000Z' });
+    await engine.analyzeSpokenTurn({ ...input, now: '2026-09-17T12:00:00.000Z' });
+
+    const all = await ctx.review.list(ctx.learnerId, 100);
+    expect(all.filter((r) => r.kind === 'pronunciation')).toHaveLength(1);
+  });
+});
+
+describe('Evidence source persistence (integrity)', () => {
+  it('keeps stt_substitution evidence after repository reload', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(ctx, createTranscriptComparisonPronunciationProvider());
+    await engine.analyzeSpokenTurn({
+      transcript: 'I walk to school yesterday',
+      expectedText: 'I walked to school yesterday',
+      now: NOW,
+    });
+
+    const reloaded = new SQLitePronunciationRepository(ctx.adapter);
+    const rows = await reloaded.listWeaknesses(ctx.learnerId, { limit: 50 });
+    const endingRow = rows.find((r) => r.targetSound.startsWith('ending:'));
+    expect(endingRow).toBeDefined();
+    expect(endingRow!.evidenceLog).toHaveLength(1);
+    expect(endingRow!.evidenceLog![0].source).toBe('stt_substitution');
+    expect(endingRow!.evidenceLog![0].at).toBe(NOW);
+  });
+
+  it('keeps transcript_comparison evidence for unrecognized targets', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(ctx, createTranscriptComparisonPronunciationProvider());
+    await engine.analyzeSpokenTurn({
+      transcript: 'florbidax',
+      expectedText: 'comfortable',
+      now: NOW,
+    });
+
+    const reloaded = new SQLitePronunciationRepository(ctx.adapter);
+    const rows = await reloaded.listWeaknesses(ctx.learnerId, { limit: 50 });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].evidenceLog![0].source).toBe('transcript_comparison');
+    expect(rows[0].evidenceLog![0].confidence).toBe('low');
+  });
+
+  it('appends evidence per occurrence (never resets it)', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(ctx, fakeProvider({ observations: [wordObservation()] }));
+    const input = { transcript: 'comf-ta-ble', expectedText: 'comfortable' };
+    await engine.analyzeSpokenTurn({ ...input, now: '2026-09-17T10:00:00.000Z' });
+    await engine.analyzeSpokenTurn({ ...input, now: '2026-09-17T11:00:00.000Z' });
+
+    const reloaded = new SQLitePronunciationRepository(ctx.adapter);
+    const rows = await reloaded.listWeaknesses(ctx.learnerId, { limit: 50 });
+    expect(rows[0].evidenceLog).toHaveLength(2);
+    expect(rows[0].evidenceLog![0].source).toBe('stt_substitution');
+    expect(rows[0].evidenceLog![0].confidence).toBe('medium');
+    expect(rows[0].evidenceLog![1].at).toBe('2026-09-17T11:00:00.000Z');
+  });
+
+  it('ai_explanation_only is never persisted as pronunciation evidence', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(
+      ctx,
+      fakeProvider({
+        observations: [
+          {
+            type: 'vowel',
+            target: 'comfortable',
+            description: 'AI explains the /ʌ/ vowel — explanation only, nothing heard.',
+            evidence: 'ai_explanation_only',
+            confidence: 'high',
+          },
+        ],
+      }),
+    );
+    const outcome = await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: NOW,
+    });
+    // Feedback may still be informational, but NOTHING is persisted.
+    const pronRows = await ctx.pronunciation.listWeaknesses(ctx.learnerId, { limit: 50 });
+    const weakRows = await ctx.weaknesses.listWeaknesses(ctx.learnerId, 100);
+    expect(pronRows).toHaveLength(0);
+    expect(weakRows).toHaveLength(0);
+    expect(outcome).not.toBeNull();
+  });
+});
+
+describe('Exact weakness lookup (integrity)', () => {
+  it('finds the pronunciation weakness beyond the 100-row list cap and preserves lifecycle', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(ctx, fakeProvider({ observations: [wordObservation()] }));
+
+    // First observation → weakness created (status observed).
+    await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: '2026-09-17T10:00:00.000Z',
+    });
+    const [weakness] = await ctx.weaknesses.listWeaknesses(ctx.learnerId, 100);
+    expect(weakness.status).toBe('observed');
+
+    // Flood with 120 UNRELATED grammar weaknesses (newer than the target).
+    for (let i = 0; i < 120; i += 1) {
+      await ctx.weaknesses.upsertWeakness({
+        learnerId: ctx.learnerId,
+        type: 'grammar',
+        referenceId: `1ef907b7-6c12-4ead-8f9a-c97bd3${String(i).padStart(5, '0')}`,
+        status: 'observed',
+        severity: 0.3,
+        occurrenceCount: 1,
+        lastSeenAt: NOW,
+        firstSeenAt: NOW,
+        contexts: [],
+        evidence: [],
+        resolved: false,
+      });
+    }
+
+    // The capped list no longer contains the pronunciation weakness…
+    const capped = await ctx.weaknesses.listWeaknesses(ctx.learnerId, 100);
+    expect(capped.filter((w) => w.type === 'pronunciation')).toHaveLength(0);
+
+    // …but the EXACT lookup still finds it.
+    const exact = await ctx.weaknesses.getWeaknessByReference(
+      ctx.learnerId,
+      'pronunciation',
+      weakness.referenceId,
+    );
+    expect(exact).not.toBeNull();
+    expect(exact!.id).toBe(weakness.id);
+    expect(exact!.status).toBe('observed');
+
+    // Re-observing advances the lifecycle (observed → repeated) — NOT reset.
+    await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: '2026-09-17T12:00:00.000Z',
+    });
+    const after = await ctx.weaknesses.getWeaknessByReference(
+      ctx.learnerId,
+      'pronunciation',
+      weakness.referenceId,
+    );
+    expect(after!.status).toBe('repeated');
+    expect(after!.occurrenceCount).toBe(2);
+
+    // And no duplicate learner-weakness row was created.
+    const all = await ctx.weaknesses.listWeaknesses(ctx.learnerId, 500);
+    expect(all.filter((w) => w.type === 'pronunciation')).toHaveLength(1);
+  });
+
+  it('never regresses relapsed → observed (relapsed stays active)', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(ctx, fakeProvider({ observations: [wordObservation()] }));
+    await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: '2026-09-17T10:00:00.000Z',
+    });
+    const [weakness] = await ctx.weaknesses.listWeaknesses(ctx.learnerId, 100);
+    await ctx.weaknesses.upsertWeakness({ ...weakness, status: 'relapsed' });
+
+    await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: '2026-09-17T12:00:00.000Z',
+    });
+    const after = await ctx.weaknesses.getWeaknessByReference(
+      ctx.learnerId,
+      'pronunciation',
+      weakness.referenceId,
+    );
+    expect(after!.status).toBe('relapsed');
+    expect(after!.resolved).toBe(false);
+  });
+
+  it('confirmed stays confirmed on further observation (no regression)', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(ctx, fakeProvider({ observations: [wordObservation()] }));
+    const input = { transcript: 'comf-ta-ble', expectedText: 'comfortable' };
+    await engine.analyzeSpokenTurn({ ...input, now: '2026-09-17T10:00:00.000Z' });
+    await engine.analyzeSpokenTurn({ ...input, now: '2026-09-17T11:00:00.000Z' });
+    await engine.analyzeSpokenTurn({ ...input, now: '2026-09-17T12:00:00.000Z' });
+    const [weakness] = await ctx.weaknesses.listWeaknesses(ctx.learnerId, 100);
+    expect(weakness.status).toBe('confirmed');
+
+    await engine.analyzeSpokenTurn({ ...input, now: '2026-09-17T13:00:00.000Z' });
+    const after = await ctx.weaknesses.getWeaknessByReference(
+      ctx.learnerId,
+      'pronunciation',
+      weakness.referenceId,
+    );
+    expect(after!.status).toBe('confirmed');
+  });
+});

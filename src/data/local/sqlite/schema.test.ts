@@ -56,11 +56,13 @@ describe('SQLite schema migrations (sql.js)', () => {
 
   it('records schema version in schema_migrations', async () => {
     const rows = await adapter.query(`SELECT version, description FROM schema_migrations ORDER BY version`);
-    expect(rows).toHaveLength(2);
+    expect(rows).toHaveLength(3);
     expect(rows[0].version).toBe(1);
     expect(rows[0].description).toBe(SCHEMA_MIGRATIONS[0].description);
     expect(rows[1].version).toBe(2);
     expect(rows[1].description).toBe(SCHEMA_MIGRATIONS[1].description);
+    expect(rows[2].version).toBe(3);
+    expect(rows[2].description).toBe(SCHEMA_MIGRATIONS[2].description);
   });
 
   it('reports current schema version correctly', async () => {
@@ -72,13 +74,13 @@ describe('SQLite schema migrations (sql.js)', () => {
     // Run migrations again
     await runMigrations(adapter);
 
-    // Version should still be 2
+    // Version should still be 3
     const version = await getSchemaVersion(adapter);
-    expect(version).toBe(2);
+    expect(version).toBe(3);
 
-    // schema_migrations should still have only two rows
+    // schema_migrations should still have only three rows
     const rows = await adapter.query(`SELECT COUNT(*) as count FROM schema_migrations`);
-    expect(rows[0].count).toBe(2);
+    expect(rows[0].count).toBe(3);
   });
 
   it('enforces foreign keys (PRAGMA foreign_keys = ON)', async () => {
@@ -312,8 +314,8 @@ describe('SQLite schema migrations (sql.js)', () => {
   });
 
   describe('Migration version 2: expression metadata', () => {
-    it('CURRENT_SCHEMA_VERSION is 2', async () => {
-      expect(CURRENT_SCHEMA_VERSION).toBe(2);
+    it('CURRENT_SCHEMA_VERSION is 3', async () => {
+      expect(CURRENT_SCHEMA_VERSION).toBe(3);
     });
 
     it('migration v2 exists with correct description', async () => {
@@ -391,16 +393,16 @@ describe('SQLite schema migrations (sql.js)', () => {
       await runMigrations(adapter);
 
       const versionBefore = await getSchemaVersion(adapter);
-      expect(versionBefore).toBe(2);
+      expect(versionBefore).toBe(3);
 
       // Run migrations again
       await runMigrations(adapter);
 
       const versionAfter = await getSchemaVersion(adapter);
-      expect(versionAfter).toBe(2);
+      expect(versionAfter).toBe(3);
 
       const rows = await adapter.query(`SELECT COUNT(*) as count FROM schema_migrations`);
-      expect(rows[0].count).toBe(2);
+      expect(rows[0].count).toBe(3);
     });
 
     it('fresh database applies v1 then v2 successfully', async () => {
@@ -408,10 +410,10 @@ describe('SQLite schema migrations (sql.js)', () => {
       await freshAdapter.init();
 
       const version = await getSchemaVersion(freshAdapter);
-      expect(version).toBe(2);
+      expect(version).toBe(3);
 
       const rows = await freshAdapter.query(`SELECT version FROM schema_migrations ORDER BY version`);
-      expect(rows).toHaveLength(2);
+      expect(rows).toHaveLength(3);
       expect(rows[0].version).toBe(1);
       expect(rows[1].version).toBe(2);
 
@@ -421,6 +423,46 @@ describe('SQLite schema migrations (sql.js)', () => {
       expect(columnNames).toContain('natural_alternatives');
       expect(columnNames).toContain('register');
       expect(columnNames).toContain('domain');
+    });
+  });
+
+  describe('Migration version 3: pronunciation evidence_log', () => {
+    it('migration v3 exists with correct description and step', () => {
+      const v3 = SCHEMA_MIGRATIONS.find((m) => m.version === 3);
+      expect(v3).toBeDefined();
+      expect(v3!.description).toBe('Add evidence_log to pronunciation_weaknesses (evidence source + confidence)');
+      expect(v3!.steps).toHaveLength(1);
+      expect(v3!.steps[0].sql).toContain('ALTER TABLE pronunciation_weaknesses ADD COLUMN evidence_log');
+    });
+
+    it('fresh database has evidence_log column with [] default', async () => {
+      const freshAdapter = new SqlJsAdapter(':memory:');
+      await freshAdapter.init();
+      const now = new Date().toISOString();
+
+      const tables = await freshAdapter.query(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name='pronunciation_weaknesses'`,
+      );
+      expect(tables).toHaveLength(1);
+
+      // A learner row first (foreign key), then a minimal pronunciation row;
+      // evidence_log must default to '[]'.
+      await freshAdapter.execute(
+        `INSERT INTO learner_profile (id, display_name, target_language, target_level, current_level, created_at, updated_at)
+         VALUES ('1ef907b7-6c12-4ead-8f9a-c97bd31e83f3', 'Test', 'en', 'B1', 'A2', ?, ?)`,
+        [now, now],
+      );
+      await freshAdapter.execute(
+        `INSERT INTO pronunciation_weaknesses (
+          id, learner_id, target_sound, occurrence_count, last_seen_at, first_seen_at, created_at, updated_at
+        ) VALUES ('pw-1', '1ef907b7-6c12-4ead-8f9a-c97bd31e83f3', 'word_pronunciation:demo', 1, ?, ?, ?, ?)`,
+        [now, now, now, now],
+      );
+      const rows = await freshAdapter.query(
+        `SELECT evidence_log FROM pronunciation_weaknesses WHERE id = 'pw-1'`,
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].evidence_log).toBe('[]');
     });
   });
 });

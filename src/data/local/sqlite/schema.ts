@@ -15,7 +15,7 @@
  */
 
 /** Current schema version. Bump this when adding a migration. */
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 /** A single SQL step inside a migration. */
 export interface SchemaStep {
@@ -308,6 +308,13 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       { sql: `ALTER TABLE lexical_items ADD COLUMN natural_alternatives TEXT NOT NULL DEFAULT '[]'` },
       { sql: `ALTER TABLE lexical_items ADD COLUMN register TEXT` },
       { sql: `ALTER TABLE lexical_items ADD COLUMN domain TEXT` },
+    ],
+  },
+  {
+    version: 3,
+    description: 'Add evidence_log to pronunciation_weaknesses (evidence source + confidence)',
+    steps: [
+      { sql: `ALTER TABLE pronunciation_weaknesses ADD COLUMN evidence_log TEXT NOT NULL DEFAULT '[]'` },
     ],
   },
 ];

@@ -30,6 +30,7 @@ import type {
   ProgressRecord,
   ReviewItem,
 } from '../domain/models/learning';
+import type { PronunciationEvidenceSource, QualitativeConfidence } from '../pronunciation/types';
 
 /** Exact activity aggregates over a learner's persisted conversation sessions. */
 export interface ConversationActivityStats {
@@ -103,6 +104,10 @@ export interface PronunciationObservationInput {
   readonly exampleText?: string;
   /** Extra context tags for this occurrence (e.g. "lexical:<id>"). */
   readonly context?: string;
+  /** Evidence source of this observation (persisted with the row). */
+  readonly evidenceSource: PronunciationEvidenceSource;
+  /** Qualitative confidence of this observation, when the provider gives one. */
+  readonly confidence?: QualitativeConfidence;
   readonly at: IsoDate;
 }
 
@@ -130,6 +135,17 @@ export interface PronunciationRepository {
 }
 
 export interface WeaknessRepository {
+  /**
+   * Exact lookup by (learnerId, type, referenceId) — never a capped scan.
+   * Optional: backends may omit it, but the pronunciation engine requires
+   * an exact implementation to preserve lifecycle state safely.
+   */
+  getWeaknessByReference?(
+    learnerId: string,
+    type: LearnerWeakness['type'],
+    referenceId: string,
+  ): Promise<LearnerWeakness | null>;
+
   listWeaknesses(learnerId: string, limit?: number): Promise<readonly LearnerWeakness[]>;
   listStrengths(learnerId: string, limit?: number): Promise<readonly LearnerStrength[]>;
   upsertWeakness(weakness: Omit<LearnerWeakness, 'id' | 'createdAt' | 'updatedAt'>): Promise<LearnerWeakness>;
@@ -205,6 +221,16 @@ export interface ExpressionRepository {
 
 export interface ReviewRepository {
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly ReviewItem[]>;
+  /**
+   * Exact existence lookup by (learnerId, kind, referenceId) — including
+   * items scheduled for the FUTURE (which listDue cannot see). Retired
+   * items do not count as existing. Optional: backends may omit it.
+   */
+  getByReference?(
+    learnerId: string,
+    kind: ReviewItem['kind'],
+    referenceId: string,
+  ): Promise<ReviewItem | null>;
   markReviewed(
     id: string,
     result: 'correct' | 'incorrect' | 'partial',

@@ -20,6 +20,18 @@ export type PronunciationEvidenceSource =
   | 'practice_result'
   | 'ai_explanation_only';
 
+/** One persisted piece of pronunciation evidence (what/when/source — no scores). */
+export interface PronunciationEvidenceEntry {
+  /** When this evidence was observed. */
+  readonly at: string;
+  /** Where the evidence came from (e.g. transcript_comparison). */
+  readonly source: PronunciationEvidenceSource;
+  /** Qualitative confidence only (low | medium | high). */
+  readonly confidence?: QualitativeConfidence;
+  /** Observed transcript snippet for this occurrence, when available. */
+  readonly observed?: string;
+}
+
 /** Qualitative pronunciation issue categories (no phoneme scores). */
 export type PronunciationObservationType =
   | 'word_pronunciation'

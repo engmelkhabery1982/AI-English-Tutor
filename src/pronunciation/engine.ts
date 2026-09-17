@@ -8,26 +8,36 @@
  * - Dedup identity: "<observation type>:<normalized target>" so repeated
  *   evidence increments occurrence data instead of creating duplicates.
  * - Pronunciation-specific evidence lives in the existing
- *   pronunciation_weaknesses table; the generic lifecycle lives in the
- *   existing learner_weaknesses table (type 'pronunciation', same states:
+ *   pronunciation_weaknesses table (including the per-occurrence evidence
+ *   source log); the generic lifecycle lives in the existing
+ *   learner_weaknesses table (type 'pronunciation', same states:
  *   observed → repeated → confirmed → …, conservative, no shortcuts).
- * - A pending review item (kind 'pronunciation') is scheduled through the
- *   existing review repository so the Review tab can retrain the issue.
+ * - Weakness identity is resolved with an EXACT repository lookup by
+ *   (learnerId, type, referenceId) — never by scanning a capped list — so
+ *   lifecycle state can never reset because a learner has >100 weaknesses.
+ * - Review scheduling: an existing pronunciation review item (kind
+ *   'pronunciation', same referenceId) is looked up EXACTLY — including
+ *   future-scheduled items listDue cannot see — and is NEVER recreated or
+ *   reset. Its reviewCount, consecutiveCorrect, outcomeHistory,
+ *   lastReviewAt and dueAt are preserved untouched.
+ * - A pending review item is created only when none exists yet, through
+ *   the existing review repository (no second scheduler).
  * - Analysis/persistence failures are non-destructive: the caller's
  *   conversation flow continues untouched.
  */
 
 import type { ConversationMode, IsoDate, WeaknessStatus } from '../domain/shared/types';
 import type { LearnerWeakness, PronunciationWeakness } from '../domain/models/learner';
+import type { ReviewItem } from '../domain/models/learning';
 import type {
   PronunciationObservationInput,
   PronunciationObservationRecord,
   PronunciationRepository,
+  ReviewRepository,
   UserProfileRepository,
   VocabularyRepository,
   WeaknessRepository,
 } from '../repositories';
-import type { ReviewRepository } from '../repositories';
 import type {
   PronunciationAnalysis,
   PronunciationObservation,
@@ -57,9 +67,32 @@ export interface PronunciationEngineDeps {
     ) => Promise<PronunciationObservationRecord>;
     readonly listWeaknesses?: PronunciationRepository['listWeaknesses'];
   };
-  readonly weaknesses: Pick<WeaknessRepository, 'listWeaknesses' | 'upsertWeakness' | 'addWeaknessEvidence'>;
+  readonly weaknesses: {
+    readonly upsertWeakness: WeaknessRepository['upsertWeakness'];
+    /**
+     * EXACT lookup by (learnerId, type, referenceId) — required so the
+     * engine never mistakes an old weakness for a new one (no capped scan).
+     */
+    readonly getWeaknessByReference: (
+      learnerId: string,
+      type: LearnerWeakness['type'],
+      referenceId: string,
+    ) => Promise<LearnerWeakness | null>;
+  };
   /** Existing review repository — schedules retraining through the Review system. */
-  readonly review?: Pick<ReviewRepository, 'listDue' | 'upsert'>;
+  readonly review?: {
+    readonly upsert: NonNullable<ReviewRepository['upsert']>;
+    /**
+     * EXACT existence lookup by (learnerId, kind, referenceId) — including
+     * future-scheduled items. Required when review is provided, so repeats
+     * never reset already-practiced review items.
+     */
+    readonly getByReference: (
+      learnerId: string,
+      kind: ReviewItem['kind'],
+      referenceId: string,
+    ) => Promise<ReviewItem | null>;
+  };
   /** Existing profile repository — the only source of the learner id. */
   readonly profile?: Pick<UserProfileRepository, 'get'>;
   /** Existing lexical repositories — links evidence to saved items, never duplicates them. */
@@ -128,23 +161,23 @@ export class PronunciationEngine {
       };
     }
 
-    // Persist only evidence-backed observations (never inference-only entries).
+    // Persist only evidence-backed observations. AI explanations are NOT
+    // pronunciation evidence and are never persisted as such.
     const persistable = analysis.observations
-      .filter((o) => !o.inferenceOnly && !analysis.insufficientEvidence)
+      .filter(
+        (o) =>
+          !o.inferenceOnly &&
+          o.evidence !== 'ai_explanation_only' &&
+          !analysis.insufficientEvidence,
+      )
       .slice(0, MAX_PERSISTED_PER_TURN);
 
     if (persistable.length > 0) {
       try {
-        // Bounded reads ONCE per turn — no N+1 queries.
-        const [existingWeaknesses, dueItems, lexicalLinks] = await Promise.all([
-          this.deps.weaknesses.listWeaknesses(learnerId, 100),
-          this.deps.review?.listDue
-            ? this.deps.review.listDue(learnerId, at)
-            : Promise.resolve([]),
-          this.resolveLexicalLinks(learnerId, persistable),
-        ]);
+        // Bounded read ONCE per turn for lexical links — no N+1 queries.
+        const lexicalLinks = await this.resolveLexicalLinks(learnerId, persistable);
         for (const observation of persistable) {
-          await this.persistObservation(learnerId, observation, existingWeaknesses, dueItems, {
+          await this.persistObservation(learnerId, observation, {
             at,
             lexicalItemId: lexicalLinks.get(observation.target?.toLowerCase().trim() ?? ''),
             context: input.context,
@@ -190,13 +223,12 @@ export class PronunciationEngine {
 
   /**
    * Persist one observation: pronunciation-specific evidence (deduped by
-   * identity) + conservative learner-weakness lifecycle + review scheduling.
+   * identity, with its evidence source) + conservative learner-weakness
+   * lifecycle + review scheduling that never resets existing history.
    */
   private async persistObservation(
     learnerId: string,
     observation: PronunciationObservation,
-    existingWeaknesses: readonly LearnerWeakness[],
-    dueReviewItems: readonly { referenceId: string }[],
     opts: { at: IsoDate; lexicalItemId?: string; context?: string },
   ): Promise<void> {
     const identity = observationIdentity(observation);
@@ -209,15 +241,18 @@ export class PronunciationEngine {
       target,
       exampleText: observation.observed ?? observation.description,
       context: opts.lexicalItemId ? `lexical:${opts.lexicalItemId}` : undefined,
+      evidenceSource: observation.evidence,
+      confidence: observation.confidence,
       at: opts.at,
     });
 
-    // ---- Existing learner-weakness lifecycle (conservative) ----
-    const existing = existingWeaknesses.find(
-      (w) =>
-        w.type === 'pronunciation' &&
-        !w.resolved &&
-        (w.referenceId === record.weakness.id || w.notes?.trim().toLowerCase() === identity),
+    // ---- Existing learner-weakness lifecycle (conservative, EXACT lookup) ----
+    // A single-row lookup by referenceId: immune to any list cap, so an
+    // existing weakness is never mistaken for a new one.
+    const existing = await this.deps.weaknesses.getWeaknessByReference(
+      learnerId,
+      'pronunciation',
+      record.weakness.id,
     );
 
     let nextStatus: WeaknessStatus = 'observed';
@@ -229,14 +264,14 @@ export class PronunciationEngine {
       } else if (existing.status === 'repeated') {
         nextStatus = 'confirmed';
       } else {
-        // confirmed/active_training/improving stay until Review practice
-        // (through the existing lifecycle) moves them — no shortcuts.
+        // confirmed/active_training/improving/relapsed stay until Review
+        // practice (through the existing lifecycle) moves them — never
+        // regress confirmed → observed or relapsed → observed here.
         nextStatus = existing.status;
       }
     }
 
-    // Union contexts (bounded) and append evidence (bounded) — never truncate
-    // the learner's history silently beyond these caps.
+    // Union contexts (bounded) and append evidence (bounded).
     const newContextTag = opts.lexicalItemId
       ? `lexical:${opts.lexicalItemId}`
       : opts.context
@@ -271,9 +306,17 @@ export class PronunciationEngine {
     });
 
     // ---- Existing Review system (the ONLY scheduler) ----
-    if (this.deps.review?.upsert) {
-      const alreadyScheduled = dueReviewItems.some((r) => r.referenceId === weakness.id);
-      if (!alreadyScheduled) {
+    // EXACT existence lookup — listDue can NOT see future-scheduled items,
+    // so it must never be used to decide existence. An existing review item
+    // keeps its complete history (reviewCount, consecutiveCorrect,
+    // outcomeHistory, lastReviewAt) and its schedule (dueAt) untouched.
+    if (this.deps.review?.upsert && this.deps.review?.getByReference) {
+      const existingReview = await this.deps.review.getByReference(
+        learnerId,
+        'pronunciation',
+        weakness.id,
+      );
+      if (!existingReview) {
         await this.deps.review.upsert({
           learnerId,
           kind: 'pronunciation',
