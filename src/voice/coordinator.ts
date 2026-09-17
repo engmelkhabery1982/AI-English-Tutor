@@ -195,11 +195,14 @@ export class VoiceSessionCoordinator {
       // Same session (e.g. second mic press): active recording must survive.
       return;
     }
+    // Identify the session being replaced: it is closed BEFORE anything else, so
+    // late async work it holds can never commit into it (same guarantee as the
+    // atomic switchSession()).
+    const oldSession = this.session;
     // Invalidate every in-flight operation: its result belongs to the previous
-    // session and must never be submitted, spoken or written anywhere. The
-    // replaced session is closed too, so late async work cannot commit into it.
+    // session and must never be submitted, spoken or written anywhere.
     this.generation += 1;
-    this.session.abandon?.();
+    oldSession.abandon?.();
     // Playback is stopped without state writes: a cleanup continuation from the
     // previous session must never overwrite the new session's lifecycle.
     void this.stopPlayback();
@@ -216,38 +219,49 @@ export class VoiceSessionCoordinator {
   /**
    * Atomically replaces the active conversation session.
    *
-   * Ordering is what makes this safe (see BLOCKER-class race: an old, still
-   * awaiting `reset()` could otherwise overwrite the NEW session's lifecycle):
-   *   1. invalidate every in-flight operation of the OLD session (generation++),
-   *   2. stop the old recorder and playback and AWAIT that cleanup,
-   *   3. only then install and activate the new session,
-   *   4. every state write is generation/switch guarded, so a superseded or
+   * Ordering is what makes this safe (see BLOCKER-class races: an old, still
+   * awaiting `reset()` could overwrite the NEW session's lifecycle, and an old
+   * ConversationSession could still COMMIT a turn during cleanup):
+   *   1. capture the OLD session and invalidate every in-flight operation
+   *      (generation++),
+   *   2. close the OLD session IMMEDIATELY — before any awaiting cleanup — so a
+   *      late AI/STT result that resolves during teardown can never commit a
+   *      turn, feedback or vocabulary persistence into the replaced session,
+   *   3. stop the old recorder and playback and AWAIT that cleanup,
+   *   4. only then install and activate the new session, and only if this switch
+   *      is still current,
+   *   5. every state write is generation/switch guarded, so a superseded or
    *      disposed cleanup can never write into the new lifecycle.
-   * New voice work is refused while the switch is running.
+   * New voice work is refused while the switch is running. The INCOMING session
+   * is never abandoned.
    */
   async switchSession(newSession: ConversationSession): Promise<ConversationSession | null> {
     if (this.disposed) return null;
     if (this.session === newSession) return newSession;
 
-    // 1. Invalidate all in-flight work of the old session up front.
+    // 1. Identify the session being replaced and invalidate all in-flight work.
+    const oldSession = this.session;
     this.generation += 1;
     const generation = this.generation;
     this.switching = true;
     this.notifyListeners();
 
-    // 2. Stop and await old recorder/playback cleanup. No lifecycle state is
+    // 2. The replaced session becomes non-writable at the exact start of the
+    // replacement — never after the awaited cleanup, which is a race window in
+    // which an old AI request could still commit history/feedback/persistence.
+    oldSession.abandon?.();
+
+    // 3. Stop and await old recorder/playback cleanup. No lifecycle state is
     // written here: the guarded writes happen in step 4 (or in a newer switch).
     await this.teardown();
 
-    // 3. A newer switch/reset/dispose superseded this one: install nothing and
+    // 4. A newer switch/reset/dispose superseded this one: install nothing and
     // report it, so the caller never assumes an activation that did not happen.
     if (this.disposed || this.generation !== generation) {
       return null;
     }
 
-    // 4. Activate the new session with a clean lifecycle for it. The replaced
-    // session is closed so any late async work it still holds is discarded.
-    this.session.abandon?.();
+    // 5. Activate the new session with a clean lifecycle for it.
     this.session = newSession;
     this.switching = false;
     this.processing = false;

@@ -224,6 +224,7 @@ class GatedTTS implements TextToSpeechProvider {
 function createDeferredFirstProvider(
   firstReply: string,
   immediateReply = 'Understood — what happened next?',
+  firstFeedback: ConversationFeedback | null = null,
 ): AIProvider & { resolveFirst: () => void; readonly requests: number } {
   let resolveFirst: ((result: AIProviderResult) => void) | null = null;
   const state = { requests: 0 };
@@ -233,7 +234,10 @@ function createDeferredFirstProvider(
       return state.requests;
     },
     resolveFirst: () => {
-      resolveFirst?.({ ok: true, response: { content: firstReply } });
+      resolveFirst?.({
+        ok: true,
+        response: { content: firstReply, feedback: firstFeedback },
+      });
     },
     async generate(): Promise<AIProviderResult> {
       state.requests += 1;
@@ -245,6 +249,15 @@ function createDeferredFirstProvider(
       return { ok: true, response: { content: immediateReply } };
     },
   };
+}
+
+/** Tick until the predicate holds (bounded): used for in-flight landmarks. */
+async function waitFor(predicate: () => boolean, maxTicks = 50): Promise<void> {
+  for (let i = 0; i < maxTicks; i += 1) {
+    if (predicate()) return;
+    await tick();
+  }
+  throw new Error('waitFor: the expected state was never reached');
 }
 
 /** TTS that keeps "speaking" until it is stopped — used for barge-in tests. */
@@ -1050,6 +1063,110 @@ describe('Talk — tutor-led conversational flow', () => {
     expect(prompt).toContain('Current CEFR Level: B1');
 
     await adapter.close();
+  });
+
+  it('45. a replaced session cannot commit a turn that resolves while voice teardown is still running', async () => {
+    // The old turn's AI answer is held open; its feedback carries vocabulary so
+    // the persistence side effect is observable too.
+    const staleFeedback: ConversationFeedback = {
+      correction: null,
+      vocabulary: {
+        headword: 'stale',
+        type: 'word',
+        meaning: 'left over from the replaced conversation',
+        example: 'This turn should never be stored.',
+      },
+      coachingNote: 'stale coaching note',
+    };
+    const provider = createDeferredFirstProvider(
+      'Stale tutor reply from the replaced conversation.',
+      'Fresh reply in the new conversation.',
+      staleFeedback,
+    );
+
+    const saveSpy = vi.fn(async () => undefined);
+    const session = createConversationSession(
+      createConversationOrchestrator(createConversationEngine(createDemoLearnerModel()), provider),
+      { mode: 'natural', onSaveVocabulary: saveSpy },
+    );
+
+    const recorder = createDemoAudioRecorder();
+    const tts = new GatedTTS();
+    const coordinator = createVoiceSessionCoordinator({
+      session,
+      recorder,
+      sttProvider: createDemoSTTProvider({
+        defaultTranscript: 'Old learner turn in the replaced conversation.',
+        delayMs: 5,
+      }),
+      ttsProvider: tts,
+    });
+
+    // 1. The old voice turn reaches the AI request and is held there.
+    await coordinator.startRecording();
+    const pendingTurn = coordinator.stopRecordingAndProcess();
+    await waitFor(() => provider.requests === 1);
+    expect(pendingTurn).toBeDefined();
+    expect(session.getHistory()).toEqual([]);
+
+    // 2. The replacement begins, and teardown is held so the switch has NOT
+    //    finished when the old AI answer arrives.
+    tts.holdStop = true;
+    // The replacement conversation uses the same provider: its FIRST (stale)
+    // answer was consumed by the replaced conversation above, so it answers
+    // immediately from here on.
+    const replacement = buildSessionWithProvider(provider, 'natural');
+    const switching = coordinator.switchSession(replacement);
+    await tick();
+    expect(coordinator.getStatus().isSwitching).toBe(true);
+
+    // 3. The OLD AI request resolves while the switch is still inside teardown.
+    provider.resolveFirst();
+    const staleTurn = await pendingTurn;
+
+    // 4. The replaced session must not commit anything: no learner turn, no
+    //    assistant turn, no feedback and no vocabulary persistence.
+    expect(staleTurn.ok).toBe(false);
+    expect(session.getHistory()).toEqual([]);
+    expect(session.getLastFeedback()).toBeNull();
+    expect(session.getSavedVocabulary()).toEqual([]);
+    expect(saveSpy).not.toHaveBeenCalled();
+    expect(session.getHistory().some((turn) => turn.content.includes('Stale tutor'))).toBe(false);
+    // …and the replacement conversation stays untouched by the stale turn.
+    expect(replacement.getHistory()).toEqual([]);
+    expect(replacement.getLastFeedback()).toBeNull();
+
+    // 5. Releasing teardown completes the switch normally.
+    tts.holdStop = false;
+    tts.releaseStop();
+    const installed = await switching;
+    expect(installed).toBe(replacement);
+    expect(coordinator.getStatus().isSwitching).toBe(false);
+    expect(coordinator.getStatus().state).toBe('idle');
+
+    // 6. The replacement session works normally afterwards.
+    const fresh = await replacement.send({ userMessage: 'Hello again.' });
+    expect(fresh.ok).toBe(true);
+    expect(replacement.getHistory().map((turn) => turn.role)).toEqual(['user', 'assistant']);
+    expect(replacement.getHistory()[1].content).toBe('Fresh reply in the new conversation.');
+    expect(replacement.getLastFeedback()).toBeNull();
+
+    // …and the new conversation is writable through the SAME session API.
+    const second = await replacement.send({ userMessage: 'One more thing.' });
+    expect(second.ok).toBe(true);
+    expect(replacement.getHistory()).toHaveLength(4);
+
+    // Voice work is available again too: the microphone can open and only the
+    // changed lifecycle of the replacement session owns it.
+    await coordinator.startRecording();
+    expect(coordinator.getStatus().state).toBe('recording');
+    expect(coordinator.getStatus().canStopRecording).toBe(true);
+
+    // The replaced conversation never received anything.
+    expect(session.getHistory()).toEqual([]);
+    expect(saveSpy).not.toHaveBeenCalled();
+
+    await coordinator.dispose();
   });
 
   it('23. Talk introduces no second conversation, adaptive or persistence engine', () => {
