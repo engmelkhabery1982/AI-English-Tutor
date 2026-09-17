@@ -49,6 +49,7 @@ export * from './types';
 export * from './planner';
 export * from './prompts';
 export * from './speaking';
+export * from './voice';
 export * from './service';
 
 /**
