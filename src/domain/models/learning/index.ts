@@ -61,7 +61,13 @@ export interface Exercise {
 export interface ReviewItem {
   readonly id: Uuid;
   readonly learnerId: Uuid;
-  readonly kind: 'vocabulary' | 'expression' | 'grammar' | 'pronunciation';
+  readonly kind:
+    | 'vocabulary'
+    | 'expression'
+    | 'grammar'
+    | 'pronunciation'
+    /** Phase 1 listening retraining: re-listen and recognize words/meanings. */
+    | 'listening';
   readonly referenceId: Uuid;
   readonly prompt: string;
   readonly expectedResponse?: string;

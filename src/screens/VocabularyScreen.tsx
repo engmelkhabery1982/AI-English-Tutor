@@ -123,6 +123,8 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
   const [selectedEntry, setSelectedEntry] = useState<WorkspaceEntry | null>(null);
   const [pronunciationNotes, setPronunciationNotes] = useState<readonly string[]>([]);
   const [editMeaningIndex, setEditMeaningIndex] = useState<number | null>(null);
+  const [newMeaningDefinition, setNewMeaningDefinition] = useState<string>('');
+  const [isAddingMeaning, setIsAddingMeaning] = useState<boolean>(false);
   const [editDefinition, setEditDefinition] = useState<string>('');
   const [editExamples, setEditExamples] = useState<string[]>([]);
   const [isSavingEdit, setIsSavingEdit] = useState<boolean>(false);
@@ -306,6 +308,37 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
       setActionError('Could not save your changes. Please try again.');
     } finally {
       setIsSavingEdit(false);
+    }
+  };
+
+  /**
+   * Add the FIRST meaning to an item saved without one (e.g. from
+   * listening practice) through the existing workspace service — the item
+   * id and all other data are preserved; review data starts cleanly.
+   */
+  const handleAddFirstMeaning = async () => {
+    const service = serviceRef.current;
+    const entry = selectedEntry;
+    if (!service || !entry || isAddingMeaning) return;
+    if (newMeaningDefinition.trim().length === 0) {
+      setActionError('Definition cannot be empty.');
+      return;
+    }
+    try {
+      setIsAddingMeaning(true);
+      setActionError(null);
+      const updatedEntry = await service.addFirstMeaning({
+        entryId: entry.id,
+        kind: entry.kind,
+        definition: newMeaningDefinition,
+      });
+      setNewMeaningDefinition('');
+      setSelectedEntry(updatedEntry);
+      await loadWorkspace(true);
+    } catch {
+      setActionError('Could not add the meaning. Please try again.');
+    } finally {
+      setIsAddingMeaning(false);
     }
   };
 
@@ -763,8 +796,42 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
               <Text style={styles.detailSectionLabel}>
                 Meanings ({selectedEntry.meaningCount})
               </Text>
-              {(selectedEntry.item.meanings ?? []).map((meaning, index) =>
-                renderMeaningBlock(meaning, index),
+              {selectedEntry.meaningCount === 0 ? (
+                <View style={styles.addMeaningBlock}>
+                  <Text style={styles.addMeaningHint}>
+                    This item has no definition yet (saved without one). Add the first real
+                    meaning — review tracking starts fresh once you do.
+                  </Text>
+                  <TextInput
+                    style={styles.editInput}
+                    placeholder="Type a definition…"
+                    placeholderTextColor="#9CA3AF"
+                    value={newMeaningDefinition}
+                    onChangeText={setNewMeaningDefinition}
+                    multiline
+                    testID="add_first_meaning_input"
+                  />
+                  <TouchableOpacity
+                    style={[
+                      styles.editActionButton,
+                      styles.editSaveButton,
+                      newMeaningDefinition.trim().length === 0 && styles.editSaveDisabled,
+                    ]}
+                    onPress={handleAddFirstMeaning}
+                    disabled={newMeaningDefinition.trim().length === 0 || isAddingMeaning}
+                    testID="add_first_meaning_button"
+                    accessibilityRole="button"
+                    accessibilityLabel="Add first meaning"
+                  >
+                    <Text style={styles.editSaveButtonText}>
+                      {isAddingMeaning ? 'Saving…' : 'Add meaning'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                (selectedEntry.item.meanings ?? []).map((meaning, index) =>
+                  renderMeaningBlock(meaning, index),
+                )
               )}
 
               <TouchableOpacity
@@ -1154,6 +1221,23 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     marginTop: 2,
   },
+  addMeaningBlock: {
+    backgroundColor: '#FFFDF2',
+    borderRadius: 10,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: '#F2E8B9',
+    gap: 8,
+  },
+  addMeaningHint: {
+    fontSize: 13,
+    color: '#6B7280',
+    lineHeight: 18,
+  },
+  editSaveDisabled: {
+    opacity: 0.5,
+  },
+
   detailSectionLabel: {
     marginTop: 20,
     marginBottom: 8,

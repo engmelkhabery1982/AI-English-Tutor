@@ -2447,6 +2447,9 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
             now,
           ],
         );
+        // Persist examples in the lexical_examples table as well, so the
+        // read path (fetchExamplesForMeaning) returns them.
+        await insertExamplesForMeaning(this.adapter, id, meaningId, meaning.examples ?? [], now);
       }
 
       return this.getFullItem(id);
@@ -2508,6 +2511,9 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
           now,
         ],
       );
+      // Persist examples in the lexical_examples table as well, so the
+      // read path (fetchExamplesForMeaning) returns them.
+      await insertExamplesForMeaning(this.adapter, id, meaningId, meaning.examples ?? [], now);
     }
 
     return this.getFullItem(id);

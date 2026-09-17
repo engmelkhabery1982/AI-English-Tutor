@@ -1,0 +1,413 @@
+/**
+ * src/listening/service.ts
+ *
+ * ListeningService (Phase 1): plans bounded sessions, evaluates answers
+ * (deterministic-first), and persists evidence through the EXISTING
+ * learner-weakness lifecycle, the EXISTING Adaptive Review system, the
+ * EXISTING vocabulary/expression repositories, and the EXISTING progress
+ * records — no second learner model, no second scheduler, no analytics DB.
+ *
+ * - Weakness identity: stable ids like "word_recognition:deadline" mapped to
+ *   a deterministic UUID-shaped referenceId; repeated problems deduplicate
+ *   into ONE weakness row and advance conservatively (observed → repeated →
+ *   confirmed; stable/mastered → relapsed; never regress; no shortcuts).
+ * - Review items: created ONCE per weakness via EXACT getByReference lookup
+ *   (future-scheduled and retired rows count as existing) — existing review
+ *   history is never reset.
+ * - Failures are non-destructive: evaluation results always reach the UI;
+ *   persistence problems are reported without losing the visible feedback.
+ */
+
+import type { IsoDate } from '../domain/shared/types';
+import type { ProgressRecord } from '../domain/models/learning';
+import type { ExpressionItem } from '../domain/models/vocabulary';
+import type { AIProvider } from '../providers/ai/types';
+import type {
+  ExpressionRepository,
+  ProgressRepository,
+  ReviewRepository,
+  UserProfileRepository,
+  VocabularyRepository,
+  WeaknessRepository,
+} from '../repositories';
+import type {
+  ListeningEvaluation,
+  ListeningExercise,
+  ListeningResultCategory,
+  ListeningSessionSummary,
+} from './types';
+import { evaluateListeningAnswer } from './evaluator';
+import { planListeningSession, stableReferenceId } from './generator';
+
+/** Max missed key items persisted per exercise (bounded evidence). */
+const MAX_MISSED_PER_EXERCISE = 2;
+/** Bounded evidence entries per weakness (append-only, most recent kept). */
+const MAX_EVIDENCE_ENTRIES = 20;
+const MAX_CONTEXTS = 10;
+
+export interface ListeningServiceDeps {
+  readonly weaknesses: {
+    readonly listWeaknesses: WeaknessRepository['listWeaknesses'];
+    readonly upsertWeakness: WeaknessRepository['upsertWeakness'];
+    /**
+     * EXACT lookup by (learnerId, type, referenceId) — required, so a
+     * learner with many weaknesses can never get duplicate/regressed rows.
+     */
+    readonly getWeaknessByReference: (
+      learnerId: string,
+      type: 'listening',
+      referenceId: string,
+    ) => Promise<Awaited<ReturnType<WeaknessRepository['listWeaknesses']>>[number] | null>;
+  };
+  /** Existing review repository — the ONLY scheduler. */
+  readonly review?: {
+    readonly upsert: NonNullable<ReviewRepository['upsert']>;
+    readonly getByReference: (
+      learnerId: string,
+      kind: 'listening',
+      referenceId: string,
+    ) => Promise<Awaited<ReturnType<ReviewRepository['listDue']>>[number] | null>;
+  };
+  readonly vocabulary: Pick<VocabularyRepository, 'list' | 'listDue' | 'upsert' | 'get'>;
+  readonly expressions?: Pick<ExpressionRepository, 'list' | 'listDue' | 'upsert'>;
+  /** Existing progress records — counts only, never legacy score fields. */
+  readonly progress?: Pick<ProgressRepository, 'record'>;
+  /** EXISTING AI provider — only for open-ended comprehension evaluation. */
+  readonly aiProvider?: AIProvider;
+  /** EXISTING profile repository — the ONLY source of the learner id (never fabricated). */
+  readonly profile?: Pick<UserProfileRepository, 'get'>;
+}
+
+/** True when the result indicates a comprehension problem worth persisting. */
+function isProblemResult(result: ListeningResultCategory): boolean {
+  return (
+    result === 'partial' ||
+    result === 'missed_key_meaning' ||
+    result === 'misunderstood'
+  );
+}
+
+function persistenceTag(exercise: ListeningExercise): string {
+  return `exercise:${exercise.type}`;
+}
+
+export class ListeningService {
+  constructor(private readonly deps: ListeningServiceDeps) {}
+
+  /**
+   * Resolve the active learner via the EXISTING profile repository.
+   * Returns null when there is no profile — the caller shows an honest
+   * state instead of fabricating a learner.
+   */
+  async resolveLearnerId(): Promise<string | null> {
+    if (!this.deps.profile) return null;
+    try {
+      const profile = await this.deps.profile.get();
+      return profile && profile.id ? profile.id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Plan ONE bounded practice session. Deterministic for the same inputs;
+   * no fabricated learner data — when there is no profile data the session
+   * is general and clearly labeled.
+   */
+  async startSession(
+    learnerId: string,
+    options?: { difficulty?: 'easy' | 'medium' | 'hard'; now?: IsoDate; targetCount?: number },
+  ): Promise<{ exercises: readonly ListeningExercise[]; sourceNote: string }> {
+    if (!learnerId) {
+      return {
+        exercises: [],
+        sourceNote: 'No learner profile found yet. Set up your profile to start listening practice.',
+      };
+    }
+    try {
+      return await planListeningSession(
+        {
+          weaknesses: { listWeaknesses: this.deps.weaknesses.listWeaknesses },
+          vocabulary: this.deps.vocabulary,
+          expressions: this.deps.expressions,
+        },
+        learnerId,
+        options,
+      );
+    } catch {
+      // Planning must never crash the screen — an honest empty session.
+      return {
+        exercises: [],
+        sourceNote: 'Listening practice is unavailable right now. Please try again.',
+      };
+    }
+  }
+
+  /**
+   * Evaluate one answer (typed or chosen option). Persistence of evidence,
+   * weaknesses and review items is failure-safe: the evaluation result is
+   * ALWAYS returned; persistence problems are flagged, never thrown away
+   * with the learner's visible feedback.
+   */
+  async evaluateAnswer(
+    learnerId: string,
+    exercise: ListeningExercise,
+    answer: string,
+    opts?: { replayCount?: number; now?: IsoDate },
+  ): Promise<{ evaluation: ListeningEvaluation; persistenceError: boolean }> {
+    const now = opts?.now ?? new Date().toISOString();
+
+    // 1. Evaluate (deterministic first; existing AIProvider for open-ended).
+    const evaluation = await evaluateListeningAnswer(this.deps.aiProvider, exercise, answer);
+
+    // 2. Persist evidence — non-destructive on failure.
+    let persistenceError = false;
+    try {
+      await this.persistEvidence(learnerId, exercise, evaluation, {
+        replayCount: opts?.replayCount ?? 0,
+        now,
+      });
+    } catch {
+      persistenceError = true;
+    }
+    return { evaluation, persistenceError };
+  }
+
+  /**
+   * Persist one exercise outcome: weakness lifecycle (conservative, exact
+   * lookups) + one-time review scheduling through the EXISTING system.
+   */
+  private async persistEvidence(
+    learnerId: string,
+    exercise: ListeningExercise,
+    evaluation: ListeningEvaluation,
+    opts: { replayCount: number; now: IsoDate },
+  ): Promise<void> {
+    // General exercises still produce evidence when the learner struggles:
+    // missed key items become listening weaknesses (deduplicated by identity).
+    if (!isProblemResult(evaluation.result)) return;
+
+    const missedItems =
+      evaluation.missedItems.length > 0
+        ? evaluation.missedItems
+        : exercise.keyItems.slice(0, MAX_MISSED_PER_EXERCISE);
+
+    for (const item of missedItems.slice(0, MAX_MISSED_PER_EXERCISE)) {
+      const kind = /\s+/.test(item.trim()) ? 'expression_recognition' : 'word_recognition';
+      const normalized = item.toLowerCase().trim();
+      const identity = `${kind}:${normalized}`;
+      const referenceId = exercise.weaknessReferenceId ?? stableReferenceId(identity);
+
+      // EXACT lookup — never a capped-list scan.
+      const existing = await this.deps.weaknesses.getWeaknessByReference(
+        learnerId,
+        'listening',
+        referenceId,
+      );
+
+      let nextStatus: 'observed' | 'repeated' | 'confirmed' | 'relapsed' = 'observed';
+      if (existing) {
+        if (existing.status === 'stable' || existing.status === 'mastered') {
+          nextStatus = 'relapsed';
+        } else if (existing.status === 'observed') {
+          nextStatus = 'repeated';
+        } else if (existing.status === 'repeated') {
+          nextStatus = 'confirmed';
+        } else {
+          // confirmed/active_training/improving/relapsed stay until Review
+          // practice moves them — never regress, no shortcuts.
+          nextStatus = existing.status as typeof nextStatus;
+        }
+      }
+
+      const contextTag = exercise.lexicalItemId
+        ? `lexical:${exercise.lexicalItemId}`
+        : persistenceTag(exercise);
+      const contexts = Array.from(
+        new Set([...(existing?.contexts ?? []), contextTag, `replays:${opts.replayCount}`]),
+      )
+        .slice(-MAX_CONTEXTS);
+
+      const evidence = [
+        ...(existing?.evidence ?? []),
+        {
+          id: `${referenceId}-${opts.now}`,
+          kind: 'turn' as const,
+          at: opts.now,
+          summary: `${exercise.type} — result: ${evaluation.result}; replays: ${opts.replayCount}; missed '${item}'${
+            exercise.contextTopic ? ` (topic: ${exercise.contextTopic})` : ''
+          }`,
+        },
+      ].slice(-MAX_EVIDENCE_ENTRIES);
+
+      const weakness = await this.deps.weaknesses.upsertWeakness({
+        learnerId,
+        type: 'listening',
+        referenceId,
+        severity: 0.5,
+        status: nextStatus,
+        lastSeenAt: opts.now,
+        firstSeenAt: existing?.firstSeenAt ?? opts.now,
+        occurrenceCount: (existing?.occurrenceCount ?? 0) + 1,
+        contexts,
+        notes: identity,
+        evidence,
+        resolved: false,
+      });
+
+      // ---- EXISTING Review system: create ONCE, never reset history ----
+      if (this.deps.review?.upsert && this.deps.review?.getByReference) {
+        const existingReview = await this.deps.review.getByReference(
+          learnerId,
+          'listening',
+          weakness.id,
+        );
+        if (!existingReview) {
+          await this.deps.review.upsert({
+            learnerId,
+            kind: 'listening',
+            referenceId: weakness.id,
+            prompt: this.reviewPromptFor(exercise, item),
+            expectedResponse: item,
+            contextTopic: exercise.contextTopic,
+            state: 'learning',
+            dueAt: opts.now,
+            reviewCount: 0,
+            consecutiveCorrect: 0,
+            outcomeHistory: [],
+          });
+        }
+      }
+    }
+  }
+
+  /** Review prompt for a listening retraining item (played via existing TTS in Review). */
+  private reviewPromptFor(exercise: ListeningExercise, item: string): string {
+    switch (exercise.type) {
+      case 'expression_in_context':
+        return `Listen and choose the meaning of '${item}'`;
+      case 'missing_word':
+        return `Listen and identify the missing word ('${item}')`;
+      case 'listen_and_choose':
+        return `Listen and choose what '${item}' means`;
+      default:
+        return `Listen and type what you hear (focus: '${item}')`;
+    }
+  }
+
+  /**
+   * Record a completed session in the EXISTING progress records — REAL
+   * counts only (sessions/exercises). Legacy numeric score fields are never
+   * populated. There is NO dedicated listening dashboard metric in Phase 1:
+   * listening sessions appear as regular activity counts, and listening
+   * problems appear as regular 'listening' learner weaknesses in the
+   * existing dashboard weakness cards.
+   */
+  async recordSessionCompleted(
+    learnerId: string,
+    summary: ListeningSessionSummary,
+    opts?: { now?: IsoDate },
+  ): Promise<void> {
+    if (!this.deps.progress) return;
+    const now = opts?.now ?? new Date().toISOString();
+    const dayStart = `${now.slice(0, 10)}T00:00:00.000Z`;
+    const dayEnd = `${now.slice(0, 10)}T23:59:59.999Z`;
+    try {
+      await this.deps.progress.record({
+        learnerId,
+        recordedAt: now,
+        windowStart: dayStart,
+        windowEnd: dayEnd,
+        sessionsCompleted: 1,
+        turnsCompleted: summary.exercisesCompleted,
+        newWordsLearned: 0,
+      } as Omit<ProgressRecord, 'id'>);
+    } catch {
+      // Non-destructive: session completion UI feedback is unaffected.
+    }
+  }
+
+  /**
+   * Save a missed/interesting word through the EXISTING vocabulary
+   * repository with HONEST semantics:
+   * - the listening sentence is NEVER stored as a definition — it is kept
+   *   as a usage example (source: 'learner-created', context
+   *   'from listening practice') when a meaning row exists;
+   * - a placeholder definition is NEVER invented: only a REAL meaning
+   *   carried by the exercise (e.g. the item's known meaning) is stored;
+   *   otherwise the item is saved with an EMPTY meanings array and the
+   *   learner can add a definition through the existing workspace editor;
+   * - an already-saved headword is reused untouched (no duplicate, no
+   *   change to its meanings, examples or meaning.review history).
+   */
+  async saveVocabulary(
+    learnerId: string,
+    headword: string,
+    opts?: { meaning?: string; exampleText?: string },
+  ): Promise<{ item: Awaited<ReturnType<VocabularyRepository['upsert']>>; created: boolean }> {
+    const normalized = headword.toLowerCase().trim();
+    const saved = await this.deps.vocabulary.list(learnerId, { limit: 500 });
+    const existing = saved.find((v) => v.headword.toLowerCase().trim() === normalized);
+    if (existing) return { item: existing, created: false };
+
+    const realMeaning = opts?.meaning?.trim();
+    const examples = opts?.exampleText?.trim()
+      ? [
+          {
+            text: opts.exampleText.trim(),
+            source: 'learner-created' as const,
+            context: 'from listening practice',
+          },
+        ]
+      : [];
+    const created = await this.deps.vocabulary.upsert({
+      learnerId,
+      headword: headword.trim(),
+      type: 'word',
+      meanings: realMeaning
+        ? [{ definition: realMeaning, examples }]
+        : [],
+      source: { addedBy: 'learner-created', addedAt: new Date().toISOString() },
+      tags: ['listening'],
+    });
+    return { item: created, created: true };
+  }
+
+  /**
+   * Save an expression through the EXISTING expression repository with the
+   * same honest no-duplicate, no-fake-definition semantics.
+   */
+  async saveExpression(
+    learnerId: string,
+    expression: string,
+    opts?: { meaning?: string; exampleText?: string },
+  ): Promise<{ item: ExpressionItem; created: boolean } | null> {
+    if (!this.deps.expressions) return null;
+    const normalized = expression.toLowerCase().trim();
+    const saved = await this.deps.expressions.list(learnerId, { limit: 500 });
+    const existing = saved.find((e) => e.expression.toLowerCase().trim() === normalized);
+    if (existing) return { item: existing, created: false };
+
+    const realMeaning = opts?.meaning?.trim();
+    const examples = opts?.exampleText?.trim()
+      ? [
+          {
+            text: opts.exampleText.trim(),
+            source: 'learner-created' as const,
+            context: 'from listening practice',
+          },
+        ]
+      : [];
+    const created = await this.deps.expressions.upsert({
+      learnerId,
+      expression: expression.trim(),
+      type: 'common_expression',
+      meanings: realMeaning
+        ? [{ definition: realMeaning, examples }]
+        : [],
+      source: { addedBy: 'learner-created', addedAt: new Date().toISOString() },
+      tags: ['listening'],
+    });
+    return { item: created, created: true };
+  }
+}

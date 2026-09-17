@@ -277,6 +277,64 @@ export function evaluatePronunciationRepeatLocally(
 }
 
 /**
+ * Qualitative local evaluation for listening practice review items
+ * (Phase 1). The expected response is a word/phrase/meaning the learner
+ * had to recognize by listening; comparison is normalized text only.
+ * No comprehension percentage, band, or score is ever produced.
+ */
+export function evaluateListeningPracticeLocally(
+  candidate: ReviewItemCandidate,
+  userAnswer: string,
+): EvaluationResult {
+  const normUser = normalizeText(userAnswer);
+  if (!normUser) {
+    return {
+      result: 'incorrect',
+      feedback: 'No answer was given. Insufficient evidence — replay the item and try once more.',
+      explanation: candidate.explanation,
+      suggestedCorrection: candidate.expectedAnswer,
+    };
+  }
+
+  const normExpected = normalizeText(candidate.expectedAnswer);
+  if (normUser === normExpected) {
+    return {
+      result: 'correct',
+      feedback: 'Correct — you recognized the target clearly.',
+      explanation: candidate.explanation,
+      suggestedCorrection: candidate.expectedAnswer,
+    };
+  }
+
+  const expectedWords = normExpected.split(' ').filter((w) => w.length > 1);
+  const matchedCount = expectedWords.filter((w) => normUser.includes(w)).length;
+  const matchRatio = expectedWords.length > 0 ? matchedCount / expectedWords.length : 0;
+
+  if (matchRatio >= 0.8) {
+    return {
+      result: 'correct',
+      feedback: 'Correct enough — the key words were recognized in your answer.',
+      explanation: candidate.explanation,
+      suggestedCorrection: candidate.expectedAnswer,
+    };
+  }
+  if (matchRatio >= 0.4) {
+    return {
+      result: 'partial',
+      feedback: 'Partial — parts of the meaning were recognized, parts are still unclear. Listen again.',
+      explanation: candidate.explanation,
+      suggestedCorrection: candidate.expectedAnswer,
+    };
+  }
+  return {
+    result: 'incorrect',
+    feedback: 'Still unclear — the answer did not reflect the target yet. Replay it slowly and listen for the key words.',
+    explanation: candidate.explanation,
+    suggestedCorrection: candidate.expectedAnswer,
+  };
+}
+
+/**
  * ReviewEvaluator: Evaluates learner answers deterministically or using AI provider.
  */
 export class ReviewEvaluator {
@@ -298,6 +356,12 @@ export class ReviewEvaluator {
     // transcript (qualitative). No numeric score, no acoustic claims.
     if (candidate.exerciseType === 'pronunciation_repeat') {
       return evaluatePronunciationRepeatLocally(candidate, userAnswer);
+    }
+
+    // Phase 1 listening practice is always evaluated locally (qualitative
+    // recognition). No comprehension score, no fabricated understanding.
+    if (candidate.exerciseType === 'listening_practice') {
+      return evaluateListeningPracticeLocally(candidate, userAnswer);
     }
 
     if (this.aiProvider) {

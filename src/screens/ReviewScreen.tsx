@@ -21,9 +21,11 @@ import {
   createExpoAudioRecorder,
   createDemoSTTProvider,
   createGeminiSTTProvider,
+  createExpoTTSProvider,
   getGeminiApiKey,
   type AudioRecorderService,
   type SpeechToTextProvider,
+  type TextToSpeechProvider,
 } from '../talk-demo';
 
 // Fallback Mock items for immediate demo / offline practice out of the box
@@ -113,6 +115,8 @@ export interface ReviewScreenProps {
   readonly initialDemoMode?: boolean;
   readonly recorder?: AudioRecorderService;
   readonly sttProvider?: SpeechToTextProvider;
+  /** Injectable TTS (existing provider) for listening review items. */
+  readonly ttsProvider?: TextToSpeechProvider;
 }
 
 export default function ReviewScreen(props?: ReviewScreenProps) {
@@ -153,6 +157,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
   const [recorderError, setRecorderError] = useState<string | null>(null);
   const recorderRef = useRef<AudioRecorderService | null>(null);
   const sttRef = useRef<SpeechToTextProvider | null>(null);
+  const ttsRef = useRef<TextToSpeechProvider | null>(props?.ttsProvider ?? null);
+  const [isPlayingListening, setIsPlayingListening] = useState<boolean>(false);
 
   useEffect(() => {
     recorderRef.current = props?.recorder || createExpoAudioRecorder();
@@ -325,6 +331,24 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       setSessionError('Could not load the review queue. Please try again.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  /**
+   * Play a listening review item through the EXISTING TTS provider.
+   * Failure-safe: the exercise and the typed answer are never lost.
+   */
+  const handlePlayListeningItem = async (text: string) => {
+    try {
+      if (!ttsRef.current) {
+        ttsRef.current = createExpoTTSProvider();
+      }
+      setIsPlayingListening(true);
+      await ttsRef.current.speak(text);
+      setIsPlayingListening(false);
+    } catch {
+      setIsPlayingListening(false);
+      setError('Audio playback failed. The item text is shown below — you can still answer.');
     }
   };
 
@@ -602,6 +626,22 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
               {candidate.exerciseType?.replace(/_/g, ' ') || 'recall'}
             </Text>
           </View>
+
+          {/* Listening replay control (kind === 'listening'): existing TTS */}
+          {candidate.kind === 'listening' && (
+            <View style={styles.listeningPlayRow}>
+              <TouchableOpacity
+                style={styles.listeningPlayButton}
+                onPress={() => handlePlayListeningItem(candidate.expectedAnswer)}
+                accessibilityLabel="Play listening item"
+                accessibilityRole="button"
+              >
+                <Text style={styles.listeningPlayButtonText}>
+                  {isPlayingListening ? '🔊 Playing…' : '▶ Play audio'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          )}
 
           {/* Prompt */}
           <Text style={styles.promptText}>{candidate.prompt}</Text>
@@ -1026,6 +1066,26 @@ const styles = StyleSheet.create({
     backgroundColor: '#EEF4FF',
     borderColor: '#1F4E9C',
   },
+  typeBadge_listening: {
+    backgroundColor: '#E8F5E9',
+    borderColor: '#2E7D32',
+  },
+  listeningPlayRow: {
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  listeningPlayButton: {
+    backgroundColor: '#2E7D32',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+  },
+  listeningPlayButtonText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '600',
+  },
   typeBadgeText: {
     fontSize: 10,
     fontWeight: '800',
@@ -1321,4 +1381,5 @@ const TYPE_BADGE_STYLES: Record<string, ViewStyle> = {
   vocabulary: styles.typeBadge_vocabulary,
   expression: styles.typeBadge_expression,
   pronunciation: styles.typeBadge_pronunciation,
+  listening: styles.typeBadge_listening,
 };
