@@ -738,7 +738,12 @@ describe('Vocabulary & Progress integration', () => {
     });
 
     const service = createService(ctx, { withProgress: false });
-    const result = await service.saveVocabulary(ctx.learnerId, 'Deadline', 'another definition');
+    // Re-saving an existing item (even with a candidate meaning) reuses it
+    // untouched — no duplicate, review history preserved.
+    const result = await service.saveVocabulary(ctx.learnerId, 'Deadline', {
+      meaning: 'another definition',
+      exampleText: 'We need to meet the deadline by Friday.',
+    });
     expect(result.created).toBe(false);
     expect(result.item.id).toBe(existing.id);
 
@@ -748,12 +753,94 @@ describe('Vocabulary & Progress integration', () => {
     expect(list[0].meanings[0].review?.reviewCount).toBe(
       withReview.meanings[0].review?.reviewCount,
     );
+    // The existing definition was NOT overwritten.
+    expect(list[0].meanings[0].definition).toBe('a final time limit');
 
     // Saving a NEW word creates it through the existing repository.
-    const second = await service.saveVocabulary(ctx.learnerId, 'stakeholder', 'a person with an interest');
+    const second = await service.saveVocabulary(ctx.learnerId, 'stakeholder', {
+      meaning: 'a person with an interest',
+    });
     expect(second.created).toBe(true);
     const after = await ctx.vocabulary.list(ctx.learnerId, { limit: 100 });
     expect(after).toHaveLength(2);
+  });
+
+  it('never stores the listening sentence or a placeholder as the definition', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, { withProgress: false });
+
+    // No known meaning → saved WITHOUT any definition (no fabrication).
+    const noMeaning = await service.saveVocabulary(ctx.learnerId, 'commute', {
+      exampleText: 'My commute takes about forty minutes.',
+    });
+    expect(noMeaning.created).toBe(true);
+    expect(noMeaning.item.meanings).toEqual([]);
+    const serializedNo = JSON.stringify(noMeaning.item);
+    expect(serializedNo).not.toContain('Heard in:');
+    expect(serializedNo).not.toContain('saved from listening practice');
+    expect(serializedNo).not.toContain('Meaning of');
+
+    // A REAL known meaning (from the exercise) is reused, and the listening
+    // sentence is preserved as a usage example — not as a definition.
+    const withMeaning = await service.saveVocabulary(ctx.learnerId, 'deadline', {
+      meaning: 'a final time by which something must be completed',
+      exampleText: 'We need to meet the deadline by Friday.',
+    });
+    expect(withMeaning.created).toBe(true);
+    expect(withMeaning.item.meanings).toHaveLength(1);
+    expect(withMeaning.item.meanings[0].definition).toBe(
+      'a final time by which something must be completed',
+    );
+    expect(withMeaning.item.meanings[0].examples).toHaveLength(1);
+    expect(withMeaning.item.meanings[0].examples[0].text).toBe(
+      'We need to meet the deadline by Friday.',
+    );
+    expect(withMeaning.item.meanings[0].examples[0].context).toBe('from listening practice');
+    const serialized = JSON.stringify(withMeaning.item);
+    expect(serialized).not.toContain('Heard in:');
+    expect(serialized).not.toContain('Meaning of');
+  });
+
+  it('expressions follow the same honest save semantics', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, { withProgress: false });
+
+    // Real meaning from the exercise + sentence stored as example.
+    const saved = await service.saveExpression(ctx.learnerId, 'meet the deadline', {
+      meaning: 'to finish something by the required time',
+      exampleText: 'We need to meet the deadline by Friday.',
+    });
+    expect(saved).not.toBeNull();
+    expect(saved!.created).toBe(true);
+    expect(saved!.item.meanings[0].definition).toBe('to finish something by the required time');
+    expect(saved!.item.meanings[0].examples[0].text).toBe('We need to meet the deadline by Friday.');
+    const serialized = JSON.stringify(saved!.item);
+    expect(serialized).not.toContain('Heard in:');
+    expect(serialized).not.toContain('Meaning of');
+
+    // No known meaning → empty meanings, no placeholder.
+    const noMeaning = await service.saveExpression(ctx.learnerId, 'touch base', {
+      exampleText: 'Let us touch base tomorrow morning.',
+    });
+    expect(noMeaning!.item.meanings).toEqual([]);
+
+    // Dedup: saving the same expression again reuses the existing row.
+    const again = await service.saveExpression(ctx.learnerId, 'Meet the Deadline', {
+      meaning: 'some other meaning',
+    });
+    expect(again!.created).toBe(false);
+    expect(again!.item.id).toBe(saved!.item.id);
+    const list = await ctx.expressions.list(ctx.learnerId, { limit: 100 });
+    expect(list).toHaveLength(2);
+    expect(list[0].meanings[0].definition).toBe('to finish something by the required time');
+  });
+
+  it('the screen passes the exercise-known meaning and never a "Heard in:" string', () => {
+    const screenSrc = readFileSync(join(__dirname, '../screens/ListeningScreen.tsx'), 'utf8');
+    expect(screenSrc).not.toContain('Heard in:');
+    expect(screenSrc).toContain('keyMeaning');
+    // The example text passed to save comes from the revealed transcript.
+    expect(screenSrc).toContain('revealedTranscript ?? currentExercise.speakText');
   });
 
   it('29. progress records listening activity as counts only (no scores)', async () => {
@@ -784,5 +871,103 @@ describe('Vocabulary & Progress integration', () => {
     const serialized = JSON.stringify(snapshot);
     expect(serialized).not.toMatch(/listeningScore"?\s*:\s*(0\.\d+|\d+)/);
     expect(serialized).not.toMatch(/"listening_score"/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AI provider composition (integrity fix 2) + honest Progress (fix 3)
+// ---------------------------------------------------------------------------
+describe('Default composition & honest Progress', () => {
+  it('composition accepts and reuses an injected AI provider; no second implementation', async () => {
+    const ctx = await createContext();
+    const calls = { count: 0 };
+    const service = createListeningService(ctx.adapter, {
+      aiProvider: fakeAI(undefined, calls),
+    });
+    const ex = exercise({
+      type: 'listen_and_answer',
+      speakText: 'The report is due on Tuesday morning.',
+      question: 'When is the report due?',
+      expectedAnswer: 'Tuesday morning',
+      keyItems: ['Tuesday'],
+    });
+    const { evaluation } = await service.evaluateAnswer(ctx.learnerId, ex, 'on tuesday morning', {
+      now: NOW,
+    });
+    expect(calls.count).toBe(1);
+    expect(evaluation.evaluatedBy).toBe('ai');
+
+    // Structural: the module reuses the EXISTING provider composition and
+    // adds no demo fallback and no second provider implementation.
+    const indexSrc = readFileSync(join(__dirname, './index.ts'), 'utf8');
+    expect(indexSrc).toContain('createGeminiAIProvider');
+    expect(indexSrc).toContain('getGeminiApiKey');
+    expect(indexSrc).not.toContain('createDemoAIProvider');
+  });
+
+  it('without an API key the default composition uses local fallback (valid, honest)', async () => {
+    const freshAdapter = new SqlJsAdapter();
+    await freshAdapter.init();
+    // Ensure no API key is configured for this test process.
+    vi.stubEnv('EXPO_PUBLIC_GEMINI_API_KEY', '');
+    try {
+      const service = createListeningService(freshAdapter);
+      const profileRepo = new SQLiteUserProfileRepository(freshAdapter);
+      const profile = await profileRepo.update({
+        displayName: 'NoKey',
+        currentLevel: 'A2',
+        targetLevel: 'B1',
+        learningGoals: [],
+        preferredModes: [],
+      });
+      const ex = exercise({
+        type: 'listen_and_answer',
+        speakText: 'The report is due on Tuesday morning.',
+        question: 'When is the report due?',
+        expectedAnswer: 'Tuesday morning',
+        keyItems: ['Tuesday'],
+        learnerId: profile.id,
+      });
+      const { evaluation } = await service.evaluateAnswer(profile.id, ex, 'on tuesday morning', {
+        now: NOW,
+      });
+      // No provider available → deterministic local evaluation, honest label.
+      expect(evaluation.evaluatedBy).toBe('local');
+      expect(evaluation.result).not.toBe('insufficient_evidence');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('listening activity is honestly visible in the existing dashboard (counts, no scores)', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx);
+    const ex = exercise({ type: 'missing_word', gappedText: 'the ___', expectedAnswer: 'deadline' });
+    await service.evaluateAnswer(ctx.learnerId, ex, 'headline', { now: NOW });
+    await service.recordSessionCompleted(
+      ctx.learnerId,
+      { exercisesCompleted: 6, problemResults: 1, understoodResults: 5 },
+      { now: NOW },
+    );
+
+    const dashboard = new ProgressDashboardService({
+      profile: ctx.profileRepo,
+      conversations: { listSessions: async () => [] } as never,
+      weaknesses: ctx.weaknesses,
+      vocabulary: ctx.vocabulary,
+      expressions: { list: async () => [] } as never,
+      review: ctx.review,
+      progress: ctx.progress,
+    });
+    const snapshot = await dashboard.loadDashboard(ctx.learnerId, { now: NOW });
+    // The listening weakness appears as a REAL weakness card (count/state).
+    const listeningCards = snapshot.weaknessCards.filter((c) => c.type === 'listening');
+    expect(listeningCards).toHaveLength(1);
+    expect(listeningCards[0].status).toBe('observed');
+    // Progress records expose real session counts; no score fields anywhere.
+    expect(snapshot.recentProgress.length).toBeGreaterThanOrEqual(1);
+    const serialized = JSON.stringify(snapshot);
+    expect(serialized).not.toMatch(/listeningScore"?\s*:\s*(0\.\d+|\d+)/);
+    expect(serialized).not.toMatch(/"listening_score"|"band"/);
   });
 });

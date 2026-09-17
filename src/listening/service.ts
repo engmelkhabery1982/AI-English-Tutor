@@ -298,7 +298,10 @@ export class ListeningService {
   /**
    * Record a completed session in the EXISTING progress records — REAL
    * counts only (sessions/exercises). Legacy numeric score fields are never
-   * populated.
+   * populated. There is NO dedicated listening dashboard metric in Phase 1:
+   * listening sessions appear as regular activity counts, and listening
+   * problems appear as regular 'listening' learner weaknesses in the
+   * existing dashboard weakness cards.
    */
   async recordSessionCompleted(
     learnerId: string,
@@ -326,30 +329,44 @@ export class ListeningService {
 
   /**
    * Save a missed/interesting word through the EXISTING vocabulary
-   * repository. If the headword already exists (case-insensitive), the
-   * EXISTING item is returned — never a duplicate; its meaning.review
-   * history is untouched.
+   * repository with HONEST semantics:
+   * - the listening sentence is NEVER stored as a definition — it is kept
+   *   as a usage example (source: 'learner-created', context
+   *   'from listening practice') when a meaning row exists;
+   * - a placeholder definition is NEVER invented: only a REAL meaning
+   *   carried by the exercise (e.g. the item's known meaning) is stored;
+   *   otherwise the item is saved with an EMPTY meanings array and the
+   *   learner can add a definition through the existing workspace editor;
+   * - an already-saved headword is reused untouched (no duplicate, no
+   *   change to its meanings, examples or meaning.review history).
    */
   async saveVocabulary(
     learnerId: string,
     headword: string,
-    definition?: string,
+    opts?: { meaning?: string; exampleText?: string },
   ): Promise<{ item: Awaited<ReturnType<VocabularyRepository['upsert']>>; created: boolean }> {
     const normalized = headword.toLowerCase().trim();
     const saved = await this.deps.vocabulary.list(learnerId, { limit: 500 });
     const existing = saved.find((v) => v.headword.toLowerCase().trim() === normalized);
     if (existing) return { item: existing, created: false };
 
+    const realMeaning = opts?.meaning?.trim();
+    const examples = opts?.exampleText?.trim()
+      ? [
+          {
+            text: opts.exampleText.trim(),
+            source: 'learner-created' as const,
+            context: 'from listening practice',
+          },
+        ]
+      : [];
     const created = await this.deps.vocabulary.upsert({
       learnerId,
       headword: headword.trim(),
       type: 'word',
-      meanings: [
-        {
-          definition: definition?.trim() || `Meaning of "${headword.trim()}" (saved from listening practice)`,
-          examples: [],
-        },
-      ],
+      meanings: realMeaning
+        ? [{ definition: realMeaning, examples }]
+        : [],
       source: { addedBy: 'learner-created', addedAt: new Date().toISOString() },
       tags: ['listening'],
     });
@@ -358,12 +375,12 @@ export class ListeningService {
 
   /**
    * Save an expression through the EXISTING expression repository with the
-   * same no-duplicate guarantee.
+   * same honest no-duplicate, no-fake-definition semantics.
    */
   async saveExpression(
     learnerId: string,
     expression: string,
-    definition?: string,
+    opts?: { meaning?: string; exampleText?: string },
   ): Promise<{ item: ExpressionItem; created: boolean } | null> {
     if (!this.deps.expressions) return null;
     const normalized = expression.toLowerCase().trim();
@@ -371,16 +388,23 @@ export class ListeningService {
     const existing = saved.find((e) => e.expression.toLowerCase().trim() === normalized);
     if (existing) return { item: existing, created: false };
 
+    const realMeaning = opts?.meaning?.trim();
+    const examples = opts?.exampleText?.trim()
+      ? [
+          {
+            text: opts.exampleText.trim(),
+            source: 'learner-created' as const,
+            context: 'from listening practice',
+          },
+        ]
+      : [];
     const created = await this.deps.expressions.upsert({
       learnerId,
       expression: expression.trim(),
       type: 'common_expression',
-      meanings: [
-        {
-          definition: definition?.trim() || `Meaning of "${expression.trim()}" (saved from listening practice)`,
-          examples: [],
-        },
-      ],
+      meanings: realMeaning
+        ? [{ definition: realMeaning, examples }]
+        : [],
       source: { addedBy: 'learner-created', addedAt: new Date().toISOString() },
       tags: ['listening'],
     });

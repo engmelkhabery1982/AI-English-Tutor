@@ -226,21 +226,32 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
 
   const handleSave = async (item: string, asExpression: boolean) => {
     const service = serviceRef.current;
-    if (!service) return;
+    if (!service || !currentExercise) return;
     try {
       const learner = await service.resolveLearnerId();
       if (!learner) {
         setErrorMessage('No learner profile found yet — nothing was saved.');
         return;
       }
-      const definition = evaluation?.revealedTranscript
-        ? `Heard in: "${evaluation.revealedTranscript}"`
-        : undefined;
+      // HONEST save semantics: only a REAL meaning carried by the exercise
+      // (e.g. the item's known meaning) is stored as the definition — the
+      // listening sentence is stored as a usage example, never as a
+      // definition, and no placeholder meaning is ever invented.
+      const knownMeaning =
+        currentExercise.keyMeaning ??
+        (currentExercise.source === 'due_vocabulary' ? currentExercise.expectedAnswer : undefined);
+      const exampleText = evaluation?.revealedTranscript ?? currentExercise.speakText;
+      const saveOptions = { meaning: knownMeaning, exampleText };
       const result = asExpression
-        ? await service.saveExpression(learner, item, definition)
-        : await service.saveVocabulary(learner, item, definition);
+        ? await service.saveExpression(learner, item, saveOptions)
+        : await service.saveVocabulary(learner, item, saveOptions);
       if (result) {
         setSavedItems((prev) => [...prev, `${asExpression ? 'expr' : 'word'}:${item}`]);
+        if (!knownMeaning) {
+          setErrorMessage(
+            `Saved '${item}' without a definition — you can add one in the Vocabulary tab.`,
+          );
+        }
       }
     } catch {
       setErrorMessage('Saving failed. Please try again.');

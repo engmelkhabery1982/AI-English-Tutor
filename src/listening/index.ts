@@ -11,6 +11,9 @@
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import type { AIProvider } from '../providers/ai/types';
+import { createGeminiAIProvider } from '../providers/ai/gemini';
+import { getGeminiApiKey } from '../talk-demo';
 import {
   SQLiteExpressionRepository,
   SQLiteProgressRepository,
@@ -31,6 +34,18 @@ export * from './service';
  * repositories (exact lookups included — getByReference /
  * getWeaknessByReference).
  */
+/**
+ * Resolve the default AI provider for listening using the EXISTING
+ * composition already used by Talk/Review: Gemini when an API key is
+ * configured, otherwise NO provider (the deterministic local evaluator
+ * remains valid). There is deliberately NO silent Demo fallback and no
+ * fabricated AI result here.
+ */
+function resolveDefaultListeningAI(): AIProvider | undefined {
+  const key = getGeminiApiKey();
+  return key ? createGeminiAIProvider({ apiKey: key }) : undefined;
+}
+
 export function createListeningService(
   adapter: DatabaseAdapter,
   options?: { aiProvider?: ListeningServiceDepsHint['aiProvider'] },
@@ -53,7 +68,9 @@ export function createListeningService(
     expressions: new SQLiteExpressionRepository(adapter),
     progress: new SQLiteProgressRepository(adapter),
     profile: new SQLiteUserProfileRepository(adapter),
-    aiProvider: options?.aiProvider,
+    // Explicitly injected provider wins; otherwise reuse the EXISTING
+    // real provider composition (Gemini when configured, else none).
+    aiProvider: options?.aiProvider ?? resolveDefaultListeningAI(),
   });
 }
 
