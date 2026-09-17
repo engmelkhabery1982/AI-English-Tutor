@@ -66,6 +66,9 @@ import type {
 import {
   adaptiveVoiceActionLabel,
   BUSY_MESSAGE,
+  isAdaptiveVoiceWorkActive,
+  STALE_TARGET_MESSAGE,
+  VOICE_NAVIGATION_BLOCKED_MESSAGE,
   CHOICE_EXERCISE_MESSAGE,
   createAdaptiveLessonVoiceController,
   EMPTY_ANSWER_MESSAGE,
@@ -150,6 +153,10 @@ class FakeTts implements TextToSpeechProvider {
 
 class FakeRecorder implements AudioRecorderService {
   permissionGranted = true;
+  /** Overrides `hasPermissions()` when set (forces the request path). */
+  hasPermission: boolean | null = null;
+  /** Optional gate so a test can hold the permission round-trip open. */
+  permissionHold: Promise<void> | null = null;
   recording = false;
   failStart = false;
   failStop = false;
@@ -165,12 +172,13 @@ class FakeRecorder implements AudioRecorderService {
 
   async requestPermissions(): Promise<boolean> {
     this.log.push('recorder:requestPermissions');
+    if (this.permissionHold) await this.permissionHold;
     return this.permissionGranted;
   }
 
   async hasPermissions(): Promise<boolean> {
     this.log.push('recorder:hasPermissions');
-    return this.permissionGranted;
+    return this.hasPermission ?? this.permissionGranted;
   }
 
   async startRecording(): Promise<void> {
@@ -225,6 +233,8 @@ class FakeVoiceService implements AdaptiveLessonVoiceSubmissionPort {
   readonly calls: { method: string; args: readonly unknown[] }[] = [];
   outcome: AdaptiveLessonSubmitOutcome | null = reviewOutcome();
   throwOnSubmit = false;
+  /** Optional gate so a test can hold a submission in flight. */
+  hold: Promise<void> | null = null;
 
   async submitReviewAnswer(
     candidateId: string,
@@ -262,6 +272,7 @@ class FakeVoiceService implements AdaptiveLessonVoiceSubmissionPort {
     args: readonly unknown[],
   ): Promise<AdaptiveLessonSubmitOutcome | null> {
     this.calls.push({ method, args });
+    if (this.hold) await this.hold;
     if (this.throwOnSubmit) throw new Error('service unavailable');
     return this.outcome;
   }
@@ -1204,6 +1215,13 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
+/** Let pending microtasks (awaits inside the controller) settle. */
+async function flushMicrotasks(times = 10): Promise<void> {
+  for (let index = 0; index < times; index += 1) {
+    await Promise.resolve();
+  }
+}
+
 /**
  * Drive the controller from a real prepared step material, submitting through
  * the REAL AdaptiveLessonService (the port assignment is the type-level proof
@@ -1430,11 +1448,350 @@ describe('Voice-first lessons — real service integration', () => {
 });
 
 /* ================================================================== *
+ * 6b. Hardening — stale targets, navigation integrity, feedback state
+ * ================================================================== */
+
+describe('Voice-first lessons — stale target hardening', () => {
+  it('44. a target change during STT discards the late transcript (never routed to the new item)', async () => {
+    const harness = createHarness({ target: reviewTarget({ itemId: 'item-A' }) });
+    const hold = deferred();
+    harness.stt.hold = hold.promise;
+    harness.stt.transcript = 'answer for A';
+
+    await harness.controller.startRecording();
+    const pending = harness.controller.stopRecordingAndSubmit();
+    await flushMicrotasks();
+    expect(harness.controller.getStatus().state).toBe('transcribing');
+
+    // The lesson moves on while the speech is still being transcribed.
+    harness.controller.setTarget(reviewTarget({ itemId: 'item-B' }));
+    hold.resolve();
+    const result = await pending;
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('stale-target');
+      expect(result.message).toBe(STALE_TARGET_MESSAGE);
+    }
+    // Zero service calls: the transcript belongs to A, so B is never asked.
+    expect(harness.service.calls).toEqual([]);
+    expect(harness.controller.getStatus().transcript).toBeNull();
+    expect(harness.controller.getStatus().canSpeakFeedback).toBe(false);
+    expect(isAdaptiveVoiceWorkActive(harness.controller.getStatus())).toBe(false);
+  });
+
+  it('45. the audio is dropped before transcription when the item already changed', async () => {
+    const harness = createHarness({ target: reviewTarget({ itemId: 'item-A' }) });
+    await harness.controller.startRecording();
+
+    harness.controller.setTarget(reviewTarget({ itemId: 'item-B' }));
+    const result = await harness.controller.stopRecordingAndSubmit();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('stale-target');
+    // The STT provider is never even asked for stale audio.
+    expect(harness.stt.calls).toBe(0);
+    expect(harness.service.calls).toEqual([]);
+  });
+
+  it('46. a target change while the microphone is being opened never opens the recorder', async () => {
+    const harness = createHarness({ target: speakingTarget('step-A') });
+    const hold = deferred();
+    harness.recorder.hasPermission = false; // force the explicit request path
+    harness.recorder.permissionHold = hold.promise;
+
+    const started = harness.controller.startRecording();
+    await flushMicrotasks();
+    expect(harness.controller.getStatus().isBusy).toBe(true);
+
+    harness.controller.setTarget(speakingTarget('step-B'));
+    hold.resolve();
+    const result = await started;
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('stale-target');
+    expect(harness.recorder.recording).toBe(false);
+    expect(harness.recorder.log).not.toContain('recorder:startRecording');
+    expect(harness.service.calls).toEqual([]);
+    expect(harness.stt.calls).toBe(0);
+  });
+
+  it('47. a target change during submission keeps the answer on its own item and never arms the new one', async () => {
+    const harness = createHarness({ target: reviewTarget({ itemId: 'item-A' }) });
+    const hold = deferred();
+    harness.service.hold = hold.promise;
+
+    await harness.controller.startRecording();
+    const pending = harness.controller.stopRecordingAndSubmit();
+    await flushMicrotasks();
+    expect(harness.controller.getStatus().state).toBe('submitting');
+
+    harness.controller.setTarget(reviewTarget({ itemId: 'item-B' }));
+    hold.resolve();
+    const result = await pending;
+
+    // The answer really was evaluated — for the item it belonged to.
+    expect(result.ok).toBe(true);
+    expect(harness.service.calls).toEqual([
+      { method: 'submitReviewAnswer', args: ['item-A', 'hello world', 'step-review'] },
+    ]);
+    const status = harness.controller.getStatus();
+    expect(status.state).toBe('idle');
+    expect(status.lastOutcome).toBeNull();
+    expect(status.transcript).toBeNull();
+    expect(status.canSpeakFeedback).toBe(false);
+    const spoken = await harness.controller.speakFeedback(['Correct']);
+    expect(spoken.ok).toBe(false);
+  });
+
+  it('48. a stale transcription counts no practice, evidence or progress (real service)', async () => {
+    const ctx = await createContext();
+    const item = await seedReviewItem(ctx, 'deadline');
+    const progressRecords = { count: 0 };
+    const service = createLessonService(ctx, { progressRecords });
+
+    const session = (await service.startLesson()).session!;
+    const step = session.plan.steps.find(
+      (entry) => entry.type === 'review' || entry.type === 'vocabulary' || entry.type === 'expression',
+    )!;
+    const material = await service.prepareStep(step.id);
+    if (material?.kind !== 'review') throw new Error('expected review material');
+
+    const { harness } = harnessForService(service, material);
+    const hold = deferred();
+    harness.stt.hold = hold.promise;
+    harness.stt.transcript = material.candidates[0].expectedAnswer;
+
+    await harness.controller.startRecording();
+    const pending = harness.controller.stopRecordingAndSubmit();
+    await flushMicrotasks();
+
+    // The lesson moves on (skip / next step) while the STT call is in flight.
+    harness.controller.setTarget({
+      kind: 'speaking',
+      stepId: 'step-that-is-now-active',
+      speakText: 'Talk about your week.',
+    });
+
+    // Only the REAL service can prove that nothing was written anywhere.
+    const probe = harness.controller as unknown as { service: unknown };
+    void probe;
+    hold.resolve();
+    const result = await pending;
+    expect(result.ok).toBe(false);
+
+    const stored = await ctx.review.get(item.id);
+    expect(stored?.reviewCount).toBe(0);
+    expect(stored?.outcomeHistory).toHaveLength(0);
+    const sessionSteps = service.getCurrentSession()?.steps ?? [];
+    expect(sessionSteps.every((entry) => entry.practicedItems === 0)).toBe(true);
+    expect(sessionSteps.every((entry) => entry.status !== 'completed')).toBe(true);
+    expect(service.getProgress()?.practicedItems).toBe(0);
+    expect(service.getProgress()?.practiceStepsCompleted).toBe(0);
+    expect(progressRecords.count).toBe(0);
+    expect(service.getLastSummary()).toBeNull();
+    expect(service.getCurrentSession()?.completedAt).toBeUndefined();
+  });
+
+  it('49. unmount during STT submits nothing and leaves progress untouched (real service)', async () => {
+    const ctx = await createContext();
+    const item = await seedReviewItem(ctx, 'deadline');
+    const progressRecords = { count: 0 };
+    const service = createLessonService(ctx, { progressRecords });
+    const session = (await service.startLesson()).session!;
+    const step = session.plan.steps.find(
+      (entry) => entry.type === 'review' || entry.type === 'vocabulary' || entry.type === 'expression',
+    )!;
+    const material = await service.prepareStep(step.id);
+    if (material?.kind !== 'review') throw new Error('expected review material');
+
+    const { harness } = harnessForService(service, material);
+    const hold = deferred();
+    harness.stt.hold = hold.promise;
+    harness.stt.transcript = 'deadline';
+
+    await harness.controller.startRecording();
+    const pending = harness.controller.stopRecordingAndSubmit();
+    await flushMicrotasks();
+    await harness.controller.dispose();
+    hold.resolve();
+    const result = await pending;
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('disposed');
+    const stored = await ctx.review.get(item.id);
+    expect(stored?.reviewCount).toBe(0);
+    expect(service.getProgress()?.practicedItems).toBe(0);
+    expect(progressRecords.count).toBe(0);
+  });
+
+  it('50. cancelling a recording leaves voice work inactive and nothing submitted', async () => {
+    const harness = createHarness({ target: reviewTarget() });
+    await harness.controller.startRecording();
+    expect(isAdaptiveVoiceWorkActive(harness.controller.getStatus())).toBe(true);
+
+    await harness.controller.cancelRecording();
+
+    expect(isAdaptiveVoiceWorkActive(harness.controller.getStatus())).toBe(false);
+    expect(harness.controller.getStatus().state).toBe('idle');
+    expect(harness.stt.calls).toBe(0);
+    expect(harness.service.calls).toEqual([]);
+  });
+
+  it('51. navigation-relevant work states are exactly recording, transcribing and submitting', () => {
+    for (const state of ['recording', 'transcribing', 'submitting'] as const) {
+      expect(isAdaptiveVoiceWorkActive({ state })).toBe(true);
+    }
+    for (const state of ['idle', 'playing_prompt', 'feedback', 'error'] as const) {
+      expect(isAdaptiveVoiceWorkActive({ state })).toBe(false);
+    }
+    expect(isAdaptiveVoiceWorkActive(null)).toBe(false);
+    expect(isAdaptiveVoiceWorkActive(undefined)).toBe(false);
+  });
+});
+
+describe('Voice-first lessons — feedback state survives prompt replay', () => {
+  /** Drive one answer to a real, evaluated feedback state. */
+  async function answeredHarness(target = reviewTarget()) {
+    const harness = createHarness({ target });
+    await harness.controller.startRecording();
+    const result = await harness.controller.stopRecordingAndSubmit();
+    expect(result.ok).toBe(true);
+    expect(harness.controller.getStatus().state).toBe('feedback');
+    return harness;
+  }
+
+  it('52. replaying the prompt after a real answer keeps the feedback playable', async () => {
+    const harness = await answeredHarness(listeningTarget());
+    const before = harness.controller.getStatus().lastOutcome;
+
+    const replay = harness.controller.playPrompt();
+    await flushMicrotasks();
+    harness.tts.complete();
+    const played = await replay;
+
+    expect(played.ok).toBe(true);
+    // The replay really happened (and is still counted for the exercise)…
+    expect(harness.controller.getStatus().replayCount).toBe(1);
+    // …and it did NOT erase the evaluated feedback.
+    const status = harness.controller.getStatus();
+    expect(status.state).toBe('feedback');
+    expect(status.canSpeakFeedback).toBe(true);
+    expect(status.lastOutcome).toBe(before);
+    expect(status.transcript).toBe('hello world');
+
+    const spoken = harness.controller.speakFeedback(['Heard: "The deadline is Friday."']);
+    await flushMicrotasks();
+    harness.tts.complete();
+    expect((await spoken).ok).toBe(true);
+    expect(harness.tts.spoken).toContain('Heard: "The deadline is Friday."');
+  });
+
+  it('53. a FAILED prompt replay also keeps the existing feedback playable', async () => {
+    const harness = await answeredHarness();
+    harness.tts.failSpeak = true;
+
+    const replay = await harness.controller.playPrompt();
+
+    expect(replay.ok).toBe(false);
+    harness.tts.failSpeak = false;
+    const status = harness.controller.getStatus();
+    expect(status.state).toBe('feedback');
+    expect(status.canSpeakFeedback).toBe(true);
+
+    const spoken = harness.controller.speakFeedback(['Correct', 'Nice work.']);
+    await flushMicrotasks();
+    harness.tts.complete();
+    expect((await spoken).ok).toBe(true);
+  });
+
+  it('54. stopping a replay also restores the feedback-ready state', async () => {
+    const harness = await answeredHarness();
+    const replay = harness.controller.playPrompt();
+    await flushMicrotasks();
+
+    await harness.controller.stopSpeaking();
+
+    expect(harness.controller.getStatus().state).toBe('feedback');
+    expect(harness.controller.getStatus().canSpeakFeedback).toBe(true);
+    await replay;
+  });
+
+  it('55. speakFeedback still cannot run before a real evaluated answer', async () => {
+    // (a) A fresh item, before anything: refused.
+    const fresh = createHarness({ target: reviewTarget() });
+    expect(fresh.controller.getStatus().canSpeakFeedback).toBe(false);
+    const early = await fresh.controller.speakFeedback(['Correct']);
+    expect(early.ok).toBe(false);
+    expect(fresh.tts.spoken).toEqual([]);
+
+    // (b) After a prompt replay on an unanswered item: still refused.
+    const replay = fresh.controller.playPrompt();
+    await flushMicrotasks();
+    fresh.tts.complete();
+    await replay;
+    expect(fresh.controller.getStatus().state).toBe('idle');
+    expect(fresh.controller.getStatus().canSpeakFeedback).toBe(false);
+    const afterReplay = await fresh.controller.speakFeedback(['Correct']);
+    expect(afterReplay.ok).toBe(false);
+    expect(fresh.tts.spoken).toEqual(['What word matches this definition?']);
+
+    // (c) After an answer the owning system did NOT evaluate (kind: 'none'):
+    //     still refused, and a replay does not change that.
+    const unevaluated = createHarness({ target: reviewTarget() });
+    unevaluated.service.outcome = {
+      session: { id: 'session' } as unknown as AdaptiveLessonSession,
+      result: { kind: 'none', message: 'That item is no longer part of this step.' },
+    };
+    await unevaluated.controller.startRecording();
+    await unevaluated.controller.stopRecordingAndSubmit();
+    const replay2 = unevaluated.controller.playPrompt();
+    await flushMicrotasks();
+    unevaluated.tts.complete();
+    await replay2;
+    expect(unevaluated.controller.getStatus().state).toBe('idle');
+    expect(unevaluated.controller.getStatus().canSpeakFeedback).toBe(false);
+    const notEvaluated = await unevaluated.controller.speakFeedback(['Correct']);
+    expect(notEvaluated.ok).toBe(false);
+  });
+
+  it('56. starting to record while feedback audio is playing stops the TTS first', async () => {
+    const harness = await answeredHarness(speakingTarget());
+
+    const feedback = harness.controller.speakFeedback(['Correct', 'Nice work.']);
+    await flushMicrotasks();
+    expect(harness.tts.speaking).toBe(true);
+
+    const started = await harness.controller.startRecording();
+
+    expect(started.ok).toBe(true);
+    expect(harness.tts.speaking).toBe(false);
+    expect(harness.recorder.startedWhileSpeaking).toBe(false);
+    const stopIndex = harness.log.lastIndexOf('tts:stop');
+    const recordIndex = harness.log.lastIndexOf('recorder:startRecording');
+    expect(stopIndex).toBeGreaterThanOrEqual(0);
+    expect(recordIndex).toBeGreaterThan(stopIndex);
+    // The new answer is recorded; the previous outcome is not reused.
+    expect(harness.controller.getStatus().state).toBe('recording');
+    await feedback;
+  });
+});
+
+/* ================================================================== *
  * 7. Structural checks — scope discipline
  * ================================================================== */
 
 function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+}
+
+/** Slice one `const <name> = useCallback(...)` body out of a screen source. */
+function handlerBody(source: string, name: string): string {
+  const start = source.indexOf(`const ${name} = useCallback(`);
+  if (start < 0) return '';
+  const rest = source.slice(start + 1);
+  const end = rest.indexOf('\n  const ');
+  return end >= 0 ? rest.slice(0, end) : rest;
 }
 
 describe('Voice-first lessons — architecture and scope discipline', () => {
@@ -1529,6 +1886,54 @@ describe('Voice-first lessons — architecture and scope discipline', () => {
       }
       importPattern.lastIndex = 0;
     }
+  });
+
+  it('57. the screen refuses every target-changing action during voice work', () => {
+    // The rule is derived from the controller's real lifecycle…
+    expect(screenSrc).toContain('isAdaptiveVoiceWorkActive');
+    expect(screenSrc).toMatch(
+      /const voiceWorkActive = voiceStatus !== null && isAdaptiveVoiceWorkActive\(voiceStatus\)/,
+    );
+    // …the guard is announced honestly (and tells the learner they can cancel),
+    // and never relies on render timing.
+    expect(screenSrc).toContain('setNotice(VOICE_NAVIGATION_BLOCKED_MESSAGE)');
+    expect(VOICE_NAVIGATION_BLOCKED_MESSAGE).toContain('cancel');
+    expect(VOICE_NAVIGATION_BLOCKED_MESSAGE).toMatch(/still in progress|not available yet/);
+    for (const handler of ['handleSkipStep', 'handleNextItem', 'handleCompleteStep']) {
+      expect(
+        handlerBody(screenSrc, handler),
+        `${handler} must refuse navigation while a voice answer is in flight`,
+      ).toContain('voiceNavigationAllowed()');
+    }
+    for (const handler of [
+      'handleSubmitReview',
+      'handleSubmitListening',
+      'handleSubmitPronunciation',
+      'handleSubmitSpeaking',
+    ]) {
+      expect(
+        handlerBody(screenSrc, handler),
+        `${handler} must refuse a second answer while a voice answer is in flight`,
+      ).toContain('voiceNavigationAllowed()');
+    }
+    // Skip, Continue / Finish lesson, Next item / Complete step and the text
+    // submit buttons are all disabled for recording, transcribing AND checking.
+    const disabledWhileVoice = (screenSrc.match(/disabled=\{isBusy \|\| voiceBusy\}/g) ?? [])
+      .length;
+    expect(disabledWhileVoice).toBeGreaterThanOrEqual(4);
+    // The learner can always abandon the recording instead of navigating away.
+    expect(screenSrc).toContain('cancelRecording');
+    expect(screenSrc).toContain('Cancel voice answer');
+  });
+
+  it('58. the screen never routes a late result to the item shown after a target change', () => {
+    const body = handlerBody(screenSrc, 'handleVoiceAnswer');
+    // The item the answer belongs to is captured before the async work starts…
+    expect(body).toContain('voiceTargetKey');
+    // …and a result that arrives after the lesson moved on is not shown as the
+    // new item's feedback.
+    expect(body).toMatch(/requestedKey !== activeKey/);
+    expect(body).toContain('setSession(result.outcome.session)');
   });
 
   it('43. voice status never exposes a score, percentage or rating', async () => {

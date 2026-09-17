@@ -61,9 +61,12 @@ import type {
 import { createDefaultAdaptiveLessonService } from '../adaptive-lessons';
 import {
   createAdaptiveLessonVoiceController,
+  isAdaptiveVoiceWorkActive,
   resolveAdaptiveSpeechOutputProvider,
   resolveAdaptiveVoiceInputProviders,
   resolveAdaptiveVoiceTarget,
+  VOICE_NAVIGATION_BLOCKED_MESSAGE,
+  voiceTargetKey,
 } from '../adaptive-lessons/voice';
 import type {
   AdaptiveLessonVoiceController,
@@ -323,6 +326,24 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     }
   }, [ensureVoiceController, voiceTarget]);
 
+  /**
+   * True while the learner's own voice answer is being recorded, transcribed or
+   * checked — derived from the controller's real lifecycle.
+   */
+  const voiceWorkActive = voiceStatus !== null && isAdaptiveVoiceWorkActive(voiceStatus);
+
+  /**
+   * Refuse any action that would change the current item/step while a voice
+   * answer is in flight: the learner must finish it (or cancel the recording)
+   * first. The handlers are guarded — not only the buttons — so a press that
+   * slips through React's render timing still cannot move the lesson on.
+   */
+  const voiceNavigationAllowed = useCallback((): boolean => {
+    if (!isAdaptiveVoiceWorkActive(voiceRef.current?.getStatus() ?? null)) return true;
+    setNotice(VOICE_NAVIGATION_BLOCKED_MESSAGE);
+    return false;
+  }, []);
+
   /** Leaving the lesson must never leave audio playing or a microphone open. */
   useEffect(
     () => () => {
@@ -465,9 +486,25 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     setErrorMessage(null);
     if (controller.getStatus().state === 'recording') {
       setNotice(null);
+      // Remember which item this answer belongs to: a result that arrives after
+      // the lesson moved on must never be shown as the new item's feedback.
+      const requestedKey = voiceTargetRef.current ? voiceTargetKey(voiceTargetRef.current) : null;
       const result = await controller.stopRecordingAndSubmit();
       if (!result.ok) {
         setNotice(result.message);
+        return;
+      }
+      const activeKey = voiceTargetRef.current ? voiceTargetKey(voiceTargetRef.current) : null;
+      if (requestedKey !== activeKey) {
+        // The controller already refused to submit anything for the new item;
+        // only the session snapshot is refreshed, never stale feedback.
+        if (result.outcome) {
+          setSession(result.outcome.session);
+          syncProgress();
+        }
+        setNotice(
+          'That answer was for the previous item, so it was not counted here. Nothing was saved.',
+        );
         return;
       }
       // The transcript is shown to the learner and the feedback comes from the
@@ -479,6 +516,17 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     const started = await controller.startRecording();
     if (!started.ok) setNotice(started.message);
   }, [applyOutcome, ensureVoiceController]);
+
+  /**
+   * Explicitly abandon the current recording. The learner must always be able
+   * to get back to text without sending anything.
+   */
+  const handleCancelVoiceAnswer = useCallback(async () => {
+    const controller = voiceRef.current;
+    if (!controller) return;
+    await controller.cancelRecording();
+    setNotice('Recording cancelled — nothing was sent.');
+  }, []);
 
   /** Speak the feedback that the owning engine already produced. */
   const handlePlayFeedback = useCallback(async () => {
@@ -497,6 +545,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
   const handleSubmitReview = useCallback(async () => {
     const service = serviceRef.current;
     if (!service || material?.kind !== 'review' || !currentStep || isBusy) return;
+    if (!voiceNavigationAllowed()) return;
     const candidate: ReviewItemCandidate | undefined = material.candidates[itemIndex];
     if (!candidate) return;
     setIsBusy(true);
@@ -513,11 +562,12 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     } finally {
       setIsBusy(false);
     }
-  }, [answer, applyOutcome, currentStep, isBusy, itemIndex, material]);
+  }, [answer, applyOutcome, currentStep, isBusy, itemIndex, material, voiceNavigationAllowed]);
 
   const handleSubmitListening = useCallback(async () => {
     const service = serviceRef.current;
     if (!service || material?.kind !== 'listening' || !currentStep || isBusy) return;
+    if (!voiceNavigationAllowed()) return;
     const exercise: ListeningExercise | undefined = material.exercises[itemIndex];
     if (!exercise) return;
     setIsBusy(true);
@@ -543,11 +593,12 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     } finally {
       setIsBusy(false);
     }
-  }, [answer, applyOutcome, currentStep, isBusy, itemIndex, material]);
+  }, [answer, applyOutcome, currentStep, isBusy, itemIndex, material, voiceNavigationAllowed]);
 
   const handleSubmitPronunciation = useCallback(async () => {
     const service = serviceRef.current;
     if (!service || material?.kind !== 'pronunciation' || !currentStep || isBusy) return;
+    if (!voiceNavigationAllowed()) return;
     if (!answer.trim()) {
       setNotice('Say the target, then type or record what you said.');
       return;
@@ -570,11 +621,12 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     } finally {
       setIsBusy(false);
     }
-  }, [answer, applyOutcome, currentStep, isBusy, material, syncProgress]);
+  }, [answer, applyOutcome, currentStep, isBusy, material, syncProgress, voiceNavigationAllowed]);
 
   const handleSubmitSpeaking = useCallback(async () => {
     const service = serviceRef.current;
     if (!service || !currentStep || isBusy) return;
+    if (!voiceNavigationAllowed()) return;
     if (!answer.trim()) {
       setNotice('Type or record an answer first.');
       return;
@@ -596,11 +648,12 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     } finally {
       setIsBusy(false);
     }
-  }, [answer, applyOutcome, currentStep, isBusy, syncProgress]);
+  }, [answer, applyOutcome, currentStep, isBusy, syncProgress, voiceNavigationAllowed]);
 
   const handleCompleteStep = useCallback(async () => {
     const service = serviceRef.current;
     if (!service || !currentStep || isBusy) return;
+    if (!voiceNavigationAllowed()) return;
     setIsBusy(true);
     setErrorMessage(null);
     try {
@@ -617,10 +670,11 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     } finally {
       setIsBusy(false);
     }
-  }, [currentStep, finishLesson, isBusy, openStep, session, syncProgress]);
+  }, [currentStep, finishLesson, isBusy, openStep, session, syncProgress, voiceNavigationAllowed]);
 
   /** Move to the next item inside a step, or complete the step. */
   const handleNextItem = useCallback(() => {
+    if (!voiceNavigationAllowed()) return;
     if (material?.kind === 'review' && itemIndex + 1 < material.candidates.length) {
       setItemIndex(itemIndex + 1);
       setAnswer('');
@@ -634,11 +688,12 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
       return;
     }
     void handleCompleteStep();
-  }, [handleCompleteStep, itemIndex, material]);
+  }, [handleCompleteStep, itemIndex, material, voiceNavigationAllowed]);
 
   const handleSkipStep = useCallback(async () => {
     const service = serviceRef.current;
     if (!service || !currentStep || isBusy) return;
+    if (!voiceNavigationAllowed()) return;
     setIsBusy(true);
     setErrorMessage(null);
     try {
@@ -656,7 +711,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     } finally {
       setIsBusy(false);
     }
-  }, [currentStep, finishLesson, isBusy, openStep, session, syncProgress]);
+  }, [currentStep, finishLesson, isBusy, openStep, session, syncProgress, voiceNavigationAllowed]);
 
   const handleRetry = useCallback(() => {
     void loadPractice();
@@ -731,6 +786,11 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
             <Text style={styles.voiceButtonText}>
               {status ? status.label : 'Tap to speak'}
             </Text>
+          </TouchableOpacity>
+        ) : null}
+        {status?.state === 'recording' ? (
+          <TouchableOpacity style={styles.linkButton} onPress={() => void handleCancelVoiceAnswer()}>
+            <Text style={styles.linkButtonText}>Cancel voice answer</Text>
           </TouchableOpacity>
         ) : null}
         {status && status.state !== 'idle' && status.hint ? (
@@ -956,11 +1016,9 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     // either: it keeps its honest unavailable status.
     const showSkip =
       currentStep.type !== 'wrap_up' && !itemFeedback && material.kind !== 'unavailable';
-    const voiceBusy =
-      voiceStatus !== null &&
-      (voiceStatus.state === 'recording' ||
-        voiceStatus.state === 'transcribing' ||
-        voiceStatus.state === 'submitting');
+    // Recording / transcribing / checking: the lesson must not move on (and the
+    // handlers above refuse it too, independently of this render).
+    const voiceBusy = voiceWorkActive;
 
     return (
       <View>
@@ -1019,7 +1077,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
                 <TouchableOpacity
                   style={styles.secondaryButton}
                   onPress={() => void handlePlayFeedback()}
-                  disabled={isBusy || voiceStatus.speakingFeedback}
+                  disabled={isBusy || voiceStatus.speakingFeedback || !voiceStatus.canSpeakFeedback}
                 >
                   <Text style={styles.secondaryButtonText}>
                     {voiceStatus.speakingFeedback ? 'Playing feedback…' : 'Hear feedback'}
@@ -1036,14 +1094,18 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
           <TouchableOpacity
             style={styles.primaryButton}
             onPress={() => void handleCompleteStep()}
-            disabled={isBusy}
+            disabled={isBusy || voiceBusy}
           >
             <Text style={styles.primaryButtonText}>
               {material.kind === 'wrap_up' ? 'Finish lesson' : 'Continue'}
             </Text>
           </TouchableOpacity>
         ) : itemFeedback ? (
-          <TouchableOpacity style={styles.primaryButton} onPress={handleNextItem} disabled={isBusy}>
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={handleNextItem}
+            disabled={isBusy || voiceBusy}
+          >
             <Text style={styles.primaryButtonText}>
               {(material.kind === 'review' && itemIndex + 1 < material.candidates.length) ||
               (material.kind === 'listening' && itemIndex + 1 < material.exercises.length)
@@ -1073,13 +1135,19 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
         )}
 
         {showSkip ? (
-          <TouchableOpacity style={styles.linkButton} onPress={() => void handleSkipStep()} disabled={isBusy}>
+          <TouchableOpacity
+            style={styles.linkButton}
+            onPress={() => void handleSkipStep()}
+            disabled={isBusy || voiceBusy}
+          >
             <Text style={styles.linkButtonText}>Skip this step</Text>
           </TouchableOpacity>
         ) : null}
         {showSkip ? (
           <Text style={styles.honestNote}>
-            Skipping is recorded as a skip — it does not count as practice and changes nothing.
+            {voiceBusy
+              ? VOICE_NAVIGATION_BLOCKED_MESSAGE
+              : 'Skipping is recorded as a skip — it does not count as practice and changes nothing.'}
           </Text>
         ) : null}
       </View>

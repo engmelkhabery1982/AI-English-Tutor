@@ -70,6 +70,8 @@ export type AdaptiveVoiceFailureReason =
   | 'submission-failed'
   | 'submission-unavailable'
   | 'speech-failed'
+  /** The lesson moved on: the answer no longer belongs to the active item. */
+  | 'stale-target'
   | 'busy'
   | 'disposed';
 
@@ -140,6 +142,17 @@ export const DISPOSED_MESSAGE = 'This lesson was closed.';
 
 export const FEEDBACK_NOT_READY_MESSAGE =
   'Feedback cannot be played before your answer has been checked.';
+
+/**
+ * A voice answer that finished after the lesson moved on to another item is
+ * discarded: it must never be counted against the new item.
+ */
+export const STALE_TARGET_MESSAGE =
+  'The lesson moved on to a different item, so that answer was discarded. Nothing was saved.';
+
+/** Navigation is refused while the learner's own voice answer is in flight. */
+export const VOICE_NAVIGATION_BLOCKED_MESSAGE =
+  'Your voice answer is still in progress, so this step cannot move on yet. Wait for it to finish, or cancel the recording, then try again.';
 
 export const SPEECH_FAILED_MESSAGE =
   'Feedback could not be played aloud. You can read it below.';
@@ -300,6 +313,22 @@ export function adaptiveVoiceActionLabel(
   }
 }
 
+/**
+ * True while the learner's own voice answer is being captured, transcribed or
+ * checked. Navigation (skip / next / complete step) is refused during these
+ * states so a lesson target can never change mid-operation.
+ */
+export function isAdaptiveVoiceWorkActive(
+  status: Pick<AdaptiveVoiceStatus, 'state'> | null | undefined,
+): boolean {
+  if (!status) return false;
+  return (
+    status.state === 'recording' ||
+    status.state === 'transcribing' ||
+    status.state === 'submitting'
+  );
+}
+
 /** Short honest hint shown under the voice action (no metrics). */
 export function adaptiveVoiceStateHint(state: AdaptiveVoiceState): string | null {
   switch (state) {
@@ -403,6 +432,17 @@ export class AdaptiveLessonVoiceController {
 
   private state: AdaptiveVoiceState = 'idle';
   private target: AdaptiveVoiceTarget | null = null;
+  /**
+   * The exact target an in-flight recording/transcription/submission started
+   * on. Async voice work reads ONLY this, never the live `target`, so a late
+   * transcript can never be re-routed to a different item/step.
+   */
+  private capturedTarget: AdaptiveVoiceTarget | null = null;
+  /**
+   * State to settle back into after transient playback. `feedback` survives a
+   * prompt replay so an already-evaluated answer stays playable.
+   */
+  private restingState: 'idle' | 'feedback' = 'idle';
   private transcript: string | null = null;
   private errorMessage: string | null = null;
   private replayCount = 0;
@@ -443,6 +483,8 @@ export class AdaptiveLessonVoiceController {
     this.transcript = null;
     this.lastOutcome = null;
     this.errorMessage = null;
+    // The previous item's evaluated feedback is not this item's feedback.
+    this.restingState = 'idle';
 
     if (this.state === 'recording') {
       // Never send audio for a different item.
@@ -450,10 +492,49 @@ export class AdaptiveLessonVoiceController {
     } else if (this.state !== 'submitting' && this.state !== 'transcribing') {
       if (this.state !== 'idle') this.setState('idle');
     }
+    // Any in-flight async operation keeps its captured target; it is compared
+    // against the new one before it is allowed to submit.
     void this.stopSpeakingInternal();
     this.speakToken += 1;
     this.speakingFeedback = false;
     this.notify();
+  }
+
+  /**
+   * Is this captured target still the item the learner is answering?
+   * Compared by the same stable key used for dedup, so a step/item change can
+   * never be mistaken for the same target.
+   */
+  private isTargetStillActive(target: AdaptiveVoiceTarget | null): boolean {
+    if (!target || !this.target) return false;
+    return voiceTargetKey(target) === voiceTargetKey(this.target);
+  }
+
+  /** True only when a REAL, already-evaluated answer exists for this item. */
+  private feedbackReady(): boolean {
+    return this.restingState === 'feedback' && this.lastOutcome !== null;
+  }
+
+  /**
+   * Settle the lifecycle after transient playback: back to the feedback-ready
+   * state when a real evaluated answer exists, otherwise to `fallback`.
+   */
+  private settleAfterPlayback(fallback: AdaptiveVoiceState): void {
+    this.state = this.feedbackReady() ? 'feedback' : fallback;
+    this.notify();
+  }
+
+  /**
+   * Discard an async answer whose item is no longer the active one.
+   * Nothing is submitted, counted or advanced — and no stale transcript is
+   * shown for the new item.
+   */
+  private discardStaleTarget(): AdaptiveVoiceFailure {
+    this.transcript = null;
+    this.errorMessage = null;
+    this.state = this.feedbackReady() ? 'feedback' : 'idle';
+    this.notify();
+    return this.fail('stale-target', STALE_TARGET_MESSAGE);
   }
 
   getTarget(): AdaptiveVoiceTarget | null {
@@ -550,10 +631,10 @@ export class AdaptiveLessonVoiceController {
       await tts.speak(text);
     } catch {
       if (token === this.speakToken) {
-        this.state = 'idle';
-        this.notify();
+        // A failed replay must not destroy feedback that really exists.
+        this.settleAfterPlayback('error');
       }
-      return this.fail('speech-unavailable', SPEECH_UNAVAILABLE_MESSAGE);
+      return this.fail('speech-failed', SPEECH_UNAVAILABLE_MESSAGE);
     }
 
     if (token !== this.speakToken) {
@@ -564,8 +645,9 @@ export class AdaptiveLessonVoiceController {
     // The exercise audio really played: the real replay count is preserved for
     // the existing listening evaluation path.
     if (target.kind === 'listening') this.replayCount += 1;
-    this.state = 'idle';
-    this.notify();
+    // Replaying the prompt after a real answer must NOT erase feedback
+    // readiness: the evaluated outcome is still on screen and still playable.
+    this.settleAfterPlayback('idle');
     return { ok: true };
   }
 
@@ -589,6 +671,10 @@ export class AdaptiveLessonVoiceController {
     const stt = this.stt;
     if (!recorder || !stt) return this.fail('voice-unavailable', VOICE_UNAVAILABLE_MESSAGE);
 
+    // This recording belongs to THIS target from here on. Everything below
+    // reads the captured value, never the live `target`.
+    this.capturedTarget = target;
+    this.restingState = 'idle';
     this.errorMessage = null;
     this.transcript = null;
     this.pendingStart = true;
@@ -600,14 +686,21 @@ export class AdaptiveLessonVoiceController {
       this.speakToken += 1;
       this.speakingFeedback = false;
       if (this.disposed) return this.fail('disposed', DISPOSED_MESSAGE);
-      if (this.state === 'playing_prompt') this.setState('idle');
+      this.settleAfterPlayback('idle');
 
       // 2. Permission — a denial records and submits nothing.
       const granted = await this.ensureMicrophonePermission(recorder);
       if (this.disposed) return this.fail('disposed', DISPOSED_MESSAGE);
       if (!granted) return this.fail('permission-denied', PERMISSION_DENIED_MESSAGE);
 
-      // 3. Only now may the recorder start.
+      // 3. The item must still be the active one: never open the microphone
+      // for a target the learner already left.
+      if (!this.isTargetStillActive(target)) {
+        this.pendingStart = false;
+        return this.discardStaleTarget();
+      }
+
+      // 4. Only now may the recorder start.
       await recorder.startRecording();
       if (this.disposed) {
         await this.discardRecording();
@@ -630,8 +723,10 @@ export class AdaptiveLessonVoiceController {
    */
   async stopRecordingAndSubmit(): Promise<AdaptiveVoiceAnswerResult | AdaptiveVoiceFailure> {
     if (this.disposed) return this.fail('disposed', DISPOSED_MESSAGE);
-    const target = this.target;
-    if (!target) return this.fail('no-target', NO_VOICE_TARGET_MESSAGE);
+    // The recording is bound to the target it was started on — never to
+    // whatever item happens to be active when it finishes.
+    const target = this.capturedTarget;
+    if (!target) return this.fail('busy', BUSY_MESSAGE);
     if (this.state !== 'recording') return this.fail('busy', BUSY_MESSAGE);
 
     const recorder = this.recorder;
@@ -648,6 +743,9 @@ export class AdaptiveLessonVoiceController {
       return this.fail('recording-failed', RECORDING_FAILED_MESSAGE);
     }
     if (this.disposed) return this.fail('disposed', DISPOSED_MESSAGE);
+    // The item changed while the audio was being captured: never transcribe
+    // (or submit) audio that belongs to a different item.
+    if (!this.isTargetStillActive(target)) return this.discardStaleTarget();
 
     let transcript = '';
     try {
@@ -672,9 +770,12 @@ export class AdaptiveLessonVoiceController {
     }
     // An unmounted/closed lesson must never submit late audio.
     if (this.disposed) return this.fail('disposed', DISPOSED_MESSAGE);
+    // The item changed while the speech was being transcribed: the late
+    // transcript is discarded (no submission, no evidence, no progress).
+    if (!this.isTargetStillActive(target)) return this.discardStaleTarget();
 
     this.transcript = transcript;
-    return this.submitTranscript(transcript);
+    return this.submitTranscript(target, transcript, true);
   }
 
   /**
@@ -683,9 +784,12 @@ export class AdaptiveLessonVoiceController {
    */
   async submitTypedAnswer(answer: string): Promise<AdaptiveVoiceAnswerResult | AdaptiveVoiceFailure> {
     if (this.disposed) return this.fail('disposed', DISPOSED_MESSAGE);
+    // A typed answer is for the CURRENT item, so voice work in flight (which
+    // owns that same item) must finish or be cancelled first.
     if (this.isBusy()) return this.fail('busy', BUSY_MESSAGE);
-    if (!this.target) return this.fail('no-target', NO_VOICE_TARGET_MESSAGE);
-    return this.submitTranscript(answer);
+    const target = this.target;
+    if (!target) return this.fail('no-target', NO_VOICE_TARGET_MESSAGE);
+    return this.submitTranscript(target, answer, false);
   }
 
   /** Abandon an active recording without transcribing or submitting it. */
@@ -693,8 +797,12 @@ export class AdaptiveLessonVoiceController {
     if (this.state === 'recording') {
       await this.discardRecording();
       this.transcript = null;
+      this.capturedTarget = null;
       if (this.state === 'recording') this.setState('idle');
+    } else if (this.pendingStart) {
+      this.capturedTarget = null;
     }
+    this.restingState = 'idle';
     this.pendingStart = false;
   }
 
@@ -711,7 +819,9 @@ export class AdaptiveLessonVoiceController {
       .join(' ')
       .trim();
     if (!text) return this.fail('no-target', NO_VOICE_TARGET_MESSAGE);
-    if (this.state !== 'feedback' || this.lastOutcome === null) {
+    // Feedback audio requires a REAL evaluated outcome for the ACTIVE item:
+    // never before an answer, and never for an item the lesson left behind.
+    if (this.state !== 'feedback' || !this.feedbackReady()) {
       return this.fail('busy', FEEDBACK_NOT_READY_MESSAGE);
     }
     const tts = this.tts;
@@ -742,7 +852,10 @@ export class AdaptiveLessonVoiceController {
     await this.stopSpeakingInternal();
     this.speakToken += 1;
     this.speakingFeedback = false;
-    if (this.state === 'playing_prompt') this.setState('idle');
+    if (this.state === 'playing_prompt') {
+      // Stopping a replay keeps an already-evaluated answer playable.
+      this.settleAfterPlayback('idle');
+    }
     this.notify();
   }
 
@@ -754,11 +867,14 @@ export class AdaptiveLessonVoiceController {
   async dispose(): Promise<void> {
     this.disposed = true;
     this.pendingStart = false;
+    this.capturedTarget = null;
+    this.restingState = 'idle';
     await this.discardRecording();
     await this.stopSpeakingInternal();
     this.speakToken += 1;
     this.speakingFeedback = false;
     this.transcript = null;
+    this.lastOutcome = null;
     this.state = 'idle';
     this.listeners.clear();
   }
@@ -838,16 +954,25 @@ export class AdaptiveLessonVoiceController {
   }
 
   private async submitTranscript(
+    target: AdaptiveVoiceTarget,
     rawAnswer: string,
+    fromVoice: boolean,
   ): Promise<AdaptiveVoiceAnswerResult | AdaptiveVoiceFailure> {
-    const target = this.target;
-    if (!target) return this.fail('no-target', NO_VOICE_TARGET_MESSAGE);
+    // The answer belongs to the target it was produced for. If the lesson has
+    // moved on, it is discarded — never re-routed to the new item.
+    if (!this.isTargetStillActive(target)) return this.discardStaleTarget();
     const answer = rawAnswer.trim();
     if (!answer) return this.fail('empty-answer', EMPTY_ANSWER_MESSAGE);
     // Never submit while the microphone is open, while it is being opened or
-    // while another submission is already in flight. (Being in `transcribing`
-    // is exactly the state that leads here, so it is not a conflict.)
-    if (this.pendingStart || this.state === 'recording' || this.state === 'submitting') {
+    // while another submission is already in flight. A voice answer arriving
+    // from `transcribing` is the exception: that state leads here by design.
+    const voiceArrival = fromVoice && this.state === 'transcribing';
+    if (
+      this.pendingStart ||
+      this.state === 'recording' ||
+      this.state === 'submitting' ||
+      (!voiceArrival && this.state === 'transcribing')
+    ) {
       return this.fail('busy', BUSY_MESSAGE);
     }
 
@@ -858,6 +983,7 @@ export class AdaptiveLessonVoiceController {
       // engine is NOT asked again and nothing is counted twice.
       this.transcript = answer;
       this.lastOutcome = cached;
+      this.restingState = 'feedback';
       this.setState('feedback');
       return { ok: true, outcome: cached, transcript: answer, duplicate: true };
     }
@@ -875,16 +1001,33 @@ export class AdaptiveLessonVoiceController {
       return this.fail('submission-unavailable', SUBMISSION_UNAVAILABLE_MESSAGE);
     }
 
+    if (!this.isTargetStillActive(target)) {
+      // The answer was evaluated for the item it belonged to, but the lesson
+      // moved on while it was in flight: never re-arm feedback readiness (and
+      // never show a stale transcript) for the newly active item.
+      if (outcome.result.kind !== 'none') this.outcomes.set(key, outcome);
+      this.transcript = null;
+      this.lastOutcome = null;
+      this.restingState = 'idle';
+      this.state = 'idle';
+      this.notify();
+      return { ok: true, outcome, transcript: answer, duplicate: false };
+    }
+
     this.transcript = answer;
     if (outcome.result.kind === 'none') {
       // The owning system refused the answer (e.g. the item is no longer part
       // of this step): nothing was evaluated or counted, so it is not cached
       // and the learner can try again.
+      this.restingState = 'idle';
       this.setState('idle');
       return { ok: true, outcome, transcript: answer, duplicate: false };
     }
     this.outcomes.set(key, outcome);
     this.lastOutcome = outcome;
+    // A real evaluated answer: feedback stays playable from here on, through
+    // prompt replays, until the item changes.
+    this.restingState = 'feedback';
     this.setState('feedback');
     return { ok: true, outcome, transcript: answer, duplicate: false };
   }
@@ -902,7 +1045,10 @@ export class AdaptiveLessonVoiceController {
    */
   private fail(reason: AdaptiveVoiceFailureReason, message: string): AdaptiveVoiceFailure {
     const preservesState =
-      reason === 'busy' || reason === 'no-target' || reason === 'speech-failed';
+      reason === 'busy' ||
+      reason === 'no-target' ||
+      reason === 'speech-failed' ||
+      reason === 'stale-target';
     if (!preservesState) {
       this.errorMessage = message;
       if (!this.disposed) {
