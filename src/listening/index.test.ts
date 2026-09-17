@@ -46,6 +46,7 @@ import { createListeningService, MAX_SESSION_EXERCISES } from './index';
 import type { ListeningExercise } from './types';
 import type { AIProvider, AIProviderResult } from '../providers/ai/types';
 import { ProgressDashboardService } from '../progress-dashboard/service';
+import { VocabularyWorkspaceService } from '../vocabulary-workspace/service';
 import { ReviewService } from '../review/service';
 import { ReviewEvaluator } from '../review/evaluator';
 
@@ -969,5 +970,153 @@ describe('Default composition & honest Progress', () => {
     const serialized = JSON.stringify(snapshot);
     expect(serialized).not.toMatch(/listeningScore"?\s*:\s*(0\.\d+|\d+)/);
     expect(serialized).not.toMatch(/"listening_score"|"band"/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// No dead-end lexical items (final data-integrity fix): items saved without
+// a known meaning can be completed through the EXISTING workspace service.
+// ---------------------------------------------------------------------------
+describe('First-meaning completion via the existing workspace', () => {
+  it('an item saved without a meaning can be completed by the workspace (no dead end)', async () => {
+    const ctx = await createContext();
+    const listening = createService(ctx, { withProgress: false });
+
+    // Save WITHOUT a known meaning (honest empty meanings).
+    const saved = await listening.saveVocabulary(ctx.learnerId, 'commute', {
+      exampleText: 'My commute takes about forty minutes.',
+    });
+    expect(saved.item.meanings).toEqual([]);
+
+    const workspace = new VocabularyWorkspaceService({
+      vocabulary: ctx.vocabulary,
+      expressions: ctx.expressions,
+      profile: ctx.profileRepo,
+    });
+
+    // Add the FIRST real meaning through the existing workspace service.
+    const entry = await workspace.addFirstMeaning({
+      entryId: saved.item.id,
+      kind: 'vocabulary',
+      definition: 'A regular trip between home and work or school.',
+      exampleTexts: ['My commute takes about forty minutes.'],
+    });
+    expect(entry.meaningCount).toBe(1);
+    expect(entry.primaryMeaning).toBe('A regular trip between home and work or school.');
+
+    // Persisted reload contains that meaning with clean review data.
+    const reloaded = await ctx.vocabulary.get(saved.item.id);
+    expect(reloaded).not.toBeNull();
+    expect(reloaded!.meanings).toHaveLength(1);
+    expect(reloaded!.meanings[0].definition).toBe('A regular trip between home and work or school.');
+    expect(reloaded!.meanings[0].examples[0].text).toBe('My commute takes about forty minutes.');
+    expect(reloaded!.meanings[0].review?.state).toBe('new');
+    expect(reloaded!.meanings[0].review?.reviewCount).toBe(0);
+    expect(reloaded!.meanings[0].review?.lastReviewAt).toBeUndefined();
+
+    // Same lexical item (id preserved), source/tags preserved, no duplicate.
+    expect(reloaded!.id).toBe(saved.item.id);
+    expect(reloaded!.source.addedBy).toBe('learner-created');
+    expect(reloaded!.tags).toContain('listening');
+    const all = await ctx.vocabulary.list(ctx.learnerId, { limit: 100 });
+    expect(all).toHaveLength(1);
+
+    // Guard: adding a "first" meaning to an item that now HAS one throws
+    // and changes nothing (no duplicates, no resets).
+    await expect(
+      workspace.addFirstMeaning({
+        entryId: saved.item.id,
+        kind: 'vocabulary',
+        definition: 'Another meaning',
+      }),
+    ).rejects.toThrow(/already has a meaning/i);
+    const unchanged = await ctx.vocabulary.get(saved.item.id);
+    expect(unchanged!.meanings).toHaveLength(1);
+    expect(unchanged!.meanings[0].definition).toBe('A regular trip between home and work or school.');
+
+    // Empty definitions are rejected (no fake/placeholder semantics).
+    const empty = await listening.saveVocabulary(ctx.learnerId, 'errand', {});
+    await expect(
+      workspace.addFirstMeaning({ entryId: empty.item.id, kind: 'vocabulary', definition: '   ' }),
+    ).rejects.toThrow(/empty/i);
+  });
+
+  it('expressions support first-meaning completion the same way', async () => {
+    const ctx = await createContext();
+    const listening = createService(ctx, { withProgress: false });
+    const saved = await listening.saveExpression(ctx.learnerId, 'touch base', {
+      exampleText: 'Let us touch base tomorrow morning.',
+    });
+    expect(saved!.item.meanings).toEqual([]);
+
+    const workspace = new VocabularyWorkspaceService({
+      vocabulary: ctx.vocabulary,
+      expressions: ctx.expressions,
+      profile: ctx.profileRepo,
+    });
+    const entry = await workspace.addFirstMeaning({
+      entryId: saved!.item.id,
+      kind: 'expression',
+      definition: 'To make brief contact with someone to update each other.',
+    });
+    expect(entry.meaningCount).toBe(1);
+
+    const reloaded = await ctx.expressions.get(saved!.item.id);
+    expect(reloaded!.meanings[0].definition).toBe('To make brief contact with someone to update each other.');
+    expect(reloaded!.meanings[0].review?.state).toBe('new');
+    expect(reloaded!.id).toBe(saved!.item.id);
+    const all = await ctx.expressions.list(ctx.learnerId, { limit: 100 });
+    expect(all).toHaveLength(1);
+  });
+
+  it('existing items with meanings and review history are untouched by the new operation', async () => {
+    const ctx = await createContext();
+    const existing = await saveVocab(ctx, 'deadline', 'a final time limit');
+    await ctx.vocabulary.update(existing.id, {
+      meanings: [
+        {
+          ...existing.meanings[0],
+          review: {
+            state: 'familiar' as const,
+            lastReviewAt: NOW,
+            nextReviewAt: '2026-09-25T00:00:00.000Z',
+            reviewCount: 4,
+            consecutiveCorrect: 3,
+          },
+        },
+      ],
+    });
+
+    const workspace = new VocabularyWorkspaceService({
+      vocabulary: ctx.vocabulary,
+      expressions: ctx.expressions,
+      profile: ctx.profileRepo,
+    });
+    // addFirstMeaning refuses (item already has a meaning)…
+    await expect(
+      workspace.addFirstMeaning({
+        entryId: existing.id,
+        kind: 'vocabulary',
+        definition: 'something else',
+      }),
+    ).rejects.toThrow(/already has a meaning/i);
+
+    // …and the review history is exactly as before.
+    const after = await ctx.vocabulary.get(existing.id);
+    expect(after!.meanings[0].review?.reviewCount).toBe(4);
+    expect(after!.meanings[0].review?.consecutiveCorrect).toBe(3);
+    expect(after!.meanings[0].definition).toBe('a final time limit');
+  });
+
+  it('the screens expose the complete-first-meaning flow honestly', () => {
+    const vocabSrc = readFileSync(join(__dirname, '../screens/VocabularyScreen.tsx'), 'utf8');
+    expect(vocabSrc).toContain('addFirstMeaning');
+    expect(vocabSrc).toContain('add_first_meaning_input');
+
+    const listeningSrc = readFileSync(join(__dirname, '../screens/ListeningScreen.tsx'), 'utf8');
+    // The listening message stays honest (and is now true).
+    expect(listeningSrc).toContain('you can add one in the Vocabulary tab');
+    // Still no placeholder definitions anywhere.
+    expect(listeningSrc).not.toContain('Heard in:');
   });
 });

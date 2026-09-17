@@ -186,6 +186,16 @@ export function resolvePracticeAction(decision: PracticeDecision): PracticeActio
 }
 
 /** Editable content of one meaning (system-owned review data is never editable here). */
+/** Input for adding the FIRST meaning to a lexical item with no meanings yet. */
+export interface FirstMeaningInput {
+  readonly entryId: string;
+  readonly kind: WorkspaceItemKind;
+  /** A real, learner-supplied definition — never a placeholder. */
+  readonly definition: string;
+  /** Optional example sentences (e.g. the listening sentence as context). */
+  readonly exampleTexts?: readonly string[];
+}
+
 export interface MeaningContentEdit {
   readonly entryId: string;
   readonly kind: WorkspaceItemKind;
@@ -306,6 +316,53 @@ export class VocabularyWorkspaceService {
       throw new Error('Item disappeared after update.');
     }
     return toWorkspaceEntry(updated, edit.kind, at);
+  }
+
+  /**
+   * Add the FIRST real meaning to a lexical item whose meanings array is
+   * empty (e.g. an item saved from listening practice without a known
+   * meaning), so such items never become dead ends in the workspace.
+   *
+   * - Uses the EXISTING repository layer; the lexical item id, source,
+   *   tags and pronunciation data are preserved (only `meanings` changes).
+   * - Creates a meaning ONLY from a non-empty learner-supplied definition
+   *   — placeholders are never fabricated.
+   * - No review field is written: the repository's normal defaults apply
+   *   (state 'new', zero counts) — review history is never fabricated and
+   *   existing data is never reset.
+   * - Refuses to run when the item already has meanings (use
+   *   updateMeaningContent instead), so nothing can be duplicated.
+   */
+  async addFirstMeaning(input: FirstMeaningInput, now?: IsoDate): Promise<WorkspaceEntry> {
+    const at = now ?? new Date().toISOString();
+    const repo = input.kind === 'expression' ? this.deps.expressions : this.deps.vocabulary;
+
+    const item = await repo.get(input.entryId);
+    if (!item) {
+      throw new Error('Item not found. It may have been deleted already.');
+    }
+    if ((item.meanings ?? []).length > 0) {
+      throw new Error('This item already has a meaning — edit the existing meaning instead.');
+    }
+    const definition = input.definition.trim();
+    if (definition.length === 0) {
+      throw new Error('Definition cannot be empty.');
+    }
+
+    const examples: UsageExample[] = (input.exampleTexts ?? [])
+      .map((text) => text.trim())
+      .filter((text) => text.length > 0)
+      .map((text) => ({ text, source: 'learner-created' as const, createdAt: at }));
+
+    const firstMeaning: Meaning = { definition, examples };
+
+    await repo.update(input.entryId, { meanings: [firstMeaning] });
+
+    const updated = await repo.get(input.entryId);
+    if (!updated) {
+      throw new Error('Item disappeared after update.');
+    }
+    return toWorkspaceEntry(updated, input.kind, at);
   }
 
   /**
