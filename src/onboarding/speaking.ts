@@ -111,10 +111,15 @@ export interface DiagnosticSpeakingStep {
    * Absorbs turns that the EXISTING voice coordinator committed directly into
    * the session (mic → STT → session.send → TTS). Driven by the real committed
    * history, so calling it repeatedly never double-counts.
+   *
+   * AWAITABLE: the promise resolves only once the committed turns have actually
+   * been absorbed (and any real feedback evidence persisted through the EXISTING
+   * service), so the caller must never read `getSpeakingEvidence()` /
+   * `getLanguageUseEvidence()` before awaiting it.
    */
   observeCommittedHistory(options?: {
     readonly purpose?: 'speaking' | 'language_use';
-  }): void;
+  }): Promise<void>;
 
   /** Structured speaking evidence gathered so far (no invented values). */
   getSpeakingEvidence(): DiagnosticSpeakingEvidence;
@@ -296,9 +301,9 @@ export function createDiagnosticSpeakingStep(input: {
       return result;
     },
 
-    observeCommittedHistory: (options) => {
+    observeCommittedHistory: async (options) => {
       if (abandoned) return;
-      void absorbCommittedHistory(options?.purpose ?? 'speaking');
+      await absorbCommittedHistory(options?.purpose ?? 'speaking');
     },
 
     getSpeakingEvidence: () => speaking,

@@ -108,10 +108,19 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
   const pendingPurposeRef = useRef<'speaking' | 'language_use' | 'pronunciation'>('speaking');
   /** The diagnostic step TOKEN captured when that recording started. */
   const pendingStepTokenRef = useRef<number | null>(null);
+  /**
+   * ONE integrity rule: diagnostic step navigation is blocked while ANY answer /
+   * evaluation / evidence operation for the current step is unresolved. This is a
+   * SYNCHRONOUS ref (not the `busy` render state), so a fast repeated press cannot
+   * slip through before a rerender.
+   */
+  const diagnosticOperationInFlightRef = useRef<boolean>(false);
   /** Re-entrancy guards: a double press can never submit/advance twice. */
   const micInFlightRef = useRef<boolean>(false);
   const answerInFlightRef = useRef<boolean>(false);
   const continueInFlightRef = useRef<boolean>(false);
+  /** The listening evaluation currently running (re-entrancy + token binding). */
+  const listeningInFlightRef = useRef<boolean>(false);
   const mountedRef = useRef<boolean>(true);
 
   // Listening step.
@@ -276,6 +285,12 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           const purpose = pendingPurposeRef.current;
           const stepToken = pendingStepTokenRef.current;
 
+          // The recorded voice operation is unresolved until the very end of
+          // this block: for pronunciation that includes the PronunciationEngine
+          // analysis AFTER STT; for conversation it includes the awaited
+          // evidence absorption and the DiagnosticSession record.
+          diagnosticOperationInFlightRef.current = true;
+          try {
           if (purpose === 'pronunciation') {
             // TRANSCRIPTION-ONLY: the repeat never enters the ConversationSession
             // (no learner turn, no tutor reply, no feedback, no vocabulary, no
@@ -299,7 +314,10 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
             // and records it against the step the turn was STARTED in.
             const outcome = await coordinator.stopRecordingAndProcess();
             if (!mountedRef.current) return;
-            handle.speaking.observeCommittedHistory({ purpose });
+            // AWAIT the absorption BEFORE reading the evidence snapshot: the
+            // committed voice turn must really be counted first.
+            await handle.speaking.observeCommittedHistory({ purpose });
+            if (!mountedRef.current) return;
             const token = stepToken ?? handle.session.getCurrentStepToken();
             if (purpose === 'language_use') {
               handle.session.recordLanguageUse(handle.speaking.getLanguageUseEvidence(), token);
@@ -312,6 +330,10 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           }
 
           setTurns(handle.conversation.getHistory().length);
+          } finally {
+            // The operation is resolved: navigation is allowed again.
+            diagnosticOperationInFlightRef.current = false;
+          }
         } finally {
           setBusy(false);
         }
@@ -335,10 +357,18 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     const answer = textAnswer.trim();
     if (!handle || !service || !answer || answerInFlightRef.current) return;
     answerInFlightRef.current = true;
+    diagnosticOperationInFlightRef.current = true;
     setBusy(true);
     setTurnError(null);
     try {
-      const onLanguageUse = handle.session.getCurrentStepId() === 'language_use';
+      // The step AND its token are captured at submission start: a late answer
+      // can never become evidence for the next diagnostic step.
+      const stepId = handle.session.getCurrentStepId();
+      const stepToken = handle.session.getCurrentStepToken();
+      const onLanguageUse = stepId === 'language_use';
+
+      // Text submission goes through the SERVICE (same existing session path),
+      // which internally awaits the committed turn and records its own evidence.
       const outcome = onLanguageUse
         ? await service.recordLanguageUseAnswer(handle, answer)
         : await service.recordSpeakingAnswer(handle, answer);
@@ -346,10 +376,21 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       if (!outcome.ok) {
         setTurnError(outcome.errorMessage ?? 'That answer could not be evaluated. Nothing was recorded.');
       }
+      // The service recorded the evidence against the CURRENT step; if the flow
+      // somehow moved on, re-record only for the captured step and never for a
+      // different one (the state machine refuses stale tokens anyway).
+      if (handle.session.getCurrentStepId() !== stepId) {
+        setTurnError('That answer arrived after the step changed, so it was not recorded.');
+      } else if (onLanguageUse) {
+        handle.session.recordLanguageUse(handle.speaking.getLanguageUseEvidence(), stepToken);
+      } else {
+        handle.session.recordSpeaking(handle.speaking.getSpeakingEvidence(), stepToken);
+      }
       setTextAnswer('');
       setTurns(handle.conversation.getHistory().length);
     } finally {
       answerInFlightRef.current = false;
+      diagnosticOperationInFlightRef.current = false;
       setBusy(false);
     }
   }, [textAnswer]);
@@ -365,8 +406,22 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     if (!handle || !service || continueInFlightRef.current) return;
     setTurnError(null);
 
-    // Any current voice work for this step blocks navigation: permission prompt,
-    // recording, transcription, the tutor thinking, or the tutor speaking.
+    // ONE integrity rule: no step change while any answer/evaluation/evidence
+    // operation for the CURRENT step is unresolved — including work that keeps
+    // running after the voice coordinator returned to idle (pronunciation
+    // analysis, listening evaluation) and typed answers.
+    if (
+      diagnosticOperationInFlightRef.current ||
+      micInFlightRef.current ||
+      answerInFlightRef.current ||
+      listeningInFlightRef.current
+    ) {
+      setTurnError('Wait for your answer to finish before continuing.');
+      return;
+    }
+
+    // Any current voice work for this step blocks navigation too: permission
+    // prompt, recording, transcription, the tutor thinking, or the tutor speaking.
     const voice = coordinatorRef.current?.getStatus();
     if (
       voice &&
@@ -434,17 +489,27 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     const handle = handleRef.current;
     if (!handle || exercise) return;
     let active = true;
+    // Planning the (single) listening task is an unresolved operation for this
+    // step: navigating away before it settles would skip the step silently.
+    diagnosticOperationInFlightRef.current = true;
     void (async () => {
       const service = serviceRef.current;
-      if (!service) return;
-      const planned = await service.startListeningTask(handle);
-      if (!active) return;
-      if (planned.status === 'ready') {
-        setExercise(planned.exercise);
-        setListeningNote(null);
-      } else {
-        // Unavailable infrastructure is stated plainly — never a learner error.
-        setListeningNote(planned.message);
+      if (!service) {
+        diagnosticOperationInFlightRef.current = false;
+        return;
+      }
+      try {
+        const planned = await service.startListeningTask(handle);
+        if (!active) return;
+        if (planned.status === 'ready') {
+          setExercise(planned.exercise);
+          setListeningNote(null);
+        } else {
+          // Unavailable infrastructure is stated plainly — never a learner error.
+          setListeningNote(planned.message);
+        }
+      } finally {
+        if (active) diagnosticOperationInFlightRef.current = false;
       }
     })();
     return () => {
@@ -471,11 +536,30 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     if (!handle || !service || !exercise) return;
     const answer = listeningAnswer.trim();
     if (!answer) return;
+    // A double press is refused, so the existing ListeningService can never be
+    // asked to evaluate (and persist) the same task twice.
+    if (listeningInFlightRef.current) return;
+
+    listeningInFlightRef.current = true;
+    diagnosticOperationInFlightRef.current = true;
     setBusy(true);
     try {
-      const outcome = await service.recordListeningAnswer(handle, exercise, answer);
+      // The listening step token is captured BEFORE evaluation starts, so the
+      // evidence is recorded against the step this answer belonged to — a late
+      // result from a changed step is refused by the state machine.
+      const stepToken = handle.session.getCurrentStepToken();
+      // The captured token travels with the call: the EXISTING ListeningService
+      // stays the persistence owner, and the diagnostic evidence can only land on
+      // the step this answer was given in.
+      const outcome = await service.recordListeningAnswer(handle, exercise, answer, { stepToken });
+      if (!mountedRef.current) return;
       setListeningNote(outcome.message);
+      if (!outcome.ok) {
+        setTurnError(outcome.message);
+      }
     } finally {
+      listeningInFlightRef.current = false;
+      diagnosticOperationInFlightRef.current = false;
       setBusy(false);
     }
   }, [exercise, listeningAnswer]);

@@ -1271,7 +1271,7 @@ describe('Onboarding — integration with the rest of the app', () => {
     expect(outcome.ok).toBe(false);
 
     // Nothing was committed, so the diagnostic absorbs no evidence at all.
-    step.observeCommittedHistory();
+    await step.observeCommittedHistory();
     expect(session.getHistory()).toEqual([]);
     expect(step.getSpeakingEvidence().committedLearnerTurns).toBe(0);
     expect(step.getSpeakingEvidence().committedTutorTurns).toBe(0);
@@ -1294,8 +1294,8 @@ describe('Onboarding — integration with the rest of the app', () => {
     const outcome = await coordinator.stopRecordingAndProcess();
     expect(outcome.ok).toBe(true);
 
-    step.observeCommittedHistory();
-    step.observeCommittedHistory(); // repeated observation never double-counts
+    await step.observeCommittedHistory();
+    await step.observeCommittedHistory(); // repeated observation never double-counts
     const evidence = step.getSpeakingEvidence();
     expect(evidence.committedLearnerTurns).toBe(1);
     expect(evidence.committedTutorTurns).toBe(1);
@@ -1928,8 +1928,8 @@ describe('Onboarding — integration with the rest of the app', () => {
     expect(second).toEqual(first);
     expect(second.committedLearnerTurns).toBe(1);
 
-    step.observeCommittedHistory();
-    step.observeCommittedHistory();
+    await step.observeCommittedHistory();
+    await step.observeCommittedHistory();
     expect(step.getSpeakingEvidence().committedLearnerTurns).toBe(1);
 
     const mistakes = await new SQLiteMistakeRepository(adapter).listMistakes(learnerId);
@@ -2314,6 +2314,421 @@ describe('Onboarding — integration with the rest of the app', () => {
       expect(strongest.status).toBe('estimated');
       expect(strongest.level).toBe('B2');
       expect(strongest.confidence).toBe('strong');
+    });
+  });
+
+  describe('Diagnostic async integrity — no step change while evidence work runs', () => {
+    it('81. voice evidence absorption is AWAITED before the evidence snapshot is read', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      const learnerId = (await seedProfile(adapter)).id;
+      const persistence = createLearningPersistenceService(adapter, learnerId);
+      const provider = createFeedbackProvider([
+        { content: 'Let us fix that.', feedback: INCORRECT_FEEDBACK },
+      ]);
+      const session = buildSpeakingSession(provider, 'coach');
+      const step = createDiagnosticSpeakingStep({
+        session,
+        mode: 'coach',
+        isRealAI: true,
+        learningPersistence: persistence,
+      });
+
+      // A real voice turn committed through the EXISTING coordinator.
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider({ defaultTranscript: 'Yesterday I go to work by bus.' }),
+        ttsProvider: createDemoTTSProvider(),
+      });
+      await coordinator.startRecording();
+      await coordinator.stopRecordingAndProcess();
+
+      // The AWAITED absorption resolves only after the real evidence (and its
+      // persistence through the EXISTING owner) is applied…
+      await step.observeCommittedHistory();
+
+      // …so the snapshot read right after it already contains the turn.
+      const evidence = step.getSpeakingEvidence();
+      expect(evidence.committedLearnerTurns).toBe(1);
+      expect(evidence.incorrectCorrections).toBe(1);
+      const mistakes = await new SQLiteMistakeRepository(adapter).listMistakes(learnerId);
+      expect(mistakes.length).toBe(1);
+      expect(mistakes[0].occurrenceCount).toBe(1);
+    });
+
+    it('82. the awaited absorption is what the diagnostic records for language use', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      const learnerId = (await seedProfile(adapter)).id;
+      const session = buildSpeakingSession(
+        createFeedbackProvider([{ content: 'Almost.', feedback: UNNATURAL_FEEDBACK }]),
+        'coach',
+      );
+      const step = createDiagnosticSpeakingStep({
+        session,
+        mode: 'coach',
+        isRealAI: true,
+        learningPersistence: createLearningPersistenceService(adapter, learnerId),
+      });
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider({ defaultTranscript: 'I am agree with the plan.' }),
+        ttsProvider: createDemoTTSProvider(),
+      });
+
+      await coordinator.startRecording();
+      await coordinator.stopRecordingAndProcess();
+      await step.observeCommittedHistory({ purpose: 'language_use' });
+
+      const languageUse = step.getLanguageUseEvidence();
+      expect(languageUse.answered).toBe(1);
+      expect(languageUse.unnatural).toBe(1);
+      expect(step.getSpeakingEvidence().committedLearnerTurns).toBe(0); // never double-counted
+    });
+
+    it('83. awaiting absorption twice never doubles the evidence (idempotent)', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      await seedProfile(adapter);
+      const session = buildSpeakingSession(createStubProvider(['A reply.']), 'coach');
+      const step = createDiagnosticSpeakingStep({ session, mode: 'coach', isRealAI: true });
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider({ defaultTranscript: 'I manage a small team.' }),
+        ttsProvider: createDemoTTSProvider(),
+      });
+      await coordinator.startRecording();
+      await coordinator.stopRecordingAndProcess();
+
+      await step.observeCommittedHistory();
+      await step.observeCommittedHistory();
+      await step.observeCommittedHistory();
+      expect(step.getSpeakingEvidence().committedLearnerTurns).toBe(1);
+    });
+
+    it('84. a pronunciation operation stays guarded until the engine finishes (post-STT)', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      await seedProfile(adapter);
+
+      let releaseEngine: (() => void) | null = null;
+      const finishEngine = () => {
+        const release = releaseEngine;
+        releaseEngine = null;
+        release?.();
+      };
+      const service = createOnboardingService({
+        adapter,
+        learnerModel: createTalkLearnerModel(adapter)!,
+        profileRepository: new SQLiteUserProfileRepository(adapter),
+        pronunciation: {
+          analyzeSpokenTurn: async () => {
+            await new Promise<void>((resolve) => {
+              releaseEngine = resolve;
+            });
+            return {
+              analysis: {
+                learnerId: 'x',
+                observations: [],
+                weakPoints: [],
+                strengths: [],
+                analyzedAt: NOW,
+              },
+              feedbackLines: ['The final sound in "walked" was softened.'],
+              unavailable: false,
+            } as never;
+          },
+        },
+        now: () => NOW,
+      });
+
+      const handle = await service.beginDiagnostic();
+      const session = handle.conversation;
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider({ defaultTranscript: 'I usually walk to work.' }),
+        ttsProvider: createDemoTTSProvider(),
+      });
+      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+      for (let index = 0; index < 4; index += 1) handle.session.advance();
+      const capturedToken = handle.session.getCurrentStepToken();
+
+      await coordinator.startRecording();
+      const transcription = await coordinator.stopRecordingAndTranscribe();
+      expect(transcription.ok).toBe(true);
+      // STT finished and the coordinator is idle again…
+      expect(coordinator.getStatus().state).toBe('idle');
+      expect(session.getHistory()).toEqual([]); // …still no conversation turn
+
+      // …but the OPERATION is not finished: the engine analysis is running.
+      const recording = service.recordPronunciation(
+        handle,
+        transcription.transcript!,
+        handle.pronunciationTask.sentence,
+        { stepToken: capturedToken },
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(handle.session.snapshot().evidence.pronunciation).toBeNull();
+
+      finishEngine();
+      const observed = await recording;
+      expect(observed.observed).toBe(true);
+      expect(handle.session.snapshot().evidence.pronunciation?.noteLines).toHaveLength(1);
+    });
+
+    it('85. a late listening answer cannot be attributed to a later step (captured token)', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      await seedProfile(adapter);
+      let releaseEvaluation: (() => void) | null = null;
+      const finishEvaluation = () => {
+        const release = releaseEvaluation;
+        releaseEvaluation = null;
+        release?.();
+      };
+      const service = createOnboardingService({
+        adapter,
+        learnerModel: createTalkLearnerModel(adapter)!,
+        profileRepository: new SQLiteUserProfileRepository(adapter),
+        listening: {
+          startSession: async () => ({
+            exercises: [
+              {
+                id: 'ex-1',
+                learnerId: 'x',
+                type: 'listen_and_type',
+                difficulty: 'medium',
+                speakText: 'The meeting starts at nine.',
+                expectedAnswer: 'The meeting starts at nine.',
+                keyItems: ['meeting'],
+                source: 'general',
+              },
+            ],
+            sourceNote: '',
+          }),
+          evaluateAnswer: async () => {
+            await new Promise<void>((resolve) => {
+              releaseEvaluation = resolve;
+            });
+            return {
+              evaluation: {
+                result: 'understood',
+                feedbackLines: ['You caught it.'],
+                missedItems: [],
+                revealedTranscript: 'The meeting starts at nine.',
+                evaluatedBy: 'local',
+              },
+              persistenceError: false,
+            };
+          },
+          resolveLearnerId: async () => 'x',
+        },
+        now: () => NOW,
+      });
+
+      const handle = await service.beginDiagnostic();
+      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+      handle.session.advance();
+      handle.session.recordSpeaking(speakingEvidence(), handle.session.getCurrentStepToken());
+      handle.session.advance(); // listening
+      const capturedToken = handle.session.getCurrentStepToken();
+      const planned = await service.startListeningTask(handle);
+      expect(planned.status).toBe('ready');
+      if (planned.status !== 'ready') return;
+
+      const pending = service.recordListeningAnswer(handle, planned.exercise, 'The meeting starts at nine.', {
+        stepToken: capturedToken,
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      // The flow moved on before the evaluation finished.
+      handle.session.advance(); // language_use
+      finishEvaluation();
+      const outcome = await pending;
+
+      expect(outcome.ok).toBe(false);
+      expect(handle.session.snapshot().evidence.listening).toBeNull();
+      expect(handle.session.snapshot().evidence.languageUse).toBeNull();
+    });
+
+    it('89. the listening record uses the CAPTURED token, never the later current one', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      await seedProfile(adapter);
+      const service = createOnboardingService({
+        adapter,
+        learnerModel: createTalkLearnerModel(adapter)!,
+        profileRepository: new SQLiteUserProfileRepository(adapter),
+        listening: {
+          startSession: async () => ({
+            exercises: [
+              {
+                id: 'ex-1',
+                learnerId: 'x',
+                type: 'listen_and_type',
+                difficulty: 'medium',
+                speakText: 'The meeting starts at nine.',
+                expectedAnswer: 'The meeting starts at nine.',
+                keyItems: ['meeting'],
+                source: 'general',
+              },
+            ],
+            sourceNote: '',
+          }),
+          evaluateAnswer: async () => ({
+            evaluation: {
+              result: 'understood',
+              feedbackLines: ['You caught it.'],
+              missedItems: [],
+              revealedTranscript: 'The meeting starts at nine.',
+              evaluatedBy: 'local',
+            },
+            persistenceError: false,
+          }),
+          resolveLearnerId: async () => 'x',
+        },
+        now: () => NOW,
+      });
+
+      const handle = await service.beginDiagnostic();
+      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+      handle.session.advance();
+      handle.session.recordSpeaking(speakingEvidence(), handle.session.getCurrentStepToken());
+      handle.session.advance(); // listening
+      const capturedToken = handle.session.getCurrentStepToken();
+      const planned = await service.startListeningTask(handle);
+      if (planned.status !== 'ready') throw new Error('expected a listening task');
+
+      // Probe: observe WHICH token the service hands to the state machine.
+      const seenTokens: number[] = [];
+      const realRecordListening = handle.session.recordListening.bind(handle.session);
+      const probeHandle = {
+        ...handle,
+        session: {
+          ...handle.session,
+          recordListening: (evidence: Parameters<typeof realRecordListening>[0], token: number) => {
+            seenTokens.push(token);
+            return realRecordListening(evidence, token);
+          },
+        },
+      };
+
+      // A deliberately stale token (as if the answer belonged to an older entry
+      // of this step): the service must forward the CALLER's token, not read the
+      // current one after the evaluation finished.
+      const staleToken = capturedToken + 1;
+      const outcome = await service.recordListeningAnswer(
+        probeHandle,
+        planned.exercise,
+        planned.exercise.expectedAnswer,
+        { stepToken: staleToken },
+      );
+
+      expect(seenTokens).toEqual([staleToken]);
+      expect(seenTokens).not.toContain(handle.session.getCurrentStepToken());
+      expect(outcome.ok).toBe(false); // stale token → honestly refused
+      expect(handle.session.snapshot().evidence.listening).toBeNull();
+    });
+
+    it('86. the listening evaluation records against the token captured before it started', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      await seedProfile(adapter);
+      const seenTokens: number[] = [];
+      const service = createOnboardingService({
+        adapter,
+        learnerModel: createTalkLearnerModel(adapter)!,
+        profileRepository: new SQLiteUserProfileRepository(adapter),
+        listening: createListeningService(adapter),
+        now: () => NOW,
+      });
+      const handle = await service.beginDiagnostic();
+      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+      handle.session.advance();
+      handle.session.recordSpeaking(speakingEvidence(), handle.session.getCurrentStepToken());
+      handle.session.advance();
+      const capturedToken = handle.session.getCurrentStepToken();
+      seenTokens.push(capturedToken);
+
+      const planned = await service.startListeningTask(handle);
+      if (planned.status !== 'ready') throw new Error('expected a listening task');
+      const outcome = await service.recordListeningAnswer(handle, planned.exercise, planned.exercise.expectedAnswer, {
+        stepToken: capturedToken,
+      });
+
+      expect(outcome.ok).toBe(true);
+      const evidence = handle.session.snapshot().evidence.listening;
+      expect(evidence?.answered).toBe(1);
+      // The recorded evidence belongs to the captured (current) step.
+      const listeningStep = handle.session.snapshot().steps.find((step) => step.id === 'listening');
+      expect(listeningStep?.status).toBe('active');
+    });
+
+    it('87. the screen blocks navigation with a SYNCHRONOUS guard for every operation', () => {
+      const screen = readFileSync(join(__dirname, '..', 'screens', 'OnboardingScreen.tsx'), 'utf8');
+
+      // One unified operation guard, checked BEFORE anything else in continueStep.
+      expect(screen).toContain('diagnosticOperationInFlightRef');
+      const continueIndex = screen.indexOf('const continueStep = useCallback');
+      const guardIndex = screen.indexOf('diagnosticOperationInFlightRef.current ||', continueIndex);
+      const advanceIndex = screen.indexOf('handle.session.advance();', continueIndex);
+      expect(guardIndex).toBeGreaterThan(continueIndex);
+      expect(guardIndex).toBeLessThan(advanceIndex);
+      for (const guard of [
+        'micInFlightRef.current',
+        'answerInFlightRef.current',
+        'listeningInFlightRef.current',
+      ]) {
+        expect(screen).toContain(guard);
+      }
+
+      // Typed answers hold the operation guard for their whole duration.
+      const typedIndex = screen.indexOf('const submitTextAnswer = useCallback');
+      const typedBlock = screen.slice(typedIndex, screen.indexOf('const continueStep = useCallback'));
+      expect(typedBlock).toContain('diagnosticOperationInFlightRef.current = true;');
+      expect(typedBlock).toContain('diagnosticOperationInFlightRef.current = false;');
+      expect(typedBlock).toContain('const stepToken = handle.session.getCurrentStepToken();');
+
+      // Listening is guarded and re-entrancy protected with a captured token.
+      const listeningIndex = screen.indexOf('const submitListeningAnswer = useCallback');
+      const listeningBlock = screen.slice(listeningIndex, screen.indexOf('const acceptLevel = useCallback'));
+      expect(listeningBlock).toContain('if (listeningInFlightRef.current) return;');
+      expect(listeningBlock).toContain('{ stepToken }');
+
+      // Pronunciation holds the guard across STT *and* the engine analysis.
+      const micIndex = screen.indexOf('const pressMic = useCallback');
+      const micBlock = screen.slice(micIndex, screen.indexOf('const submitTextAnswer = useCallback'));
+      expect(micBlock).toContain('diagnosticOperationInFlightRef.current = true;');
+      const pronounceIndex = micBlock.indexOf('stopRecordingAndTranscribe()');
+      const releaseIndex = micBlock.indexOf('diagnosticOperationInFlightRef.current = false;');
+      expect(pronounceIndex).toBeGreaterThan(-1);
+      expect(releaseIndex).toBeGreaterThan(pronounceIndex); // guard spans the engine call too
+      expect(micBlock).toContain('await handle.speaking.observeCommittedHistory({ purpose });');
+    });
+
+    it('88. after a completed operation navigation works again', async () => {
+      const adapter = new SqlJsAdapter(':memory:');
+      await adapter.init();
+      await seedProfile(adapter);
+      const service = createOnboardingService({
+        adapter,
+        learnerModel: createTalkLearnerModel(adapter)!,
+        profileRepository: new SQLiteUserProfileRepository(adapter),
+        now: () => NOW,
+      });
+      const handle = await service.beginDiagnostic();
+      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+      handle.session.advance();
+
+      // A completed (awaited) operation leaves the state machine free to advance.
+      await service.recordSpeakingAnswer(handle, 'I work in logistics and I manage a small team.');
+      expect(handle.session.getCurrentStepId()).toBe('speaking');
+      expect(handle.session.advance()).toBe('listening');
+      expect(handle.session.getCurrentStepId()).toBe('listening');
     });
   });
 

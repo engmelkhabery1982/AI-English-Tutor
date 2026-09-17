@@ -141,11 +141,16 @@ export interface OnboardingService {
     | { readonly status: 'unavailable'; readonly message: string }
   >;
 
-  /** Evaluates one listening answer through the existing service (its own owner). */
+  /**
+   * Evaluates one listening answer through the existing service (its own owner).
+   * The caller may pass the step token it captured BEFORE evaluation started, so
+   * a late result can never be attributed to a different diagnostic step.
+   */
   recordListeningAnswer(
     handle: DiagnosticHandle,
     exercise: ListeningExercise,
     answer: string,
+    options?: { readonly stepToken?: number },
   ): Promise<{ readonly ok: boolean; readonly message: string }>;
 
   /**
@@ -492,8 +497,13 @@ export function createOnboardingService(deps: OnboardingServiceDeps = {}): Onboa
       return { status: 'ready', exercise };
     },
 
-    async recordListeningAnswer(handle, exercise, answer) {
-      const token = handle.session.getCurrentStepToken();
+    async recordListeningAnswer(handle, exercise, answer, options) {
+      // The caller's captured token wins (see recordPronunciation): the evidence
+      // belongs to the step the answer was given in, never to a later one.
+      const token = options?.stepToken ?? handle.session.getCurrentStepToken();
+      if (handle.session.getCurrentStepId() !== 'listening') {
+        return { ok: false, message: 'That listening answer arrived after the step changed.' };
+      }
       const engine = await resolveListening();
       if (!engine) {
         handle.session.markListeningUnavailable(UNAVAILABLE_LISTENING_MESSAGE, token);
@@ -518,8 +528,16 @@ export function createOnboardingService(deps: OnboardingServiceDeps = {}): Onboa
         missedKeyMeaning: category === 'missed_key_meaning' || category === 'misunderstood' ? 1 : 0,
         evaluatedBy: evaluation.evaluatedBy,
       };
-      handle.session.recordListening(evidence, token);
-      return { ok: true, message: evaluation.feedbackLines[0] ?? 'Listening task completed.' };
+      // The state machine refuses a token that belongs to a step the learner has
+      // already left, and the caller is told honestly instead of being given a
+      // silent success for evidence that was never recorded.
+      const recorded = handle.session.recordListening(evidence, token);
+      return {
+        ok: recorded,
+        message: recorded
+          ? evaluation.feedbackLines[0] ?? 'Listening task completed.'
+          : 'That listening answer arrived after the step changed.',
+      };
     },
 
     async recordPronunciation(handle, transcript, expectedText, options) {
