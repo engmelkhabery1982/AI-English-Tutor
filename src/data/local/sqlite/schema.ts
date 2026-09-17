@@ -1,4 +1,4 @@
-/**
+﻿/**
  * src/data/local/sqlite/schema.ts
  *
  * SQLite schema definition and migration runner.
