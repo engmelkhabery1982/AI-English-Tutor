@@ -34,9 +34,16 @@ export {
 
 export {
   DEFAULT_MAX_TARGET_EXPRESSIONS,
+  GOAL_RELEVANT_CATEGORIES,
+  WEAKNESS_LANGUAGE_EMPHASIS,
   difficultyBandRank,
+  emphasizedLanguageGoalIds,
   levelRank,
   planScenario,
+  prioritizeLanguageGoals,
+  prioritizeSpeakingGoals,
+  professionalContext,
+  relevantGoals,
   resolveCoachingMode,
   resolveDifficulty,
   selectChallenges,

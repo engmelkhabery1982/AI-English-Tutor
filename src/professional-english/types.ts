@@ -200,6 +200,12 @@ export interface ScenarioPlan {
   readonly difficultyDescriptor: CategoryDifficultyDescriptor;
   readonly coachingMode: CoachingMode;
   readonly coachingNotes: string;
+  /**
+   * Optional profession/industry context carried for the future execution
+   * layer. At this step it does NOT alter the deterministic scenario,
+   * examples, or register — it is context only, never an applied adaptation.
+   */
+  readonly professionalContext?: string;
   /** Human-readable, qualitative rationale for personalization choices. */
   readonly personalizationNotes: readonly string[];
   /** True when no category matched and the general fallback was used. */
