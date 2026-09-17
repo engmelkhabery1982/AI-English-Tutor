@@ -39,6 +39,17 @@ export interface VoiceStatus {
   readonly canRecord: boolean;
   readonly canStopRecording: boolean;
   readonly canSendText: boolean;
+  /**
+   * True while an async voice operation (STT or AI response) is still running.
+   * Used to keep the UI honest when the session was replaced mid-operation:
+   * the old work is cancelled and its result will be discarded.
+   */
+  readonly isProcessing?: boolean;
+  /**
+   * True while the coordinator is atomically switching to another conversation
+   * session. No new voice work may start until the switch completes.
+   */
+  readonly isSwitching?: boolean;
 }
 
 export type VoiceStatusListener = (status: VoiceStatus) => void;
