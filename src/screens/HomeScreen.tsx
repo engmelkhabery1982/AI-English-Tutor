@@ -32,10 +32,14 @@ import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 
 import type { AdaptiveLessonService, AdaptiveTodayPractice } from '../adaptive-lessons';
 import { createDefaultAdaptiveLessonService } from '../adaptive-lessons';
+import type { OnboardingPrefill, OnboardingService } from '../onboarding';
+import { createDefaultOnboardingService } from '../onboarding';
 
 export interface HomeScreenProps {
   /** Injectable service (tests/composition); defaults to the real factory. */
   readonly service?: AdaptiveLessonService;
+  /** Injectable onboarding service (tests/composition); defaults to the real factory. */
+  readonly onboardingService?: OnboardingService;
 }
 
 const SOURCE_LABELS: Record<AdaptiveTodayPractice['status'], string> = {
@@ -50,6 +54,26 @@ export default function HomeScreen(props?: HomeScreenProps) {
   const [practice, setPractice] = useState<AdaptiveTodayPractice | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+
+  /**
+   * Onboarding entry point: the EXISTING profile tells Home whether a learning
+   * plan still needs to be set up. Read-only — nothing is written from Home.
+   */
+  const onboardingRef = useRef<OnboardingService | null>(props?.onboardingService ?? null);
+  const [prefill, setPrefill] = useState<OnboardingPrefill | null>(null);
+  const loadProfileState = useCallback(async () => {
+    try {
+      if (!onboardingRef.current) {
+        onboardingRef.current = await createDefaultOnboardingService();
+      }
+      const state = await onboardingRef.current.loadPrefill();
+      setPrefill(state);
+    } catch {
+      // The adaptive plan already reports profile problems honestly; Home keeps
+      // its onboarding card hidden rather than inventing profile state.
+      setPrefill(null);
+    }
+  }, []);
 
   const loadPractice = useCallback(async () => {
     try {
@@ -70,8 +94,13 @@ export default function HomeScreen(props?: HomeScreenProps) {
   useFocusEffect(
     useCallback(() => {
       void loadPractice();
-    }, [loadPractice]),
+      void loadProfileState();
+    }, [loadPractice, loadProfileState]),
   );
+
+  const openOnboarding = () => {
+    navigation.navigate('Onboarding');
+  };
 
   const openLesson = () => {
     navigation.navigate('AdaptiveLesson');
@@ -161,6 +190,45 @@ export default function HomeScreen(props?: HomeScreenProps) {
       <Text style={styles.subtitle}>
         One lesson at a time, chosen from your own practice history.
       </Text>
+
+      {prefill && !prefill.isComplete ? (
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Text style={styles.cardTitle}>Set up your learning plan</Text>
+            <View style={styles.pill}>
+              <Text style={styles.pillText}>New</Text>
+            </View>
+          </View>
+          <Text style={styles.body}>
+            A few questions and a short diagnostic so your practice is built around your goals and
+            your real level.
+          </Text>
+          <Text style={styles.sourceNote}>Still missing: {prefill.missingFields.join(', ')}</Text>
+          <TouchableOpacity style={styles.primaryButton} onPress={openOnboarding}>
+            <Text style={styles.primaryButtonText}>Start onboarding</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+
+      {prefill && prefill.isComplete ? (
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Text style={styles.cardTitle}>Your learning plan</Text>
+            <View style={styles.pillPersonal}>
+              <Text style={styles.pillText}>{prefill.currentLevel}</Text>
+            </View>
+          </View>
+          <Text style={styles.body}>
+            Target: {prefill.targetLevel} · {prefill.learningGoals.slice(0, 2).join(', ')}
+          </Text>
+          <TouchableOpacity
+            style={styles.secondaryButton}
+            onPress={openOnboarding}
+          >
+            <Text style={styles.secondaryButtonText}>Assess my English again</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
 
       {isLoading ? (
         <View style={styles.loadingBox}>
