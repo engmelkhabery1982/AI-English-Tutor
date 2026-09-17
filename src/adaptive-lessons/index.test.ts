@@ -76,6 +76,7 @@ import { createConversationSpeakingPort } from './speaking';
 import type {
   AdaptiveLessonPlan,
   AdaptiveLessonPlanningInput,
+  ReviewItemCandidate,
   AdaptiveLessonPronunciationPort,
   AdaptiveLessonSpeakingPort,
   AdaptiveLessonStep,
@@ -3069,5 +3070,384 @@ describe('Hardening — provenance is claimed from persisted identities only', (
     expect(body).toContain('candidate.referenceId === weakness.id');
     expect(body).toContain('candidate.referenceId === weakness.referenceId');
     expect(body).not.toMatch(/toLowerCase\(|\.includes\(|\.indexOf\(/);
+  });
+});
+
+/* ========================================================================= *
+ * 9. Allocation fairness regressions (blocking finding: specialized starvation)
+ * ========================================================================= */
+
+describe('Hardening — fair review candidate allocation (no specialized starvation)', () => {
+  /** Prepare every review-family step and collect what each one was served. */
+  async function collectAllocation(
+    service: AdaptiveLessonService,
+    session: { plan: AdaptiveLessonPlan },
+    order: 'plan' | 'reverse' = 'plan',
+  ): Promise<Map<string, { material: Awaited<ReturnType<typeof service.prepareStep>>; ids: string[] }>> {
+    const reviewSteps = session.plan.steps.filter(
+      (step) => step.capability === 'review-service',
+    );
+    const ordered = order === 'plan' ? reviewSteps : [...reviewSteps].reverse();
+    const served = new Map<
+      string,
+      { material: Awaited<ReturnType<typeof service.prepareStep>>; ids: string[] }
+    >();
+    for (const step of ordered) {
+      const material = await service.prepareStep(step.id);
+      served.set(step.id, {
+        material,
+        ids: material?.kind === 'review' ? material.candidates.map((c) => c.id) : [],
+      });
+    }
+    return served;
+  }
+
+  it('85. a targeted vocabulary step cannot starve a separate vocabulary step', async () => {
+    const ctx = await createContext();
+    const invoice = await seedVocabulary(ctx, 'invoice', 'a bill listing charges');
+    const weakness = await seedWeakness(ctx, {
+      type: 'vocabulary',
+      status: 'confirmed',
+      referenceId: invoice.id,
+      notes: 'invoice',
+      occurrenceCount: 3,
+    });
+    const agenda = await seedVocabulary(ctx, 'agenda', 'a list of items to discuss');
+
+    const service = createLessonService(ctx);
+    const session = (await service.startLesson()).session!;
+    const targeted = session.plan.steps.find(
+      (step) => step.capability === 'review-service' && step.target.id === weakness.id,
+    );
+    const sibling = session.plan.steps.find(
+      (step) =>
+        step.capability === 'review-service' &&
+        step.reviewKindFilter === 'vocabulary' &&
+        step.id !== targeted?.id,
+    );
+    expect(targeted).toBeTruthy();
+    expect(sibling).toBeTruthy();
+
+    const served = await collectAllocation(service, session);
+    const targetedMaterial = served.get(targeted!.id)!.material;
+    const siblingMaterial = served.get(sibling!.id)!.material;
+    expect(targetedMaterial?.kind).toBe('review');
+    expect(siblingMaterial?.kind).toBe('review');
+    if (targetedMaterial?.kind !== 'review' || siblingMaterial?.kind !== 'review') {
+      throw new Error('expected review material for both vocabulary steps');
+    }
+
+    // Phase 1: the targeted step reserves exactly its linked item …
+    expect(targetedMaterial.candidates.map((c) => c.referenceId)).toEqual([invoice.id]);
+    expect(targetedMaterial.targetMatched).toBe(true);
+    // … and must NOT fill its remaining capacity with the sibling's item.
+    expect(targetedMaterial.candidates.map((c) => c.referenceId)).not.toContain(agenda.id);
+    // Phase 2: the sibling specialized step gets its own matching-kind item.
+    expect(siblingMaterial.candidates.map((c) => c.referenceId)).toEqual([agenda.id]);
+
+    const allIds = [...served.get(targeted!.id)!.ids, ...served.get(sibling!.id)!.ids];
+    expect(new Set(allIds).size).toBe(allIds.length);
+  });
+
+  it('86. a targeted grammar step cannot starve a sibling grammar step', async () => {
+    const ctx = await createContext();
+    const mistake = await seedGrammarMistake(
+      ctx,
+      'I live here since 2020',
+      'I have lived here since 2020',
+    );
+    const linked = await seedWeakness(ctx, {
+      type: 'grammar',
+      status: 'relapsed',
+      referenceId: mistake.id,
+      notes: 'I live here since 2020',
+      occurrenceCount: 4,
+    });
+    // A second grammar weakness whose source row is no longer in the due queue.
+    const orphan = await seedWeakness(ctx, {
+      type: 'grammar',
+      status: 'confirmed',
+      referenceId: uid(888),
+      notes: 'She go to work every day',
+      occurrenceCount: 3,
+    });
+    await seedReviewItem(ctx, {
+      kind: 'grammar',
+      prompt: 'Correct this unrelated sentence',
+      referenceId: 'ref-grammar-sibling',
+    });
+
+    const service = createLessonService(ctx);
+    const session = (await service.startLesson()).session!;
+    const linkedStep = session.plan.steps.find(
+      (step) => step.capability === 'review-service' && step.target.id === linked.id,
+    );
+    const orphanStep = session.plan.steps.find(
+      (step) => step.capability === 'review-service' && step.target.id === orphan.id,
+    );
+    expect(linkedStep).toBeTruthy();
+    expect(orphanStep).toBeTruthy();
+
+    const served = await collectAllocation(service, session);
+    const linkedMaterial = served.get(linkedStep!.id)!.material;
+    const orphanMaterial = served.get(orphanStep!.id)!.material;
+    if (linkedMaterial?.kind !== 'review') throw new Error('expected review material');
+    if (orphanMaterial?.kind !== 'review') throw new Error('expected review material');
+
+    // The linked step gets its own mistake — and only that in phase 1.
+    expect(linkedMaterial.candidates[0].contextSentence).toBe('I live here since 2020');
+    expect(linkedMaterial.targetMatched).toBe(true);
+    // The sibling grammar step is not starved: it holds the other grammar item.
+    expect(orphanMaterial.candidates.length).toBeGreaterThan(0);
+    expect(
+      orphanMaterial.candidates.every((c) => c.contextSentence !== 'I live here since 2020'),
+    ).toBe(true);
+    expect(orphanMaterial.candidates.map((c) => c.referenceId)).toContain('ref-grammar-sibling');
+    // Its provenance stays honest: this is not the item it was planned from.
+    expect(orphanMaterial.targetMatched).toBe(false);
+    expect(orphanMaterial.note?.toLowerCase()).toContain('not that targeted item');
+
+    const allIds = [...served.get(linkedStep!.id)!.ids, ...served.get(orphanStep!.id)!.ids];
+    expect(new Set(allIds).size).toBe(allIds.length);
+    expect(allIds).toHaveLength(2);
+  });
+
+  it('87. generic Quick Review receives only genuine leftovers', async () => {
+    const ctx = await createContext();
+    const invoice = await seedVocabulary(ctx, 'invoice', 'a bill listing charges');
+    const weakness = await seedWeakness(ctx, {
+      type: 'vocabulary',
+      status: 'confirmed',
+      referenceId: invoice.id,
+      notes: 'invoice',
+      occurrenceCount: 3,
+    });
+    const agenda = await seedVocabulary(ctx, 'agenda', 'a list of items to discuss');
+    await seedReviewItem(ctx, {
+      kind: 'grammar',
+      prompt: 'Correct this unrelated sentence',
+      referenceId: 'ref-grammar-leftover',
+    });
+
+    const service = createLessonService(ctx);
+    const session = (await service.startLesson()).session!;
+    const targeted = session.plan.steps.find(
+      (step) => step.capability === 'review-service' && step.target.id === weakness.id,
+    );
+    const generic = session.plan.steps.find(
+      (step) => step.capability === 'review-service' && !step.reviewKindFilter,
+    );
+    const specialized = session.plan.steps.find(
+      (step) =>
+        step.capability === 'review-service' &&
+        step.reviewKindFilter === 'vocabulary' &&
+        step.id !== targeted?.id,
+    );
+    expect(targeted).toBeTruthy();
+    expect(generic).toBeTruthy();
+    expect(specialized).toBeTruthy();
+    // The generic step is prepared BEFORE the specialized one in plan order —
+    // exactly the ordering that used to let it swallow reserved candidates.
+    expect(session.plan.steps.indexOf(generic!)).toBeLessThan(
+      session.plan.steps.indexOf(specialized!),
+    );
+
+    const served = await collectAllocation(service, session);
+    const targetedMaterial = served.get(targeted!.id)!.material;
+    const genericMaterial = served.get(generic!.id)!.material;
+    const specializedMaterial = served.get(specialized!.id)!.material;
+    if (targetedMaterial?.kind !== 'review') throw new Error('expected review material');
+    if (genericMaterial?.kind !== 'review') throw new Error('expected review material');
+    if (specializedMaterial?.kind !== 'review') throw new Error('expected review material');
+
+    // Phase 1 → targeted requirement satisfied first.
+    expect(targetedMaterial.candidates.map((c) => c.referenceId)).toEqual([invoice.id]);
+    // Phase 2 → specialized minimum satisfied second.
+    expect(specializedMaterial.candidates.map((c) => c.referenceId)).toEqual([agenda.id]);
+    // Phase 4 → generic only ever receives what was genuinely unallocated.
+    expect(genericMaterial.candidates.map((c) => c.referenceId)).toEqual(['ref-grammar-leftover']);
+    expect(genericMaterial.candidates.map((c) => c.referenceId)).not.toContain(invoice.id);
+    expect(genericMaterial.candidates.map((c) => c.referenceId)).not.toContain(agenda.id);
+
+    const allIds = [
+      ...served.get(targeted!.id)!.ids,
+      ...served.get(specialized!.id)!.ids,
+      ...served.get(generic!.id)!.ids,
+    ];
+    expect(new Set(allIds).size).toBe(allIds.length);
+  });
+
+  it('88. allocation is deterministic for an identical plan, candidate order and state', async () => {
+    const ctx = await createContext();
+    // Real evidence shapes the PLAN (targeted + specialized + generic steps).
+    const invoice = await seedVocabulary(ctx, 'invoice', 'a bill listing charges');
+    const weakness = await seedWeakness(ctx, {
+      type: 'vocabulary',
+      status: 'confirmed',
+      referenceId: invoice.id,
+      notes: 'invoice',
+      occurrenceCount: 3,
+    });
+    await seedVocabulary(ctx, 'agenda', 'a list of items to discuss');
+    await seedReviewItem(ctx, {
+      kind: 'grammar',
+      prompt: 'Correct this unrelated sentence',
+      referenceId: 'ref-grammar-leftover',
+    });
+
+    /*
+     * The EXISTING ReviewService sorts candidates by priority and breaks exact
+     * ties with `a.id.localeCompare(b.id)`, where the candidate id is freshly
+     * generated on every call — so two equally due items can legitimately swap
+     * places between fetches. Determinism of the ALLOCATION is therefore tested
+     * against a fixed candidate order (the finding's premise), with a stable
+     * pool served by a stub port.
+     */
+    const fixedPool: readonly ReviewItemCandidate[] = [
+      {
+        id: 'cand-target',
+        learnerId: ctx.learnerId,
+        kind: 'vocabulary',
+        exerciseType: 'vocabulary_recall',
+        // Identity link to the persisted weakness that created the step.
+        referenceId: weakness.id,
+        prompt: 'What word matches this definition? (word)',
+        expectedAnswer: 'invoice',
+        dueAt: DUE_AT,
+        consecutiveCorrect: 0,
+        reviewCount: 0,
+      },
+      {
+        id: 'cand-agenda',
+        learnerId: ctx.learnerId,
+        kind: 'vocabulary',
+        exerciseType: 'vocabulary_recall',
+        referenceId: 'ref-agenda',
+        prompt: 'What word matches this definition? (word)',
+        expectedAnswer: 'agenda',
+        dueAt: DUE_AT,
+        consecutiveCorrect: 0,
+        reviewCount: 0,
+      },
+      {
+        id: 'cand-grammar',
+        learnerId: ctx.learnerId,
+        kind: 'grammar',
+        exerciseType: 'sentence_correction',
+        referenceId: 'ref-grammar-leftover',
+        prompt: 'Correct this sentence',
+        expectedAnswer: 'I have lived here since 2020',
+        dueAt: DUE_AT,
+        consecutiveCorrect: 0,
+        reviewCount: 0,
+      },
+    ];
+    const stubReview: ReviewPort = {
+      planSession: async () => fixedPool,
+      evaluateAnswer: async () => {
+        throw new Error('not used by this test');
+      },
+      recordPracticeResult: async () => {
+        throw new Error('not used by this test');
+      },
+    };
+
+    const service = createLessonService(ctx, { review: stubReview });
+    type Allocation = readonly {
+      readonly key: string;
+      readonly targeted: boolean;
+      readonly ids: readonly string[];
+    }[];
+    const collect = async (plan: AdaptiveLessonPlan): Promise<Allocation> => {
+      const entries: { key: string; targeted: boolean; ids: string[] }[] = [];
+      for (const step of plan.steps.filter((entry) => entry.capability === 'review-service')) {
+        const material = await service.prepareStep(step.id);
+        entries.push({
+          key: `${step.id}/${step.reviewKindFilter ?? 'any'}`,
+          targeted: step.target.id === weakness.id,
+          ids:
+            material?.kind === 'review'
+              ? material.candidates.map((candidate) => candidate.id)
+              : ['unavailable'],
+        });
+      }
+      return entries;
+    };
+
+    const first = (await service.startLesson()).session!;
+    const runA = await collect(first.plan);
+
+    service.cancelLesson();
+    const second = (await service.startLesson()).session!;
+    expect(second.plan.id).toBe(first.plan.id);
+    const runB = await collect(second.plan);
+
+    // Identical plan + identical candidate order + identical learner state
+    // ⇒ identical candidate ids per step, in identical order.
+    expect(runB).toEqual(runA);
+    expect(runA.length).toBeGreaterThanOrEqual(3);
+    expect(runA.flatMap((entry) => entry.ids)).not.toContain('unavailable');
+
+    // Fairness invariants hold in both runs, independent of pool ordering.
+    for (const run of [runA, runB]) {
+      // The targeted step holds its exact linked candidate.
+      expect(run.find((entry) => entry.targeted)?.ids).toContain('cand-target');
+      // The generic (unfiltered) step only ever receives the true leftover.
+      const genericEntries = run.filter((entry) => entry.key.endsWith('/any'));
+      expect(genericEntries).toHaveLength(1);
+      expect(genericEntries[0].ids).toEqual(['cand-grammar']);
+      // The specialized sibling is not starved by the targeted step.
+      const vocabularyEntries = run.filter((entry) => entry.key.endsWith('/vocabulary'));
+      expect(vocabularyEntries).toHaveLength(2);
+      expect(vocabularyEntries.every((entry) => entry.ids.length > 0)).toBe(true);
+      // Disjoint: every candidate id is allocated at most once.
+      const ids = run.flatMap((entry) => entry.ids);
+      expect(new Set(ids).size).toBe(ids.length);
+    }
+  });
+
+  it('89. candidates stay disjoint and targeted even when steps are prepared last-first', async () => {
+    const ctx = await createContext();
+    const invoice = await seedVocabulary(ctx, 'invoice', 'a bill listing charges');
+    const weakness = await seedWeakness(ctx, {
+      type: 'vocabulary',
+      status: 'confirmed',
+      referenceId: invoice.id,
+      notes: 'invoice',
+      occurrenceCount: 3,
+    });
+    await seedMixedReviewQueue(ctx);
+
+    const service = createLessonService(ctx);
+    const session = (await service.startLesson()).session!;
+    // Reverse preparation order: allocation is reserved up front, so the order
+    // in which the UI opens steps cannot change who gets what.
+    const served = await collectAllocation(service, session, 'reverse');
+
+    const ids: string[] = [];
+    for (const step of session.plan.steps.filter((s) => s.capability === 'review-service')) {
+      const entry = served.get(step.id)!;
+      if (entry.material?.kind !== 'review') continue;
+      expect(entry.material.candidates.length).toBeLessThanOrEqual(step.bounds.maxItems);
+      if (step.reviewKindFilter) {
+        for (const candidate of entry.material.candidates) {
+          expect(candidate.kind).toBe(step.reviewKindFilter);
+        }
+      }
+      for (const candidate of entry.material.candidates) ids.push(candidate.id);
+    }
+
+    // Every candidate id appears at most once across the whole lesson.
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.length).toBeGreaterThan(2);
+
+    // The targeted step still holds exactly its own item.
+    const targeted = session.plan.steps.find(
+      (step) => step.capability === 'review-service' && step.target.id === weakness.id,
+    )!;
+    const targetedMaterial = served.get(targeted.id)!.material;
+    if (targetedMaterial?.kind !== 'review') throw new Error('expected review material');
+    expect(targetedMaterial.candidates.map((c) => c.referenceId)).toContain(invoice.id);
+    expect(targetedMaterial.targetMatched).toBe(true);
   });
 });

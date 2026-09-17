@@ -740,21 +740,30 @@ export class AdaptiveLessonService {
 
   /**
    * Reserve candidates from the single bounded pool for each planned
-   * review-family step, deterministically and disjointly.
+   * review-family step, deterministically, disjointly and FAIRLY.
    *
-   * Order of precedence (this is what stops starvation):
-   *  1. steps aimed at ONE persisted weakness get their exactly linked
-   *     candidate first (identity match, never text matching);
-   *  2. those steps, then other kind-specialized steps (vocabulary /
-   *     expression / grammar), fill their remaining capacity from candidates
-   *     of their own kind;
-   *  3. a generic Review step only ever uses what is genuinely left, so it can
-   *     never consume items a later specialized step was planned around;
-   *  4. leftovers are offered back to specialized steps that still have room.
+   * Allocation runs in four phases, and no step may fill extra capacity before
+   * every sibling's minimum has been offered — that ordering is what stops one
+   * step from starving another of the same kind:
    *
-   * Every candidate is allocated at most once, so no item can be practiced
-   * twice in one lesson, and the whole computation is a pure function of the
-   * (deterministic) pool order and the plan.
+   *  Phase 1 — exact targeted reservation: a step planned from ONE persisted
+   *            weakness reserves its genuinely linked candidate (id /
+   *            referenceId / evidence identity only, never loose text), and at
+   *            most that one candidate.
+   *  Phase 2 — minimum specialized reservation: every kind-specialized step
+   *            that still has nothing receives ONE matching-kind candidate when
+   *            one exists. A targeted step that already holds its exact target
+   *            has met its minimum and is passed over.
+   *  Phase 3 — fill remaining specialized capacity up to `bounds.maxItems`.
+   *  Phase 4 — generic (unfiltered) Review steps take only what is genuinely
+   *            unallocated, so they can never starve a targeted or specialized
+   *            step — and, symmetrically, phase 2/3 guarantee a targeted step
+   *            cannot starve a sibling specialized step either.
+   *
+   * Plan order is preserved inside every phase, so the result is a pure
+   * function of the (deterministic) pool order and the plan. Every candidate is
+   * allocated at most once, so no item can be practiced twice in one lesson.
+   * This is distribution fairness only: the pool stays ONE bounded read.
    */
   private allocateReviewPool(
     session: MutableSession,
@@ -788,23 +797,36 @@ export class AdaptiveLessonService {
     };
 
     const targeted = reviewSteps.filter((step) => this.weaknessRowForStep(session, step) !== null);
+    // A targeted step is always specialized too (defensive: even if a future
+    // blueprint had no kind filter, it must keep its phase 2/3 priority).
     const specialized = reviewSteps.filter(
-      (step) => Boolean(step.reviewKindFilter) && !targeted.includes(step),
+      (step) => Boolean(step.reviewKindFilter) || targeted.includes(step),
     );
-    const generic = reviewSteps.filter(
-      (step) => !step.reviewKindFilter && !targeted.includes(step),
-    );
+    const generic = reviewSteps.filter((step) => !specialized.includes(step));
+    const held = (step: AdaptiveLessonStep): number => allocation.get(step.id)?.length ?? 0;
 
+    /* Phase 1 — exact targeted reservation (identity match only). */
     for (const step of targeted) {
       const weakness = this.weaknessRowForStep(session, step);
-      take(
-        step,
-        available(step).filter((candidate) => candidateMatchesWeakness(candidate, weakness)),
+      const exact = available(step).filter((candidate) =>
+        candidateMatchesWeakness(candidate, weakness),
       );
+      if (exact.length > 0) take(step, exact.slice(0, 1));
     }
-    for (const step of [...targeted, ...specialized]) take(step, available(step));
+
+    /* Phase 2 — minimum specialized reservation: one matching-kind candidate
+     * for every specialized step that received nothing, BEFORE any step is
+     * allowed to fill extra capacity. */
+    for (const step of specialized) {
+      if (held(step) > 0) continue;
+      take(step, available(step).slice(0, 1));
+    }
+
+    /* Phase 3 — fill the remaining specialized capacity (bounded, plan order). */
+    for (const step of specialized) take(step, available(step));
+
+    /* Phase 4 — generic Review takes only the genuine leftovers. */
     for (const step of generic) take(step, available(step));
-    for (const step of [...targeted, ...specialized]) take(step, available(step));
 
     return allocation;
   }
