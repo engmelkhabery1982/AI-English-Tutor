@@ -97,6 +97,15 @@ function cloneCoachingContext(context: CoachingContext): CoachingContext {
       reviewState: e.reviewState,
       nextReviewAt: e.nextReviewAt,
     })),
+    // Bounded summaries only; never transcripts.
+    recentConversations: (context.recentConversations ?? []).map((conversation) => ({
+      sessionId: conversation.sessionId,
+      mode: conversation.mode,
+      topic: conversation.topic,
+      startedAt: conversation.startedAt,
+      endedAt: conversation.endedAt,
+      turnCount: conversation.turnCount,
+    })),
     recentProgress: context.recentProgress ? { ...context.recentProgress } : null,
     dueReviewCount: context.dueReviewCount,
     generatedAt: context.generatedAt,

@@ -78,6 +78,28 @@ export {
   type TalkTurnControls,
 } from './turn-controls';
 export {
+  buildConversationReview,
+  finalizeConversationWithReview,
+  createConversationMemoryRecorder,
+  createConversationMemoryService,
+  stripHiddenFeedback,
+  CONVERSATION_MEMORY_DEMO_NOTICE,
+  CONVERSATION_MEMORY_EMPTY_NOTICE,
+  CONVERSATION_MEMORY_FAILED_NOTICE,
+  CONVERSATION_REVIEW_TITLE,
+  type ConversationFinalizeReason,
+  type ConversationMemoryRecorder,
+  type ConversationMemoryService,
+  type ConversationMemoryServiceOptions,
+  type ConversationMemorySnapshot,
+  type ConversationMemoryTurn,
+  type ConversationReview,
+  type ConversationReviewEvidence,
+  type ConversationReviewSection,
+  type ConversationReviewSectionId,
+  type FinalizeConversationResult,
+} from './conversation-memory';
+export {
   createDemoSTTProvider,
   createGeminiSTTProvider,
   createDemoTTSProvider,

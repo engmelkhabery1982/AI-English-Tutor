@@ -58,23 +58,26 @@ export interface LearningPersistenceService {
 export function createLearningPersistenceService(injectedAdapter?: DatabaseAdapter, injectedLearnerId?: string): LearningPersistenceService {
   async function resolveDependencies() {
     try {
-      if (injectedAdapter && injectedLearnerId) {
-        return { adapter: injectedAdapter, learnerId: injectedLearnerId };
+      // An injected adapter is ALWAYS used as-is: no second database instance is
+      // ever opened just because the learner id still has to be resolved.
+      let adapter = injectedAdapter ?? null;
+      if (!adapter) {
+        const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
+        adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
+        await adapter.init();
       }
-      
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
 
-      const userProfileRepo = new SQLiteUserProfileRepository(adapter);
-      let learnerId: string | null = null;
-      try {
-        const profile = await userProfileRepo.get();
-        if (profile && profile.id) {
-          learnerId = profile.id;
+      let learnerId: string | null = injectedLearnerId ?? null;
+      if (!learnerId) {
+        const userProfileRepo = new SQLiteUserProfileRepository(adapter);
+        try {
+          const profile = await userProfileRepo.get();
+          if (profile && profile.id) {
+            learnerId = profile.id;
+          }
+        } catch {
+          learnerId = null;
         }
-      } catch {
-        learnerId = null;
       }
 
       if (!learnerId) {

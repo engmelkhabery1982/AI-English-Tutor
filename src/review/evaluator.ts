@@ -68,6 +68,7 @@ function createNeutralReviewCoachingContext(): CoachingContext {
     expressionFocus: [],
     recentProgress: null,
     dueReviewCount: 0,
+    recentConversations: [],
     generatedAt: new Date().toISOString(),
   };
 }

@@ -128,6 +128,20 @@ export function buildSystemPrompt(
   // Due Reviews
   const reviewsSection = `Spaced Repetition Due Reviews: ${context.dueReviewCount} item(s) due.`;
 
+  // Recent Persisted Conversations (summaries only — never transcripts)
+  const recentConversations = context.recentConversations ?? [];
+  const conversationsSection =
+    recentConversations.length > 0
+      ? `Recent Conversations (Persisted):\n${recentConversations
+          .map((conversation) => {
+            const topicLabel = conversation.topic?.trim()
+              ? ` on "${conversation.topic.trim()}"`
+              : '';
+            return `- ${conversation.mode}${topicLabel}, ${conversation.turnCount} turn(s)`;
+          })
+          .join('\n')}`
+      : 'Recent Conversations (Persisted):\nNone recorded.';
+
   // Recent Progress
   let progressSection: string;
   if (context.recentProgress) {
@@ -211,6 +225,8 @@ export function buildSystemPrompt(
     exprSection,
     '',
     reviewsSection,
+    '',
+    conversationsSection,
     '',
     progressSection,
   ].join('\n');
