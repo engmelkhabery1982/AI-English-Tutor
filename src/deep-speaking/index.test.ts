@@ -52,6 +52,20 @@ import type { LearningPersistenceService } from '../talk-demo/learning-persisten
 import type { ProgressRecord } from '../domain/models/learning';
 
 import {
+  FINISH_BLOCKED_MESSAGE,
+  buildSpeakingSeed,
+  isLearnerOperationActive,
+  resolveFinishAvailability,
+} from './index';
+import {
+  createTalkVoiceCoordinator,
+  type AudioRecorderService,
+  type SpeechToTextProvider,
+  type TextToSpeechProvider,
+  type VoiceStatus,
+} from '../talk-demo';
+import type { VoiceState } from '../voice';
+import {
   HARD_MAX_TURNS,
   MAX_RECENT_CONVERSATIONS,
   MAX_TARGET_EXPRESSIONS,
@@ -1150,7 +1164,9 @@ describe('Deep Speaking service', () => {
     expect(harness.recordFeedbackEvidence).toHaveBeenCalledWith(feedback);
   });
 
-  it('32. repeated handling of the same feedback object cannot persist twice', async () => {
+  it('32. two committed turns are BOTH persisted, even with the same feedback object', async () => {
+    // Ownership is the committed TURN, never the feedback object identity: a
+    // provider (or an implementation) may legitimately reuse one object.
     const shared: ConversationFeedback = {
       correction: {
         original: 'He go',
@@ -1164,8 +1180,97 @@ describe('Deep Speaking service', () => {
     await startHarnessSession(harness);
     await harness.service.openConversation();
     await harness.service.sendLearnerTurn('The first learner turn with a real correction here.');
-    await harness.service.sendLearnerTurn('The second learner turn with the same correction here.');
     expect(harness.recordFeedbackEvidence).toHaveBeenCalledTimes(1);
+    await harness.service.sendLearnerTurn('The second learner turn with the same correction here.');
+    expect(harness.recordFeedbackEvidence).toHaveBeenCalledTimes(2);
+    expect(harness.recordFeedbackEvidence.mock.calls[0]?.[0]).toBe(shared);
+    expect(harness.recordFeedbackEvidence.mock.calls[1]?.[0]).toBe(shared);
+    // The conversation really committed two learner turns.
+    expect(harness.service.getProgress().learnerTurns).toBe(2);
+  });
+
+  it('32b. three committed turns with feedback are persisted three times', async () => {
+    const shared: ConversationFeedback = {
+      coachingNote: 'Keep using the past tense for finished actions.',
+    };
+    const provider = createFakeProvider(() => okResponse('Okay.', shared));
+    const harness = createHarness({ aiProvider: provider.provider });
+    await startHarnessSession(harness);
+    await harness.service.openConversation();
+    for (const message of [
+      'The first committed learner turn of this speaking practice.',
+      'The second committed learner turn of this speaking practice.',
+      'The third committed learner turn of this speaking practice.',
+    ]) {
+      await harness.service.sendLearnerTurn(message);
+    }
+    expect(harness.recordFeedbackEvidence).toHaveBeenCalledTimes(3);
+  });
+
+  it('32c. a refused duplicate submit adds no committed turn and no persistence', async () => {
+    const gateControl: { release: (() => void) | null } = { release: null };
+    const gate = new Promise<void>((resolve) => {
+      gateControl.release = resolve;
+    });
+    const feedback: ConversationFeedback = {
+      correction: {
+        original: 'I am agree',
+        improved: 'I agree',
+        explanation: 'Agree is a verb.',
+        severity: 'incorrect',
+      },
+    };
+    const provider = createFakeProvider(() => okResponse('Okay.', feedback));
+    const originalGenerate = provider.provider.generate;
+    let calls = 0;
+    const slowProvider: AIProvider = {
+      id: 'slow-ai',
+      async generate(request) {
+        calls += 1;
+        if (calls > 1) await gate;
+        return originalGenerate(request);
+      },
+    };
+    const harness = createHarness({ aiProvider: slowProvider });
+    await startHarnessSession(harness);
+    await harness.service.openConversation();
+
+    const first = harness.service.sendLearnerTurn('The first committed learner turn in flight.');
+    await expect(harness.service.sendLearnerTurn('The duplicate turn.')).rejects.toThrow(
+      /already being processed/i,
+    );
+    gateControl.release?.();
+    await first;
+
+    expect(harness.service.getProgress().learnerTurns).toBe(1);
+    expect(harness.recordFeedbackEvidence).toHaveBeenCalledTimes(1);
+  });
+
+  it('32d. the feedback persisted belongs to the turn that just committed', async () => {
+    // A stale "last feedback" slot must never be re-persisted for a later turn
+    // and a turn without feedback must persist nothing.
+    const firstFeedback: ConversationFeedback = {
+      correction: {
+        original: 'I go yesterday',
+        improved: 'I went yesterday',
+        explanation: 'Past tense.',
+        severity: 'incorrect',
+      },
+    };
+    const provider = createFakeProvider((_request, index) =>
+      index === 0
+        ? okResponse('Hello!')
+        : index === 1
+          ? okResponse('Thanks!', firstFeedback)
+          : okResponse('Interesting — go on.'),
+    );
+    const harness = createHarness({ aiProvider: provider.provider });
+    await startHarnessSession(harness);
+    await harness.service.openConversation();
+    await harness.service.sendLearnerTurn('I go to the market yesterday with my brother.');
+    await harness.service.sendLearnerTurn('Then we walked home and cooked dinner together.');
+    expect(harness.recordFeedbackEvidence).toHaveBeenCalledTimes(1);
+    expect(harness.recordFeedbackEvidence).toHaveBeenCalledWith(firstFeedback);
   });
 
   it('33. conversation memory is finalized exactly once', async () => {
@@ -1302,9 +1407,42 @@ describe('Deep Speaking service', () => {
     const summary = await harness.service.completePractice();
     expect(summary.learnerTurns).toBe(0);
     const text = summary.sections.flatMap((section) => section.items).join('\n');
-    expect(summary.sections.some((section) => section.id === 'went_well')).toBe(false);
     expect(summary.sections.some((section) => section.id === 'corrections')).toBe(false);
     expect(text).not.toMatch(/perfect|flawless|no mistakes|without a correction/i);
+  });
+
+  it('37b. absence of corrections is NOT treated as positive evidence', async () => {
+    // Many real learner turns, several explicit "no correction" tutor replies,
+    // and no other positive evidence: the summary must not praise anything.
+    const provider = createFakeProvider(() => okResponse('Nice — and what happened next?'));
+    const harness = createHarness({ aiProvider: provider.provider });
+    await startHarnessSession(harness);
+    await harness.service.openConversation();
+    for (const message of [
+      'Yesterday I practised speaking with a colleague about our project plan.',
+      'We agreed to prepare the slides together on Friday morning this week.',
+      'In the evening I cooked dinner for my family and we watched a film.',
+    ]) {
+      const result = await harness.service.sendLearnerTurn(message);
+      expect(result.ok).toBe(true);
+    }
+
+    const summary = await harness.service.completePractice();
+    expect(summary.learnerTurns).toBe(3);
+    // No corrections existed → no "went well" section may be produced at all.
+    expect(summary.sections.map((section) => section.id)).not.toContain('corrections');
+    expect(summary.sections.map((section) => section.title)).not.toContain('What went well');
+    const text = [
+      summary.notice,
+      ...summary.sections.flatMap((section) => [section.title, ...section.items]),
+    ].join('\n');
+    expect(text).not.toMatch(/went well/i);
+    expect(text).not.toMatch(/understood without|without a correction|no mistakes/i);
+    expect(text).not.toMatch(/perfect|flawless|excellent|great job|well done/i);
+    // The section ids the summary may use are limited to real evidence.
+    for (const section of summary.sections) {
+      expect(['corrections', 'expressions', 'practice_next']).toContain(section.id);
+    }
   });
 
   it('38. the summary claims no pronunciation evidence it does not have', async () => {
@@ -1509,6 +1647,322 @@ describe('Deep Speaking service', () => {
     expect(typeof service.planPractice).toBe('function');
     expect(typeof service.completePractice).toBe('function');
     expect(typeof service.dispose).toBe('function');
+  });
+});
+
+/* ================================================================== *
+ * Screen-level semantics: turn liveness, finishing, seeding
+ * ================================================================== */
+
+/** Minimal, honest status object for the finish rule (no renderer needed). */
+function idleLiveness(overrides: Partial<{
+  voiceState: VoiceState;
+  isVoiceProcessing: boolean;
+  isSubmitting: boolean;
+  isOpening: boolean;
+  isTurnInFlight: boolean;
+  isServiceTurnActive: boolean;
+}> = {}) {
+  return {
+    voiceState: 'idle' as VoiceState,
+    isVoiceProcessing: false,
+    isSubmitting: false,
+    isOpening: false,
+    isTurnInFlight: false,
+    isServiceTurnActive: false,
+    ...overrides,
+  };
+}
+
+function createFakeRecorder(): AudioRecorderService {
+  let recording = false;
+  let started = 0;
+  return {
+    async requestPermissions() {
+      return true;
+    },
+    async hasPermissions() {
+      return true;
+    },
+    async startRecording() {
+      recording = true;
+      started += 1;
+    },
+    async stopRecording() {
+      recording = false;
+      return { uri: 'file:///fake.m4a', mimeType: 'audio/m4a', durationMs: 1200 };
+    },
+    isRecording() {
+      return recording;
+    },
+    getElapsedSeconds() {
+      void started;
+      return 1;
+    },
+  };
+}
+
+function createFakeSTT(transcript: string): SpeechToTextProvider {
+  return {
+    id: 'fake-stt',
+    async transcribe() {
+      return { ok: true, transcript };
+    },
+  } as unknown as SpeechToTextProvider;
+}
+
+function createFakeTTS(): TextToSpeechProvider {
+  return {
+    id: 'fake-tts',
+    isSpeaking: () => false,
+    speak: async () => undefined,
+    stop: async () => undefined,
+  } as unknown as TextToSpeechProvider;
+}
+
+describe('Deep Speaking finish rules (screen semantics)', () => {
+  it('57. an idle conversation may finish', () => {
+    const finish = resolveFinishAvailability(idleLiveness());
+    expect(finish.allowed).toBe(true);
+    expect(finish.reason).toBeNull();
+    expect(isLearnerOperationActive(idleLiveness())).toBe(false);
+  });
+
+  it('58. every in-flight learner operation refuses finishing synchronously', () => {
+    const cases: ReadonlyArray<[string, ReturnType<typeof idleLiveness>]> = [
+      ['typed submit starting', idleLiveness({ isSubmitting: true })],
+      ['single-flight learner turn', idleLiveness({ isTurnInFlight: true })],
+      ['service-owned learner turn', idleLiveness({ isServiceTurnActive: true })],
+      ['tutor opening', idleLiveness({ isOpening: true })],
+      ['recording', idleLiveness({ voiceState: 'recording' })],
+      ['requesting permission', idleLiveness({ voiceState: 'requesting_permission' })],
+      ['transcribing', idleLiveness({ voiceState: 'transcribing' })],
+      ['sending', idleLiveness({ voiceState: 'sending' })],
+      ['voice work still processing', idleLiveness({ isVoiceProcessing: true })],
+    ];
+    for (const [label, liveness] of cases) {
+      const finish = resolveFinishAvailability(liveness);
+      expect(finish.allowed, label).toBe(false);
+      expect(finish.reason, label).toBe(FINISH_BLOCKED_MESSAGE);
+    }
+  });
+
+  it('59. tutor playback is not learner work: finishing is allowed while speaking', () => {
+    expect(resolveFinishAvailability(idleLiveness({ voiceState: 'speaking' })).allowed).toBe(true);
+    expect(resolveFinishAvailability(idleLiveness({ voiceState: 'error' })).allowed).toBe(true);
+  });
+
+  it('60. the SCREEN finish path settles an in-flight turn instead of destroying it', async () => {
+    // Real service + real ConversationSession + real VoiceSessionCoordinator,
+    // driven exactly like the screen: liveness first, then teardown, then complete.
+    const gateControl: { release: (() => void) | null } = { release: null };
+    const gate = new Promise<void>((resolve) => {
+      gateControl.release = resolve;
+    });
+    const provider = createFakeProvider(() => okResponse('Okay, tell me more.'));
+    const originalGenerate = provider.provider.generate;
+    let calls = 0;
+    const slowProvider: AIProvider = {
+      id: 'slow-ai',
+      async generate(request) {
+        calls += 1;
+        if (calls > 1) await gate;
+        return originalGenerate(request);
+      },
+    };
+    const harness = createHarness({ aiProvider: slowProvider });
+    const started = await startHarnessSession(harness);
+    await harness.service.openConversation();
+
+    const coordinator = createTalkVoiceCoordinator({
+      session: started.conversationSession,
+      providerKind: 'demo',
+      recorder: createFakeRecorder(),
+      sttProvider: createFakeSTT('unused'),
+      ttsProvider: createFakeTTS(),
+      isMuted: true,
+    });
+
+    // A learner turn is submitted and is still in flight.
+    const turn = harness.service.sendLearnerTurn(
+      'A learner turn the learner submitted before pressing Finish.',
+    );
+    const voiceStatus: VoiceStatus = coordinator.getStatus();
+
+    // The screen reads liveness SYNCHRONOUSLY and refuses to finish.
+    const blocked = resolveFinishAvailability(idleLiveness({
+      voiceState: voiceStatus.state,
+      isVoiceProcessing: voiceStatus.isProcessing === true,
+      isSubmitting: true,
+      isTurnInFlight: true,
+      isServiceTurnActive: harness.service.hasActiveLearnerTurn(),
+    }));
+    expect(blocked.allowed).toBe(false);
+    // The refusal happens BEFORE any teardown, so nothing is disposed here.
+
+    gateControl.release?.();
+    const result = await turn;
+    expect(result.ok).toBe(true);
+    expect(harness.service.hasActiveLearnerTurn()).toBe(false);
+
+    // Now that nothing is in flight the screen may finish: teardown (which
+    // abandons the session — safe now) and then the idempotent completion.
+    const allowed = resolveFinishAvailability(idleLiveness({
+      voiceState: coordinator.getStatus().state,
+      isServiceTurnActive: harness.service.hasActiveLearnerTurn(),
+    }));
+    expect(allowed.allowed).toBe(true);
+
+    await coordinator.dispose();
+    const summary = await harness.service.completePractice();
+    expect(summary.learnerTurns).toBe(1);
+    expect(summary.tutorTurns).toBe(2);
+    expect(harness.finalizeSpy).toHaveBeenCalledTimes(1);
+    expect(harness.progressRecord).toHaveBeenCalledTimes(1);
+    expect(await harness.service.completePractice()).toBe(summary);
+  });
+
+  it('61. finishing during a recording never turns it into learner evidence', async () => {
+    const provider = createFakeProvider(() => okResponse('Okay.'));
+    const harness = createHarness({ aiProvider: provider.provider });
+    const started = await startHarnessSession(harness);
+    await harness.service.openConversation();
+    const requestsAfterOpening = provider.requests.length;
+
+    const recorder = createFakeRecorder();
+    const coordinator = createTalkVoiceCoordinator({
+      session: started.conversationSession,
+      providerKind: 'demo',
+      recorder,
+      sttProvider: createFakeSTT('I recorded this but never sent it.'),
+      ttsProvider: createFakeTTS(),
+      isMuted: true,
+    });
+    await coordinator.startRecording();
+    expect(coordinator.getStatus().state).toBe('recording');
+
+    // The screen refuses to finish while recording…
+    const blocked = resolveFinishAvailability(idleLiveness({
+      voiceState: coordinator.getStatus().state,
+      isVoiceProcessing: coordinator.getStatus().isProcessing === true,
+      isServiceTurnActive: harness.service.hasActiveLearnerTurn(),
+    }));
+    expect(blocked.allowed).toBe(false);
+
+    // …and a teardown (unmount/leave) discards the recording WITHOUT submitting
+    // it: no AI turn, no committed learner turn, no persistence.
+    await coordinator.dispose();
+    expect(provider.requests.length).toBe(requestsAfterOpening);
+    expect(started.conversationSession.getHistory().filter((t) => t.role === 'user')).toHaveLength(0);
+    expect(harness.service.getProgress().learnerTurns).toBe(0);
+    expect(harness.recordFeedbackEvidence).not.toHaveBeenCalled();
+
+    // Completing an empty conversation saves no learner evidence. (The memory
+    // SERVICE is still asked — deciding "empty" is its own honest contract, see
+    // the real createConversationMemoryService — but nothing about the learner
+    // is recorded.)
+    const summary = await harness.service.completePractice();
+    expect(summary.learnerTurns).toBe(0);
+    expect(summary.hasEvidence).toBe(false);
+    expect(harness.recordFeedbackEvidence).not.toHaveBeenCalled();
+    expect(harness.progressRecord).not.toHaveBeenCalled();
+  });
+
+  it('62. the screen wires the rule into both the guard and the button', () => {
+    const screen = readFileSync(join(__dirname, '..', 'screens/DeepSpeakingScreen.tsx'), 'utf8');
+    // The guard is evaluated from ONE rule…
+    expect(screen).toContain('resolveFinishAvailability');
+    expect(screen).toContain('hasActiveLearnerTurn');
+
+    // …and INSIDE the finish handler the synchronous refusal comes BEFORE any
+    // voice teardown, so dispose() can never abandon an in-flight turn.
+    const handlerStart = screen.indexOf('const handleCompletePractice');
+    const handlerEnd = screen.indexOf('const handlePracticeAgain');
+    expect(handlerStart).toBeGreaterThan(-1);
+    expect(handlerEnd).toBeGreaterThan(handlerStart);
+    const handler = screen.slice(handlerStart, handlerEnd);
+    const guard = handler.indexOf('if (!liveness.allowed)');
+    const teardown = handler.indexOf('await disposeVoice();');
+    expect(guard).toBeGreaterThan(-1);
+    expect(teardown).toBeGreaterThan(guard);
+    // The learner is told why instead of losing their turn.
+    expect(handler).toContain('setErrorMessage(liveness.reason)');
+
+    // The button is disabled by the SAME rule while an operation is in flight.
+    expect(screen).toMatch(/disabled=\{!finishAvailability\.allowed\}/);
+    expect(screen).toContain('FINISH_BLOCKED_MESSAGE');
+  });
+});
+
+describe('Deep Speaking adaptive-lesson seed', () => {
+  it('63. the REAL step target is used as the practice target', () => {
+    const seed = buildSpeakingSeed({
+      stepId: 'step-7',
+      targetText: '  follow up  ',
+      prompt: 'Practise the phrase in a short conversation.',
+    });
+    expect(seed).not.toBeNull();
+    expect(seed?.stepId).toBe('step-7');
+    expect(seed?.targetText).toBe('follow up');
+    expect(seed?.prompt).toBe('Practise the phrase in a short conversation.');
+  });
+
+  it('64. a step without target text falls back to its own real material', () => {
+    const seed = buildSpeakingSeed({
+      stepId: 'step-8',
+      targetText: '   ',
+      prompt: 'Answer the interview question: describe your last project.',
+    });
+    expect(seed?.targetText).toBe('Answer the interview question: describe your last project.');
+  });
+
+  it('65. a step with no real target invents nothing', () => {
+    expect(buildSpeakingSeed({ stepId: 'step-9' })).toBeNull();
+    expect(buildSpeakingSeed({ stepId: 'step-9', targetText: '', prompt: '  ' })).toBeNull();
+    expect(buildSpeakingSeed({ stepId: '   ', targetText: 'follow up' })).toBeNull();
+  });
+
+  it('66. the seeded plan carries the real target, not a display title', () => {
+    const step = {
+      id: 'step-7',
+      title: 'Speaking retraining', // a display label, never a target
+      targetText: 'I am interesting in this',
+    };
+    const seed = buildSpeakingSeed({
+      stepId: step.id,
+      targetText: step.targetText,
+      prompt: 'Say the corrected sentence out loud.',
+    });
+    expect(seed?.targetText).toBe('I am interesting in this');
+    expect(seed?.targetText).not.toBe(step.title);
+
+    const planned = planSpeakingPractice(
+      {
+        coaching: makeCoaching(),
+        hasProfile: true,
+        recentConversations: [],
+        now: NOW,
+      },
+      { seed: seed ?? undefined },
+    );
+    expect(planned.status).toBe('planned');
+    if (planned.status !== 'planned') return;
+    expect(planned.plan.topic).toBe('I am interesting in this');
+    expect(planned.plan.scenarioPrompt).toBe('Say the corrected sentence out loud.');
+    expect(planned.plan.seedFromAdaptiveLesson).toEqual({
+      stepId: 'step-7',
+      targetText: 'I am interesting in this',
+    });
+  });
+
+  it('67. the adaptive lesson screen passes the real target text, never the title', () => {
+    const adaptive = readFileSync(join(__dirname, '..', 'screens/AdaptiveLessonScreen.tsx'), 'utf8');
+    expect(adaptive).toContain('buildSpeakingSeed');
+    expect(adaptive).toMatch(/targetText: material\.step\.targetText/);
+    expect(adaptive).not.toMatch(/targetText: material\.step\.title/);
+    // The inline speaking path is untouched by this change.
+    expect(adaptive).toContain('renderSpeakingMaterial');
+    expect(adaptive).toContain('handleSubmitSpeaking');
   });
 });
 

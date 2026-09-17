@@ -59,6 +59,7 @@ import type {
   AdaptiveTodayPractice,
 } from '../adaptive-lessons';
 import { createDefaultAdaptiveLessonService } from '../adaptive-lessons';
+import { buildSpeakingSeed } from '../deep-speaking';
 import { useNavigation } from '@react-navigation/native';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 import {
@@ -986,14 +987,17 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
    */
   const openFullSpeakingPractice = useCallback(() => {
     if (material?.kind !== 'speaking') return;
+    // The seed carries the REAL practice target when the step has one (a word,
+    // expression or phrase). The step title is only a display label and is never
+    // used as a learning target; when the step has no real target text, the
+    // step's own prompt is used, and a step with neither starts a general plan.
+    const seed = buildSpeakingSeed({
+      stepId: material.step.id,
+      targetText: material.step.targetText,
+      prompt: material.prompt,
+    });
     try {
-      navigation.navigate('DeepSpeaking', {
-        seed: {
-          stepId: material.step.id,
-          targetText: material.step.title,
-          prompt: material.prompt,
-        },
-      });
+      navigation.navigate('DeepSpeaking', seed ? { seed } : undefined);
       setNotice(null);
     } catch {
       // No Deep Speaking route in this composition: the inline step stays usable.

@@ -33,6 +33,8 @@
  * - Failed turn never produces learning persistence.
  * - Stale/abandoned session result is ignored.
  * - Demo feedback never becomes learner evidence.
+ * - Real committed feedback is persisted once per learner TURN (never deduped
+ *   by feedback object identity, so two turns are always both recorded).
  */
 
 import type {
@@ -163,8 +165,13 @@ interface SpeakingSessionHandle {
   pendingTurn: Promise<ConversationSessionResult> | null;
   /** The (single) finalized summary, returned by repeated completePractice(). */
   summary: SpeakingPracticeSummary | null;
-  /** Set of feedback object identities already persisted (dedup). */
-  persistedFeedback: WeakSet<ConversationFeedback>;
+  /**
+   * Learner-turn indexes whose feedback was already persisted. The dedup key is
+   * the COMMITTED TURN, never the feedback object: two different turns are both
+   * recorded even when a provider returns the same feedback object, while a
+   * re-entrant call for the same turn cannot double-record it.
+   */
+  persistedTurnIndexes: Set<number>;
 }
 
 /* ------------------------------------------------------------------ *
@@ -368,7 +375,7 @@ export class SpeakingPracticeService {
       abandoned: false,
       pendingTurn: null,
       summary: null,
-      persistedFeedback: new WeakSet<ConversationFeedback>(),
+      persistedTurnIndexes: new Set<number>(),
     };
 
     return { session, conversationSession, providerKind, isRealAI };
@@ -439,6 +446,14 @@ export class SpeakingPracticeService {
     }
   }
 
+  /**
+   * True while a learner turn is in flight. The UI uses this as the
+   * authoritative liveness signal before it touches the voice stack.
+   */
+  hasActiveLearnerTurn(): boolean {
+    return this.handle?.pendingTurn != null;
+  }
+
   /** Synchronous refusal rules shared by every learner-turn entry point. */
   private assertTurnAllowed(handle: SpeakingSessionHandle): void {
     if (handle.abandoned) {
@@ -496,14 +511,17 @@ export class SpeakingPracticeService {
       learnerTurnCount: handle.session.learnerTurnCount + 1,
     };
 
-    const feedback = handle.conversationSession.getLastFeedback();
+    // The feedback that belongs to THIS committed turn (the session returns the
+    // feedback of the turn it just committed). It is never read from a stale
+    // "last feedback" slot.
+    const feedback = result.feedback ?? null;
 
     // Note feedback for conversation memory (recorder dedups by identity).
     handle.recorder.noteFeedback(feedback);
 
-    // Feed REAL feedback exactly once to the existing LearningPersistenceService.
+    // Feed the REAL committed feedback exactly once for THIS turn.
     if (handle.isRealAI && feedback) {
-      this.persistFeedbackOnce(handle, feedback);
+      this.persistFeedbackForTurn(handle, feedback);
     }
 
     // Update the turn goal for the NEXT tutor reply based on this evidence.
@@ -569,15 +587,21 @@ export class SpeakingPracticeService {
   /* ------------------------- feedback persist ------------------------- */
 
   /**
-   * Feed a REAL ConversationFeedback to the existing LearningPersistenceService
-   * exactly once. Dedup is by object identity (WeakSet).
+   * Feed the REAL feedback of the turn that just committed to the existing
+   * LearningPersistenceService, exactly once for THAT TURN.
+   *
+   * The ownership key is the committed learner-turn index (single-flight turns
+   * guarantee one commit per index). Deduplicating by feedback object identity
+   * would be wrong: two distinct committed turns must both be recorded even if a
+   * provider happens to reuse the same object.
    */
-  private persistFeedbackOnce(
+  private persistFeedbackForTurn(
     handle: SpeakingSessionHandle,
     feedback: ConversationFeedback,
   ): void {
-    if (handle.persistedFeedback.has(feedback)) return;
-    handle.persistedFeedback.add(feedback);
+    const turnIndex = handle.session.learnerTurnCount;
+    if (handle.persistedTurnIndexes.has(turnIndex)) return;
+    handle.persistedTurnIndexes.add(turnIndex);
     // Non-blocking: persistence failure must not corrupt the conversation.
     void handle.learningPersistence.recordFeedbackEvidence(feedback).catch(() => {
       // Swallow: same non-destructive semantics as Talk.
@@ -809,23 +833,16 @@ export class SpeakingPracticeService {
 
     const sections: SpeakingSummarySection[] = [];
 
-    // What went well — only when there were clean learner turns.
+    // NO praise section: the existing feedback model corrects selectively, so
+    // the absence of a correction is NOT evidence that grammar, naturalness or
+    // fluency were good. This summary only reports explicit, real evidence
+    // (corrections and stored vocabulary) plus the real turn count the UI shows.
     const corrections = snapshot.feedback
       .map((f) => f.correction)
       .filter(
         (c): c is NonNullable<typeof c> =>
           Boolean(c && c.original && c.improved),
       );
-    const cleanTurns = Math.max(0, learnerTurns - corrections.length);
-    if (learnerTurns > 0 && cleanTurns > 0) {
-      sections.push({
-        id: 'went_well',
-        title: 'What went well',
-        items: [
-          `${cleanTurns} of your ${learnerTurns} turns were understood without a correction.`,
-        ],
-      });
-    }
 
     // Useful corrections — only real corrections.
     if (corrections.length > 0) {

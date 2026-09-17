@@ -189,8 +189,12 @@ export interface SpeakingPracticeProgress {
   readonly label: string;
 }
 
+/**
+ * Summary sections. There is deliberately no "what went well" section: the
+ * existing feedback model corrects selectively, so the absence of a correction
+ * is not evidence of good grammar, naturalness or fluency.
+ */
 export type SpeakingSummarySectionId =
-  | 'went_well'
   | 'corrections'
   | 'expressions'
   | 'practice_next';

@@ -66,7 +66,10 @@ import {
   type VoiceStatus,
 } from '../talk-demo';
 import {
+  FINISH_BLOCKED_MESSAGE,
   createDefaultSpeakingService,
+  resolveFinishAvailability,
+  type FinishAvailability,
   type SpeakingPracticePlan,
   type SpeakingPracticeProgress,
   type SpeakingPracticeSeed,
@@ -184,6 +187,24 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
     phaseRef.current = next;
     setPhaseState(next);
   }, []);
+
+  /**
+   * The CURRENT liveness of every learner operation, read synchronously from
+   * refs + state. It is the single input of the finish rule below, so the button
+   * and the handler can never disagree.
+   */
+  const readLiveness = useCallback(
+    (): Parameters<typeof resolveFinishAvailability>[0] => ({
+      voiceState: voiceStatusRef.current.state,
+      isVoiceProcessing: voiceStatusRef.current.isProcessing === true,
+      isSubmitting,
+      isOpening,
+      isTurnInFlight: turnInFlightRef.current,
+      // The service is the authority on its own in-flight learner turn.
+      isServiceTurnActive: serviceRef.current?.hasActiveLearnerTurn() === true,
+    }),
+    [isOpening, isSubmitting],
+  );
 
   /* ----------------------------- planning ----------------------------- */
 
@@ -498,16 +519,33 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
     if (completingRef.current || phaseRef.current === 'finalizing') return;
     const service = serviceRef.current;
     if (!service) return;
+
+    // SYNCHRONOUS REFUSAL — before anything else, in particular BEFORE any voice
+    // teardown: disposing the voice coordinator abandons the conversation
+    // session, so finishing while a typed turn / STT / AI reply / tutor opening
+    // is still in flight could destroy the learner's own turn. The operation in
+    // flight is always allowed to settle through its own path first.
+    const liveness = resolveFinishAvailability(readLiveness());
+    if (!liveness.allowed) {
+      if (liveness.reason) setErrorMessage(liveness.reason);
+      return;
+    }
+
     const token = restartTokenRef.current;
     completingRef.current = true;
+    // Any late UI write of an already-settled turn is now stale by definition.
+    turnTokenRef.current += 1;
     setIsSubmitting(false);
     setStreamingText(null);
     setErrorMessage(null);
+    // The phase change blocks every new learner turn synchronously, so nothing
+    // can start between this guard and the teardown below.
     updatePhase('finalizing');
 
     try {
-      // Close the voice work FIRST: no recorder/TTS overlap, and a late STT
-      // result can never start a new turn while finalization is running.
+      // No learner operation is in flight (guaranteed above), so closing the
+      // voice work here cannot cancel one: it only stops playback/recorder and
+      // invalidates late voice results.
       await disposeVoice();
       const completed = await service.completePractice();
       if (unmountedRef.current || restartTokenRef.current !== token) return;
@@ -527,7 +565,7 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
     } finally {
       completingRef.current = false;
     }
-  }, [disposeVoice, updatePhase]);
+  }, [disposeVoice, readLiveness, updatePhase]);
 
   const handlePracticeAgain = useCallback(async (): Promise<void> => {
     // Invalidate any in-flight finalization/summary from the previous practice.
@@ -587,6 +625,11 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
 
   // The EXISTING voice-turn description drives the microphone label/hint.
   const micStatus = describeVoiceTurn(voiceStatus, isSubmitting || isOpening);
+  // ONE rule decides both the button state and the handler's refusal, so the two
+  // can never disagree: while a learner operation is in flight, finishing is
+  // refused and the learner is told why instead of losing their turn.
+  const finishAvailability: FinishAvailability =
+    phase === 'practicing' ? resolveFinishAvailability(readLiveness()) : { allowed: false, reason: null };
   const turnControls = resolveTalkTurnControls({
     voiceStatus,
     inputText,
@@ -919,11 +962,20 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
         {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
 
         <TouchableOpacity
-          style={styles.completeButton}
+          style={[
+            styles.completeButton,
+            finishAvailability.allowed ? null : styles.completeButtonDisabled,
+          ]}
+          disabled={!finishAvailability.allowed}
           onPress={() => void handleCompletePractice()}
         >
           <Text style={styles.completeButtonText}>Finish practice</Text>
         </TouchableOpacity>
+        {!finishAvailability.allowed ? (
+          <Text style={styles.sizeNote}>
+            {finishAvailability.reason ?? FINISH_BLOCKED_MESSAGE}
+          </Text>
+        ) : null}
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -1068,6 +1120,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginTop: 6,
   },
+  completeButtonDisabled: { opacity: 0.45 },
   completeButtonText: { color: '#0b6b3a', fontSize: 15, fontWeight: '700' },
   linkButton: { alignItems: 'center', paddingVertical: 12 },
   linkText: { fontSize: 13, color: '#6b6b70', textDecorationLine: 'underline' },
