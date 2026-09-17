@@ -4,7 +4,7 @@
  * Each entry is pure data describing a professional speaking scenario.
  * The catalog is intentionally general-purpose: it must remain useful for
  * any profession or industry, with fallbacks rather than hard-coded
- * construction/engineering assumptions.
+ * industry assumptions.
  *
  * Difficulty is qualitative (`simple` / `moderate` / `complex`) plus a short
  * reasoning string. There are no numeric skill scores anywhere.
@@ -20,6 +20,13 @@ import type {
 
 type RankedChallenge = ChallengeEvent;
 
+/**
+ * Minimal, local difficulty ranking. Kept here (rather than importing from the
+ * planner) so this data module stays dependency-free and acyclic. `simple` is
+ * the lowest band and therefore rank 0.
+ */
+const RANK_SIMPLE = 0;
+
 /** Small helper so scenario literals stay readable and satisfaction is checked. */
 const speaking = (id: string, description: string): SpeakingGoal => ({ id, description });
 const language = (id: string, description: string): LanguageGoal => ({ id, description });
@@ -32,7 +39,7 @@ const challenge = (
 /** A generic opening challenge every scenario can fall back on. */
 export const BASELINE_CHALLENGE: RankedChallenge = challenge(
   'clarify-and-confirm',
-  'simple' as unknown as number,
+  RANK_SIMPLE,
   'Ask a clarifying question and confirm understanding before continuing.',
 );
 
@@ -52,10 +59,13 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('state-a-point', 'State a point of view clearly and briefly.'),
       speaking('agree-disagree', 'Agree or disagree politely with reasoning.'),
       speaking('summarise-actions', 'Summarise the agreed actions at the end.'),
+      speaking('meetings_and_updates', 'Give and react to summary points tied to the meeting agenda.'),
     ],
     languageGoals: [
       language('turn-taking', 'Take and hold a turn with natural openers.'),
       language('hedging', 'Hedge claims appropriately ("I would suggest", "it seems").'),
+      language('accuracy', 'Keep grammar and tense use accurate under pressure.'),
+      language('fillers', 'Reduce hesitation with natural fillers and connectors.'),
     ],
     targetExpressions: [
       'Could I add one point here?',
@@ -92,6 +102,7 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
     languageGoals: [
       language('progress-tenses', 'Use present perfect and present continuous accurately.'),
       language('softening', 'Soften problems using "slightly behind", "we may need to".'),
+      language('structure', 'Organise the update into clear, signposted sections.'),
     ],
     targetExpressions: [
       'On track for the end of the month.',
@@ -124,10 +135,13 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('signpost', 'Signpost the structure of the talk.'),
       speaking('explain-idea', 'Explain an idea so a non-expert can follow it.'),
       speaking('handle-question', 'Respond to an audience question confidently.'),
+      speaking('presentations', 'Deliver prepared content with a clear through-line and closing.'),
     ],
     languageGoals: [
       language('discourse-markers', 'Use signposting language ("firstly", "moving on").'),
       language('emphasis', 'Emphasise key points with stress and repetition.'),
+      language('structure', 'Keep the talk organised around a clear narrative.'),
+      language('pace', 'Control speaking pace so key points land clearly.'),
     ],
     targetExpressions: [
       "I'll begin with the background, then move to the results.",
@@ -160,10 +174,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('star-answer', 'Structure an answer with situation, action, and result.'),
       speaking('describe-strength', 'Describe a relevant strength with evidence.'),
       speaking('ask-question', 'Ask a thoughtful question about the role.'),
+      speaking('interviews', 'Answer motivation and fit questions convincingly.'),
     ],
     languageGoals: [
       language('past-narrative', 'Narrate past experience fluently.'),
       language('professional-register', 'Maintain a confident professional register.'),
+      language('register', 'Keep a consistently formal, professional tone.'),
     ],
     targetExpressions: [
       'In a previous role, I was responsible for...',
@@ -196,10 +212,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('state-position', 'State a position clearly and calmly.'),
       speaking('counter-offer', 'Respond to a counter-offer without conceding everything.'),
       speaking('close-agreement', 'Confirm the agreed terms precisely.'),
+      speaking('negotiation', 'Hold a position across several rounds of give-and-take.'),
     ],
     languageGoals: [
       language('conditionals', 'Use conditional offers ("if you could..., we would...").'),
       language('polite-firmness', 'Stay polite while holding a position.'),
+      language('register', 'Maintain a diplomatic, professional tone throughout.'),
     ],
     targetExpressions: [
       'I understand your position, however...',
@@ -232,10 +250,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('ask-needs', 'Ask open questions to uncover the client’s need.'),
       speaking('clarify-expectations', 'Clarify expectations without over-promising.'),
       speaking('confirm-next-step', 'Confirm the next step with the client.'),
+      speaking('client_communication', 'Maintain a warm, trust-building client relationship.'),
     ],
     languageGoals: [
       language('open-questions', 'Use open questions to explore needs.'),
       language('positive-tone', 'Maintain a warm, positive, professional tone.'),
+      language('register', 'Keep language appropriately courteous for clients.'),
     ],
     targetExpressions: [
       'What would a good outcome look like for you?',
@@ -268,10 +288,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('acknowledge-priority', 'Acknowledge another party’s priority sincerely.'),
       speaking('explain-tradeoff', 'Explain a trade-off plainly and diplomatically.'),
       speaking('build-alignment', 'Move the group towards a shared decision.'),
+      speaking('leadership', 'Steer competing interests towards a decision.'),
     ],
     languageGoals: [
       language('balancing', 'Balance viewpoints with contrastive structures.'),
       language('diplomatic-language', 'Use diplomatic language for disagreement.'),
+      language('register', 'Maintain a measured, professional tone under pressure.'),
     ],
     targetExpressions: [
       'I can see why that matters to your team.',
@@ -304,10 +326,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('describe-problem', 'Describe a problem precisely and factually.'),
       speaking('weigh-options', 'Weigh two or three options aloud.'),
       speaking('agree-solution', 'Agree a solution and who will do what.'),
+      speaking('technical_discussion', 'Reason aloud about a technical cause and fix.'),
     ],
     languageGoals: [
       language('cause-effect', 'Express cause and effect clearly.'),
       language('hypothesising', 'Hypothesise ("it might be because...").'),
+      language('structure', 'Organise the diagnosis into clear, logical steps.'),
     ],
     targetExpressions: [
       'What seems to be happening is...',
@@ -340,10 +364,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('headline', 'Lead with the headline finding.'),
       speaking('report-evidence', 'Report evidence neutrally and accurately.'),
       speaking('state-implication', 'State the implication for the team.'),
+      speaking('reporting_and_writing', 'Turn findings into a clear spoken report.'),
     ],
     languageGoals: [
       language('reporting-verbs', 'Use reporting verbs ("shows", "suggests", "indicates").'),
       language('degree', 'Express degree of certainty precisely.'),
+      language('structure', 'Organise the report headline-first.'),
     ],
     targetExpressions: [
       'The headline is that...',
@@ -376,10 +402,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('summarise-thread', 'Summarise a written thread orally.'),
       speaking('clarify-point', 'Clarify one ambiguous point from the thread.'),
       speaking('confirm-next', 'Confirm in speech what was agreed in writing.'),
+      speaking('email_discussion', 'Bridge written and spoken communication smoothly.'),
     ],
     languageGoals: [
       language('reported-speech', 'Report what was written using reported speech.'),
       language('paraphrase', 'Paraphrase formal written language into speech.'),
+      language('register', 'Match the formality of the original thread.'),
     ],
     targetExpressions: [
       'In your email you mentioned that...',
@@ -417,6 +445,7 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
     languageGoals: [
       language('instructions', 'Give clear, sequenced instructions.'),
       language('confirmation-checks', 'Use confirmation checks ("does that make sense?").'),
+      language('structure', 'Sequence instructions in a clear order.'),
     ],
     targetExpressions: [
       'What I need is for us to start with...',
@@ -449,10 +478,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('acknowledge-concern', 'Acknowledge the complaint without admitting fault.'),
       speaking('gather-facts', 'Ask precise questions to gather the facts.'),
       speaking('propose-resolution', 'Propose a resolution that is realistic.'),
+      speaking('claim_discussion', 'Handle a complaint calmly and professionally.'),
     ],
     languageGoals: [
       language('empathetic-language', 'Use empathetic, calm language.'),
       language('neutral-framing', 'Frame the issue neutrally, without blame.'),
+      language('register', 'Stay courteous and professional throughout.'),
     ],
     targetExpressions: [
       'I am sorry to hear that — let me understand what happened.',
@@ -485,10 +516,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('clarify-term', 'Clarify a specific term or clause.'),
       speaking('confirm-obligation', 'Confirm an obligation clearly.'),
       speaking('flag-open-item', 'Flag an item that remains open.'),
+      speaking('contract_discussion', 'Discuss obligations with precision and care.'),
     ],
     languageGoals: [
       language('modal-obligation', 'Express obligation and permission exactly.'),
       language('precision', 'Use precise, unambiguous wording.'),
+      language('register', 'Keep a formal, contract-appropriate tone.'),
     ],
     targetExpressions: [
       'Just so we are both clear on the wording...',
@@ -521,10 +554,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('simplify', 'Simplify a technical idea without distorting it.'),
       speaking('analogy', 'Use an analogy or example to aid understanding.'),
       speaking('adapt-level', 'Adjust the level of detail based on the listener.'),
+      speaking('technical_discussion', 'Reason about technical detail at the right depth.'),
     ],
     languageGoals: [
       language('defining', 'Define terms in plain language.'),
       language('clause-connections', 'Connect ideas with clear cause and contrast.'),
+      language('structure', 'Build the explanation in a logical sequence.'),
     ],
     targetExpressions: [
       'In simple terms, what happens is...',
@@ -557,10 +592,12 @@ export const SCENARIOS: readonly ScenarioDefinition[] = [
       speaking('set-direction', 'Set direction clearly and decisively.'),
       speaking('acknowledge-view', 'Acknowledge the other person’s perspective.'),
       speaking('secure-commitment', 'Secure a clear commitment to the next step.'),
+      speaking('leadership', 'Lead a conversation that shapes direction and commitment.'),
     ],
     languageGoals: [
       language('decisive-language', 'Use decisive, confident language.'),
       language('inclusive-framing', 'Use inclusive framing ("what we can achieve together").'),
+      language('register', 'Balance authority with an approachable tone.'),
     ],
     targetExpressions: [
       'Here is where I would like us to focus.',
