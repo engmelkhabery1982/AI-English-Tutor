@@ -214,6 +214,69 @@ export function evaluateOpenEndedLocally(
 }
 
 /**
+ * Qualitative evaluation for pronunciation repeat practice (Phase 1).
+ *
+ * Evidence is transcript-derived: the existing recorder/STT path produced
+ * `userAnswer`. We compare it to the expected target text and report
+ * whether the attempt was RECOGNIZABLE — never an acoustic score or
+ * "phoneme accuracy". Feedback stays qualitative.
+ */
+export function evaluatePronunciationRepeatLocally(
+  candidate: ReviewItemCandidate,
+  userAnswer: string,
+): EvaluationResult {
+  const normUser = normalizeText(userAnswer);
+  if (!normUser) {
+    return {
+      result: 'incorrect',
+      feedback: 'No speech was captured. Insufficient evidence — try recording again.',
+      explanation: candidate.explanation,
+      suggestedCorrection: candidate.expectedAnswer,
+    };
+  }
+
+  const normExpected = normalizeText(candidate.expectedAnswer);
+  if (normUser === normExpected) {
+    return {
+      result: 'correct',
+      feedback: 'Correct enough — the target was clearly recognizable. Keep practicing it aloud.',
+      explanation: candidate.explanation,
+      suggestedCorrection: candidate.expectedAnswer,
+    };
+  }
+
+  // Word-level overlap: how much of the target was recognizable.
+  const expectedWords = normExpected.split(' ').filter((w) => w.length > 1);
+  const matchedCount = expectedWords.filter((w) => normUser.includes(w)).length;
+  const matchRatio = expectedWords.length > 0 ? matchedCount / expectedWords.length : 0;
+
+  if (matchRatio >= 0.8) {
+    return {
+      result: 'correct',
+      feedback: 'Correct enough — nearly the whole target was recognizable in your attempt.',
+      explanation: candidate.explanation,
+      suggestedCorrection: candidate.expectedAnswer,
+    };
+  }
+
+  if (matchRatio >= 0.4) {
+    return {
+      result: 'partial',
+      feedback: 'Improved — parts of the target were recognizable, parts were still unclear. Say it slowly once more.',
+      explanation: candidate.explanation,
+      suggestedCorrection: candidate.expectedAnswer,
+    };
+  }
+
+  return {
+    result: 'incorrect',
+    feedback: 'Still unclear — the attempt did not closely match the target text yet. Listen, then repeat slowly.',
+    explanation: candidate.explanation,
+    suggestedCorrection: candidate.expectedAnswer,
+  };
+}
+
+/**
  * ReviewEvaluator: Evaluates learner answers deterministically or using AI provider.
  */
 export class ReviewEvaluator {
@@ -229,6 +292,12 @@ export class ReviewEvaluator {
       candidate.exerciseType === 'fill_the_gap'
     ) {
       return evaluateSimpleItemLocally(candidate, userAnswer);
+    }
+
+    // Phase 1 pronunciation practice is always evaluated locally from the
+    // transcript (qualitative). No numeric score, no acoustic claims.
+    if (candidate.exerciseType === 'pronunciation_repeat') {
+      return evaluatePronunciationRepeatLocally(candidate, userAnswer);
     }
 
     if (this.aiProvider) {

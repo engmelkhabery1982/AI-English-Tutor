@@ -19,7 +19,7 @@ import type {
   PronunciationWeakness,
   UserProfile,
 } from '../domain/models/learner';
-import type { EvidenceRef, WeaknessStatus } from '../domain/shared/types';
+import type { EvidenceRef, IsoDate, Uuid, WeaknessStatus } from '../domain/shared/types';
 import type {
   ExpressionItem,
   VocabularyItem,
@@ -30,6 +30,7 @@ import type {
   ProgressRecord,
   ReviewItem,
 } from '../domain/models/learning';
+import type { PronunciationEvidenceSource, QualitativeConfidence } from '../pronunciation/types';
 
 /** Exact activity aggregates over a learner's persisted conversation sessions. */
 export interface ConversationActivityStats {
@@ -87,15 +88,64 @@ export interface MistakeRepository {
   updateMistake(id: string, patch: Partial<Omit<GrammarMistake, 'id' | 'createdAt'>>): Promise<GrammarMistake>;
 }
 
+/** Input for recording one deduplicated pronunciation observation. */
+export interface PronunciationObservationInput {
+  readonly learnerId: Uuid;
+  /**
+   * Stable issue identity used for deduplication, e.g.
+   * "word_pronunciation:comfortable" or "ending:worked-ed".
+   * Repeated observations increase occurrence data instead of
+   * creating duplicate rows.
+   */
+  readonly identity: string;
+  /** Human-readable practice target, e.g. the word itself. */
+  readonly target: string;
+  /** Observed transcript snippet for this occurrence, when available. */
+  readonly exampleText?: string;
+  /** Extra context tags for this occurrence (e.g. "lexical:<id>"). */
+  readonly context?: string;
+  /** Evidence source of this observation (persisted with the row). */
+  readonly evidenceSource: PronunciationEvidenceSource;
+  /** Qualitative confidence of this observation, when the provider gives one. */
+  readonly confidence?: QualitativeConfidence;
+  readonly at: IsoDate;
+}
+
+/** Result of recording one pronunciation observation. */
+export interface PronunciationObservationRecord {
+  readonly weakness: PronunciationWeakness;
+  /** True when this call created the weakness row (first observation). */
+  readonly created: boolean;
+}
+
 export interface PronunciationRepository {
   recordWeakness(
     weakness: Omit<PronunciationWeakness, 'id' | 'createdAt' | 'updatedAt'>,
   ): Promise<PronunciationWeakness>;
   listWeaknesses(learnerId: string, opts?: { resolved?: boolean; limit?: number }): Promise<readonly PronunciationWeakness[]>;
   markResolved(id: string, resolved: boolean): Promise<PronunciationWeakness>;
+  /**
+   * Record one pronunciation observation under a stable identity
+   * (issue type + normalized target). First call creates the row;
+   * repeated calls increment occurrence data instead of duplicating it.
+   * Read/write helper over the same pronunciation_weaknesses table;
+   * optional — backends may omit it.
+   */
+  recordObservation?(input: PronunciationObservationInput): Promise<PronunciationObservationRecord>;
 }
 
 export interface WeaknessRepository {
+  /**
+   * Exact lookup by (learnerId, type, referenceId) — never a capped scan.
+   * Optional: backends may omit it, but the pronunciation engine requires
+   * an exact implementation to preserve lifecycle state safely.
+   */
+  getWeaknessByReference?(
+    learnerId: string,
+    type: LearnerWeakness['type'],
+    referenceId: string,
+  ): Promise<LearnerWeakness | null>;
+
   listWeaknesses(learnerId: string, limit?: number): Promise<readonly LearnerWeakness[]>;
   listStrengths(learnerId: string, limit?: number): Promise<readonly LearnerStrength[]>;
   upsertWeakness(weakness: Omit<LearnerWeakness, 'id' | 'createdAt' | 'updatedAt'>): Promise<LearnerWeakness>;
@@ -171,6 +221,17 @@ export interface ExpressionRepository {
 
 export interface ReviewRepository {
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly ReviewItem[]>;
+  /**
+   * Exact existence lookup by (learnerId, kind, referenceId) — including
+   * items scheduled for the FUTURE (which listDue cannot see) and items
+   * already RETIRED (whose review history must never be silently reset by
+   * a "create initial item" path). Optional: backends may omit it.
+   */
+  getByReference?(
+    learnerId: string,
+    kind: ReviewItem['kind'],
+    referenceId: string,
+  ): Promise<ReviewItem | null>;
   markReviewed(
     id: string,
     result: 'correct' | 'incorrect' | 'partial',

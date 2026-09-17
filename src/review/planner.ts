@@ -12,6 +12,7 @@ import type {
 import type {
   GrammarMistake,
   LearnerWeakness,
+  PronunciationWeakness,
 } from '../domain/models/learner';
 import type {
   VocabularyItem,
@@ -105,6 +106,36 @@ function mistakeToCandidate(
     status: weakness?.status ?? 'observed',
     consecutiveCorrect: 0,
     reviewCount: mistake.occurrenceCount ?? 1,
+  };
+}
+
+/**
+ * Convert a persisted pronunciation weakness to a review candidate that
+ * flows through the EXISTING review pipeline (no second scheduler).
+ * Phase 1 exercise: listen-and-repeat with qualitative transcript-based
+ * evaluation. referenceId points at the matching learner weakness when
+ * one exists so lifecycle updates stay connected.
+ */
+function pronunciationToCandidate(
+  weakness: PronunciationWeakness,
+  learnerWeaknessId?: string,
+): ReviewItemCandidate {
+  const target = weakness.notes?.trim() || weakness.targetSound;
+  return {
+    id: generateId(),
+    learnerId: weakness.learnerId,
+    kind: 'pronunciation',
+    exerciseType: 'pronunciation_repeat',
+    referenceId: learnerWeaknessId ?? weakness.id,
+    prompt: `Listen and repeat clearly: "${target}"`,
+    contextSentence: weakness.wordExamples[0],
+    expectedAnswer: target,
+    explanation: 'Say the word or phrase slowly and clearly, exactly as written.',
+    dueAt: weakness.lastSeenAt,
+    severity: 0.5,
+    status: 'active_training',
+    consecutiveCorrect: 0,
+    reviewCount: weakness.occurrenceCount,
   };
 }
 
@@ -203,6 +234,9 @@ function reviewItemToCandidate(item: ReviewItem): ReviewItemCandidate {
     exerciseType = 'sentence_correction';
   } else if (item.kind === 'expression') {
     exerciseType = 'expression_use';
+  } else if (item.kind === 'pronunciation') {
+    // Pronunciation review items always practice as repeat tasks.
+    exerciseType = 'pronunciation_repeat';
   } else if (item.prompt.includes('___') || (item.contextTopic && item.contextTopic.includes('gap'))) {
     exerciseType = 'fill_the_gap';
   }
@@ -245,10 +279,11 @@ export class ReviewPlanner {
     const dueReviews = await this.repos.review.listDue(learnerId, nowIso, maxItems * 2);
     const candidates: ReviewItemCandidate[] = dueReviews.map(reviewItemToCandidate);
 
-    // 2. Gather active weaknesses and mistakes
-    const [weaknesses, mistakes] = await Promise.all([
+    // 2. Gather active weaknesses, mistakes, and pronunciation weaknesses
+    const [weaknesses, mistakes, pronunciationWeaknesses] = await Promise.all([
       this.repos.weaknesses.listWeaknesses(learnerId, 100),
       this.repos.mistakes.listMistakes(learnerId, { resolved: false, limit: 20 }),
+      this.repos.pronunciation.listWeaknesses(learnerId, { resolved: false, limit: 20 }),
     ]);
 
     const activeWeaknesses = weaknesses.filter((w) => !w.resolved);
@@ -262,6 +297,21 @@ export class ReviewPlanner {
       const alreadyIncluded = candidates.some((c) => c.referenceId === (matchingWeakness?.id ?? mistake.id));
       if (!alreadyIncluded) {
         candidates.push(mistakeToCandidate(mistake, matchingWeakness));
+      }
+    }
+
+    // 2b. Pronunciation weaknesses become repeat-practice candidates via the
+    // same pipeline (existing Review system — no separate scheduler).
+    if (candidates.length < maxItems * 2 && pronunciationWeaknesses.length > 0) {
+      for (const pronWeakness of pronunciationWeaknesses) {
+        const matchingLearnerWeakness = activeWeaknesses.find(
+          (w) => w.type === 'pronunciation' && w.referenceId === pronWeakness.id,
+        );
+        const referenceId = matchingLearnerWeakness?.id ?? pronWeakness.id;
+        const alreadyIncluded = candidates.some((c) => c.referenceId === referenceId);
+        if (!alreadyIncluded) {
+          candidates.push(pronunciationToCandidate(pronWeakness, matchingLearnerWeakness?.id));
+        }
       }
     }
 

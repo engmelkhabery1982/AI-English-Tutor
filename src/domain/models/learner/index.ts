@@ -24,6 +24,7 @@ import type {
   Uuid,
   WeaknessStatus,
 } from '../../shared/types';
+import type { PronunciationEvidenceEntry } from '../../../pronunciation/types';
 
 /** The learner's own profile. */
 export interface UserProfile {
@@ -89,6 +90,12 @@ export interface PronunciationWeakness {
   readonly originTurnId?: Uuid;
   readonly resolved: boolean;
   readonly notes?: string;
+  /**
+   * Bounded evidence log for this weakness: what was observed, when, and
+   * from which evidence source (qualitative only — never scores).
+   * Optional: rows created before this field existed may omit it.
+   */
+  readonly evidenceLog?: readonly PronunciationEvidenceEntry[];
   readonly createdAt: IsoDate;
   readonly updatedAt: IsoDate;
 }

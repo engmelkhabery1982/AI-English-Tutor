@@ -627,7 +627,11 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
               <View style={styles.inputWrapper}>
                 <TextInput
                   style={styles.answerInput}
-                  placeholder="Type your answer in English..."
+                  placeholder={
+                    candidate.exerciseType === 'pronunciation_repeat'
+                      ? 'Say it aloud with the mic, or type what you said...'
+                      : 'Type your answer in English...'
+                  }
                   placeholderTextColor="#9CA3AF"
                   value={userAnswer}
                   onChangeText={setUserAnswer}
@@ -1018,6 +1022,10 @@ const styles = StyleSheet.create({
   typeBadge_grammar: { backgroundColor: '#EFF6FF' },
   typeBadge_vocabulary: { backgroundColor: '#ECFDF5' },
   typeBadge_expression: { backgroundColor: '#FFF7ED' },
+  typeBadge_pronunciation: {
+    backgroundColor: '#EEF4FF',
+    borderColor: '#1F4E9C',
+  },
   typeBadgeText: {
     fontSize: 10,
     fontWeight: '800',
@@ -1312,4 +1320,5 @@ const TYPE_BADGE_STYLES: Record<string, ViewStyle> = {
   grammar: styles.typeBadge_grammar,
   vocabulary: styles.typeBadge_vocabulary,
   expression: styles.typeBadge_expression,
+  pronunciation: styles.typeBadge_pronunciation,
 };

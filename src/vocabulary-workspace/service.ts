@@ -19,6 +19,7 @@ import type {
   ReviewRepository,
   UserProfileRepository,
   VocabularyRepository,
+  WeaknessRepository,
 } from '../repositories';
 import type { ReviewItem } from '../domain/models/learning';
 import type { ReviewService } from '../review/service';
@@ -32,6 +33,30 @@ import type {
   WorkspaceSnapshot,
   WorkspaceSummary,
 } from './types';
+
+/** Pronunciation note label for a dedup identity like 'word_stress:development'. */
+export function prettifyPronunciationIdentity(identity?: string | null): string | null {
+  if (!identity) return null;
+  const idx = identity.indexOf(':');
+  if (idx <= 0) return identity.trim() || null;
+  const type = identity.slice(0, idx);
+  const target = identity.slice(idx + 1).trim();
+  const labels: Record<string, string> = {
+    word_pronunciation: 'word pronunciation',
+    word_stress: 'word stress',
+    sentence_stress: 'sentence stress',
+    vowel: 'vowel sound',
+    consonant: 'consonant sound',
+    ending: 'word ending',
+    linking: 'linking',
+    rhythm: 'rhythm',
+    intonation: 'intonation',
+    intelligibility: 'clarity',
+    other: 'pronunciation',
+  };
+  const label = labels[type] ?? 'pronunciation';
+  return target ? `${target} — ${label}` : label;
+}
 
 /** Normalize text for local search: lowercase, trimmed, collapsed whitespace. */
 export function normalizeSearchText(text: string): string {
@@ -193,6 +218,11 @@ export interface VocabularyWorkspaceServiceDeps extends VocabularyWorkspaceRepos
    */
   readonly reviewCleanup?: Pick<ReviewRepository, 'deleteByReference'>;
   /**
+   * Existing weakness repository — read-only source of linked pronunciation
+   * notes (weakness rows tagged `lexical:<itemId>`). Never written here.
+   */
+  readonly pronunciationNotes?: Pick<WeaknessRepository, 'listWeaknesses'>;
+  /**
    * Atomic data-layer delete: removes the lexical item AND its matching
    * review rows (same referenceId + same kind) in ONE adapter transaction.
    * Provided by composition (see vocabulary-workspace/index.ts); when
@@ -283,6 +313,29 @@ export class VocabularyWorkspaceService {
    * Returns null when no profile exists yet — the caller must show an
    * honest "no profile" state; learner IDs are never fabricated.
    */
+  /**
+   * Human-readable pronunciation notes linked to a saved word/expression.
+   * Reads the EXISTING learner weaknesses (type 'pronunciation') whose
+   * context tags reference this item — never creates or edits rows and
+   * never duplicates review/mastery data.
+   */
+  async getPronunciationNotes(entry: WorkspaceEntry): Promise<readonly string[]> {
+    const repo = this.deps.pronunciationNotes;
+    if (!repo) return [];
+    const learnerId = await this.getActiveLearnerId();
+    if (!learnerId) return [];
+    try {
+      const weaknesses = await repo.listWeaknesses(learnerId, 100);
+      const tag = `lexical:${entry.id}`;
+      return weaknesses
+        .filter((w) => w.type === 'pronunciation' && !w.resolved && w.contexts.includes(tag))
+        .map((w) => prettifyPronunciationIdentity(w.notes))
+        .filter((note): note is string => Boolean(note));
+    } catch {
+      return [];
+    }
+  }
+
   async getActiveLearnerId(): Promise<string | null> {
     if (!this.deps.profile) return null;
     try {

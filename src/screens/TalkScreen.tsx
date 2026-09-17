@@ -1,4 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
+import type { PronunciationEngine } from '../pronunciation';
+import { createDefaultPronunciationEngine } from '../pronunciation';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -38,6 +40,8 @@ export interface TalkScreenProps {
   readonly sttProvider?: SpeechToTextProvider;
   readonly ttsProvider?: TextToSpeechProvider;
   readonly initialMuted?: boolean;
+  /** Injectable pronunciation engine (defaults to the real composition). */
+  readonly pronunciationEngine?: PronunciationEngine;
 }
 
 export default function TalkScreen(props?: TalkScreenProps) {
@@ -64,9 +68,50 @@ export default function TalkScreen(props?: TalkScreenProps) {
     canSendText: true,
   });
 
+  const [pronunciationLines, setPronunciationLines] = useState<readonly string[] | null>(null);
+
   const sessionRef = useRef<ConversationSession | null>(null);
   const voiceCoordinatorRef = useRef<VoiceSessionCoordinator | null>(null);
+  const pronunciationEngineRef = useRef<PronunciationEngine | null>(
+    props?.pronunciationEngine ?? null,
+  );
   const scrollViewRef = useRef<ScrollView | null>(null);
+
+  // Pronunciation analysis is secondary to the conversation: compose the
+  // engine lazily and never let it break the talk flow.
+  useEffect(() => {
+    if (pronunciationEngineRef.current) return;
+    let active = true;
+    createDefaultPronunciationEngine()
+      .then((engine) => {
+        if (active) pronunciationEngineRef.current = engine;
+      })
+      .catch(() => {
+        // Analysis stays unavailable; conversation is unaffected.
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const runPronunciationAnalysis = async () => {
+    const engine = pronunciationEngineRef.current;
+    if (!engine) return;
+    try {
+      const spokenTurn = [...sessionRef.current?.getHistory() ?? []]
+        .reverse()
+        .find((turn) => turn.role === 'user');
+      const transcript = spokenTurn?.content?.trim();
+      setPronunciationLines(null);
+      if (!transcript) return;
+
+      const outcome = await engine.analyzeSpokenTurn({ transcript, mode });
+      setPronunciationLines(outcome?.feedbackLines?.length ? outcome.feedbackLines : null);
+    } catch {
+      // Non-destructive: pronunciation analysis must never fail the turn.
+      setPronunciationLines(null);
+    }
+  };
 
   // Initialize or retrieve the active voice coordinator
   const getOrCreateVoiceCoordinator = (
@@ -228,6 +273,9 @@ export default function TalkScreen(props?: TalkScreenProps) {
       if (!res.ok && res.error) {
         setErrorMessage(res.error);
       }
+
+      // Analyze pronunciation once per spoken turn (never blocks the flow).
+      await runPronunciationAnalysis();
     } else if (voiceStatus.canRecord) {
       setErrorMessage(null);
       await coordinator.startRecording();
@@ -478,6 +526,18 @@ export default function TalkScreen(props?: TalkScreenProps) {
                     </View>
                   )}
                 </View>
+
+                {/* Pronunciation note (compact, evidence-based, mode-aware) */}
+                {isLastAssistant && pronunciationLines && pronunciationLines.length > 0 && (
+                  <View style={styles.pronunciationContainer} testID="pronunciation-note">
+                    <Text style={styles.pronunciationTitle}>🎙️ Pronunciation note</Text>
+                    {pronunciationLines.map((line, index) => (
+                      <Text key={index} style={styles.pronunciationLine}>
+                        • {line}
+                      </Text>
+                    ))}
+                  </View>
+                )}
 
                 {/* Feedback Panel (rendered under the latest assistant response) */}
                 {isLastAssistant && lastFeedback && (
@@ -957,6 +1017,25 @@ const styles = StyleSheet.create({
   },
   assistantMessageText: {
     color: '#1F2937',
+  },
+  pronunciationContainer: {
+    backgroundColor: '#EEF4FF',
+    borderColor: '#C9DAF8',
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 10,
+    marginTop: 8,
+  },
+  pronunciationTitle: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#1F4E9C',
+    marginBottom: 4,
+  },
+  pronunciationLine: {
+    fontSize: 13,
+    color: '#2C3E50',
+    lineHeight: 18,
   },
   feedbackContainer: {
     marginTop: 8,
