@@ -15,10 +15,11 @@ import {
   View,
 } from 'react-native';
 import {
-  createTalkLearnerModel,
   createTalkSession,
   createTalkVoiceCoordinator,
   createLearningPersistenceService,
+  resolveTalkCoaching,
+  resolveTalkTurnControls,
   TALK_REAL_AI_UNAVAILABLE_MESSAGE,
   describeVoiceTurn,
   type AudioRecorderService,
@@ -28,6 +29,9 @@ import {
   type ConversationSession,
   type ConversationTurn,
   type SpeechToTextProvider,
+  type TalkCoachingComposition,
+  type TalkCoachingResolution,
+  type TalkCoachingSource,
   type TalkProviderInfo,
   type TalkProviderKind,
   type VoiceTurnPhase,
@@ -55,8 +59,18 @@ export interface TalkScreenProps {
   /**
    * Optional local database adapter used to compose the REAL learner model so
    * the existing ConversationEngine can adapt to persisted coaching context.
+   * When absent, Talk resolves the canonical application database composition
+   * itself (see `loadCoachingComposition`).
    */
   readonly databaseAdapter?: DatabaseAdapter;
+  /** Pre-composed real learner model (tests / embedding). */
+  readonly learnerModel?: LearnerModel;
+  /**
+   * Override for the default (real app database) coaching composition. Defaults
+   * to `createDefaultTalkComposition()`, so the ROUTED Talk screen always talks
+   * to the same canonical local database as the rest of the app.
+   */
+  readonly loadCoachingComposition?: () => Promise<TalkCoachingComposition>;
 }
 
 /**
@@ -84,8 +98,17 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const [providerKind, setProviderKind] = useState<TalkProviderKind>('demo');
   const [providerInfo, setProviderInfo] = useState<TalkProviderInfo | null>(null);
   const [isOpening, setIsOpening] = useState<boolean>(false);
-  /** Incremented for every new conversation identity (drives the tutor opening). */
-  const [conversationEpoch, setConversationEpoch] = useState<number>(0);
+  /**
+   * Incremented once a NEW conversation session is actually installed and active
+   * (drives the tutor opening). It is deliberately bumped AFTER the atomic
+   * session switch settles, so the opening always runs against the live session
+   * — never against the session that is still being replaced.
+   */
+  const [sessionEpoch, setSessionEpoch] = useState<number>(0);
+  /** Resolved coaching context; null while the real composition is loading. */
+  const [coachingSource, setCoachingSource] = useState<TalkCoachingSource | null>(null);
+  /** A session switch is running: no learner turn may start until it settles. */
+  const [isSwitching, setIsSwitching] = useState<boolean>(false);
 
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>({
     state: 'idle',
@@ -104,13 +127,18 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const sessionRef = useRef<ConversationSession | null>(null);
   const voiceCoordinatorRef = useRef<VoiceSessionCoordinator | null>(null);
   const providerInfoRef = useRef<TalkProviderInfo | null>(null);
-  /** Real learner model (existing system) + its persisted-context refresh. */
-  const learnerModelRef = useRef<LearnerModel | null>(null);
+  /** In-flight refresh of the persisted coaching context for the live session. */
   const learnerRefreshRef = useRef<Promise<void> | null>(null);
   /** Invalidates in-flight opening attempts when the conversation changes. */
   const openingTokenRef = useRef<number>(0);
   /** Mode+topic identity of the conversation currently composed. */
   const conversationIdentityRef = useRef<string>('');
+  /** Resolved real coaching composition (persisted learner evidence). */
+  const coachingRef = useRef<TalkCoachingResolution | null>(null);
+  /** Guards concurrent session switches: only the newest one may install. */
+  const switchTokenRef = useRef<number>(0);
+  /** Mirror of `isSwitching` for async callbacks that must not re-enter. */
+  const coordinatorIsSwitchingRef = useRef<boolean>(false);
   const pronunciationEngineRef = useRef<PronunciationEngine | null>(
     props?.pronunciationEngine ?? null,
   );
@@ -201,33 +229,27 @@ export default function TalkScreen(props?: TalkScreenProps) {
    * the opening token below, so they can never land in the replacement session.
    */
   const startConversation = useCallback(
-    (targetMode: ConversationMode, targetTopic: string): ConversationSession => {
+    async (
+      targetMode: ConversationMode,
+      targetTopic: string,
+    ): Promise<ConversationSession | null> => {
+      const switchToken = (switchTokenRef.current += 1);
+      // Any tutor opening of the previous conversation is invalidated at once.
       openingTokenRef.current += 1;
       conversationIdentityRef.current = `${targetMode}::${targetTopic.trim()}`;
-      setConversationEpoch((prev) => prev + 1);
-      const coordinator = voiceCoordinatorRef.current;
-      if (coordinator) {
-        void coordinator.reset();
-      }
+      setIsOpening(false);
+      setIsSwitching(true);
+      coordinatorIsSwitchingRef.current = true;
 
-      // Compose the EXISTING learner model once per conversation and refresh its
-      // persisted coaching context (weaknesses, due vocabulary/expressions,
-      // level, goals, progress) so the existing ConversationEngine can adapt to
-      // real evidence. Absent an adapter, the demo model stays in use and no
-      // personalization is claimed.
-      const adapter = props?.databaseAdapter;
-      if (adapter && !learnerModelRef.current) {
-        learnerModelRef.current = createTalkLearnerModel(adapter);
-      }
-      if (!adapter) {
-        learnerModelRef.current = null;
-      }
-      const learnerModel = learnerModelRef.current;
-      if (learnerModel) {
-        learnerRefreshRef.current = learnerModel.refresh().catch(() => undefined);
-      } else {
-        learnerRefreshRef.current = null;
-      }
+      const coaching = coachingRef.current;
+      const learnerModel = coaching?.learnerModel ?? null;
+
+      // Refresh the persisted coaching context for the new conversation so the
+      // existing ConversationEngine sees current weaknesses, due vocabulary,
+      // level, goals and progress.
+      learnerRefreshRef.current = learnerModel
+        ? learnerModel.refresh().catch(() => undefined)
+        : null;
 
       const bundle = createTalkSession(
         {
@@ -235,20 +257,36 @@ export default function TalkScreen(props?: TalkScreenProps) {
           topic: targetTopic.trim() || undefined,
         },
         {
-          databaseAdapter: adapter,
+          databaseAdapter: coaching?.databaseAdapter,
           learnerModel: learnerModel ?? undefined,
         },
       );
+
+      const coordinator = voiceCoordinatorRef.current;
+      if (coordinator) {
+        // ATOMIC switch: the old conversation's recorder/playback cleanup is
+        // awaited BEFORE the new session becomes active, and every cleanup write
+        // is generation guarded — an older reset can never clobber this session.
+        const installed = await coordinator.switchSession(bundle.session);
+        if (installed !== bundle.session) {
+          // Superseded (or the screen was disposed): the newer operation owns the
+          // coordinator and will settle the switch state itself.
+          return null;
+        }
+      } else {
+        getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+      }
+
+      // A newer switch superseded this one: install nothing. The newer switch
+      // owns the switch flag and will clear it when it settles.
+      if (switchToken !== switchTokenRef.current) {
+        return null;
+      }
+
       sessionRef.current = bundle.session;
       providerInfoRef.current = bundle.providerInfo;
       setProviderKind(bundle.providerKind);
       setProviderInfo(bundle.providerInfo);
-
-      if (coordinator) {
-        coordinator.setSession(bundle.session);
-      } else {
-        getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
-      }
 
       setHistory([]);
       setLastFeedback(null);
@@ -258,11 +296,42 @@ export default function TalkScreen(props?: TalkScreenProps) {
       setErrorMessage(null);
       setPronunciationLines(null);
       setIsSending(false);
+      setIsSwitching(false);
+      coordinatorIsSwitchingRef.current = false;
+      // Only now is the replacement session live: the tutor opening may run.
+      setSessionEpoch((prev) => prev + 1);
 
       return bundle.session;
     },
-    [getOrCreateVoiceCoordinator, props?.databaseAdapter],
+    [getOrCreateVoiceCoordinator],
   );
+
+  /**
+   * Resolve the coaching context BEFORE the first conversation is composed.
+   *
+   * The routed Talk screen passes no adapter, so this resolves the canonical
+   * application database composition: real Gemini conversation then adapts to
+   * the learner's persisted profile, weaknesses, vocabulary and progress through
+   * the EXISTING ConversationEngine. The demo learner model is used only when no
+   * persisted data can be composed at all, and that is surfaced honestly.
+   */
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      const resolution = await resolveTalkCoaching({
+        databaseAdapter: props?.databaseAdapter,
+        learnerModel: props?.learnerModel,
+        loadDefaultComposition: props?.loadCoachingComposition,
+      });
+      if (!active) return;
+      coachingRef.current = resolution;
+      setCoachingSource(resolution.source);
+    })();
+    return () => {
+      active = false;
+    };
+    // Injected adapters/models are fixed for the lifetime of the screen.
+  }, [props?.databaseAdapter, props?.learnerModel, props?.loadCoachingComposition]);
 
   /**
    * Best-effort wait for the persisted coaching context refresh so the very
@@ -279,27 +348,21 @@ export default function TalkScreen(props?: TalkScreenProps) {
     }
   };
 
-  // Initialize or retrieve the active session bundle
-  const getOrCreateSession = (
-    targetMode: ConversationMode,
-    targetTopic: string
-  ): ConversationSession => {
-    if (!sessionRef.current) {
-      return startConversation(targetMode, targetTopic);
-    }
-    return sessionRef.current;
-  };
-
   // Fresh conversation whenever the mode or the (empty-history) topic changes —
   // the same rule as before, funnelled through startConversation so the previous
   // voice work is always cancelled safely. The identity guard keeps a single
   // composition per identity (no duplicate session/opening).
   useEffect(() => {
+    if (coachingSource === null) {
+      // Still resolving the REAL persisted coaching context: composing now would
+      // silently fall back to the demo learner model.
+      return;
+    }
     const identity = `${mode}::${topic.trim()}`;
     if (history.length === 0 && conversationIdentityRef.current !== identity) {
-      startConversation(mode, topic);
+      void startConversation(mode, topic);
     }
-  }, [mode, topic, history.length, startConversation]);
+  }, [mode, topic, history.length, coachingSource, startConversation]);
 
   const topicEditable = history.length === 0 && !isSending && !isOpening;
 
@@ -321,6 +384,10 @@ export default function TalkScreen(props?: TalkScreenProps) {
     let cancelled = false;
 
     const runOpening = async (): Promise<void> => {
+      // A session switch (New Chat / mode change) owns the coordinator now.
+      if (coordinatorIsSwitchingRef.current) {
+        return;
+      }
       // Stale guard: the learner kept editing the topic, or the conversation was
       // replaced — this opening must not run at all.
       if (cancelled || openingTokenRef.current !== token || sessionRef.current !== session) {
@@ -359,6 +426,12 @@ export default function TalkScreen(props?: TalkScreenProps) {
         setStreamingText(null);
 
         if (!result.ok) {
+          if (result.error.code === 'cancelled') {
+            // The learner started the conversation first (typed/spoken turn), so
+            // the stale opening was discarded by the session itself: keep their
+            // turn and stay silent instead of showing a false error.
+            return;
+          }
           setErrorMessage(
             result.error.message ||
               'The tutor could not start the conversation. Please try again.',
@@ -392,7 +465,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [conversationEpoch]);
+  }, [sessionEpoch]);
 
   // Clean up voice coordinator when component unmounts: stops the recorder and
   // any playback, and discards late voice results.
@@ -417,6 +490,8 @@ export default function TalkScreen(props?: TalkScreenProps) {
   // active recording/playback and starts the tutor's opening turn.
   const handleSelectMode = (newMode: ConversationMode) => {
     if (newMode === mode) return;
+    // Cancels any in-flight tutor opening; the conversation effect then performs
+    // the atomic session switch for the new mode.
     setIsOpening(false);
     setMode(newMode);
     setLastFeedback(null);
@@ -430,8 +505,11 @@ export default function TalkScreen(props?: TalkScreenProps) {
   // Handle New / Clear conversation: cancels active voice work, then starts a
   // brand-new conversation with the tutor's real opening turn.
   const handleNewConversation = () => {
+    // New Chat cancels the active voice work and the tutor opening atomically:
+    // the previous conversation's recorder/playback cleanup is awaited before
+    // the replacement session becomes active.
     setIsOpening(false);
-    startConversation(mode, topic);
+    void startConversation(mode, topic);
   };
 
   // Handle save vocabulary item
@@ -450,7 +528,9 @@ export default function TalkScreen(props?: TalkScreenProps) {
       // record yet. The learner stays in control once the turn completes.
       return;
     }
-    const session = getOrCreateSession(mode, topic);
+    // No active conversation yet (still preparing or switching): nothing to do.
+    const session = sessionRef.current;
+    if (!session || isSwitching) return;
     const coordinator = getOrCreateVoiceCoordinator(session, providerKind);
 
     if (voiceStatus.state === 'recording') {
@@ -533,9 +613,19 @@ export default function TalkScreen(props?: TalkScreenProps) {
     const userTurn: ConversationTurn = { role: 'user', content: trimmedMessage };
     setHistory((prev) => [...prev, userTurn]);
 
+    const targetSession = sessionRef.current;
+    if (!targetSession || isSwitching) {
+      return;
+    }
+
     try {
       await ensureLearnerContext();
-      const session = getOrCreateSession(mode, topic);
+      const session = targetSession;
+      // Never race the tutor opening: it must finish or be invalidated first.
+      if (isOpening) {
+        setInputText(trimmedMessage);
+        return;
+      }
       const result = await session.send(
         { userMessage: trimmedMessage },
         (chunk: string) => {
@@ -577,8 +667,19 @@ export default function TalkScreen(props?: TalkScreenProps) {
     }
   };
 
-  const isSendDisabled =
-    inputText.trim().length === 0 || isSending || !voiceStatus.canSendText;
+  const isPreparing = coachingSource === null;
+  // One place decides whether a learner turn may start right now: while the
+  // tutor opening is in flight, while a switch is running, or while a turn is
+  // being processed, neither the microphone nor the composer is available.
+  const turnControls = resolveTalkTurnControls({
+    voiceStatus,
+    inputText,
+    isOpening,
+    isSending,
+    isSwitching,
+    isPreparing,
+  });
+  const isSendDisabled = turnControls.sendDisabled;
   const isGemini = providerKind === 'gemini';
   const isRealAI = providerInfo?.isRealAI ?? isGemini;
   const providerLabel = providerInfo?.label ?? (isGemini ? 'Gemini • Online' : 'Local Demo • Offline');
@@ -586,6 +687,9 @@ export default function TalkScreen(props?: TalkScreenProps) {
   // Learner-facing turn phase, derived from the EXISTING voice status model.
   const turnView = describeVoiceTurn(voiceStatus, isSending || isOpening);
   const isOfflineDemo = !isRealAI;
+  // Honest coaching status: personalization is claimed ONLY when the real
+  // persisted learner model is in use.
+  const usesDemoLearnerModel = coachingSource === 'demo-fallback';
   const turnPhase: VoiceTurnPhase = turnView.phase;
   const micLabel =
     turnPhase === 'recording'
@@ -690,6 +794,20 @@ export default function TalkScreen(props?: TalkScreenProps) {
             </Text>
           </View>
         )}
+
+        {/*
+          Honest coaching status: with real AI but no persisted learner data, the
+          tutor cannot adapt to the learner's saved progress — so it says so
+          instead of implying personalization.
+        */}
+        {isRealAI && usesDemoLearnerModel && (
+          <View style={styles.offlineNotice}>
+            <Text style={styles.offlineNoticeText}>
+              Personalized coaching is unavailable: your saved learner data could
+              not be loaded, so replies are not adapted to your progress yet.
+            </Text>
+          </View>
+        )}
       </View>
 
       {/* Chat Area */}
@@ -703,10 +821,12 @@ export default function TalkScreen(props?: TalkScreenProps) {
       >
         {history.length === 0 ? (
           <View style={styles.emptyState}>
-            {isOpening ? (
+            {isPreparing || isOpening ? (
               <View style={styles.openingContainer}>
                 <ActivityIndicator size="small" color="#2563EB" />
-                <Text style={styles.emptyStateTitle}>Your tutor is starting…</Text>
+                <Text style={styles.emptyStateTitle}>
+                  {isPreparing ? 'Loading your progress…' : 'Your tutor is starting…'}
+                </Text>
               </View>
             ) : (
               <Text style={styles.emptyStateTitle}>
@@ -714,7 +834,9 @@ export default function TalkScreen(props?: TalkScreenProps) {
               </Text>
             )}
             <Text style={styles.emptyStateDescription}>
-              {isOfflineDemo
+              {isPreparing
+                ? 'Preparing your tutor with your saved level, weaknesses, vocabulary and progress before the conversation begins.'
+                : isOfflineDemo
                 ? 'No real AI tutor is available, so replies come from the offline demo script. You can still try the flow, but nothing here is real AI conversation or personalized feedback.'
                 : 'Pick a mode and an optional topic — your tutor opens the conversation. Then just tap the microphone and talk naturally.'}
             </Text>
@@ -994,6 +1116,9 @@ export default function TalkScreen(props?: TalkScreenProps) {
         <TouchableOpacity
           style={[
             styles.micButton,
+            // The microphone is the obvious primary action whenever the learner
+            // holds the turn (never while the tutor is opening or replying).
+            turnControls.microphoneIsPrimary && styles.micButtonPrimary,
             voiceStatus.state === 'recording' && styles.micButtonRecording,
             voiceStatus.state === 'transcribing' && styles.micButtonTranscribing,
             voiceStatus.state === 'speaking' && styles.micButtonSpeaking,
@@ -1002,11 +1127,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
               styles.micButtonDisabled,
           ]}
           onPress={handleToggleRecording}
-          disabled={
-            isOpening ||
-            isSending ||
-            (!voiceStatus.canRecord && voiceStatus.state !== 'recording')
-          }
+          disabled={turnControls.micDisabled}
           accessibilityRole="button"
           accessibilityLabel={micLabel}
           accessibilityHint={turnView.hint}
@@ -1661,6 +1782,10 @@ const styles = StyleSheet.create({
     borderColor: '#BFDBFE',
     justifyContent: 'center',
     alignItems: 'center',
+  },
+  micButtonPrimary: {
+    backgroundColor: '#DBEAFE',
+    borderColor: '#93C5FD',
   },
   micButtonRecording: {
     backgroundColor: '#DC2626',

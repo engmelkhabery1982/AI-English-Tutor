@@ -27,6 +27,21 @@ import type {
   ConversationSessionSendInput,
 } from './types';
 
+/**
+ * Honest message returned when a tutor opening is discarded because the
+ * conversation started (or was cleared) while the opening request was in flight.
+ * Nothing was added to the conversation.
+ */
+export const CONVERSATION_OPENING_DISCARDED_MESSAGE =
+  'The learner started the conversation before the tutor opening arrived, so the opening was discarded.';
+
+/**
+ * Returned when a turn or opening tries to commit into a session that was
+ * already replaced/closed: nothing is written to history or feedback.
+ */
+export const CONVERSATION_ABANDONED_MESSAGE =
+  'This conversation was replaced before the turn finished, so the turn was discarded.';
+
 export type {
   ConversationMode,
   ConversationTurn,
@@ -83,11 +98,36 @@ export function createConversationSession(
   const history: ConversationTurn[] = [];
   const savedVocabularyMap = new Map<string, ConversationFeedbackVocabulary>();
   let lastFeedback: ConversationFeedback | null = null;
+  /**
+   * Conversation generation. Bumped by every committed turn and by clear().
+   * An async opening captures it before the AI request and commits ONLY when it
+   * is still unchanged — so a learner turn (or a reset) that arrives while the
+   * opening is in flight always wins and the stale opening is discarded.
+   */
+  let historyVersion = 0;
+  /** True once the session was replaced/closed (late work must be discarded). */
+  let abandoned = false;
+
+  /** Discriminated refusal used for every abandoned-session case. */
+  function abandonedResult(): ConversationSessionResult {
+    return {
+      ok: false,
+      error: {
+        code: 'cancelled',
+        message: CONVERSATION_ABANDONED_MESSAGE,
+        retryable: false,
+      },
+      history: cloneHistory(history),
+      feedback: null,
+    };
+  }
 
   async function executeTurn(
     input: ConversationSessionSendInput,
     onChunk?: AIStreamCallback
   ): Promise<ConversationSessionResult> {
+    if (abandoned) return abandonedResult();
+
     const requestInput: ConversationRequestInput = {
       mode: sessionConfig.mode,
       ...(typeof sessionConfig.topic === 'string' && { topic: sessionConfig.topic }),
@@ -108,7 +148,13 @@ export function createConversationSession(
       }
     }
 
+    if (abandoned) {
+      // The session was replaced while the AI was answering: never commit.
+      return abandonedResult();
+    }
+
     if (result.ok) {
+      historyVersion += 1;
       history.push({
         role: 'user',
         content: input.userMessage,
@@ -163,6 +209,8 @@ export function createConversationSession(
     input: ConversationSessionSendInput,
     onChunk?: AIStreamCallback
   ): Promise<ConversationSessionResult> {
+    if (abandoned) return abandonedResult();
+
     if (history.length > 0) {
       return {
         ok: false,
@@ -174,6 +222,9 @@ export function createConversationSession(
         history: cloneHistory(history),
       };
     }
+
+    // Capture the pristine state this opening started from.
+    const startedVersion = historyVersion;
 
     const requestInput: ConversationRequestInput = {
       mode: sessionConfig.mode,
@@ -205,6 +256,29 @@ export function createConversationSession(
       };
     }
 
+    if (abandoned) {
+      // The session was replaced while the opening was in flight.
+      return abandonedResult();
+    }
+
+    // Commit ONLY if this session is still in the pristine state the opening
+    // started from. A learner turn (or a clear) that landed while the opening
+    // was in flight always wins: the opening is discarded, never appended to an
+    // already-started conversation and never allowed to touch feedback/history.
+    if (historyVersion !== startedVersion || history.length > 0) {
+      return {
+        ok: false,
+        error: {
+          code: 'cancelled',
+          message: CONVERSATION_OPENING_DISCARDED_MESSAGE,
+          retryable: true,
+        },
+        history: cloneHistory(history),
+        feedback: null,
+      };
+    }
+
+    historyVersion += 1;
     history.push({ role: 'assistant', content: result.response.content });
 
     return {
@@ -285,8 +359,16 @@ export function createConversationSession(
     },
 
     clear(): void {
+      historyVersion += 1;
       history.length = 0;
       lastFeedback = null;
+    },
+
+    abandon(): void {
+      if (abandoned) return;
+      abandoned = true;
+      // Invalidate every in-flight turn/opening of this session.
+      historyVersion += 1;
     },
 
     getConfig(): ConversationSessionConfig {

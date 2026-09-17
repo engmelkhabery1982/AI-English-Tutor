@@ -20,7 +20,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createConversationEngine } from '../conversation-engine';
 import { createConversationOrchestrator } from '../conversation-orchestrator';
-import { createConversationSession } from '../conversation-session';
+import {
+  createConversationSession,
+  CONVERSATION_OPENING_DISCARDED_MESSAGE,
+} from '../conversation-session';
 import { SqlJsAdapter } from '../data/local/sqlite/SqlJsAdapter';
 import {
   SQLiteUserProfileRepository,
@@ -98,6 +101,150 @@ class PermissiveRecorder extends DemoAudioRecorder {
       return this.lastResult;
     }
   }
+}
+
+/**
+ * Recorder whose cleanup can be held open, so a session switch can be observed
+ * while the OLD recorder is still shutting down.
+ */
+class GatedRecorder extends DemoAudioRecorder {
+  private stopResolvers: (() => void)[] = [];
+  private releasePermissionFn: (() => void) | null = null;
+  private granted = true;
+  holdStop = false;
+  holdPermission = false;
+
+  /** Model an ungranted microphone so requestPermissions() is really used. */
+  requireRequest(): void {
+    this.granted = false;
+    this.setPermission(false);
+  }
+
+  override async hasPermissions(): Promise<boolean> {
+    return this.granted;
+  }
+
+  override async requestPermissions(): Promise<boolean> {
+    if (this.holdPermission) {
+      await new Promise<void>((resolve) => {
+        this.releasePermissionFn = resolve;
+      });
+    }
+    this.granted = true;
+    this.setPermission(true);
+    return true;
+  }
+
+  override async stopRecording() {
+    if (this.holdStop) {
+      await new Promise<void>((resolve) => {
+        this.stopResolvers.push(resolve);
+      });
+    }
+    return super.stopRecording();
+  }
+
+  releaseStop(): void {
+    const pending = this.stopResolvers;
+    this.stopResolvers = [];
+    for (const release of pending) release();
+  }
+
+  releasePermission(): void {
+    const release = this.releasePermissionFn;
+    this.releasePermissionFn = null;
+    release?.();
+  }
+}
+
+/**
+ * TTS whose `stop()` can be held open (playback cleanup in flight) while it can
+ * still start new playback — the exact shape of the reset/session race.
+ */
+class GatedTTS implements TextToSpeechProvider {
+  readonly id = 'gated-tts';
+  readonly log: string[] = [];
+  holdStop = false;
+  private holdNextStopFlag = false;
+  private active = false;
+  private speakToken = 0;
+  private releaseStopFns: (() => void)[] = [];
+  private resolveSpoken: (() => void) | null = null;
+
+  async speak(text: string, options?: TTSOptions): Promise<void> {
+    const token = (this.speakToken += 1);
+    this.active = true;
+    this.log.push(`speak:${text.slice(0, 14)}`);
+    options?.onStart?.();
+    await new Promise<void>((resolve) => {
+      this.resolveSpoken = resolve;
+    });
+    // A newer playback started while this one was pending: it is not ours to end.
+    if (this.speakToken !== token) return;
+    this.active = false;
+    this.log.push('done');
+    options?.onDone?.();
+  }
+
+  /** Hold ONLY the next stop, so newer cleanup can still proceed. */
+  holdNextStop(): void {
+    this.holdNextStopFlag = true;
+  }
+
+  async stop(): Promise<void> {
+    this.log.push('stop');
+    // A stop only ever ends the playback that was active when it was requested.
+    const tokenAtStop = this.speakToken;
+    const gated = this.holdStop || this.holdNextStopFlag;
+    this.holdNextStopFlag = false;
+    if (gated) {
+      await new Promise<void>((resolve) => {
+        this.releaseStopFns.push(resolve);
+      });
+    }
+    if (this.speakToken !== tokenAtStop) return;
+    this.active = false;
+    const resolve = this.resolveSpoken;
+    this.resolveSpoken = null;
+    resolve?.();
+  }
+
+  async isSpeaking(): Promise<boolean> {
+    return this.active;
+  }
+
+  releaseStop(): void {
+    const pending = this.releaseStopFns;
+    this.releaseStopFns = [];
+    for (const release of pending) release();
+  }
+}
+
+/** AI provider whose FIRST call is deferred and whose later calls answer at once. */
+function createDeferredFirstProvider(
+  firstReply: string,
+  immediateReply = 'Understood — what happened next?',
+): AIProvider & { resolveFirst: () => void; readonly requests: number } {
+  let resolveFirst: ((result: AIProviderResult) => void) | null = null;
+  const state = { requests: 0 };
+  return {
+    id: 'deferred-first-ai',
+    get requests() {
+      return state.requests;
+    },
+    resolveFirst: () => {
+      resolveFirst?.({ ok: true, response: { content: firstReply } });
+    },
+    async generate(): Promise<AIProviderResult> {
+      state.requests += 1;
+      if (state.requests === 1) {
+        return new Promise<AIProviderResult>((resolve) => {
+          resolveFirst = resolve;
+        });
+      }
+      return { ok: true, response: { content: immediateReply } };
+    },
+  };
 }
 
 /** TTS that keeps "speaking" until it is stopped — used for barge-in tests. */
@@ -219,7 +366,7 @@ function createTalkFlow<T extends TextToSpeechProvider = ReturnType<typeof creat
     provider?: AIProvider;
     stt?: SpeechToTextProvider;
     tts?: T;
-    recorder?: ReturnType<typeof createDemoAudioRecorder>;
+    recorder?: ReturnType<typeof createDemoAudioRecorder> | GatedRecorder;
     mode?: 'natural' | 'coach' | 'intensive';
   } = {},
 ) {
@@ -927,6 +1074,7 @@ describe('Talk — tutor-led conversational flow', () => {
     >;
     expect(Object.keys(session).sort()).toEqual(
       [
+        'abandon',
         'clear',
         'getConfig',
         'getHistory',
@@ -1155,6 +1303,353 @@ describe('Talk — tutor-led conversational flow', () => {
     expect(session.getHistory()[1].content).toBe('Great, tell me more about your day.');
 
     await adapter.close();
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // BLOCKER-class regressions: session switching, reset races, opening races
+  // ═══════════════════════════════════════════════════════════════════════
+
+  it('33. an older async reset cannot overwrite the NEW session recording state', async () => {
+    const tts = new GatedTTS();
+    const { recorder, coordinator } = createTalkFlow({ tts });
+
+    await coordinator.startRecording();
+    expect(recorder.isRecording()).toBe(true);
+
+    // An old reset is still awaiting its playback cleanup…
+    tts.holdNextStop();
+    const oldReset = coordinator.reset();
+    await tick();
+
+    // …while the coordinator is already moved to a NEW session that records.
+    const newSession = createTalkSession({ mode: 'natural' }).session;
+    coordinator.setSession(newSession);
+    const started = await coordinator.startRecording();
+    expect(started).toBe(true);
+    expect(coordinator.getStatus().state).toBe('recording');
+
+    // The old reset NOW finishes (late): it must NOT clobber the new lifecycle.
+    tts.releaseStop();
+    await oldReset;
+
+    const status = coordinator.getStatus();
+    expect(status.state).toBe('recording');
+    expect(status.canStopRecording).toBe(true);
+    expect(status.isProcessing).toBe(false);
+    expect(recorder.isRecording()).toBe(true);
+    expect(newSession.getHistory()).toEqual([]);
+
+    await coordinator.dispose();
+  });
+
+  it('34. an older async reset cannot overwrite the NEW session speaking state', async () => {
+    const tts = new GatedTTS();
+    const { session, coordinator } = createTalkFlow({ tts });
+
+    // The old reset is held open inside playback cleanup.
+    tts.holdNextStop();
+    const oldReset = coordinator.reset();
+    await tick();
+
+    // The new session starts speaking while the old reset is still pending.
+    const newSession = createTalkSession({ mode: 'natural' }).session;
+    coordinator.setSession(newSession);
+    const speaking = coordinator.speakResponse('Hello from the new conversation.');
+    await tick();
+    expect(coordinator.getStatus().state).toBe('speaking');
+
+    // The old reset NOW finishes (late): it must NOT clobber the new lifecycle.
+    tts.releaseStop();
+    await oldReset;
+
+    // Still speaking: the stale reset wrote nothing.
+    expect(coordinator.getStatus().state).toBe('speaking');
+    expect(coordinator.getStatus().isSpeaking).toBe(true);
+    expect(session.getHistory()).toEqual([]);
+    expect(newSession.getHistory()).toEqual([]);
+
+    await coordinator.dispose();
+    await speaking;
+  });
+
+  it('35. a session switch AWAITS recorder cleanup before the new session is active', async () => {
+    const recorder = new GatedRecorder();
+    const { coordinator } = createTalkFlow({ recorder });
+
+    await coordinator.startRecording();
+    expect(recorder.isRecording()).toBe(true);
+
+    recorder.holdStop = true;
+    const replacement = createTalkSession({ mode: 'coach' }).session;
+    const switching = coordinator.switchSession(replacement);
+    await tick();
+
+    // The switch is in flight: no new voice work may start, and the new session
+    // is NOT active yet.
+    expect(coordinator.getStatus().isSwitching).toBe(true);
+    expect(coordinator.getStatus().canRecord).toBe(false);
+    expect(coordinator.getStatus().canSendText).toBe(false);
+    expect(await coordinator.startRecording()).toBe(false);
+    expect(coordinator.getStatus().state).toBe('recording'); // old session still owns the mic until cleanup finishes
+
+    // Releasing the old recorder cleanup completes the switch.
+    recorder.releaseStop();
+    const installed = await switching;
+    expect(installed).toBe(replacement);
+    expect(recorder.isRecording()).toBe(false);
+    expect(coordinator.getStatus().state).toBe('idle');
+    expect(coordinator.getStatus().isSwitching).toBe(false);
+    expect(coordinator.getStatus().canRecord).toBe(true);
+  });
+
+  it('36. a session switch AWAITS TTS cleanup before the new session is active', async () => {
+    const tts = new GatedTTS();
+    const { session, coordinator } = createTalkFlow({ tts });
+
+    const speaking = coordinator.speakResponse('Old conversation playback.');
+    await tick();
+    expect(coordinator.getStatus().state).toBe('speaking');
+
+    tts.holdStop = true;
+    const replacement = createTalkSession({ mode: 'natural' }).session;
+    const switching = coordinator.switchSession(replacement);
+    await tick();
+    expect(coordinator.getStatus().isSwitching).toBe(true);
+
+    tts.holdStop = false;
+    tts.releaseStop();
+    const installed = await switching;
+
+    expect(installed).toBe(replacement);
+    expect(coordinator.getStatus().state).toBe('idle');
+    expect(coordinator.getStatus().isSpeaking).toBe(false);
+    expect(coordinator.getStatus().isSwitching).toBe(false);
+    expect(session.getHistory()).toEqual([]);
+    expect(replacement.getHistory()).toEqual([]);
+
+    await coordinator.dispose();
+    await speaking.catch(() => undefined);
+  });
+
+  it('37. New Chat during recording leaves the replacement conversation clean', async () => {
+    const recorder = new GatedRecorder();
+    const tts = createDemoTTSProvider();
+    const { session, coordinator } = createTalkFlow({
+      recorder,
+      tts,
+      stt: createDemoSTTProvider({ defaultTranscript: 'Recorded in the old chat.' }),
+    });
+
+    await coordinator.startRecording();
+    expect(recorder.isRecording()).toBe(true);
+
+    // New Chat = atomic switch to a fresh session (talk screen behaviour).
+    const replacement = createTalkSession({ mode: 'natural' }).session;
+    const installed = await coordinator.switchSession(replacement);
+
+    expect(installed).toBe(replacement);
+    expect(recorder.isRecording()).toBe(false);
+    expect(coordinator.getStatus().isProcessing).toBe(false);
+    expect(replacement.getHistory()).toEqual([]);
+    expect(session.getHistory()).toEqual([]);
+    expect(tts.getSpokenTexts()).toEqual([]);
+
+    // The new conversation works normally afterwards.
+    await coordinator.startRecording();
+    const result = await coordinator.stopRecordingAndProcess();
+    expect(result.ok).toBe(true);
+    expect(replacement.getHistory()).toHaveLength(2);
+    expect(session.getHistory()).toEqual([]);
+  });
+
+  it('38. mode change during tutor playback leaves the replacement conversation clean', async () => {
+    const tts = new GatedTTS();
+    const { session, coordinator } = createTalkFlow({
+      provider: createStubProvider('Tutor reply from the previous mode.'),
+      tts,
+    });
+
+    await coordinator.startRecording();
+    const oldTurn = coordinator.stopRecordingAndProcess();
+    await tick(3);
+    expect(coordinator.getStatus().state).toBe('speaking');
+
+    // Mode change = atomic switch while playback is still running.
+    const replacement = createTalkSession({ mode: 'intensive' }).session;
+    const installed = await coordinator.switchSession(replacement);
+
+    expect(installed).toBe(replacement);
+    expect(await tts.isSpeaking()).toBe(false);
+    expect(coordinator.getStatus().state).toBe('idle');
+    expect(coordinator.getStatus().isSwitching).toBe(false);
+    expect(replacement.getHistory()).toEqual([]);
+
+    // The interrupted old turn keeps its own history exactly once.
+    const old = await oldTurn;
+    expect(old.ok).toBe(true);
+    expect(session.getHistory()).toHaveLength(2);
+    expect(replacement.getHistory()).toEqual([]);
+  });
+
+  it('39. changing the session during a permission request captures nothing', async () => {
+    const recorder = new GatedRecorder();
+    const { coordinator } = createTalkFlow({ recorder });
+
+    recorder.requireRequest();
+    recorder.holdPermission = true;
+    const starting = coordinator.startRecording();
+    await tick();
+    expect(coordinator.getStatus().state).toBe('requesting_permission');
+
+    const replacement = createTalkSession({ mode: 'natural' }).session;
+    const installed = await coordinator.switchSession(replacement);
+    expect(installed).toBe(replacement);
+
+    recorder.releasePermission();
+    const started = await starting;
+
+    expect(started).toBe(false);
+    expect(recorder.isRecording()).toBe(false);
+    expect(coordinator.getStatus().state).toBe('idle');
+    expect(coordinator.getStatus().isProcessing).toBe(false);
+    expect(replacement.getHistory()).toEqual([]);
+  });
+
+  it('40. an opening in flight and a typed send can never both commit', async () => {
+    const provider = createDeferredFirstProvider('Hi! What would you like to talk about?');
+    const { session, coordinator } = createTalkFlow({ provider });
+
+    const opening = session.openConversation!({
+      userMessage: 'Begin the conversation now.',
+    });
+    await tick();
+    expect(provider.requests).toBe(1);
+
+    // The learner takes over while the opening request is still in flight.
+    const typed = await session.send({ userMessage: 'Actually, let me start.' });
+    expect(typed.ok).toBe(true);
+    expect(session.getHistory()).toHaveLength(2);
+    expect(session.getHistory()[0]).toEqual({
+      role: 'user',
+      content: 'Actually, let me start.',
+    });
+
+    // The opening lands later: it is discarded, never appended out of order.
+    provider.resolveFirst();
+    const openingResult = await opening;
+
+    expect(openingResult.ok).toBe(false);
+    if (!openingResult.ok) {
+      expect(openingResult.error.code).toBe('cancelled');
+      expect(openingResult.error.message).toBe(CONVERSATION_OPENING_DISCARDED_MESSAGE);
+    }
+    const history = session.getHistory();
+    expect(history).toHaveLength(2);
+    expect(history.map((turn) => turn.content)).not.toContain(
+      'Hi! What would you like to talk about?',
+    );
+    expect(history.some((turn) => turn.role === 'assistant' && turn.content.startsWith('Hi!'))).toBe(
+      false,
+    );
+    expect(session.getLastFeedback()).toBeNull();
+    expect(coordinator.getStatus().state).toBe('idle');
+  });
+
+  it('41. an opening is discarded when the conversation was cleared before it resolved', async () => {
+    const provider = createDeferredFirstProvider('Welcome! Tell me about your day.');
+    const { session } = createTalkFlow({ provider });
+
+    const opening = session.openConversation!({ userMessage: 'Begin the conversation now.' });
+    await tick();
+
+    // New Chat clears the conversation while the opening is in flight.
+    session.clear();
+
+    provider.resolveFirst();
+    const result = await opening;
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.code).toBe('cancelled');
+    }
+    expect(session.getHistory()).toEqual([]);
+    expect(session.getLastFeedback()).toBeNull();
+  });
+
+  it('42. a stale opening never appears in the replacement session', async () => {
+    const provider = createDeferredFirstProvider('Stale opening from the old conversation.');
+    const { session, coordinator } = createTalkFlow({ provider });
+
+    const opening = session.openConversation!({ userMessage: 'Begin the conversation now.' });
+    await tick();
+
+    const replacement = createTalkSession({ mode: 'natural' }).session;
+    const installed = await coordinator.switchSession(replacement);
+    expect(installed).toBe(replacement);
+
+    provider.resolveFirst();
+    const result = await opening;
+
+    expect(result.ok).toBe(false);
+    expect(session.getHistory()).toEqual([]);
+    expect(replacement.getHistory()).toEqual([]);
+    expect(replacement.getLastFeedback()).toBeNull();
+    expect(coordinator.getStatus().state).toBe('idle');
+  });
+
+  it('43. a normal opening still stores exactly one tutor turn and the typed fallback still works', async () => {
+    const { mockFetch, calls } = createGeminiFetch([
+      'Hello! I am your tutor. What shall we talk about?',
+      'Great — tell me more about that.',
+    ]);
+    const bundle = createTalkSession(
+      { mode: 'natural' },
+      { apiKey: 'mock-key', fetchImpl: mockFetch },
+    );
+
+    const opening = await bundle.session.openConversation!({
+      userMessage: 'Begin the conversation now.',
+    });
+    expect(opening.ok).toBe(true);
+    expect(bundle.session.getHistory()).toHaveLength(1);
+    expect(bundle.session.getHistory()[0].role).toBe('assistant');
+
+    // The learner then types normally through the same session.
+    const typed = await bundle.session.send({ userMessage: 'I went hiking yesterday.' });
+    expect(typed.ok).toBe(true);
+    expect(bundle.session.getHistory().map((turn) => turn.role)).toEqual([
+      'assistant',
+      'user',
+      'assistant',
+    ]);
+    expect(bundle.session.getHistory()[1].content).toBe('I went hiking yesterday.');
+    expect(calls).toHaveLength(2);
+    // The second request carries the opening as conversation context.
+    const secondContents = calls[1].body.contents as { role: string }[];
+    expect(secondContents.map((entry) => entry.role)).toEqual(['model', 'user']);
+  });
+
+  it('44. switching sessions while a voice turn is in flight discards its late result', async () => {
+    const stt = createDemoSTTProvider({ defaultTranscript: 'Late words.', delayMs: 25 });
+    const tts = createDemoTTSProvider();
+    const { session, coordinator } = createTalkFlow({ stt, tts });
+
+    await coordinator.startRecording();
+    const pending = coordinator.stopRecordingAndProcess();
+    await tick();
+
+    const replacement = createTalkSession({ mode: 'natural' }).session;
+    const installed = await coordinator.switchSession(replacement);
+    expect(installed).toBe(replacement);
+
+    const result = await pending;
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe(VOICE_SESSION_CHANGED_MESSAGE);
+    expect(replacement.getHistory()).toEqual([]);
+    expect(session.getHistory()).toEqual([]);
+    expect(tts.getSpokenTexts()).toEqual([]);
+    expect(coordinator.getStatus().state).toBe('idle');
   });
 
   it('32. Adaptive Lessons behaviour and voice guards are unchanged', async () => {

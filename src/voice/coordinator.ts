@@ -39,6 +39,9 @@ export const VOICE_SESSION_CHANGED_MESSAGE =
 /** Message used when a voice operation finishes after the coordinator was disposed. */
 export const VOICE_DISPOSED_MESSAGE = 'This conversation was closed.';
 
+/** Message used when voice work is requested while the session is switching. */
+export const VOICE_SWITCHING_MESSAGE = 'The conversation is changing. Please try again.';
+
 /**
  * Learner-facing lifecycle of one conversational voice turn. Derived from — and
  * never duplicating — the coordinator's VoiceStatus: it only names the phase
@@ -163,6 +166,12 @@ export class VoiceSessionCoordinator {
    */
   private generation: number = 0;
   private disposed: boolean = false;
+  /**
+   * True while `switchSession()` is replacing the active conversation. New voice
+   * work is refused during the switch so it can never be captured against a
+   * session that is on its way out.
+   */
+  private switching: boolean = false;
 
   constructor(config: VoiceSessionCoordinatorConfig) {
     this.recorder = config.recorder;
@@ -175,15 +184,25 @@ export class VoiceSessionCoordinator {
   /**
    * Updates the active ConversationSession (e.g. on new chat or mode switch).
    */
+  /**
+   * Synchronously installs a session without awaiting recorder/TTS cleanup.
+   * Kept for same-session/idempotent callers and tests; conversation changes in
+   * the app must use the atomic `switchSession()` instead, which stops the old
+   * work BEFORE the new session becomes active.
+   */
   setSession(newSession: ConversationSession): void {
     if (this.session === newSession) {
       // Same session (e.g. second mic press): active recording must survive.
       return;
     }
     // Invalidate every in-flight operation: its result belongs to the previous
-    // session and must never be submitted, spoken or written anywhere.
+    // session and must never be submitted, spoken or written anywhere. The
+    // replaced session is closed too, so late async work cannot commit into it.
     this.generation += 1;
-    this.stopSpeaking();
+    this.session.abandon?.();
+    // Playback is stopped without state writes: a cleanup continuation from the
+    // previous session must never overwrite the new session's lifecycle.
+    void this.stopPlayback();
     if (this.state === 'recording') {
       this.cancelRecording();
     }
@@ -192,6 +211,52 @@ export class VoiceSessionCoordinator {
     this.errorMessage = null;
     this.state = 'idle';
     this.notifyListeners();
+  }
+
+  /**
+   * Atomically replaces the active conversation session.
+   *
+   * Ordering is what makes this safe (see BLOCKER-class race: an old, still
+   * awaiting `reset()` could otherwise overwrite the NEW session's lifecycle):
+   *   1. invalidate every in-flight operation of the OLD session (generation++),
+   *   2. stop the old recorder and playback and AWAIT that cleanup,
+   *   3. only then install and activate the new session,
+   *   4. every state write is generation/switch guarded, so a superseded or
+   *      disposed cleanup can never write into the new lifecycle.
+   * New voice work is refused while the switch is running.
+   */
+  async switchSession(newSession: ConversationSession): Promise<ConversationSession | null> {
+    if (this.disposed) return null;
+    if (this.session === newSession) return newSession;
+
+    // 1. Invalidate all in-flight work of the old session up front.
+    this.generation += 1;
+    const generation = this.generation;
+    this.switching = true;
+    this.notifyListeners();
+
+    // 2. Stop and await old recorder/playback cleanup. No lifecycle state is
+    // written here: the guarded writes happen in step 4 (or in a newer switch).
+    await this.teardown();
+
+    // 3. A newer switch/reset/dispose superseded this one: install nothing and
+    // report it, so the caller never assumes an activation that did not happen.
+    if (this.disposed || this.generation !== generation) {
+      return null;
+    }
+
+    // 4. Activate the new session with a clean lifecycle for it. The replaced
+    // session is closed so any late async work it still holds is discarded.
+    this.session.abandon?.();
+    this.session = newSession;
+    this.switching = false;
+    this.processing = false;
+    this.elapsedSeconds = 0;
+    this.recognizedTranscript = null;
+    this.errorMessage = null;
+    this.state = 'idle';
+    this.notifyListeners();
+    return newSession;
   }
 
   /**
@@ -244,9 +309,14 @@ export class VoiceSessionCoordinator {
     const canRecord =
       (this.state === 'idle' || this.state === 'speaking' || this.state === 'error') &&
       !this.processing &&
+      !this.switching &&
       !this.disposed;
     const canStopRecording = this.state === 'recording';
-    const canSendText = !this.disposed && this.state !== 'recording' && this.state !== 'transcribing';
+    const canSendText =
+      !this.disposed &&
+      !this.switching &&
+      this.state !== 'recording' &&
+      this.state !== 'transcribing';
 
     return {
       state: this.state,
@@ -259,6 +329,7 @@ export class VoiceSessionCoordinator {
       canStopRecording,
       canSendText,
       isProcessing: this.processing,
+      isSwitching: this.switching,
     };
   }
 
@@ -280,6 +351,8 @@ export class VoiceSessionCoordinator {
    */
   async startRecording(): Promise<boolean> {
     if (this.disposed) return false;
+    // Never start new voice work while the conversation session is switching.
+    if (this.switching) return false;
     // Prevent starting if already recording, transcribing, or sending — and
     // never open the microphone while another voice operation is in flight.
     if (
@@ -377,6 +450,7 @@ export class VoiceSessionCoordinator {
     onStreamChunk?: (chunk: string) => void
   ): Promise<{ ok: boolean; transcript?: string; error?: string }> {
     if (this.disposed) return { ok: false, error: VOICE_DISPOSED_MESSAGE };
+    if (this.switching) return { ok: false, error: VOICE_SWITCHING_MESSAGE };
     // One learner utterance = at most one submitted turn: this guard (plus the
     // immediate state change below) makes a re-entrant call impossible.
     if (this.processing || this.state !== 'recording') {
@@ -576,16 +650,28 @@ export class VoiceSessionCoordinator {
   /**
    * Stops any currently active text-to-speech playback.
    */
-  async stopSpeaking(): Promise<void> {
+  /**
+   * Stops playback WITHOUT touching lifecycle state. Used by session switches so
+   * old playback cleanup can never write into the new session's state.
+   */
+  private async stopPlayback(): Promise<void> {
     try {
       await this.ttsProvider.stop();
     } catch {
       // Ignore stop errors
-    } finally {
-      if (this.state === 'speaking') {
-        this.state = 'idle';
-        this.notifyListeners();
-      }
+    }
+  }
+
+  async stopSpeaking(): Promise<void> {
+    const generation = this.generation;
+    await this.stopPlayback();
+    // A switch/reset/dispose that started during the stop owns the state now.
+    if (this.disposed || this.switching || this.generation !== generation) {
+      return;
+    }
+    if (this.state === 'speaking') {
+      this.state = 'idle';
+      this.notifyListeners();
     }
   }
 
@@ -608,12 +694,10 @@ export class VoiceSessionCoordinator {
   }
 
   /**
-   * Full reset (e.g. when New Chat or mode change is pressed).
+   * Stops the recorder (if active) and playback, awaiting both. Writes NO
+   * lifecycle state, so it is safe inside a switch/reset that may be superseded.
    */
-  async reset(): Promise<void> {
-    // Invalidate in-flight operations first: nothing they produce may be
-    // applied after a reset (new chat, mode change, unmount).
-    this.generation += 1;
+  private async teardown(): Promise<void> {
     if (this.timerHandle) {
       clearInterval(this.timerHandle);
       this.timerHandle = null;
@@ -625,7 +709,26 @@ export class VoiceSessionCoordinator {
         // Ignore
       }
     }
-    await this.stopSpeaking();
+    await this.stopPlayback();
+  }
+
+  /**
+   * Full reset (e.g. when New Chat or mode change is pressed).
+   */
+  async reset(): Promise<void> {
+    // Invalidate in-flight operations first: nothing they produce may be
+    // applied after a reset (new chat, mode change, unmount).
+    this.generation += 1;
+    const generation = this.generation;
+    await this.teardown();
+
+    // A newer switch/reset/dispose owns the coordinator now: this (older) reset
+    // must not overwrite the new session's lifecycle state.
+    if (this.disposed || this.generation !== generation) {
+      return;
+    }
+
+    this.switching = false;
     this.processing = false;
     this.state = 'idle';
     this.elapsedSeconds = 0;
@@ -638,10 +741,20 @@ export class VoiceSessionCoordinator {
    * Safe teardown (screen unmount): in-flight voice work is invalidated, an
    * active recording is stopped and any playback is stopped. Late STT/AI
    * results are discarded instead of being applied to a dead screen.
+   *
+   * Disposal is terminal, so this IS allowed to write the final idle state.
    */
   async dispose(): Promise<void> {
     this.disposed = true;
-    await this.reset();
+    this.generation += 1;
+    await this.teardown();
+    this.switching = false;
+    this.processing = false;
+    this.state = 'idle';
+    this.elapsedSeconds = 0;
+    this.recognizedTranscript = null;
+    this.errorMessage = null;
+    this.notifyListeners();
   }
 }
 

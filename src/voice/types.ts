@@ -45,6 +45,11 @@ export interface VoiceStatus {
    * the old work is cancelled and its result will be discarded.
    */
   readonly isProcessing?: boolean;
+  /**
+   * True while the coordinator is atomically switching to another conversation
+   * session. No new voice work may start until the switch completes.
+   */
+  readonly isSwitching?: boolean;
 }
 
 export type VoiceStatusListener = (status: VoiceStatus) => void;

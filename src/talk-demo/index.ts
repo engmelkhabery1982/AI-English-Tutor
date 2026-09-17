@@ -73,6 +73,11 @@ export {
   createLearningPersistenceService,
 } from './learning-persistence';
 export {
+  resolveTalkTurnControls,
+  type TalkTurnControlInput,
+  type TalkTurnControls,
+} from './turn-controls';
+export {
   createDemoSTTProvider,
   createGeminiSTTProvider,
   createDemoTTSProvider,
@@ -364,6 +369,116 @@ export function createTalkSession(
     providerKind: 'demo',
     providerInfo: describeProviderKind('demo'),
   };
+}
+
+/**
+ * The REAL coaching composition used by Talk: the canonical application
+ * database plus the EXISTING learner model composed on it. Nothing else is
+ * needed to make real Gemini conversation adapt to persisted evidence.
+ */
+export interface TalkCoachingComposition {
+  readonly databaseAdapter: DatabaseAdapter;
+  readonly learnerModel: LearnerModel;
+}
+
+/**
+ * Where the tutoring context came from.
+ * - 'persisted': the EXISTING learner model on the real app database.
+ * - 'demo-fallback': the deterministic demo learner model, used ONLY when no
+ *   persisted app data could be composed. Never presented as personalization.
+ */
+export type TalkCoachingSource = 'persisted' | 'demo-fallback';
+
+export interface TalkCoachingResolution {
+  readonly databaseAdapter?: DatabaseAdapter;
+  readonly learnerModel?: LearnerModel;
+  readonly source: TalkCoachingSource;
+}
+
+export interface TalkCoachingResolutionOptions {
+  /** Injected adapter (tests / embedding) — composed into the real learner model. */
+  readonly databaseAdapter?: DatabaseAdapter;
+  /** Injected pre-composed learner model (tests / embedding). */
+  readonly learnerModel?: LearnerModel;
+  /** Override for the default bootstrap (tests); defaults to the app database. */
+  readonly loadDefaultComposition?: () => Promise<TalkCoachingComposition>;
+}
+
+/**
+ * Compose the Talk coaching context on a given adapter using the EXISTING
+ * learner model + repositories. Throws when the adapter cannot back a learner
+ * model, so callers fall back EXPLICITLY instead of silently using demo data.
+ */
+export function createTalkComposition(adapter: DatabaseAdapter): TalkCoachingComposition {
+  const learnerModel = createTalkLearnerModel(adapter);
+  if (!learnerModel) {
+    throw new Error(
+      'Persisted learner data could not be composed from the local database.',
+    );
+  }
+  return { databaseAdapter: adapter, learnerModel };
+}
+
+// Default composition bootstrap. The dynamic Expo SQLite import and adapter
+// lifecycle live HERE — behind composition — never inside UI screens. This
+// follows the SAME pattern already used by the adaptive lessons, listening and
+// pronunciation modules, on the SAME canonical database file.
+let defaultCompositionPromise: Promise<TalkCoachingComposition> | null = null;
+
+/** Compose Talk's coaching context on the default app database (reused). */
+export function createDefaultTalkComposition(): Promise<TalkCoachingComposition> {
+  if (!defaultCompositionPromise) {
+    defaultCompositionPromise = (async () => {
+      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
+      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
+      await adapter.init();
+      return createTalkComposition(adapter);
+    })().catch((error: unknown) => {
+      // Allow a later retry instead of caching a failed bootstrap forever.
+      defaultCompositionPromise = null;
+      throw error;
+    });
+  }
+  return defaultCompositionPromise;
+}
+
+/**
+ * Resolves the coaching context Talk must use, in this order:
+ * 1. an explicitly injected learner model (tests / embedding),
+ * 2. an injected adapter, composed through the existing learner model,
+ * 3. the DEFAULT application database composition.
+ *
+ * Only when no persisted data can be composed at all does it return an explicit
+ * 'demo-fallback' resolution — the caller must then say so instead of claiming
+ * personalization.
+ */
+export async function resolveTalkCoaching(
+  options: TalkCoachingResolutionOptions = {},
+): Promise<TalkCoachingResolution> {
+  if (options.learnerModel) {
+    return {
+      databaseAdapter: options.databaseAdapter,
+      learnerModel: options.learnerModel,
+      source: 'persisted',
+    };
+  }
+
+  if (options.databaseAdapter) {
+    try {
+      const composition = createTalkComposition(options.databaseAdapter);
+      return { ...composition, source: 'persisted' };
+    } catch {
+      return { source: 'demo-fallback' };
+    }
+  }
+
+  try {
+    const load = options.loadDefaultComposition ?? createDefaultTalkComposition;
+    const composition = await load();
+    return { ...composition, source: 'persisted' };
+  } catch {
+    return { source: 'demo-fallback' };
+  }
 }
 
 /**

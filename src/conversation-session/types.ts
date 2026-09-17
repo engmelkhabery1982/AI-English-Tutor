@@ -91,6 +91,13 @@ export interface ConversationSession {
     onChunk?: AIStreamCallback
   ): Promise<ConversationSessionResult>;
 
+  /**
+   * Marks this session as replaced/closed. After that, no turn or opening may be
+   * committed: late async results are discarded instead of mutating history or
+   * feedback. Optional so existing sessions/providers stay compatible.
+   */
+  abandon?(): void;
+
   sendStream?(
     input: ConversationSessionSendInput,
     onChunk: AIStreamCallback
