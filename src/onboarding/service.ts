@@ -49,6 +49,7 @@ import { createDiagnosticSession, type DiagnosticSession } from './session';
 import {
   createDiagnosticSpeakingStep,
   languageUseTaskForDiagnostic,
+  pronunciationTaskForDiagnostic,
   type DiagnosticSpeakingStep,
   type LanguageUseTask,
 } from './speaking';
@@ -60,6 +61,7 @@ import type {
   DiagnosticSpeakingEvidence,
   OnboardingPrefill,
   OnboardingProfileDraft,
+  PronunciationTask,
 } from './types';
 
 /** Learner-facing labels for what a complete profile still needs. */
@@ -106,6 +108,8 @@ export interface DiagnosticHandle {
   readonly providerKind: TalkProviderKind;
   readonly speaking: DiagnosticSpeakingStep;
   readonly languageUseTask: LanguageUseTask;
+  /** The fixed sentence the learner hears and repeats for the pronunciation part. */
+  readonly pronunciationTask: PronunciationTask;
 }
 
 export interface OnboardingService {
@@ -144,10 +148,15 @@ export interface OnboardingService {
     answer: string,
   ): Promise<{ readonly ok: boolean; readonly message: string }>;
 
-  /** Real pronunciation observations of one spoken turn (unavailable → omitted). */
+  /**
+   * Real pronunciation observations of the learner's REPEAT of the diagnostic
+   * target sentence. Requires the actual transcript AND the known target text:
+   * without a target nothing is analysed (never a guess from free conversation).
+   */
   recordPronunciation(
     handle: DiagnosticHandle,
     transcript: string,
+    expectedText?: string,
   ): Promise<{ readonly observed: boolean }>;
 
   /** Finalizes the diagnostic ONLY when required steps are resolved. */
@@ -166,6 +175,7 @@ export function createOnboardingService(deps: OnboardingServiceDeps = {}): Onboa
   const now = deps.now ?? nowIso;
   let composition: TalkCoachingResolution | null = null;
   let listening: OnboardingServiceDeps['listening'] | undefined = deps.listening;
+  let pronunciation: OnboardingServiceDeps['pronunciation'] | undefined = deps.pronunciation;
 
   /** Resolves the EXISTING persisted composition (never a second database). */
   async function resolveComposition(): Promise<TalkCoachingResolution> {
@@ -229,6 +239,24 @@ export function createOnboardingService(deps: OnboardingServiceDeps = {}): Onboa
     if (!adapter) return undefined;
     // The EXISTING service stays the mutation owner for weakness/review evidence.
     return createLearningPersistenceService(adapter, learnerId);
+  }
+
+  /**
+   * The EXISTING PronunciationEngine composition on the active adapter. The
+   * default service factory already injects it; this fallback keeps every
+   * composition path honest instead of silently reporting "unavailable".
+   */
+  async function resolvePronunciation(): Promise<OnboardingServiceDeps['pronunciation'] | undefined> {
+    if (pronunciation) return pronunciation;
+    const resolved = await resolveComposition();
+    if (!resolved.databaseAdapter) return undefined;
+    try {
+      const { createPronunciationEngine } = await import('../pronunciation');
+      pronunciation = createPronunciationEngine(resolved.databaseAdapter);
+      return pronunciation;
+    } catch {
+      return undefined;
+    }
   }
 
   async function resolveListening(): Promise<OnboardingServiceDeps['listening'] | undefined> {
@@ -379,7 +407,13 @@ export function createOnboardingService(deps: OnboardingServiceDeps = {}): Onboa
         throw new Error('Set up your learning profile before starting the assessment.');
       }
 
-      const mode = options.mode ?? 'natural';
+      /**
+       * The diagnostic runs in the EXISTING 'coach' mode: the same engine, the
+       * same session, but important problems are corrected while we talk, which
+       * is what produces real structured evidence for the assessment. It is not
+       * a second evaluator — it is the existing mode built for this.
+       */
+      const mode = options.mode ?? 'coach';
       const config = {
         mode,
         ...(options.topic ? { topic: options.topic } : {}),
@@ -405,6 +439,7 @@ export function createOnboardingService(deps: OnboardingServiceDeps = {}): Onboa
         providerKind: bundle.providerKind,
         speaking,
         languageUseTask: languageUseTaskForDiagnostic(),
+        pronunciationTask: pronunciationTaskForDiagnostic(),
       };
     },
 
@@ -481,15 +516,40 @@ export function createOnboardingService(deps: OnboardingServiceDeps = {}): Onboa
       return { ok: true, message: evaluation.feedbackLines[0] ?? 'Listening task completed.' };
     },
 
-    async recordPronunciation(handle, transcript) {
+    async recordPronunciation(handle, transcript, expectedText) {
       const token = handle.session.getCurrentStepToken();
-      const engine = deps.pronunciation;
-      if (!engine || !transcript.trim()) {
+      const target = (expectedText ?? handle.pronunciationTask.sentence).trim();
+      const spoken = transcript.trim();
+      // Phase-1 pronunciation is transcript/evidence based: it needs BOTH the
+      // learner's real transcript and the known target sentence. Without a
+      // target it is honestly unavailable — free conversation is never judged.
+      if (!spoken) {
+        handle.session.markPronunciationUnavailable(
+          'No repeated sentence was transcribed, so pronunciation was not assessed.',
+          token,
+        );
+        return { observed: false };
+      }
+      if (!target) {
+        handle.session.markPronunciationUnavailable(
+          'No target sentence was set, so pronunciation was not assessed.',
+          token,
+        );
+        return { observed: false };
+      }
+      const engine = await resolvePronunciation();
+      if (!engine) {
         handle.session.markPronunciationUnavailable(UNAVAILABLE_PRONUNCIATION_MESSAGE, token);
         return { observed: false };
       }
       try {
-        const outcome = await engine.analyzeSpokenTurn({ transcript, mode: 'coach' });
+        // The EXISTING engine compares the real transcript with the known target
+        // and persists only what it considers a valid observation itself.
+        const outcome = await engine.analyzeSpokenTurn({
+          transcript: spoken,
+          expectedText: target,
+          mode: 'coach',
+        });
         const lines = outcome && !outcome.unavailable ? outcome.feedbackLines : [];
         if (!outcome || outcome.unavailable || lines.length === 0) {
           // No real observation → the pronunciation section is simply omitted.

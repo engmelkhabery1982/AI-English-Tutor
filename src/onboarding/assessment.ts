@@ -27,9 +27,15 @@ import type {
 
 /** Minimum committed learner turns before connected speech can be judged at all. */
 export const MIN_SPEAKING_TURNS_FOR_ESTIMATE = 3;
-/** Turns that show the learner could sustain and expand a conversation. */
-const SUSTAINED_TURNS = 5;
-const EXPANDED_TURNS = 8;
+/** Turns that show the learner held a real conversation (each one substantive). */
+const CONNECTED_TURNS = 3;
+/** Turns that show sustained, expanding answers. */
+const SUSTAINED_TURNS = 6;
+/** Coverage thresholds for confidence (coverage only — never AI self-confidence). */
+const STRONG_COVERAGE_TURNS = 5;
+/** Repeated explicit problems become negative evidence (bounded). */
+const REPEATED_UNNATURAL = 2;
+const REPEATED_INCORRECT = 3;
 /** Bounded corrections counted per conversation (evidence stays representative). */
 const MAX_COUNTED_CORRECTIONS = 3;
 
@@ -68,18 +74,31 @@ function selectRealEvidence(evidence: DiagnosticEvidence): RealEvidence {
 /**
  * Deterministic level estimate.
  *
- * Rules (explicit and testable):
- *   signal starts at 0.
- *   SPEAKING  sustained speech:  >= 5 turns +1, >= 8 turns +1 more
- *             no incorrect corrections: +2; no incorrect and <= 2 unnatural: +1
- *             3+ incorrect corrections: -1
- *   LANGUAGE  natural +1, unnatural 0, incorrect -1
- *   LISTENING best outcome: understood +1, mostly_understood 0,
- *             partial -1, missed/misunderstood -1
- *   signal <= 0 → A2, 1–2 → B1, 3–4 → B2, >= 5 → C1
+ * CONSERVATIVE EVIDENCE RULE (why absence of correction is not a positive):
+ * the normal ConversationEngine deliberately does NOT correct every sentence.
+ * "No correction emitted" therefore only means "nothing was reported" — it is
+ * NOT proof of correct grammar or natural phrasing, so it awards NOTHING here.
+ * Only what the engine actually reported is used, and it is used only as
+ * NEGATIVE evidence (a real, observed problem).
  *
- * A1/C2 are deliberately never produced: a short diagnostic only supports a
- * conservative mid-range working estimate.
+ * Rules (explicit and testable). `signal` starts at 0:
+ *   SPEAKING
+ *     >= 6 substantive committed turns .......... +2  (sustained, expanding)
+ *     >= 3 substantive committed turns .......... +1  (held a real conversation)
+ *     >= 3 'incorrect' corrections .............. -2
+ *     >= 1 'incorrect' correction ............... -1
+ *     >= 2 'unnatural' corrections .............. -1
+ *     no corrections at all .....................  0  (neutral — never positive)
+ *   LANGUAGE USE (the dedicated rephrasing task)
+ *     any reported problem (incorrect/unnatural) . -1
+ *     no reported problem .......................  0  (neutral)
+ *   LISTENING (one real task, existing evaluator)
+ *     understood ................................ +1
+ *     partial / missed key meaning .............. -1
+ *
+ * Mapping: signal <= 0 → A2, 1–2 → B1, >= 3 → B2.
+ * A short Phase-1 diagnostic NEVER claims C1/C2 (its evidence cannot support
+ * them) and never claims A1, so the ceiling is deliberately B2.
  *
  * Sufficiency (anything less → 'insufficient'):
  *   real conversation with >= 3 learner turns AND (real language use OR listening)
@@ -116,36 +135,34 @@ export function estimateWorkingLevel(evidence: DiagnosticEvidence): DiagnosticLe
   let signal = 0;
 
   if (speaking) {
-    if (speaking.committedLearnerTurns >= EXPANDED_TURNS) {
+    if (speaking.committedLearnerTurns >= SUSTAINED_TURNS) {
       signal += 2;
-      basis.push('You sustained a long conversation with connected answers.');
-    } else if (speaking.committedLearnerTurns >= SUSTAINED_TURNS) {
+      basis.push('You sustained a long conversation and expanded your answers.');
+    } else if (speaking.committedLearnerTurns >= CONNECTED_TURNS) {
       signal += 1;
-      basis.push('You kept the conversation going and expanded your answers.');
+      basis.push('You held a real conversation and kept your answers going.');
     }
 
     const incorrect = Math.min(speaking.incorrectCorrections, MAX_COUNTED_CORRECTIONS);
     const unnatural = Math.min(speaking.unnaturalCorrections, MAX_COUNTED_CORRECTIONS);
-    if (incorrect === 0 && unnatural === 0) {
-      signal += 2;
-      basis.push('The engine reported no corrections in this conversation.');
-    } else if (incorrect === 0 && unnatural <= 2) {
-      signal += 1;
-      basis.push('Only a little unnatural phrasing was corrected in this conversation.');
-    }
-    if (speaking.incorrectCorrections >= MAX_COUNTED_CORRECTIONS) {
-      signal -= 1;
+    if (incorrect >= REPEATED_INCORRECT) {
+      signal -= 2;
       basis.push('Several sentences needed a grammatical correction.');
+    } else if (incorrect >= 1) {
+      signal -= 1;
+      basis.push('A sentence needed a grammatical correction.');
+    }
+    if (unnatural >= REPEATED_UNNATURAL) {
+      signal -= 1;
+      basis.push('Repeated phrasing was corrected as unnatural.');
     }
   }
 
   if (languageUse) {
-    if (languageUse.natural > 0 && languageUse.incorrect === 0) {
-      signal += 1;
-      basis.push('You rephrased an idea naturally in your own words.');
-    } else if (languageUse.incorrect > 0) {
+    // Only a REPORTED problem counts: a silent turn is not proof of quality.
+    if (languageUse.incorrect + languageUse.unnatural > 0) {
       signal -= 1;
-      basis.push('The rephrasing task needed a grammatical correction.');
+      basis.push('The rephrasing task needed a phrasing or grammar correction.');
     }
   }
 
@@ -167,12 +184,14 @@ export function estimateWorkingLevel(evidence: DiagnosticEvidence): DiagnosticLe
   };
 }
 
-/** Deterministic signal → level mapping (never A1/C2 — see the module note). */
+/**
+ * Deterministic signal → level mapping. The Phase-1 diagnostic is short, so its
+ * ceiling is B2: A1 and C1/C2 are never claimed from this evidence at all.
+ */
 function levelFromSignal(signal: number): CefrLevel {
   if (signal <= 0) return 'A2';
   if (signal <= 2) return 'B1';
-  if (signal <= 4) return 'B2';
-  return 'C1';
+  return 'B2';
 }
 
 /**
@@ -185,7 +204,7 @@ function confidenceFromCoverage(evidence: RealEvidence): DiagnosticConfidence {
   const hasLanguageUse = Boolean(evidence.languageUse);
   const hasListening = Boolean(evidence.listening);
 
-  if (turns >= SUSTAINED_TURNS && hasLanguageUse && hasListening) return 'strong';
+  if (turns >= STRONG_COVERAGE_TURNS && hasLanguageUse && hasListening) return 'strong';
   if (turns >= MIN_SPEAKING_TURNS_FOR_ESTIMATE && (hasLanguageUse || hasListening)) {
     return 'moderate';
   }
@@ -233,21 +252,14 @@ export function focusAreasFromEvidence(evidence: DiagnosticEvidence): readonly s
 export function strengthsFromEvidence(evidence: DiagnosticEvidence): readonly string[] {
   const lines: string[] = [];
   const speaking = evidence.speaking && evidence.speaking.provenance === 'real' ? evidence.speaking : null;
-  const languageUse =
-    evidence.languageUse && evidence.languageUse.provenance === 'real' ? evidence.languageUse : null;
   const listening = evidence.listening;
 
+  // Only REAL positives: connected speaking that was actually observed and real
+  // task outcomes. The absence of a correction is never reported as a strength.
   if (speaking && speaking.committedLearnerTurns >= SUSTAINED_TURNS) {
-    lines.push('You kept a full conversation going without switching to your own language.');
-  }
-  if (speaking && speaking.incorrectCorrections === 0 && speaking.committedLearnerTurns > 0) {
-    lines.push('Your sentences were grammatically clear throughout the conversation.');
-  }
-  if (speaking && speaking.unnaturalCorrections === 0 && speaking.committedLearnerTurns > 0) {
-    lines.push('Your phrasing sounded natural for the situations you described.');
-  }
-  if (languageUse && languageUse.natural > 0 && languageUse.incorrect === 0) {
-    lines.push('You found a natural way to say the same idea in your own words.');
+    lines.push('You kept a long conversation going and expanded on your answers.');
+  } else if (speaking && speaking.committedLearnerTurns >= CONNECTED_TURNS) {
+    lines.push('You held a real conversation in English from start to finish.');
   }
   if (listening && listening.understood > 0) {
     lines.push('You caught the main meaning of spoken English at natural speed.');

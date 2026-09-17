@@ -29,6 +29,7 @@ import type {
   DiagnosticProvenance,
   DiagnosticSpeakingEvidence,
   LanguageUseOutcome,
+  PronunciationTask,
 } from './types';
 
 /** Bounded correction notes kept per step (evidence stays compact + honest). */
@@ -65,6 +66,32 @@ export const LANGUAGE_USE_TASKS: readonly LanguageUseTask[] = [
 /** The task the diagnostic uses (deterministic — same task for the same flow). */
 export function languageUseTaskForDiagnostic(): LanguageUseTask {
   return LANGUAGE_USE_TASKS[0];
+}
+
+/**
+ * The bounded Phase-1 pronunciation tasks: plain sentences that are easy to
+ * repeat and that contain a few reliably observable contrasts (final consonants,
+ * word stress, a contraction). The engine compares the learner's REAL transcript
+ * against this known target text — no acoustic analysis is claimed.
+ */
+export const PRONUNCIATION_TASKS: readonly PronunciationTask[] = [
+  {
+    id: 'repeat-daily-routine',
+    sentence: 'I usually walk to work, but yesterday I took the bus instead.',
+  },
+  {
+    id: 'repeat-work-plan',
+    sentence: 'We finished the project last week and the client was very pleased.',
+  },
+  {
+    id: 'repeat-travel-plan',
+    sentence: 'Next month I am going to visit my family and stay for three days.',
+  },
+];
+
+/** The pronunciation task the diagnostic uses (deterministic). */
+export function pronunciationTaskForDiagnostic(): PronunciationTask {
+  return PRONUNCIATION_TASKS[0];
 }
 
 export interface DiagnosticSpeakingStep {

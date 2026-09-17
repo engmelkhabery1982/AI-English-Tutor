@@ -31,6 +31,7 @@ import { createTalkLearnerModel } from '../talk-demo';
 import { createLearningPersistenceService } from '../talk-demo/learning-persistence';
 import { createListeningService } from '../listening';
 import { createPronunciationEngine } from '../pronunciation';
+import { createOnboardingServiceOn } from './index';
 import { createDemoAudioRecorder } from '../voice/recorder';
 import { createVoiceSessionCoordinator } from '../voice';
 import { createDemoTTSProvider } from '../providers/tts/demo';
@@ -46,7 +47,13 @@ import {
   strengthsFromEvidence,
 } from './assessment';
 import { createOnboardingService, describeEstimateForResult } from './service';
-import { createDiagnosticSpeakingStep, LANGUAGE_USE_TASKS, languageUseTaskForDiagnostic } from './speaking';
+import {
+  createDiagnosticSpeakingStep,
+  LANGUAGE_USE_TASKS,
+  languageUseTaskForDiagnostic,
+  PRONUNCIATION_TASKS,
+  pronunciationTaskForDiagnostic,
+} from './speaking';
 import { LEARNING_GOAL_OPTIONS, NATIVE_LANGUAGE_OPTIONS } from './types';
 import type {
   DiagnosticEvidence,
@@ -98,6 +105,24 @@ function createFeedbackProvider(
         ok: true,
         response: { content: reply.content, feedback: reply.feedback ?? null },
       };
+    },
+  };
+}
+
+/** Deferred provider: every reply is released manually (late-result races). */
+function createDeferredProvider(): AIProvider & {
+  resolveNext: (content: string, feedback?: ConversationFeedback | null) => void;
+} {
+  const pending: ((result: AIProviderResult) => void)[] = [];
+  return {
+    id: 'deferred-ai',
+    resolveNext: (content, feedback = null) => {
+      pending.shift()?.({ ok: true, response: { content, feedback } });
+    },
+    async generate(): Promise<AIProviderResult> {
+      return new Promise<AIProviderResult>((resolve) => {
+        pending.push(resolve);
+      });
     },
   };
 }
@@ -750,7 +775,7 @@ describe('Onboarding — deterministic level estimation', () => {
     const second = estimateWorkingLevel(JSON.parse(JSON.stringify(input)) as DiagnosticEvidence);
     expect(first).toEqual(second);
     expect(first.status).toBe('estimated');
-    expect(first.level).toBe('B2');
+    expect(first.level).toBe('B1');
     expect(first.confidence).toBe('strong');
   });
 
@@ -779,7 +804,7 @@ describe('Onboarding — deterministic level estimation', () => {
     expect(estimate.level).toBe('unknown');
   });
 
-  it('26. the estimate moves deterministically with the evidence and never exceeds the bounded range', () => {
+  it('26. the estimate moves deterministically with the evidence and never exceeds the Phase-1 range', () => {
     const strong = estimateWorkingLevel(
       evidence({
         speaking: speakingEvidence({ committedLearnerTurns: 9 }),
@@ -794,7 +819,9 @@ describe('Onboarding — deterministic level estimation', () => {
         },
       }),
     );
-    expect(strong.level).toBe('C1');
+    // The strongest realistic evidence still does not claim C1: a short
+    // diagnostic cannot support that, so the ceiling stays at B2.
+    expect(strong.level).toBe('B2');
 
     const weak = estimateWorkingLevel(
       evidence({
@@ -819,9 +846,9 @@ describe('Onboarding — deterministic level estimation', () => {
     );
     expect(weak.level).toBe('A2');
 
-    // A short diagnostic never claims A1 or C2.
+    // A short diagnostic never claims A1, C1 or C2.
     for (const level of [strong.level, weak.level]) {
-      expect(['A2', 'B1', 'B2', 'C1']).toContain(level);
+      expect(['A2', 'B1', 'B2']).toContain(level);
     }
   });
 
@@ -887,7 +914,7 @@ describe('Onboarding — deterministic level estimation', () => {
       }),
     );
     const line = describeEstimateForResult(estimate);
-    expect(line).toContain('B2');
+    expect(line).toContain('B1');
     for (const banned of ['%', 'score', 'stars', 'XP', 'mastery']) {
       expect(line.toLowerCase()).not.toContain(banned.toLowerCase());
     }
@@ -1345,6 +1372,598 @@ describe('Onboarding — integration with the rest of the app', () => {
     const weaknesses = await weaknessRepo.listWeaknesses(learnerId);
     const references = weaknesses.map((weakness) => weakness.referenceId ?? weakness.id);
     expect(new Set(references).size).toBe(references.length); // no duplicate identity
+  });
+
+  it('49. the DEFAULT onboarding composition has the EXISTING pronunciation engine', async () => {
+    const adapter = new SqlJsAdapter(':memory:');
+    await adapter.init();
+    await seedProfile(adapter);
+
+    // The real factory used by the app (not a test double).
+    const service = createOnboardingServiceOn(adapter);
+    const handle = await service.beginDiagnostic();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+
+    // The pronunciation step is reachable with a real target sentence…
+    expect(handle.pronunciationTask.sentence.length).toBeGreaterThan(10);
+    expect(handle.pronunciationTask.sentence).toBe(pronunciationTaskForDiagnostic().sentence);
+
+    handle.session.advance();
+    handle.session.advance();
+    handle.session.advance();
+
+    // …and the REAL engine analyses a repeat of that target on this composition:
+    // the default path can never degrade into "pronunciation unavailable".
+    const outcome = await service.recordPronunciation(
+      handle,
+      handle.pronunciationTask.sentence,
+    );
+    expect(outcome.observed).toBe(true);
+    const evidence = handle.session.snapshot().evidence.pronunciation;
+    expect(evidence?.observed).toBe(true);
+    expect(evidence?.noteLines.length).toBeGreaterThan(0);
+    // Real, qualitative engine output only — no number anywhere.
+    for (const line of evidence?.noteLines ?? []) {
+      expect(line).not.toMatch(/\d+\s*%/);
+      expect(line.toLowerCase()).not.toMatch(/\bscore\b|\baccuracy\b/);
+    }
+  });
+
+  it('50. the dedicated pronunciation target is passed to the engine as expectedText', async () => {
+    const adapter = new SqlJsAdapter(':memory:');
+    await adapter.init();
+    await seedProfile(adapter);
+    const calls: { transcript: string; expectedText?: string; mode?: string }[] = [];
+    const service = createOnboardingService({
+      adapter,
+      learnerModel: createTalkLearnerModel(adapter)!,
+      profileRepository: new SQLiteUserProfileRepository(adapter),
+      pronunciation: {
+        analyzeSpokenTurn: async (input: {
+          transcript: string;
+          expectedText?: string;
+          mode?: string;
+        }) => {
+          calls.push(input);
+          return {
+            analysis: {
+              learnerId: 'x',
+              observations: [],
+              weakPoints: [],
+              strengths: [],
+              analyzedAt: NOW,
+            },
+            feedbackLines: ['Word stress on "yesterday" needed care.'],
+            unavailable: false,
+          } as never;
+        },
+      },
+      now: () => NOW,
+    });
+    const handle = await service.beginDiagnostic();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    for (let index = 0; index < 4; index += 1) handle.session.advance();
+
+    const task = handle.pronunciationTask;
+    expect(PRONUNCIATION_TASKS.map((entry) => entry.id)).toContain(task.id);
+    const outcome = await service.recordPronunciation(handle, 'I usually walk to work yesterday.', task.sentence);
+
+    expect(outcome.observed).toBe(true);
+    expect(calls.length).toBe(1);
+    expect(calls[0].expectedText).toBe(task.sentence); // the KNOWN target sentence
+    expect(calls[0].transcript).toBe('I usually walk to work yesterday.');
+    expect(calls[0].mode).toBe('coach'); // existing coaching mode
+    expect(handle.session.snapshot().evidence.pronunciation?.noteLines).toEqual([
+      'Word stress on "yesterday" needed care.',
+    ]);
+  });
+
+  it('51. no transcript or no target means unavailable — never fabricated evidence', async () => {
+    const adapter = new SqlJsAdapter(':memory:');
+    await adapter.init();
+    await seedProfile(adapter);
+    let engineCalls = 0;
+    const service = createOnboardingService({
+      adapter,
+      learnerModel: createTalkLearnerModel(adapter)!,
+      profileRepository: new SQLiteUserProfileRepository(adapter),
+      pronunciation: {
+        analyzeSpokenTurn: async () => {
+          engineCalls += 1;
+          return null;
+        },
+      },
+      now: () => NOW,
+    });
+    const handle = await service.beginDiagnostic();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    for (let index = 0; index < 4; index += 1) handle.session.advance();
+
+    // No transcript (failed STT / nothing recorded).
+    const empty = await service.recordPronunciation(handle, '   ', handle.pronunciationTask.sentence);
+    expect(empty.observed).toBe(false);
+    expect(engineCalls).toBe(0);
+    expect(handle.session.snapshot().evidence.pronunciation).toBeNull();
+    let step = handle.session.snapshot().steps.find((entry) => entry.id === 'pronunciation');
+    expect(step?.status).toBe('unavailable');
+
+    // No target sentence at all: free conversation is never judged.
+    const fresh = await service.beginDiagnostic();
+    fresh.session.markProfileStepDone(fresh.session.getCurrentStepToken());
+    for (let index = 0; index < 4; index += 1) fresh.session.advance();
+    const noTarget = await service.recordPronunciation(fresh, 'Some free conversation text.', '  ');
+    expect(noTarget.observed).toBe(false);
+    expect(engineCalls).toBe(0);
+    expect(fresh.session.snapshot().evidence.pronunciation).toBeNull();
+  });
+
+  it('52. a pronunciation result never carries a numeric score', async () => {
+    const adapter = new SqlJsAdapter(':memory:');
+    await adapter.init();
+    await seedProfile(adapter);
+    const service = createOnboardingService({
+      adapter,
+      learnerModel: createTalkLearnerModel(adapter)!,
+      profileRepository: new SQLiteUserProfileRepository(adapter),
+      pronunciation: {
+        analyzeSpokenTurn: async () => ({
+          analysis: {
+            learnerId: 'x',
+            observations: [],
+            weakPoints: [],
+            strengths: [],
+            analyzedAt: NOW,
+          },
+          feedbackLines: ['The last sound in "walked" was softened.'],
+          unavailable: false,
+        } as never),
+      },
+      now: () => NOW,
+    });
+    const handle = await service.beginDiagnostic();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    for (let index = 0; index < 4; index += 1) handle.session.advance();
+    await service.recordPronunciation(handle, 'I usually walked to work.', handle.pronunciationTask.sentence);
+
+    const evidence = handle.session.snapshot().evidence.pronunciation;
+    const serialized = JSON.stringify(evidence).toLowerCase();
+    for (const banned of [/\d+\s*%/, /\bscore\b/, /\baccuracy\b/, /\bnative-?like\b/, /\baccent\b/]) {
+      expect(serialized).not.toMatch(banned);
+    }
+  });
+
+  it('53. free conversation alone never produces pronunciation evidence', async () => {
+    const adapter = new SqlJsAdapter(':memory:');
+    await adapter.init();
+    await seedProfile(adapter);
+    const engine = createPronunciationEngine(adapter);
+    const service = createOnboardingService({
+      adapter,
+      learnerModel: createTalkLearnerModel(adapter)!,
+      profileRepository: new SQLiteUserProfileRepository(adapter),
+      pronunciation: engine,
+      now: () => NOW,
+    });
+    const handle = await service.beginDiagnostic();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await service.recordSpeakingAnswer(handle, 'I work in logistics and I manage a small team.');
+    for (let index = 0; index < 3; index += 1) handle.session.advance();
+
+    // The speaking turn exists, but the pronunciation step has no repeat and no
+    // target comparison → the step is honestly unavailable (nothing is invented).
+    expect(handle.session.getCurrentStepId()).toBe('pronunciation');
+    const before = handle.session.snapshot().evidence.pronunciation;
+    expect(before).toBeNull();
+  });
+
+  it('54. zero corrections alone cannot inflate the estimate', () => {
+    // Same real evidence, only the engine's REPORTED problems differ.
+    const clean = estimateWorkingLevel(
+      evidence({
+        speaking: speakingEvidence({ committedLearnerTurns: 3, naturalTurns: 3 }),
+        languageUse: languageUseEvidence({ natural: 1, unnatural: 0, incorrect: 0 }),
+      }),
+    );
+    expect(clean.status).toBe('estimated');
+    expect(clean.level).toBe('B1'); // only the connected conversation counts
+
+    // The absence of corrections contributes NOTHING: the same evidence with the
+    // natural/language-use counters at zero is identical.
+    const silent = estimateWorkingLevel(
+      evidence({
+        speaking: speakingEvidence({ committedLearnerTurns: 3, naturalTurns: 0 }),
+        languageUse: languageUseEvidence({ natural: 0, unnatural: 0, incorrect: 0 }),
+      }),
+    );
+    expect(silent.level).toBe(clean.level);
+    expect(silent.basis).toEqual(clean.basis);
+
+    // Real reported problems still move the estimate DOWN (never up).
+    const withProblems = estimateWorkingLevel(
+      evidence({
+        speaking: speakingEvidence({
+          committedLearnerTurns: 3,
+          naturalTurns: 3,
+          incorrectCorrections: 1,
+          unnaturalCorrections: 2,
+        }),
+        languageUse: languageUseEvidence({ natural: 0, unnatural: 1, incorrect: 0 }),
+      }),
+    );
+    expect(withProblems.status).toBe('estimated');
+    expect(withProblems.level).toBe('A2');
+  });
+
+  it('55. natural-mode silence is never interpreted as proven grammatical quality', () => {
+    // A long, silent conversation: the engine reported nothing at all.
+    const silentLong = estimateWorkingLevel(
+      evidence({
+        speaking: speakingEvidence({
+          committedLearnerTurns: 8,
+          naturalTurns: 8,
+          incorrectCorrections: 0,
+          unnaturalCorrections: 0,
+        }),
+        languageUse: languageUseEvidence({ natural: 1 }),
+      }),
+    );
+    // Sustained speaking counts (it really happened) but silence adds nothing:
+    // the result stays in the conservative middle range, never B2/C1.
+    expect(silentLong.level).toBe('B1');
+    expect(silentLong.basis.join(' ').toLowerCase()).not.toContain('no correction');
+    expect(silentLong.basis.join(' ').toLowerCase()).not.toContain('natural');
+  });
+
+  it('56. explicit incorrect/unnatural evidence lowers the estimate, sustained speaking keeps it useful', () => {
+    const base = estimateWorkingLevel(
+      evidence({
+        speaking: speakingEvidence({ committedLearnerTurns: 6 }),
+        listening: {
+          answered: 1,
+          understood: 1,
+          mostlyUnderstood: 0,
+          partial: 0,
+          missedKeyMeaning: 0,
+          evaluatedBy: 'local',
+        },
+      }),
+    );
+    expect(base.status).toBe('estimated');
+    expect(base.level).toBe('B2'); // sustained speaking + real listening outcome
+
+    const oneIncorrect = estimateWorkingLevel(
+      evidence({
+        speaking: speakingEvidence({ committedLearnerTurns: 6, incorrectCorrections: 1 }),
+        listening: {
+          answered: 1,
+          understood: 1,
+          mostlyUnderstood: 0,
+          partial: 0,
+          missedKeyMeaning: 0,
+          evaluatedBy: 'local',
+        },
+      }),
+    );
+    expect(oneIncorrect.level).toBe('B1');
+
+    const manyIncorrect = estimateWorkingLevel(
+      evidence({
+        speaking: speakingEvidence({
+          committedLearnerTurns: 6,
+          incorrectCorrections: 3,
+          naturalTurns: 0,
+        }),
+        listening: {
+          answered: 1,
+          understood: 1,
+          mostlyUnderstood: 0,
+          partial: 0,
+          missedKeyMeaning: 0,
+          evaluatedBy: 'local',
+        },
+      }),
+    );
+    // Six sustained turns alone (+2) plus the real listening outcome (+1) would
+    // be B2; three reported grammatical corrections bring it back down.
+    expect(manyIncorrect.level).toBe('B1');
+    expect(manyIncorrect.level).not.toBe(base.level);
+  });
+
+  it('57. thin evidence returns insufficient instead of an inflated level', () => {
+    // One short turn: not enough to judge connected speech, whatever the
+    // absence of corrections suggests.
+    const thin = estimateWorkingLevel(
+      evidence({
+        speaking: speakingEvidence({ committedLearnerTurns: 2, naturalTurns: 2 }),
+      }),
+    );
+    expect(thin.status).toBe('insufficient');
+    expect(thin.level).toBe('unknown');
+    expect(thin.confidence).toBe('limited');
+  });
+
+  it('58. the estimate is identical for identical evidence (deterministic, coverage-only confidence)', () => {
+    const build = () =>
+      evidence({
+        speaking: speakingEvidence({ committedLearnerTurns: 6, unnaturalCorrections: 1 }),
+        languageUse: languageUseEvidence({ natural: 0, unnatural: 1 }),
+        listening: {
+          answered: 1,
+          understood: 0,
+          mostlyUnderstood: 1,
+          partial: 0,
+          missedKeyMeaning: 0,
+          evaluatedBy: 'ai',
+        },
+      });
+    const a = estimateWorkingLevel(build());
+    const b = estimateWorkingLevel(build());
+    expect(a).toEqual(b);
+    expect(a.level).toBe('B1');
+    expect(a.confidence).toBe('strong');
+  });
+
+  it('59. the diagnostic conversation runs in the EXISTING coach mode', async () => {
+    const adapter = new SqlJsAdapter(':memory:');
+    await adapter.init();
+    await seedProfile(adapter);
+    const engine = createConversationEngine(createDemoLearnerModel());
+    let observedMode: string | null = null;
+    const service = createOnboardingService({
+      adapter,
+      learnerModel: createTalkLearnerModel(adapter)!,
+      profileRepository: new SQLiteUserProfileRepository(adapter),
+      createSpeakingBundle: (config) => {
+        observedMode = config.mode;
+        const orchestrator = createConversationOrchestrator(engine, createStubProvider(['Go on.']));
+        return {
+          session: createConversationSession(orchestrator, { mode: config.mode }),
+          providerKind: 'gemini',
+          providerInfo: {
+            kind: 'gemini',
+            label: 'Gemini • Real AI tutor',
+            isRealAI: true,
+            allowsPersonalizedFeedback: true,
+          },
+        };
+      },
+      now: () => NOW,
+    });
+    await service.beginDiagnostic();
+    expect(observedMode).toBe('coach');
+  });
+
+  it('60. the onboarding screen copy is honest about what is saved when', () => {
+    const screen = readFileSync(join(__dirname, '..', 'screens', 'OnboardingScreen.tsx'), 'utf8');
+    // The old false promise is gone.
+    expect(screen).not.toContain('Nothing on your profile changes unless you accept it');
+    expect(screen).toContain('Your learning preferences are saved when you start the diagnostic');
+    expect(screen).toContain('changes only if you accept the estimate at the end');
+    // A failed start never claims the profile was untouched.
+    expect(screen).not.toContain('Your profile was not changed');
+    expect(screen).toContain('Your learning preferences were saved, but the diagnostic could not start.');
+    expect(screen).toContain('Your learning preferences could not be saved, so the diagnostic was not started.');
+  });
+
+  it('61. the dedicated pronunciation task is the one the screen presents and repeats', () => {
+    const screen = readFileSync(join(__dirname, '..', 'screens', 'OnboardingScreen.tsx'), 'utf8');
+    // The screen shows the target sentence, plays it, and repeats it by voice.
+    expect(screen).toContain('pronunciationTask');
+    expect(screen).toContain('Play the sentence');
+    expect(screen).toContain('Repeat it');
+    // The transcript is analysed against the KNOWN target (never free text alone).
+    expect(screen).toContain('handle.pronunciationTask.sentence');
+    // Voice work in flight blocks advancing.
+    expect(screen).toContain('Wait for your answer to finish before continuing.');
+  });
+
+  it('62. a late speaking result cannot become evidence for the NEXT step', async () => {
+    const adapter = new SqlJsAdapter(':memory:');
+    await adapter.init();
+    await seedProfile(adapter);
+    const provider = createDeferredProvider();
+    const service = createOnboardingService({
+      adapter,
+      learnerModel: createTalkLearnerModel(adapter)!,
+      profileRepository: new SQLiteUserProfileRepository(adapter),
+      createSpeakingBundle: () => ({
+        session: buildSpeakingSession(provider, 'coach'),
+        providerKind: 'gemini',
+        providerInfo: {
+          kind: 'gemini',
+          label: 'Gemini • Real AI tutor',
+          isRealAI: true,
+          allowsPersonalizedFeedback: true,
+        },
+      }),
+      now: () => NOW,
+    });
+
+    const handle = await service.beginDiagnostic();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance(); // speaking
+
+    // An answer is sent while `speaking` is the current step…
+    const pending = service.recordSpeakingAnswer(
+      handle,
+      'I work in logistics and I manage a small team every day.',
+    );
+
+    // …and the flow moves on before the AI answers.
+    handle.session.advance(); // listening
+    handle.session.advance(); // language_use
+    expect(handle.session.getCurrentStepId()).toBe('language_use');
+
+    provider.resolveNext('A late tutor reply.');
+    const outcome = await pending;
+
+    const snapshot = handle.session.snapshot();
+    expect(outcome.ok).toBe(false); // the stale speaking result was refused
+    expect(snapshot.evidence.speaking).toBeNull();
+    expect(snapshot.evidence.languageUse).toBeNull();
+  });
+
+  it('63. a late language-use result cannot become pronunciation evidence', async () => {
+    const adapter = new SqlJsAdapter(':memory:');
+    await adapter.init();
+    await seedProfile(adapter);
+    const provider = createDeferredProvider();
+    const service = createOnboardingService({
+      adapter,
+      learnerModel: createTalkLearnerModel(adapter)!,
+      profileRepository: new SQLiteUserProfileRepository(adapter),
+      pronunciation: createPronunciationEngine(adapter),
+      createSpeakingBundle: () => ({
+        session: buildSpeakingSession(provider, 'coach'),
+        providerKind: 'gemini',
+        providerInfo: {
+          kind: 'gemini',
+          label: 'Gemini • Real AI tutor',
+          isRealAI: true,
+          allowsPersonalizedFeedback: true,
+        },
+      }),
+      now: () => NOW,
+    });
+
+    const handle = await service.beginDiagnostic();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    for (let index = 0; index < 3; index += 1) handle.session.advance(); // → language_use
+    expect(handle.session.getCurrentStepId()).toBe('language_use');
+
+    const pending = service.recordLanguageUseAnswer(
+      handle,
+      'I plan to travel next week because I need a rest.',
+    );
+    handle.session.advance(); // pronunciation
+    provider.resolveNext('Late reply.');
+    await pending;
+
+    const snapshot = handle.session.snapshot();
+    expect(snapshot.currentStepId).toBe('pronunciation');
+    expect(snapshot.evidence.languageUse).toBeNull();
+    // A spoken answer in the conversation is NOT pronunciation evidence: the
+    // dedicated repeat + target is still required.
+    expect(snapshot.evidence.pronunciation).toBeNull();
+  });
+
+  it('64. abandoning the diagnostic makes every late result harmless', async () => {
+    const adapter = new SqlJsAdapter(':memory:');
+    await adapter.init();
+    await seedProfile(adapter);
+    const service = createOnboardingService({
+      adapter,
+      learnerModel: createTalkLearnerModel(adapter)!,
+      profileRepository: new SQLiteUserProfileRepository(adapter),
+      pronunciation: createPronunciationEngine(adapter),
+      now: () => NOW,
+    });
+    const handle = await service.beginDiagnostic();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await service.recordSpeakingAnswer(handle, 'I work in logistics and I manage a small team.');
+    const tokenBeforeAbandon = handle.session.getCurrentStepToken();
+
+    // The learner leaves the screen: the diagnostic is abandoned FIRST.
+    handle.session.abandon();
+
+    expect(handle.session.recordSpeaking(speakingEvidence(), tokenBeforeAbandon)).toBe(false);
+    expect(
+      handle.session.recordListening(
+        {
+          answered: 1,
+          understood: 1,
+          mostlyUnderstood: 0,
+          partial: 0,
+          missedKeyMeaning: 0,
+          evaluatedBy: 'local',
+        },
+        tokenBeforeAbandon,
+      ),
+    ).toBe(false);
+    expect(handle.session.recordLanguageUse(languageUseEvidence(), tokenBeforeAbandon)).toBe(false);
+    expect(
+      handle.session.recordPronunciation({ observed: true, noteLines: ['Late note.'] }, tokenBeforeAbandon),
+    ).toBe(false);
+    expect(handle.session.snapshot().evidence.pronunciation).toBeNull();
+    expect(handle.session.canComplete()).toBe(false);
+    expect(await service.finishDiagnostic(handle)).toBeNull();
+  });
+
+  it('65. recording the same committed evidence twice neither doubles the turn nor the weaknesses', async () => {
+    const adapter = new SqlJsAdapter(':memory:');
+    await adapter.init();
+    const learnerId = (await seedProfile(adapter)).id;
+    const persistence = createLearningPersistenceService(adapter, learnerId);
+    const provider = createFeedbackProvider([
+      { content: 'Let us fix that.', feedback: INCORRECT_FEEDBACK },
+    ]);
+    const session = buildSpeakingSession(provider, 'coach');
+    const step = createDiagnosticSpeakingStep({
+      session,
+      mode: 'coach',
+      isRealAI: true,
+      learningPersistence: persistence,
+    });
+    const diagnostic = createDiagnosticSession({ learnerId, startedAt: NOW });
+    diagnostic.markProfileStepDone(diagnostic.getCurrentStepToken());
+    diagnostic.advance();
+    const token = diagnostic.getCurrentStepToken();
+
+    await step.send('Yesterday I go to the office with my manager and the team.');
+    const first = step.getSpeakingEvidence();
+    diagnostic.recordSpeaking(first, token);
+    // Re-reporting the SAME observation (for example a repeated handler call)
+    // replaces the evidence instead of accumulating it.
+    diagnostic.recordSpeaking(step.getSpeakingEvidence(), token);
+    const second = step.getSpeakingEvidence();
+    expect(second).toEqual(first);
+    expect(second.committedLearnerTurns).toBe(1);
+
+    step.observeCommittedHistory();
+    step.observeCommittedHistory();
+    expect(step.getSpeakingEvidence().committedLearnerTurns).toBe(1);
+
+    const mistakes = await new SQLiteMistakeRepository(adapter).listMistakes(learnerId);
+    expect(mistakes.length).toBe(1);
+    expect(mistakes[0].occurrenceCount).toBe(1); // one learner answer → one occurrence
+    const weaknesses = await SQLiteWeaknessRepository.prototype.listWeaknesses.call(
+      new SQLiteWeaknessRepository(adapter),
+      learnerId,
+    );
+    expect(weaknesses.length).toBeLessThanOrEqual(1);
+  });
+
+  it('66. the screen prevents double submission and advancing during voice work', () => {
+    const screen = readFileSync(join(__dirname, '..', 'screens', 'OnboardingScreen.tsx'), 'utf8');
+    // Re-entrancy guards exist for the mic, the text fallback and Continue.
+    expect(screen).toContain('micInFlightRef');
+    expect(screen).toContain('answerInFlightRef');
+    expect(screen).toContain('continueInFlightRef');
+    // Advancing is refused while the current step's voice work is in flight.
+    expect(screen).toContain('voice?.isProcessing');
+    expect(screen).toContain('voice?.isSwitching');
+    expect(screen).toContain('Stop the recording first, then continue.');
+    // The purpose of a voice turn is captured when the microphone OPENS.
+    expect(screen).toContain('pendingPurposeRef');
+    // Leaving the screen abandons the diagnostic before disposing voice work.
+    const unmountIndex = screen.indexOf('mountedRef.current = false;');
+    const abandonIndex = screen.indexOf('handle.session.abandon()', unmountIndex);
+    expect(unmountIndex).toBeGreaterThan(-1);
+    expect(abandonIndex).toBeGreaterThan(unmountIndex);
+  });
+
+  it('67. a VOICE answer is recorded against the step it was started in', () => {
+    const screen = readFileSync(join(__dirname, '..', 'screens', 'OnboardingScreen.tsx'), 'utf8');
+    // The voice path records language-use evidence as language use (never as
+    // speaking evidence for a different step)…
+    expect(screen).toContain('recordLanguageUse(handle.speaking.getLanguageUseEvidence()');
+    expect(screen).toContain('recordSpeaking(handle.speaking.getSpeakingEvidence()');
+    // …and the pronunciation voice path uses the dedicated target comparison.
+    expect(screen).toContain('recordPronunciation(');
+    expect(screen).toContain('handle.pronunciationTask.sentence,');
   });
 
   it('43. the onboarding screens and entry points are wired without new navigation architecture', () => {

@@ -99,6 +99,18 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
   const [turnError, setTurnError] = useState<string | null>(null);
   const [turns, setTurns] = useState<number>(0);
   const [textAnswer, setTextAnswer] = useState<string>('');
+  const [pronunciationReady, setPronunciationReady] = useState<boolean>(false);
+  /**
+   * The step a voice turn was started for. Captured when the microphone OPENS, so
+   * a result that arrives after the flow moved on can never be recorded against
+   * the step that is current by then.
+   */
+  const pendingPurposeRef = useRef<'speaking' | 'language_use' | 'pronunciation'>('speaking');
+  /** Re-entrancy guards: a double press can never submit/advance twice. */
+  const micInFlightRef = useRef<boolean>(false);
+  const answerInFlightRef = useRef<boolean>(false);
+  const continueInFlightRef = useRef<boolean>(false);
+  const mountedRef = useRef<boolean>(true);
 
   // Listening step.
   const [exercise, setExercise] = useState<ListeningExercise | null>(null);
@@ -142,9 +154,12 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     };
   }, [getService]);
 
-  // ── leaving the screen: stop voice work, never fake completion
+  // ── leaving the screen: abandon the diagnostic FIRST, then stop voice work
   useEffect(
     () => () => {
+      // Abandon before anything else: a late STT/AI result must not be able to
+      // mutate the diagnostic evidence after the learner left the screen.
+      mountedRef.current = false;
       const handle = handleRef.current;
       if (handle && handle.session.getStatus() === 'in_progress') {
         // An interrupted diagnostic is abandoned: it can never be reported as
@@ -174,8 +189,16 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
   const startDiagnostic = useCallback(async () => {
     setBusy(true);
     setTurnError(null);
+    const service = await getService().catch(() => null);
+    if (!service) {
+      setErrorMessage('Your learning profile is unavailable right now. Nothing was changed.');
+      setPhase('error');
+      setBusy(false);
+      return;
+    }
+
+    // The learner's own preferences are saved HERE — before the diagnostic runs.
     try {
-      const service = await getService();
       await service.saveProfileDraft({
         displayName,
         ...(nativeLanguage ? { nativeLanguage } : {}),
@@ -183,12 +206,26 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         learningGoals: goals,
         preferredModes: modes,
       });
+    } catch {
+      setErrorMessage(
+        'Your learning preferences could not be saved, so the diagnostic was not started. Nothing was changed.',
+      );
+      setPhase('error');
+      setBusy(false);
+      return;
+    }
+
+    // From here the preferences ARE saved: a startup failure says exactly that
+    // (the saved preferences are never rolled back), and it never claims the
+    // profile was untouched.
+    try {
       const handle = await service.beginDiagnostic();
       handleRef.current = handle;
       const token = handle.session.getCurrentStepToken();
       handle.session.markProfileStepDone(token);
       handle.session.advance();
       setStepId(handle.session.getCurrentStepId());
+
       const factory =
         props?.createCoordinator ??
         ((input: { session: DiagnosticHandle['conversation']; providerKind: TalkProviderKind }) =>
@@ -206,38 +243,77 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       unsubscribeVoiceRef.current = coordinator.subscribe(setVoiceStatus);
       setPhase('diagnostic');
     } catch {
-      setErrorMessage('The assessment could not start. Your profile was not changed.');
+      setErrorMessage('Your learning preferences were saved, but the diagnostic could not start.');
       setPhase('error');
     } finally {
       setBusy(false);
     }
-  }, [displayName, getService, goals, modes, nativeLanguage, props?.createCoordinator, targetLevel]);
+  }, [
+    displayName,
+    getService,
+    goals,
+    modes,
+    nativeLanguage,
+    props?.createCoordinator,
+    targetLevel,
+  ]);
 
   /** Mic press — never auto-opens the microphone; the learner is in control. */
   const pressMic = useCallback(async () => {
     const coordinator = coordinatorRef.current;
     const handle = handleRef.current;
-    if (!coordinator || !handle) return;
+    if (!coordinator || !handle || micInFlightRef.current) return;
+    micInFlightRef.current = true;
     setTurnError(null);
-    if (coordinator.getStatus().state === 'recording') {
-      setBusy(true);
-      try {
-        const outcome = await coordinator.stopRecordingAndProcess();
-        // The EXISTING coordinator committed the turn through the EXISTING
-        // session; the diagnostic only absorbs what was really committed.
-        handle.speaking.observeCommittedHistory({
-          purpose: handle.session.getCurrentStepId() === 'language_use' ? 'language_use' : 'speaking',
-        });
-        setTurns(handle.conversation.getHistory().length);
-        if (!outcome.ok) {
-          setTurnError(outcome.error ?? 'That turn could not be completed. Nothing was recorded.');
+    try {
+      const status = coordinator.getStatus();
+      if (status.state === 'recording') {
+        setBusy(true);
+        try {
+          // The purpose was captured when this recording STARTED, so a result
+          // that arrives after the flow advanced is still attributed correctly.
+          const purpose = pendingPurposeRef.current;
+          const outcome = await coordinator.stopRecordingAndProcess();
+          if (!mountedRef.current) return; // left the screen: nothing is recorded
+          const transcript = outcome.transcript ?? '';
+
+          if (purpose === 'pronunciation') {
+            // Dedicated task: the real transcript is compared with the known
+            // target sentence by the EXISTING PronunciationEngine.
+            await serviceRef.current?.recordPronunciation(
+              handle,
+              transcript,
+              handle.pronunciationTask.sentence,
+            );
+          } else {
+            // The EXISTING coordinator committed the turn through the EXISTING
+            // session; the diagnostic only absorbs what was really committed,
+            // and records it against the step the turn was STARTED in.
+            handle.speaking.observeCommittedHistory({ purpose });
+            const token = handle.session.getCurrentStepToken();
+            if (purpose === 'language_use') {
+              handle.session.recordLanguageUse(handle.speaking.getLanguageUseEvidence(), token);
+            } else {
+              handle.session.recordSpeaking(handle.speaking.getSpeakingEvidence(), token);
+            }
+          }
+          setTurns(handle.conversation.getHistory().length);
+          if (!outcome.ok) {
+            setTurnError(outcome.error ?? 'That turn could not be completed. Nothing was recorded.');
+          }
+        } finally {
+          setBusy(false);
         }
-      } finally {
-        setBusy(false);
+        return;
       }
-      return;
+      // Capture the purpose BEFORE the microphone opens.
+      const step = handle.session.getCurrentStepId();
+      pendingPurposeRef.current =
+        step === 'pronunciation' ? 'pronunciation' : step === 'language_use' ? 'language_use' : 'speaking';
+      await coordinator.startRecording();
+    } finally {
+      micInFlightRef.current = false;
     }
-    await coordinator.startRecording();
   }, []);
 
   /** Manual text fallback — the SAME existing conversation path. */
@@ -245,7 +321,8 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     const handle = handleRef.current;
     const service = serviceRef.current;
     const answer = textAnswer.trim();
-    if (!handle || !service || !answer) return;
+    if (!handle || !service || !answer || answerInFlightRef.current) return;
+    answerInFlightRef.current = true;
     setBusy(true);
     setTurnError(null);
     try {
@@ -253,67 +330,82 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       const outcome = onLanguageUse
         ? await service.recordLanguageUseAnswer(handle, answer)
         : await service.recordSpeakingAnswer(handle, answer);
+      if (!mountedRef.current) return;
       if (!outcome.ok) {
         setTurnError(outcome.errorMessage ?? 'That answer could not be evaluated. Nothing was recorded.');
       }
       setTextAnswer('');
       setTurns(handle.conversation.getHistory().length);
     } finally {
+      answerInFlightRef.current = false;
       setBusy(false);
     }
   }, [textAnswer]);
 
-  /** Continue to the next step (the state machine owns the transition). */
+  /**
+   * Continue to the next step. The state machine owns the transition; this
+   * handler refuses while a voice answer for the CURRENT step is still in
+   * flight, and it can never advance twice from a repeated press.
+   */
   const continueStep = useCallback(async () => {
     const handle = handleRef.current;
     const service = serviceRef.current;
-    if (!handle || !service) return;
+    if (!handle || !service || continueInFlightRef.current) return;
     setTurnError(null);
-    const current = handle.session.getCurrentStepId();
 
-    if (current === 'speaking') {
-      if (handle.speaking.getSpeakingEvidence().committedLearnerTurns === 0) {
-        setTurnError('Say at least one answer before continuing.');
-        return;
-      }
-      handle.session.advance();
-      setStepId(handle.session.getCurrentStepId());
+    const voice = coordinatorRef.current?.getStatus();
+    if (voice?.isProcessing || voice?.isSwitching) {
+      setTurnError('Wait for your answer to finish before continuing.');
+      return;
+    }
+    if (voice?.state === 'recording') {
+      setTurnError('Stop the recording first, then continue.');
       return;
     }
 
-    if (current === 'listening') {
-      handle.session.advance();
-      setStepId(handle.session.getCurrentStepId());
-      return;
-    }
+    continueInFlightRef.current = true;
+    try {
+      const current = handle.session.getCurrentStepId();
 
-    if (current === 'language_use') {
-      handle.session.advance();
-      setStepId(handle.session.getCurrentStepId());
-      return;
-    }
-
-    if (current === 'pronunciation') {
-      handle.session.advance();
-      setStepId(handle.session.getCurrentStepId());
-      return;
-    }
-
-    if (current === 'summary') {
-      // The service refuses to finish an incomplete/abandoned diagnostic.
-      handle.session.markSummaryDone(handle.session.getCurrentStepToken());
-      setBusy(true);
-      try {
-        const finished = await service.finishDiagnostic(handle);
-        if (!finished) {
-          setTurnError('The assessment is not complete yet, so no result was produced.');
+      if (current === 'speaking') {
+        if (handle.speaking.getSpeakingEvidence().committedLearnerTurns === 0) {
+          setTurnError('Say at least one answer before continuing.');
           return;
         }
-        setResult(finished);
-        setPhase('result');
-      } finally {
-        setBusy(false);
       }
+
+      if (current === 'pronunciation' && !handle.session.snapshot().evidence.pronunciation) {
+        // No real observation was produced: the part is honestly marked
+        // unavailable instead of being silently treated as assessed.
+        handle.session.markPronunciationUnavailable(
+          'No pronunciation observations were recorded in this session.',
+          handle.session.getCurrentStepToken(),
+        );
+      }
+
+      if (current === 'summary') {
+        // The service refuses to finish an incomplete/abandoned diagnostic.
+        handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+        setBusy(true);
+        try {
+          const finished = await service.finishDiagnostic(handle);
+          if (!finished) {
+            setTurnError('The assessment is not complete yet, so no result was produced.');
+            return;
+          }
+          if (!mountedRef.current) return;
+          setResult(finished);
+          setPhase('result');
+        } finally {
+          setBusy(false);
+        }
+        return;
+      }
+
+      handle.session.advance();
+      setStepId(handle.session.getCurrentStepId());
+    } finally {
+      continueInFlightRef.current = false;
     }
   }, []);
 
@@ -341,31 +433,17 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     };
   }, [exercise, phase, stepId]);
 
-  /** Pronunciation is analysed once, from a REAL spoken turn (or omitted). */
+  /**
+   * The pronunciation step analyses ONLY the learner's repeat of the dedicated
+   * target sentence (captured by the mic press in this step). It never judges
+   * ordinary conversation text, and it never claims acoustic analysis.
+   */
   useEffect(() => {
     if (phase !== 'diagnostic' || stepId !== 'pronunciation') return;
     const handle = handleRef.current;
     if (!handle) return;
-    let active = true;
-    void (async () => {
-      const service = serviceRef.current;
-      if (!service) return;
-      const spoken = [...handle.conversation.getHistory()]
-        .reverse()
-        .find((turn) => turn.role === 'user');
-      if (!spoken?.content.trim()) {
-        handle.session.markPronunciationUnavailable(
-          'No spoken turn was recorded, so pronunciation was not assessed.',
-          handle.session.getCurrentStepToken(),
-        );
-        return;
-      }
-      await service.recordPronunciation(handle, spoken.content);
-      if (active) setTurns(handle.conversation.getHistory().length);
-    })();
-    return () => {
-      active = false;
-    };
+    const evidence = handle.session.snapshot().evidence.pronunciation;
+    setPronunciationReady(evidence !== null);
   }, [phase, stepId]);
 
   const submitListeningAnswer = useCallback(async () => {
@@ -649,28 +727,70 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     );
   };
 
-  const renderPronunciationStep = () => (
-    <View style={styles.card}>
-      <Text style={styles.cardTitle}>{stepTitle}</Text>
-      <Text style={styles.body}>
-        We listened to your spoken answer and noted what was clear.
-      </Text>
-      {handleRef.current?.session.snapshot().evidence.pronunciation ? (
-        handleRef.current.session.snapshot().evidence.pronunciation?.noteLines.map((line) => (
-          <Text key={line} style={styles.listLine}>
-            • {line}
-          </Text>
-        ))
-      ) : (
-        <Text style={styles.muted}>
-          No pronunciation observations were recorded, so this part is left out of your result.
+  const renderPronunciationStep = () => {
+    const handle = handleRef.current;
+    const task = handle?.pronunciationTask;
+    const evidence = handle?.session.snapshot().evidence.pronunciation ?? null;
+    return (
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>{stepTitle}</Text>
+        <Text style={styles.body}>
+          Listen to this sentence, then say it back in your own voice.
         </Text>
-      )}
-      <TouchableOpacity style={styles.primaryButton} onPress={() => void continueStep()}>
-        <Text style={styles.primaryButtonText}>Continue</Text>
-      </TouchableOpacity>
-    </View>
-  );
+        {task ? (
+          <View style={styles.targetBox}>
+            <Text style={styles.targetText}>{task.sentence}</Text>
+          </View>
+        ) : null}
+        <TouchableOpacity
+          style={styles.secondaryButton}
+          onPress={() => {
+            if (task) void coordinatorRef.current?.speakResponse(task.sentence);
+          }}
+        >
+          <Text style={styles.secondaryButtonText}>Play the sentence</Text>
+        </TouchableOpacity>
+
+        <View style={styles.buttonRow}>
+          <TouchableOpacity
+            style={[styles.micButton, voiceStatus?.state === 'recording' ? styles.micButtonOn : null]}
+            onPress={() => void pressMic()}
+          >
+            <Text style={styles.micButtonText}>
+              {voiceStatus?.state === 'recording' ? 'Stop' : 'Repeat it'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+        {voiceStatus?.recognizedTranscript ? (
+          <Text style={styles.muted}>You said: {voiceStatus.recognizedTranscript}</Text>
+        ) : null}
+        {voiceStatus?.errorMessage ? (
+          <Text style={styles.errorText}>{voiceStatus.errorMessage}</Text>
+        ) : null}
+
+        {evidence ? (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>What we noticed</Text>
+            {evidence.noteLines.map((line) => (
+              <Text key={line} style={styles.listLine}>
+                • {line}
+              </Text>
+            ))}
+          </View>
+        ) : (
+          <Text style={styles.muted}>
+            {pronunciationReady
+              ? 'No pronunciation observations were recorded yet. Repeat the sentence, or continue — this part is optional.'
+              : 'This part is optional and is left out of your result if nothing is observed.'}
+          </Text>
+        )}
+
+        <TouchableOpacity style={styles.primaryButton} onPress={() => void continueStep()}>
+          <Text style={styles.primaryButtonText}>Continue</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  };
 
   const renderSummaryStep = () => (
     <View style={styles.card}>
@@ -776,7 +896,8 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         <Text style={styles.primaryButtonText}>Start the diagnostic</Text>
       </TouchableOpacity>
       <Text style={styles.muted}>
-        Takes a few minutes. Nothing on your profile changes unless you accept it at the end.
+        Your learning preferences are saved when you start the diagnostic. Your current working
+        level changes only if you accept the estimate at the end.
       </Text>
     </View>
   );
@@ -894,6 +1015,14 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   secondaryButtonText: { color: '#007AFF', fontSize: 14, fontWeight: '600' },
+  targetBox: {
+    backgroundColor: '#f0f5ff',
+    borderRadius: 10,
+    padding: 12,
+    marginTop: 4,
+    marginBottom: 4,
+  },
+  targetText: { fontSize: 15, color: '#1c1c1e', fontWeight: '600' },
   optionButton: {
     borderWidth: 1,
     borderColor: '#d7dbe3',

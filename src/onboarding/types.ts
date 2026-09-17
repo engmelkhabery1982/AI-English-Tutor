@@ -78,6 +78,20 @@ export const NATIVE_LANGUAGE_OPTIONS: readonly NativeLanguageOption[] = [
   { code: 'zh', label: 'Chinese' },
 ];
 
+/**
+ * ONE fixed, bounded pronunciation diagnostic task.
+ *
+ * The learner hears this exact English sentence and repeats it. Pronunciation is
+ * transcript/evidence based: the EXISTING PronunciationEngine compares the
+ * learner's real transcript with this known target (`expectedText`). There is no
+ * acoustic or phoneme analysis here, and no numeric score of any kind.
+ */
+export interface PronunciationTask {
+  readonly id: string;
+  /** The exact sentence the learner hears and repeats (the engine's target). */
+  readonly sentence: string;
+}
+
 /** The learner's own report collected during onboarding. */
 export interface OnboardingProfileDraft {
   readonly displayName?: string;
