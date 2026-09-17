@@ -223,8 +223,9 @@ export interface ReviewRepository {
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly ReviewItem[]>;
   /**
    * Exact existence lookup by (learnerId, kind, referenceId) — including
-   * items scheduled for the FUTURE (which listDue cannot see). Retired
-   * items do not count as existing. Optional: backends may omit it.
+   * items scheduled for the FUTURE (which listDue cannot see) and items
+   * already RETIRED (whose review history must never be silently reset by
+   * a "create initial item" path). Optional: backends may omit it.
    */
   getByReference?(
     learnerId: string,

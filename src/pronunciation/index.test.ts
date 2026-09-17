@@ -951,3 +951,109 @@ describe('Exact weakness lookup (integrity)', () => {
     expect(after!.status).toBe('confirmed');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Retired-review edge case (final integrity fix): a retired pronunciation
+// review still counts as existing — re-observing the issue must never
+// recreate or reset it.
+// ---------------------------------------------------------------------------
+describe('Retired review history preservation (integrity)', () => {
+  it('2. getByReference finds an existing pronunciation review even if retired', async () => {
+    const ctx = await createContext();
+    const referenceId = '1ef907b7-6c12-4ead-8f9a-c97bd31e00aa';
+    await ctx.review.upsert({
+      learnerId: ctx.learnerId,
+      kind: 'pronunciation',
+      referenceId,
+      prompt: 'Listen and repeat clearly: "comfortable"',
+      expectedResponse: 'comfortable',
+      state: 'retired',
+      dueAt: NOW,
+      reviewCount: 4,
+      consecutiveCorrect: 3,
+      lastReviewAt: NOW,
+      outcomeHistory: [
+        { at: NOW, result: 'correct', note: 'practice 1' },
+        { at: NOW, result: 'correct', note: 'practice 2' },
+      ],
+    });
+
+    const found = await ctx.review.getByReference(ctx.learnerId, 'pronunciation', referenceId);
+    expect(found).not.toBeNull();
+    expect(found!.state).toBe('retired');
+    expect(found!.reviewCount).toBe(4);
+  });
+
+  it('1. re-observing an issue with a retired review preserves all history (no reset, no duplicate)', async () => {
+    const ctx = await createContext();
+    const engine = createEngine(ctx, fakeProvider({ observations: [wordObservation()] }));
+
+    // Create the pronunciation review through the normal flow and practice it twice.
+    await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: NOW,
+    });
+    const [weakness] = await ctx.weaknesses.listWeaknesses(ctx.learnerId, 100);
+    const created = await ctx.review.getByReference(ctx.learnerId, 'pronunciation', weakness.id);
+    expect(created).not.toBeNull();
+
+    await ctx.review.markReviewed(created!.id, 'correct', 'first try');
+    await ctx.review.markReviewed(created!.id, 'correct', 'second try');
+
+    // Retire it (as the Review system does when an item leaves rotation).
+    const practiced = await ctx.review.get(created!.id);
+    expect(practiced!.reviewCount).toBe(2);
+    const retired = await ctx.review.upsert({
+      learnerId: practiced!.learnerId,
+      kind: practiced!.kind,
+      referenceId: practiced!.referenceId,
+      prompt: practiced!.prompt,
+      expectedResponse: practiced!.expectedResponse,
+      contextTopic: practiced!.contextTopic,
+      state: 'retired',
+      dueAt: practiced!.dueAt,
+      lastReviewAt: practiced!.lastReviewAt,
+      reviewCount: practiced!.reviewCount,
+      consecutiveCorrect: practiced!.consecutiveCorrect,
+      outcomeHistory: practiced!.outcomeHistory,
+      id: practiced!.id,
+    });
+    expect(retired.state).toBe('retired');
+
+    // Snapshot of the complete retired history.
+    const beforeRetiredRow = await ctx.review.get(created!.id);
+    const historySnapshot = beforeRetiredRow!.outcomeHistory;
+
+    // The SAME pronunciation issue is observed again.
+    await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: '2026-09-17T13:00:00.000Z',
+    });
+
+    // Same single row, fully preserved.
+    const after = await ctx.review.getByReference(ctx.learnerId, 'pronunciation', weakness.id);
+    expect(after).not.toBeNull();
+    expect(after!.id).toBe(created!.id);
+    expect(after!.state).toBe('retired');
+    expect(after!.reviewCount).toBe(2); // preserved
+    expect(after!.consecutiveCorrect).toBe(beforeRetiredRow!.consecutiveCorrect); // preserved
+    expect(after!.outcomeHistory).toEqual(historySnapshot); // preserved
+    expect(after!.lastReviewAt).toBe(beforeRetiredRow!.lastReviewAt); // preserved
+    expect(after!.dueAt).toBe(beforeRetiredRow!.dueAt); // preserved
+
+    const all = await ctx.review.list(ctx.learnerId, 100);
+    expect(all.filter((r) => r.kind === 'pronunciation')).toHaveLength(1); // no duplicate
+
+    // The weakness lifecycle still advances (observed → repeated) even though
+    // the review item is left untouched.
+    const weaknessAfter = await ctx.weaknesses.getWeaknessByReference(
+      ctx.learnerId,
+      'pronunciation',
+      weakness.referenceId,
+    );
+    expect(weaknessAfter!.status).toBe('repeated');
+    expect(weaknessAfter!.occurrenceCount).toBe(2);
+  });
+});

@@ -2726,8 +2726,11 @@ export class SQLiteReviewRepository implements ReviewRepository {
   /**
    * Exact existence lookup by (learnerId, kind, referenceId). Unlike
    * listDue, this also finds items scheduled for the FUTURE, so callers
-   * can avoid resetting already-practiced reviews. Retired items are not
-   * considered existing (re-observing may schedule them again).
+   * can avoid resetting already-practiced reviews. Retired items DO count
+   * as existing: this matches upsert's own (learnerId, kind, referenceId)
+   * lookup, so a caller that treats "not found" as "create initial item"
+   * can never overwrite a retired row's review history. Reactivating a
+   * retired item must be an explicit, history-preserving operation.
    */
   async getByReference(
     learnerId: string,
@@ -2737,7 +2740,7 @@ export class SQLiteReviewRepository implements ReviewRepository {
     if (!isValidUuid(learnerId) || !kind || !referenceId) return null;
     const rows = await this.adapter.query(
       `SELECT * FROM review_items
-       WHERE learner_id = ? AND kind = ? AND reference_id = ? AND state != 'retired'
+       WHERE learner_id = ? AND kind = ? AND reference_id = ?
        ORDER BY created_at DESC
        LIMIT 1`,
       [learnerId, kind, referenceId],
