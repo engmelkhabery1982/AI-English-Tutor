@@ -278,6 +278,42 @@ interface ResolvedMemoryDependencies {
   readonly learnerId: string;
 }
 
+/**
+ * Deterministic UUID (v4-shaped) derived from the conversation memory identity.
+ * The same conversation always maps to the same domain session id, which is what
+ * makes retry-safe/idempotent persistence possible without any new table.
+ */
+export function deriveConversationSessionId(memoryId: string): string {
+  const a = fnv1aHex(memoryId, 0x811c9dc5);
+  const b = fnv1aHex(memoryId, 0x9e3779b9);
+  const c = fnv1aHex(`${memoryId}#2`, 0x85ebca6b);
+  const d = fnv1aHex(`${memoryId}#3`, 0xc2b2ae35);
+  return `${a}-${b.slice(0, 4)}-4${b.slice(4, 7)}-a${c.slice(0, 3)}-${c.slice(3, 7)}${d}`;
+}
+
+/** 32-bit FNV-1a hash rendered as 8 lowercase hex chars (deterministic). */
+function fnv1aHex(input: string, seed: number): string {
+  let hash = seed >>> 0;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+/** Reads a session without throwing (a broken/absent row simply means "none"). */
+async function readSession(
+  repo: ConversationRepository,
+  id: string,
+): Promise<{ id: string; status: string } | null> {
+  try {
+    const session = await repo.getSession(id);
+    return session ? { id: session.id, status: session.status } : null;
+  } catch {
+    return null;
+  }
+}
+
 function createConversationMemoryService(
   options?: ConversationMemoryServiceOptions,
 ): ConversationMemoryService {
@@ -365,36 +401,94 @@ function createConversationMemoryService(
       };
     }
 
-    try {
-      const created = await deps.conversationRepo.createSession({
-        learnerId: deps.learnerId,
-        mode: snapshot.mode,
-        ...(snapshot.topic ? { topic: snapshot.topic } : {}),
-        ...(snapshot.topic ? { topicSource: 'learner-chosen' as const } : {}),
-        status: 'active',
-        startedAt: snapshot.startedAt,
-        endedAt: snapshot.endedAt,
-        durationSeconds: Math.max(
-          0,
-          Math.round(
-            (Date.parse(snapshot.endedAt) - Date.parse(snapshot.startedAt)) / 1000,
-          ) || 0,
-        ),
-        turnCount: snapshot.turns.length,
-        tags: ['talk'],
-      });
+    const sessionInput = {
+      // Deterministic domain identity: the SAME conversation identity always maps
+      // to the SAME session id, so a retry can never create a second session.
+      id: deriveConversationSessionId(snapshot.memoryId),
+      learnerId: deps.learnerId,
+      mode: snapshot.mode,
+      ...(snapshot.topic ? { topic: snapshot.topic } : {}),
+      ...(snapshot.topic ? { topicSource: 'learner-chosen' as const } : {}),
+      status: 'active' as const,
+      startedAt: snapshot.startedAt,
+      endedAt: snapshot.endedAt,
+      durationSeconds: Math.max(
+        0,
+        Math.round(
+          (Date.parse(snapshot.endedAt) - Date.parse(snapshot.startedAt)) / 1000,
+        ) || 0,
+      ),
+      turnCount: snapshot.turns.length,
+      tags: ['talk'],
+    };
+    const turnInputs = snapshot.turns.map((turn, index) => ({
+      speaker: (turn.role === 'learner' ? 'learner' : 'tutor') as 'learner' | 'tutor',
+      text: turn.text,
+      turnIndex: index,
+      startedAt: snapshot.startedAt as string,
+    }));
 
-      // Turns are appended in conversation order; the existing schema enforces
-      // UNIQUE(session_id, sequence_number), so a retry cannot duplicate them.
-      for (let index = 0; index < snapshot.turns.length; index += 1) {
-        const turn = snapshot.turns[index];
-        await deps.conversationRepo.addTurn({
-          sessionId: created.id,
-          speaker: turn.role === 'learner' ? 'learner' : 'tutor',
-          text: turn.text,
-          turnIndex: index,
-          startedAt: snapshot.startedAt,
+    try {
+      // RESUME FIRST: a previous attempt may have died after committing part (or
+      // all) of this conversation. The identity is deterministic, so the existing
+      // record is always found instead of creating a duplicate.
+      const existing = await readSession(deps.conversationRepo, sessionInput.id);
+      if (existing) {
+        const existingTurns = (await deps.conversationRepo
+          .listTurns(sessionInput.id)
+          .catch(() => [])) ?? [];
+        const persistedIndexes = new Set(existingTurns.map((turn) => turn.turnIndex));
+        const missing = turnInputs.filter((turn) => !persistedIndexes.has(turn.turnIndex));
+
+        if (existing.status === 'completed' && missing.length === 0) {
+          // The conversation is already durably complete: claim it, never rewrite.
+          input.recorder.markFinalized(existing.id);
+          return {
+            ok: true,
+            reason: 'persisted',
+            domainSessionId: existing.id,
+            turnCount: existingTurns.length,
+          };
+        }
+
+        for (const turn of missing) {
+          await deps.conversationRepo.addTurn({ sessionId: sessionInput.id, ...turn });
+        }
+        const completed = await deps.conversationRepo.updateSession(sessionInput.id, {
+          status: 'completed',
+          endedAt: snapshot.endedAt,
+          turnCount: snapshot.turns.length,
         });
+        input.recorder.markFinalized(completed.id);
+        return {
+          ok: true,
+          reason: 'persisted',
+          domainSessionId: completed.id,
+          turnCount: snapshot.turns.length,
+        };
+      }
+
+      // ATOMIC WRITE when the backend supports it: session + all turns + the
+      // completed status land together, or nothing does.
+      if (typeof deps.conversationRepo.persistConversation === 'function') {
+        const stored = await deps.conversationRepo.persistConversation({
+          session: { ...sessionInput, status: 'completed' },
+          turns: turnInputs,
+        });
+        input.recorder.markFinalized(stored.id);
+        return {
+          ok: true,
+          reason: 'persisted',
+          domainSessionId: stored.id,
+          turnCount: snapshot.turns.length,
+        };
+      }
+
+      // Retry-safe sequential fallback (backends without atomic writes): the same
+      // deterministic id is reused, so a retry resumes instead of duplicating.
+      const created = await deps.conversationRepo.createSession(sessionInput);
+      for (const turn of turnInputs) {
+        await deps.conversationRepo.addTurn({ sessionId: created.id, ...turn });
       }
 
       const updated = await deps.conversationRepo.updateSession(created.id, {
@@ -542,6 +636,81 @@ export async function finalizeConversationWithReview(input: {
       persistence: { ok: false, reason: 'persistence-failed', errorMessage: CONVERSATION_MEMORY_FAILED_NOTICE },
     });
   }
+}
+
+/** The conversation being replaced, captured before the replacement begins. */
+export interface OutgoingConversation {
+  readonly session: ConversationSession;
+  readonly recorder: ConversationMemoryRecorder;
+  readonly isRealAI: boolean;
+}
+
+export interface ReplaceConversationWithMemoryInput {
+  /** The replacement session that must become active. */
+  readonly nextSession: ConversationSession;
+  readonly service: ConversationMemoryService;
+  /**
+   * The outgoing conversation. Its memory snapshot is taken ONLY after the
+   * atomic switch below has made it non-writable.
+   */
+  readonly outgoing?: OutgoingConversation | null;
+  /**
+   * Atomic session replacement (VoiceSessionCoordinator.switchSession): it
+   * invalidates the outgoing generation, abandons the outgoing ConversationSession
+   * immediately, then awaits recorder/TTS teardown before installing `nextSession`.
+   */
+  readonly switchSession?: (
+    nextSession: ConversationSession,
+  ) => Promise<ConversationSession | null>;
+  readonly endedAt?: IsoDate;
+}
+
+export interface ReplaceConversationWithMemoryResult {
+  /** False when a newer replacement superseded this one (nothing was installed). */
+  readonly installed: boolean;
+  readonly review: ConversationReview | null;
+}
+
+/**
+ * The ONE ordering used when a conversation is replaced (New Chat, mode change):
+ *
+ *   1. capture the outgoing session + recorder + provider identity (caller),
+ *   2. BEGIN the atomic replacement, which abandons the outgoing session
+ *      immediately and discards its in-flight STT/AI work,
+ *   3. AWAIT the teardown boundary (safe switch point),
+ *   4. only now take the memory snapshot of the outgoing conversation and
+ *      finalize it from its stable, already-committed history,
+ *   5. derive its review — the replacement conversation is then activated by the
+ *      caller, untouched by review generation.
+ *
+ * The invariant this enforces: no conversation-memory snapshot is ever taken
+ * while the outgoing ConversationSession can still accept a late commit.
+ */
+export async function replaceConversationWithMemory(
+  input: ReplaceConversationWithMemoryInput,
+): Promise<ReplaceConversationWithMemoryResult> {
+  // 1./2. Atomic replacement first: the outgoing session stops being writable
+  // here (abandon + generation invalidation + awaited teardown inside).
+  if (input.switchSession) {
+    const installed = await input.switchSession(input.nextSession);
+    if (installed !== input.nextSession) {
+      // Superseded or disposed: a newer replacement owns the coordinator.
+      return { installed: false, review: null };
+    }
+  }
+
+  // 3. The outgoing session is now stable: finalize + review from real evidence.
+  const outgoing = input.outgoing;
+  if (!outgoing) return { installed: true, review: null };
+
+  const review = await finalizeConversationWithReview({
+    session: outgoing.session,
+    recorder: outgoing.recorder,
+    isRealAI: outgoing.isRealAI,
+    service: input.service,
+    ...(input.endedAt ? { endedAt: input.endedAt } : {}),
+  });
+  return { installed: true, review };
 }
 
 export type ConversationReviewSectionId =

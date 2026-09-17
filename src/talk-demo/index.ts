@@ -79,7 +79,9 @@ export {
 } from './turn-controls';
 export {
   buildConversationReview,
+  deriveConversationSessionId,
   finalizeConversationWithReview,
+  replaceConversationWithMemory,
   createConversationMemoryRecorder,
   createConversationMemoryService,
   stripHiddenFeedback,
@@ -94,6 +96,9 @@ export {
   type ConversationMemorySnapshot,
   type ConversationMemoryTurn,
   type ConversationReview,
+  type OutgoingConversation,
+  type ReplaceConversationWithMemoryInput,
+  type ReplaceConversationWithMemoryResult,
   type ConversationReviewEvidence,
   type ConversationReviewSection,
   type ConversationReviewSectionId,

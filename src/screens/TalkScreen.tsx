@@ -17,6 +17,7 @@ import {
 } from 'react-native';
 import {
   finalizeConversationWithReview,
+  replaceConversationWithMemory,
   createConversationMemoryRecorder,
   createConversationMemoryService,
   type ConversationMemoryService,
@@ -273,8 +274,8 @@ export default function TalkScreen(props?: TalkScreenProps) {
     async (
       session: ConversationSession,
       recorder: ConversationMemoryRecorder,
+      isRealAI: boolean,
     ): Promise<ConversationReview | null> => {
-      const isRealAI = providerInfoRef.current?.isRealAI ?? false;
       try {
         // One tested pipeline: persist exactly once, then derive the review
         // from the persisted evidence (demo is never stored).
@@ -314,17 +315,13 @@ export default function TalkScreen(props?: TalkScreenProps) {
       setIsSwitching(true);
       coordinatorIsSwitchingRef.current = true;
 
-      // CONVERSATION LEARNING MEMORY: the conversation being replaced is
-      // finalized exactly once through the EXISTING conversation repository
-      // (meaningful real conversations only), and its review is offered.
+      // CONVERSATION LEARNING MEMORY: capture the outgoing conversation BEFORE
+      // the replacement begins. Its memory snapshot is taken only AFTER the
+      // atomic switch has abandoned it (see replaceConversationWithMemory), so
+      // in-flight STT/AI work of the old conversation can never enter memory.
       const outgoingSession = sessionRef.current;
       const outgoingRecorder = memoryRecorderRef.current;
-      if (outgoingSession && outgoingRecorder) {
-        const review = await endConversation(outgoingSession, outgoingRecorder);
-        if (review && review.hasEvidence) {
-          setConversationReview(review);
-        }
-      }
+      const outgoingIsRealAI = providerInfoRef.current?.isRealAI ?? false;
 
       const coaching = coachingRef.current;
       const learnerModel = coaching?.learnerModel ?? null;
@@ -348,18 +345,36 @@ export default function TalkScreen(props?: TalkScreenProps) {
       );
 
       const coordinator = voiceCoordinatorRef.current;
-      if (coordinator) {
-        // ATOMIC switch: the old conversation's recorder/playback cleanup is
-        // awaited BEFORE the new session becomes active, and every cleanup write
-        // is generation guarded — an older reset can never clobber this session.
-        const installed = await coordinator.switchSession(bundle.session);
-        if (installed !== bundle.session) {
-          // Superseded (or the screen was disposed): the newer operation owns the
-          // coordinator and will settle the switch state itself.
-          return null;
-        }
-      } else {
+      // ATOMIC replacement ordered for memory integrity:
+      //   abandon + invalidate the OLD session -> await recorder/TTS teardown ->
+      //   finalize the OLD conversation from its now-stable committed history ->
+      //   derive its review. The replacement is activated by this screen only
+      //   afterwards, so review generation can never corrupt it.
+      const outcome = await replaceConversationWithMemory({
+        nextSession: bundle.session,
+        service: getMemoryService(),
+        outgoing:
+          outgoingSession && outgoingRecorder
+            ? {
+                session: outgoingSession,
+                recorder: outgoingRecorder,
+                isRealAI: outgoingIsRealAI,
+              }
+            : null,
+        ...(coordinator
+          ? { switchSession: (next: ConversationSession) => coordinator.switchSession(next) }
+          : {}),
+      });
+      if (!outcome.installed) {
+        // Superseded (or the screen was disposed): the newer operation owns the
+        // coordinator and will settle the switch state itself.
+        return null;
+      }
+      if (!coordinator) {
         getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+      }
+      if (outcome.review && outcome.review.hasEvidence) {
+        setConversationReview(outcome.review);
       }
 
       // A newer switch superseded this one: install nothing. The newer switch
@@ -571,10 +586,16 @@ export default function TalkScreen(props?: TalkScreenProps) {
     return () => {
       const session = sessionRef.current;
       const recorder = memoryRecorderRef.current;
+      const isRealAI = providerInfoRef.current?.isRealAI ?? false;
+      const disposed = voiceCoordinatorRef.current?.dispose() ?? Promise.resolve();
       if (session && recorder && recorder.hasCommittedLearnerTurn(session)) {
-        void endConversation(session, recorder);
+        void disposed.then(() => {
+          // The screen is gone and voice work is stopped: the session can accept
+          // nothing more, so its committed history is stable for the snapshot.
+          session.abandon?.();
+          void endConversation(session, recorder, isRealAI);
+        });
       }
-      void voiceCoordinatorRef.current?.dispose();
     };
   }, [endConversation]);
 

@@ -32,15 +32,19 @@ import { createDemoLearnerModel } from './demo-learner-model';
 import { createLearningPersistenceService } from './learning-persistence';
 import type { AIProvider, AIProviderResult, ConversationFeedback } from '../providers/ai';
 import { createDemoSTTProvider } from '../providers/stt';
+import type { SpeechToTextProvider, STTResult } from '../providers/stt';
 import { createDemoTTSProvider } from '../providers/tts/demo';
+import type { TextToSpeechProvider, TTSOptions } from '../providers/tts';
 import { createDemoAudioRecorder } from '../voice/recorder';
 import { createVoiceSessionCoordinator } from '../voice';
 import {
   buildConversationReview,
+  replaceConversationWithMemory,
   CONVERSATION_MEMORY_DEMO_NOTICE,
   CONVERSATION_MEMORY_FAILED_NOTICE,
   createConversationMemoryRecorder,
   createConversationMemoryService,
+  deriveConversationSessionId,
   finalizeConversationWithReview,
   stripHiddenFeedback,
   type ConversationMemoryRecorder,
@@ -86,6 +90,132 @@ function createDeferredProvider(): AIProvider & { resolveNext: (content: string,
       return new Promise<AIProviderResult>((resolve) => {
         pending.push(resolve);
       });
+    },
+  };
+}
+
+/** TTS whose stop() can be held open: models teardown still in progress. */
+class GatedTTS implements TextToSpeechProvider {
+  readonly id = 'gated-tts';
+  holdStop = false;
+  private active = false;
+  private releaseStopFns: (() => void)[] = [];
+  private resolveSpoken: (() => void) | null = null;
+
+  async speak(_text: string, options?: TTSOptions): Promise<void> {
+    this.active = true;
+    options?.onStart?.();
+    await new Promise<void>((resolve) => {
+      this.resolveSpoken = resolve;
+    });
+    this.active = false;
+    options?.onDone?.();
+  }
+
+  async stop(): Promise<void> {
+    if (this.holdStop) {
+      await new Promise<void>((resolve) => {
+        this.releaseStopFns.push(resolve);
+      });
+    }
+    this.active = false;
+    const resolve = this.resolveSpoken;
+    this.resolveSpoken = null;
+    resolve?.();
+  }
+
+  async isSpeaking(): Promise<boolean> {
+    return this.active;
+  }
+
+  releaseStop(): void {
+    const pending = this.releaseStopFns;
+    this.releaseStopFns = [];
+    for (const release of pending) release();
+  }
+}
+
+/** STT whose result can be released manually (in-flight transcription). */
+function createGatedSTT(): SpeechToTextProvider & {
+  release: (transcript: string) => void;
+} {
+  let releaseFn: ((result: STTResult) => void) | null = null;
+  return {
+    id: 'gated-stt',
+    release: (transcript: string) => {
+      const release = releaseFn;
+      releaseFn = null;
+      release?.({ ok: true, transcript });
+    },
+    async transcribe(): Promise<STTResult> {
+      return new Promise<STTResult>((resolve) => {
+        releaseFn = resolve;
+      });
+    },
+  };
+}
+
+/** Wraps a repository so a chosen operation throws exactly once (partial write). */
+function createFlakyConversationRepository(
+  inner: ReturnType<typeof buildRepository>,
+  failures: { failCreate?: boolean; failAfterTurns?: number; failComplete?: boolean },
+) {
+  let turnsAdded = 0;
+  return {
+    ...inner,
+    // Deliberately NO atomic persistConversation: exercises the retry-safe path.
+    persistConversation: undefined,
+    async createSession(session: Parameters<typeof inner.createSession>[0]) {
+      if (failures.failCreate) {
+        throw new Error('disk full while creating session');
+      }
+      return inner.createSession(session);
+    },
+    async addTurn(turn: Parameters<typeof inner.addTurn>[0]) {
+      turnsAdded += 1;
+      if (failures.failAfterTurns !== undefined && turnsAdded > failures.failAfterTurns) {
+        throw new Error('disk full while adding turn');
+      }
+      return inner.addTurn(turn);
+    },
+    async updateSession(id: string, patch: Parameters<typeof inner.updateSession>[1]) {
+      if (failures.failComplete) {
+        throw new Error('disk full while completing session');
+      }
+      return inner.updateSession(id, patch);
+    },
+  };
+}
+
+function buildRepository(adapter: SqlJsAdapter) {
+  return new SQLiteConversationRepository(adapter);
+}
+
+/**
+ * Wraps the memory service so the WRITE can be held open. This makes the ordering
+ * window observable deterministically: while the memory write is in flight, the
+ * outgoing ConversationSession must already be non-writable.
+ */
+function createGatedMemoryService(inner: ReturnType<typeof createConversationMemoryService>) {
+  let releaseGate: (() => void) | null = null;
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+  const service = {
+    async finalizeConversation(input: Parameters<typeof inner.finalizeConversation>[0]) {
+      await gate;
+      return inner.finalizeConversation(input);
+    },
+    loadReviewEvidence: () => inner.loadReviewEvidence(),
+    listRecentConversations: (limit?: number) => inner.listRecentConversations(limit),
+  };
+  return {
+    service,
+    /** Lets the held memory write proceed. */
+    releaseFinalize: () => {
+      const release = releaseGate;
+      releaseGate = null;
+      release?.();
     },
   };
 }
@@ -980,13 +1110,21 @@ describe('Conversation learning memory — persistence', () => {
   it('28. the Talk screen wires finalization and the review into New Chat / mode change', () => {
     const screenSource = readFileSync(join(__dirname, '..', 'screens', 'TalkScreen.tsx'), 'utf8');
 
+
     // Finalization happens inside the conversation lifecycle (startConversation),
-    // not in ad-hoc click handlers, and BEFORE the atomic switch.
-    const finalizeIndex = screenSource.indexOf('await endConversation(outgoingSession, outgoingRecorder)');
-    const switchIndex = screenSource.indexOf('await coordinator.switchSession(bundle.session)');
-    expect(finalizeIndex).toBeGreaterThan(-1);
+    // not in ad-hoc click handlers, and ALWAYS AFTER the atomic replacement:
+    // switchSession abandons the outgoing session before its memory snapshot is
+    // taken (see the ordering tests below).
+    const replacementIndex = screenSource.indexOf('await replaceConversationWithMemory({');
+    const switchIndex = screenSource.indexOf('switchSession: (next: ConversationSession) =>');
+    const installIndex = screenSource.indexOf('sessionRef.current = bundle.session;');
+    expect(replacementIndex).toBeGreaterThan(-1);
     expect(switchIndex).toBeGreaterThan(-1);
-    expect(finalizeIndex).toBeLessThan(switchIndex);
+    expect(switchIndex).toBeLessThan(installIndex);
+    // The outgoing conversation is captured BEFORE the replacement begins.
+    expect(screenSource.indexOf('const outgoingSession = sessionRef.current;')).toBeLessThan(
+      replacementIndex,
+    );
 
     // A fresh recorder per conversation identity (exactly-once identity).
     expect(screenSource).toContain('memoryRecorderRef.current = createConversationMemoryRecorder()');
@@ -1070,6 +1208,444 @@ describe('Conversation learning memory — persistence', () => {
     expect(broken.notice).toBe(CONVERSATION_MEMORY_FAILED_NOTICE);
     expect(broken.notice).not.toContain('Saved to your learning memory');
     expect(brokenSession.getHistory()).toHaveLength(2);
+  });
+
+  describe('Blocker 1 — the outgoing session is abandoned before any memory snapshot', () => {
+    it('30. New Chat while the AI is in flight persists only already-committed turns', async () => {
+      const provider = createDeferredProvider();
+      const outgoing = buildSession(provider, { mode: 'natural' });
+      const outgoingRecorder = createConversationMemoryRecorder({ startedAt: NOW });
+      const service = createConversationMemoryService({ databaseAdapter: adapter, learnerId });
+
+      // One committed turn already exists (this is real history to keep).
+      const first = outgoing.send({ userMessage: 'Committed turn before New Chat.' });
+      provider.resolveNext('Committed tutor reply.');
+      await first;
+      expect(outgoing.getHistory()).toHaveLength(2);
+
+      // A SECOND turn is in flight (held AI) when New Chat begins.
+      const inFlight = outgoing.send({ userMessage: 'This turn must never be persisted.' });
+
+      const tts = new GatedTTS();
+      const coordinator = createVoiceSessionCoordinator({
+        session: outgoing,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider(),
+        ttsProvider: tts,
+      });
+      const replacement = buildSession(createStubProvider(['Fresh conversation reply.']));
+
+      // Both the teardown AND the memory write are held open, so the ordering is
+      // observable: the replacement begins immediately, the memory write happens
+      // only after the switch boundary.
+      const gated = createGatedMemoryService(service);
+      tts.holdStop = true;
+      const replacementPromise = replaceConversationWithMemory({
+        nextSession: replacement,
+        service: gated.service,
+        outgoing: { session: outgoing, recorder: outgoingRecorder, isRealAI: true },
+        switchSession: (next) => coordinator.switchSession(next),
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      // (a) The replacement has begun…
+      expect(coordinator.getStatus().isSwitching).toBe(true);
+      // (b) …and the OLD session is already non-writable, even though the memory
+      //     write has not run yet: no snapshot can be taken while it could still
+      //     accept a late commit.
+      const lateAttempt = await outgoing.send({ userMessage: 'Blocked while switching.' });
+      expect(lateAttempt.ok).toBe(false);
+
+      // (c) The late AI answer resolves during the replacement: it is discarded.
+      provider.resolveNext('Late reply that must never be stored.');
+      const late = await inFlight;
+      expect(late.ok).toBe(false);
+      expect(outgoing.getHistory()).toHaveLength(2);
+
+      // (d) Only now is the held memory write released.
+      gated.releaseFinalize();
+      tts.holdStop = false;
+      tts.releaseStop();
+      const outcome = await replacementPromise;
+      expect(outcome.installed).toBe(true);
+
+      // ONLY the already-committed turns were persisted.
+      const repo = buildRepository(adapter);
+      const sessions = await repo.listSessions(learnerId);
+      expect(sessions).toHaveLength(1);
+      const turns = await repo.listTurns(sessions[0].id);
+      expect(turns.map((turn) => turn.text)).toEqual([
+        'Committed turn before New Chat.',
+        'Committed tutor reply.',
+      ]);
+      expect(turns.some((turn) => turn.text.includes('never be persisted'))).toBe(false);
+      expect(turns.some((turn) => turn.text.includes('Late reply'))).toBe(false);
+      expect(outgoingRecorder.isFinalized()).toBe(true);
+
+      // The replacement conversation starts cleanly and works.
+      expect(replacement.getHistory()).toEqual([]);
+      const fresh = await replacement.send({ userMessage: 'Hello in the new chat.' });
+      expect(fresh.ok).toBe(true);
+      expect(replacement.getHistory()).toHaveLength(2);
+    });
+
+    it('31. mode change while the AI is in flight has the same guarantee', async () => {
+      const provider = createDeferredProvider();
+      const natural = buildSession(provider, { mode: 'natural' });
+      const recorder = createConversationMemoryRecorder({ startedAt: NOW });
+      const service = createConversationMemoryService({ databaseAdapter: adapter, learnerId });
+
+      const committed = natural.send({ userMessage: 'Natural mode turn.' });
+      provider.resolveNext('Natural reply.');
+      await committed;
+
+      const inFlight = natural.send({ userMessage: 'Interrupted by the mode change.' });
+
+      const tts = new GatedTTS();
+      const coordinator = createVoiceSessionCoordinator({
+        session: natural,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider(),
+        ttsProvider: tts,
+      });
+      const coach = buildSession(createStubProvider(['Coach mode reply.']), { mode: 'coach' });
+
+      const gated = createGatedMemoryService(service);
+      tts.holdStop = true;
+      const outcomePromise = replaceConversationWithMemory({
+        nextSession: coach,
+        service: gated.service,
+        outgoing: { session: natural, recorder, isRealAI: true },
+        switchSession: (next) => coordinator.switchSession(next),
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      // The mode change already began: the old session is non-writable and the
+      // memory write has not been allowed to run yet.
+      expect(coordinator.getStatus().isSwitching).toBe(true);
+      expect((await natural.send({ userMessage: 'Blocked by the mode change.' })).ok).toBe(false);
+
+      provider.resolveNext('Late natural-mode reply.');
+      const late = await inFlight;
+      expect(late.ok).toBe(false);
+      expect(natural.getHistory()).toHaveLength(2);
+
+      gated.releaseFinalize();
+      tts.holdStop = false;
+      tts.releaseStop();
+      const outcome = await outcomePromise;
+      expect(outcome.installed).toBe(true);
+
+      const repo = buildRepository(adapter);
+      const sessions = await repo.listSessions(learnerId);
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].mode).toBe('natural');
+      const turns = await repo.listTurns(sessions[0].id);
+      expect(turns.map((turn) => turn.text)).toEqual(['Natural mode turn.', 'Natural reply.']);
+      expect(coach.getHistory()).toEqual([]);
+    });
+
+    it('32. a late STT result cannot enter persisted memory', async () => {
+      const outgoing = buildSession(createStubProvider(['Unused reply.']));
+      const recorder = createConversationMemoryRecorder({ startedAt: NOW });
+      const service = createConversationMemoryService({ databaseAdapter: adapter, learnerId });
+      const stt = createGatedSTT();
+
+      const tts = new GatedTTS();
+      const coordinator = createVoiceSessionCoordinator({
+        session: outgoing,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: stt,
+        ttsProvider: tts,
+      });
+
+      await coordinator.startRecording();
+      const pendingTurn = coordinator.stopRecordingAndProcess();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      const replacement = buildSession(createStubProvider(['Replacement reply.']));
+      const gated = createGatedMemoryService(service);
+      tts.holdStop = true;
+      const replacing = replaceConversationWithMemory({
+        nextSession: replacement,
+        service: gated.service,
+        outgoing: { session: outgoing, recorder, isRealAI: true },
+        switchSession: (next) => coordinator.switchSession(next),
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      // The replacement began (old session already abandoned) while the memory
+      // write is still held.
+      expect(coordinator.getStatus().isSwitching).toBe(true);
+      expect((await outgoing.send({ userMessage: 'Blocked while switching.' })).ok).toBe(false);
+
+      // The transcript arrives after the replacement began: it is discarded.
+      stt.release('Late transcript that must never be stored.');
+      const turn = await pendingTurn;
+      expect(turn.ok).toBe(false);
+
+      gated.releaseFinalize();
+      tts.holdStop = false;
+      tts.releaseStop();
+      const outcome = await replacing;
+      expect(outcome.installed).toBe(true);
+
+      // The outgoing conversation had no committed learner turn: nothing stored.
+      const repo = buildRepository(adapter);
+      expect(await repo.listSessions(learnerId)).toHaveLength(0);
+      expect(outgoing.getHistory()).toEqual([]);
+      expect(replacement.getHistory()).toEqual([]);
+    });
+
+    it('33. the switch boundary is awaited before the ounderlying snapshot (ordering proof)', async () => {
+      const provider = createDeferredProvider();
+      const outgoing = buildSession(provider);
+      const recorder = createConversationMemoryRecorder({ startedAt: NOW });
+      const service = createConversationMemoryService({ databaseAdapter: adapter, learnerId });
+      const tts = new GatedTTS();
+
+      const committed = outgoing.send({ userMessage: 'Committed before replacement.' });
+      provider.resolveNext('Reply before replacement.');
+      await committed;
+
+      const coordinator = createVoiceSessionCoordinator({
+        session: outgoing,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider(),
+        ttsProvider: tts,
+      });
+      const replacement = buildSession(createStubProvider(['Replacement.']));
+
+      tts.holdStop = true;
+      const switching = replaceConversationWithMemory({
+        nextSession: replacement,
+        service,
+        outgoing: { session: outgoing, recorder, isRealAI: true },
+        switchSession: (next) => coordinator.switchSession(next),
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      // While the switch awaits teardown: no memory exists yet, and the outgoing
+      // session is already abandoned (non-writable).
+      const repo = buildRepository(adapter);
+      expect(await repo.listSessions(learnerId)).toHaveLength(0);
+      expect(recorder.isFinalized()).toBe(false);
+      expect((await outgoing.send({ userMessage: 'Nope.' })).ok).toBe(false);
+
+      tts.holdStop = false;
+      tts.releaseStop();
+      const outcome = await switching;
+      expect(outcome.installed).toBe(true);
+
+      // Only after the switch completed is the conversation stored — complete.
+      const sessions = await repo.listSessions(learnerId);
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].status).toBe('completed');
+      expect((await repo.listTurns(sessions[0].id)).map((turn) => turn.text)).toEqual([
+        'Committed before replacement.',
+        'Reply before replacement.',
+      ]);
+    });
+  });
+
+  describe('Blocker 2 — retry-safe, idempotent persistence', () => {
+    it('34. failure immediately after session creation never leaves a duplicate', async () => {
+      const provider = createStubProvider(['A reply.']);
+      const session = buildSession(provider);
+      const recorder = createConversationMemoryRecorder({ startedAt: NOW });
+      const real = buildRepository(adapter);
+
+      // First attempt: the session row is created, then the next write fails.
+      const flaky = createConversationMemoryService({
+        conversationRepository: createFlakyConversationRepository(real, {
+          failAfterTurns: 0,
+        }) as never,
+        learnerId,
+      });
+      await session.send({ userMessage: 'Retry-safe turn.' });
+
+      const failed = await flaky.finalizeConversation({
+        session,
+        recorder,
+        isRealAI: true,
+        endedAt: LATER,
+      });
+      expect(failed.ok).toBe(false);
+      expect(failed.reason).toBe('persistence-failed');
+      expect(recorder.isFinalized()).toBe(false);
+      // A partial record exists at this point (that is exactly the hazard).
+      expect(await real.listSessions(learnerId)).toHaveLength(1);
+
+      // Retry with the healthy repository: resumes the SAME domain session.
+      const healthy = createConversationMemoryService({ databaseAdapter: adapter, learnerId });
+      const retried = await healthy.finalizeConversation({
+        session,
+        recorder,
+        isRealAI: true,
+        endedAt: LATER,
+      });
+      expect(retried.ok).toBe(true);
+      expect(recorder.isFinalized()).toBe(true);
+
+      const sessions = await real.listSessions(learnerId);
+      expect(sessions).toHaveLength(1); // exactly ONE session, no duplicate
+      expect(sessions[0].id).toBe(retried.domainSessionId);
+      expect(sessions[0].status).toBe('completed');
+      const turns = await real.listTurns(sessions[0].id);
+      expect(turns.map((turn) => turn.text)).toEqual(['Retry-safe turn.', 'A reply.']);
+      expect(turns.map((turn) => turn.turnIndex)).toEqual([0, 1]);
+
+      // Repeated finalization after the successful retry stays exactly-once.
+      const again = await healthy.finalizeConversation({
+        session,
+        recorder,
+        isRealAI: true,
+        endedAt: LATER,
+      });
+      expect(again.reason).toBe('already-finalized');
+      expect(again.domainSessionId).toBe(retried.domainSessionId);
+      expect(await real.listSessions(learnerId)).toHaveLength(1);
+      expect(await real.listTurns(sessions[0].id)).toHaveLength(2);
+    });
+
+    it('35. failure after the first turn resumes with every expected turn exactly once', async () => {
+      const provider = createStubProvider(['Reply one.', 'Reply two.']);
+      const session = buildSession(provider);
+      const recorder = createConversationMemoryRecorder({ startedAt: NOW });
+      const real = buildRepository(adapter);
+      await session.send({ userMessage: 'Learner turn one.' });
+      await session.send({ userMessage: 'Learner turn two.' });
+
+      const flaky = createConversationMemoryService({
+        conversationRepository: createFlakyConversationRepository(real, {
+          failAfterTurns: 1,
+        }) as never,
+        learnerId,
+      });
+      const failed = await flaky.finalizeConversation({
+        session,
+        recorder,
+        isRealAI: true,
+        endedAt: LATER,
+      });
+      expect(failed.reason).toBe('persistence-failed');
+
+      const partial = await real.listSessions(learnerId);
+      expect(partial).toHaveLength(1);
+      expect(partial[0].status).toBe('active'); // orphaned partial state
+      expect(await real.listTurns(partial[0].id)).toHaveLength(1);
+
+      // Retry: resumes the same identity, appends only the missing turns.
+      const healthy = createConversationMemoryService({ databaseAdapter: adapter, learnerId });
+      const retried = await healthy.finalizeConversation({
+        session,
+        recorder,
+        isRealAI: true,
+        endedAt: LATER,
+      });
+      expect(retried.ok).toBe(true);
+      expect(retried.domainSessionId).toBe(partial[0].id);
+
+      const sessions = await real.listSessions(learnerId);
+      expect(sessions).toHaveLength(1); // no second session, no orphan
+      expect(sessions.filter((entry) => entry.status === 'active')).toHaveLength(0);
+      expect(sessions[0].status).toBe('completed');
+      expect(sessions[0].turnCount).toBe(4);
+      const turns = await real.listTurns(sessions[0].id);
+      expect(turns.map((turn) => turn.turnIndex)).toEqual([0, 1, 2, 3]);
+      expect(turns.map((turn) => turn.text)).toEqual([
+        'Learner turn one.',
+        'Reply one.',
+        'Learner turn two.',
+        'Reply two.',
+      ]);
+    });
+
+    it('36. the atomic repository write rolls back completely on failure', async () => {
+      const real = buildRepository(adapter);
+      const learnerUuid = learnerId;
+
+      // A duplicate sequence_number violates UNIQUE(session_id, sequence_number)
+      // INSIDE the transaction: the session row and every turn must roll back.
+      await expect(
+        real.persistConversation!({
+          session: {
+            id: '11111111-1111-4111-8111-111111111111',
+            learnerId: learnerUuid,
+            mode: 'natural',
+            status: 'completed',
+            startedAt: NOW,
+            endedAt: LATER,
+            turnCount: 2,
+            tags: ['talk'],
+          },
+          turns: [
+            { speaker: 'learner', text: 'First.', turnIndex: 0, startedAt: NOW },
+            { speaker: 'tutor', text: 'Duplicate index.', turnIndex: 0, startedAt: NOW },
+          ],
+        }),
+      ).rejects.toThrow();
+
+      expect(await real.getSession('11111111-1111-4111-8111-111111111111')).toBeNull();
+      expect(await real.listSessions(learnerId)).toHaveLength(0);
+      expect(await real.listTurns('11111111-1111-4111-8111-111111111111')).toEqual([]);
+
+      // The same call with a valid conversation commits everything at once.
+      const stored = await real.persistConversation!({
+        session: {
+          id: '11111111-1111-4111-8111-111111111111',
+          learnerId,
+          mode: 'natural',
+          topic: 'Atomicity',
+          status: 'completed',
+          startedAt: NOW,
+          endedAt: LATER,
+          turnCount: 2,
+          tags: ['talk'],
+        },
+        turns: [
+          { speaker: 'learner', text: 'First.', turnIndex: 0, startedAt: NOW },
+          { speaker: 'tutor', text: 'Second.', turnIndex: 1, startedAt: NOW },
+        ],
+      });
+      expect(stored.status).toBe('completed');
+      expect(stored.turnCount).toBe(2);
+      expect(await real.listTurns(stored.id)).toHaveLength(2);
+    });
+
+    it('37. a deterministic identity is stable per conversation and never reused across conversations', () => {
+      const first = createConversationMemoryRecorder({ memoryId: 'memory-a', startedAt: NOW });
+      const second = createConversationMemoryRecorder({ memoryId: 'memory-a', startedAt: LATER });
+      const other = createConversationMemoryRecorder({ memoryId: 'memory-b', startedAt: NOW });
+
+      const idA1 = deriveConversationSessionId(first.memoryId);
+      const idA2 = deriveConversationSessionId(second.memoryId);
+      const idB = deriveConversationSessionId(other.memoryId);
+
+      expect(idA1).toBe(idA2); // retries always map to the same domain session
+      expect(idA1).not.toBe(idB); // distinct conversations stay distinct
+      expect(idA1).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    });
+
+    it('38. concurrent finalizations of ONE conversation collapse to a single session', async () => {
+      const provider = createStubProvider(['Concurrent reply.']);
+      const session = buildSession(provider);
+      const recorder = createConversationMemoryRecorder({ startedAt: NOW });
+      const service = createConversationMemoryService({ databaseAdapter: adapter, learnerId });
+      await session.send({ userMessage: 'Concurrent turn.' });
+
+      const results = await Promise.all([
+        service.finalizeConversation({ session, recorder, isRealAI: true, endedAt: LATER }),
+        service.finalizeConversation({ session, recorder, isRealAI: true, endedAt: LATER }),
+        service.finalizeConversation({ session, recorder, isRealAI: true, endedAt: LATER }),
+      ]);
+      expect(new Set(results.map((result) => result.domainSessionId)).size).toBe(1);
+
+      const repo = buildRepository(adapter);
+      const sessions = await repo.listSessions(learnerId);
+      expect(sessions).toHaveLength(1);
+      expect(await repo.listTurns(sessions[0].id)).toHaveLength(2);
+    });
   });
 
   it('27. the memory module introduces no second memory store or AI summarizer', () => {
