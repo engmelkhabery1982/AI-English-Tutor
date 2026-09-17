@@ -4,7 +4,9 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createStackNavigator } from '@react-navigation/stack';
 import { Text } from 'react-native';
 
+import type { SpeakingPracticeSeed } from '../deep-speaking';
 import HomeScreen from '../screens/HomeScreen';
+import DeepSpeakingScreen from '../screens/DeepSpeakingScreen';
 import TalkScreen from '../screens/TalkScreen';
 import VocabularyScreen from '../screens/VocabularyScreen';
 import ReviewScreen from '../screens/ReviewScreen';
@@ -23,6 +25,8 @@ import OnboardingScreen from '../screens/OnboardingScreen';
  *       ├── MainTabs (the EXISTING bottom-tab layout, unchanged)
  *       │     Home | Talk | Listening | Vocabulary | Review | Progress | Settings
  *       ├── AdaptiveLesson  ← pushed from Home → "Today's Practice"
+ *       ├── DeepSpeaking    ← pushed from Home → "Speaking practice"
+ *       │                      (and optionally from a speaking lesson step)
  *       └── Onboarding      ← pushed from Home/Settings → diagnostic assessment
  *
  * The stack exists so an adaptive lesson is a pushed destination (with a real
@@ -40,6 +44,12 @@ const Stack = createStackNavigator();
 export type RootStackParamList = {
   MainTabs: undefined;
   AdaptiveLesson: undefined;
+  /**
+   * Deep Speaking Practice / Speaking Coach. The optional seed lets a speaking
+   * lesson step start a full practice on the SAME material — the inline lesson
+   * path stays available when Deep Speaking is not.
+   */
+  DeepSpeaking: { readonly seed?: SpeakingPracticeSeed } | undefined;
   /** Personalized onboarding + diagnostic assessment (pushed from Home/Settings). */
   Onboarding: undefined;
 };
@@ -81,6 +91,11 @@ export default function RootNavigator() {
           name="AdaptiveLesson"
           component={AdaptiveLessonScreen}
           options={{ title: "Today's Practice", headerBackTitle: 'Home' }}
+        />
+        <Stack.Screen
+          name="DeepSpeaking"
+          component={DeepSpeakingScreen}
+          options={{ title: 'Speaking practice', headerBackTitle: 'Home' }}
         />
         <Stack.Screen
           name="Onboarding"
