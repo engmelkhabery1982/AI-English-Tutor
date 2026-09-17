@@ -1769,6 +1769,61 @@ describe('Talk — tutor-led conversational flow', () => {
     expect(coordinator.getStatus().state).toBe('idle');
   });
 
+  it('47. disposing the coordinator abandons the ACTIVE session before any awaited teardown', async () => {
+    // Held AI: the first two requests stay pending until released by hand; any
+    // later probe answers immediately, so a wrongly-accepted probe fails fast
+    // instead of hanging the test.
+    const held: ((result: AIProviderResult) => void)[] = [];
+    let calls = 0;
+    const provider: AIProvider = {
+      id: 'held-then-immediate-ai',
+      generate: () => {
+        calls += 1;
+        if (calls > 2) {
+          return Promise.resolve({ ok: true, response: { content: 'Probe reply.' } });
+        }
+        return new Promise<AIProviderResult>((resolve) => {
+          held.push(resolve);
+        });
+      },
+    };
+    const tts = new GatedTTS();
+    const { session, coordinator } = createTalkFlow({ provider, tts });
+
+    // A committed turn pair already exists.
+    const committed = session.send({ userMessage: 'I went to the office.' });
+    held.shift()?.({ ok: true, response: { content: 'Nice! What happened next?' } });
+    await committed;
+    expect(session.getHistory()).toHaveLength(2);
+
+    // A second answer is still in flight when the screen goes away.
+    const inFlight = session.send({ userMessage: 'Then I went home.' });
+
+    // Unmount begins; recorder/TTS teardown is held open.
+    tts.holdStop = true;
+    const disposal = coordinator.dispose();
+
+    // The session is non-writable IMMEDIATELY — before teardown finishes.
+    expect(coordinator.getStatus().state).not.toBe('speaking');
+    expect((await session.send({ userMessage: 'Blocked during disposal.' })).ok).toBe(false);
+
+    // The held answer resolves while teardown is still awaiting: discarded.
+    held.shift()?.({ ok: true, response: { content: 'Late reply from a dead screen.' } });
+    const late = await inFlight;
+    expect(late.ok).toBe(false);
+    expect(session.getHistory()).toHaveLength(2);
+    expect(session.getHistory().map((turn) => turn.content)).toEqual([
+      'I went to the office.',
+      'Nice! What happened next?',
+    ]);
+
+    tts.holdStop = false;
+    tts.releaseStop();
+    await disposal;
+    expect(coordinator.getStatus().state).toBe('idle');
+    expect(coordinator.getStatus().isProcessing).toBe(false);
+  });
+
   it('32. Adaptive Lessons behaviour and voice guards are unchanged', async () => {
     const adaptive = await import('../adaptive-lessons/voice');
 

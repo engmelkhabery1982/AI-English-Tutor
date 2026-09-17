@@ -59,9 +59,41 @@ export interface UserProfileRepository {
   update(profile: Partial<Omit<UserProfile, 'id' | 'createdAt'>>): Promise<UserProfile>;
 }
 
+/**
+ * One turn of a conversation being persisted atomically (Conversation Memory).
+ * Turn identity stays the existing (session_id, sequence_number) pair.
+ */
+export interface PersistConversationTurnInput {
+  readonly speaker: ConversationTurn['speaker'];
+  readonly text: string;
+  readonly turnIndex: number;
+  readonly startedAt: IsoDate;
+  readonly endedAt?: IsoDate;
+  readonly confidence?: number;
+  readonly detectedLanguage?: string;
+  readonly metadata?: Record<string, unknown>;
+}
+
+/** A complete conversation written in ONE atomic step. */
+export interface PersistConversationInput {
+  /**
+   * Session to write. When `id` is provided it is used as the domain identity
+   * (callers derive it deterministically so a retry can never create a second
+   * session for the same conversation).
+   */
+  readonly session: Omit<ConversationSession, 'createdAt' | 'updatedAt'>;
+  readonly turns: readonly PersistConversationTurnInput[];
+}
+
 export interface ConversationRepository {
+  /**
+   * Create a conversation session. An explicit `id` may be supplied so the
+   * caller can use a deterministic domain identity (retry-safe persistence).
+   */
   createSession(
-    session: Omit<ConversationSession, 'id' | 'createdAt' | 'updatedAt'>,
+    session: Omit<ConversationSession, 'id' | 'createdAt' | 'updatedAt'> & {
+      readonly id?: string;
+    },
   ): Promise<ConversationSession>;
   getSession(id: string): Promise<ConversationSession | null>;
   listSessions(learnerId: string, limit?: number): Promise<readonly ConversationSession[]>;
@@ -71,6 +103,13 @@ export interface ConversationRepository {
     id: string,
     patch: Partial<Omit<ConversationSession, 'id' | 'createdAt'>>,
   ): Promise<ConversationSession>;
+  /**
+   * Persist a COMPLETE conversation (session + all turns) atomically: either
+   * everything is stored or nothing is. Optional — backends that cannot offer
+   * atomicity may omit it, and callers fall back to their retry-safe sequential
+   * path.
+   */
+  persistConversation?(input: PersistConversationInput): Promise<ConversationSession>;
   /**
    * Exact aggregate counts over persisted sessions (optionally bounded to a
    * start-time range). Read-only; optional — backends may omit it.

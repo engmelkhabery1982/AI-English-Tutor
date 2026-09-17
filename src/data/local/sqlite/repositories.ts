@@ -21,6 +21,7 @@ import type {
   UserProfileRepository,
   ConversationRepository,
   ConversationActivityStats,
+  PersistConversationInput,
   LexicalBucketCounts,
   WeaknessStatusCounts,
   PronunciationObservationInput,
@@ -191,6 +192,134 @@ function buildSessionUpdate(
   return { sql, params };
 }
 
+function assertValidSessionId(id: string): void {
+  if (!isValidUuid(id)) {
+    throw new Error('Invalid session id');
+  }
+}
+
+/** Validates the required fields of a conversation session row. */
+function assertValidSessionInput(
+  session: Pick<ConversationSession, 'learnerId' | 'mode' | 'status' | 'startedAt'>,
+): void {
+  if (!session.learnerId || !isValidUuid(session.learnerId)) {
+    throw new Error('Invalid learnerId');
+  }
+  if (!session.mode) {
+    throw new Error('mode is required');
+  }
+  if (!session.status) {
+    throw new Error('status is required');
+  }
+  if (!session.startedAt) {
+    throw new Error('startedAt is required');
+  }
+}
+
+/** Validates the required fields of a conversation turn row. */
+function assertValidTurnInput(turn: {
+  sessionId: string;
+  speaker?: ConversationTurn['speaker'];
+  text?: string;
+  turnIndex?: number;
+  startedAt?: string;
+}): void {
+  if (!turn.sessionId || !isValidUuid(turn.sessionId)) {
+    throw new Error('Invalid sessionId');
+  }
+  if (!turn.speaker) {
+    throw new Error('speaker is required');
+  }
+  if (turn.text === undefined || turn.text === null) {
+    throw new Error('text is required');
+  }
+  if (turn.turnIndex === undefined || turn.turnIndex === null) {
+    throw new Error('turnIndex is required');
+  }
+  if (!turn.startedAt) {
+    throw new Error('startedAt is required');
+  }
+}
+
+/** INSERT SQL for conversation_sessions (single source of truth). */
+function sessionInsertSql(): string {
+  return `INSERT INTO conversation_sessions (
+        id, learner_id, mode, title, topic, topic_source, status,
+        started_at, ended_at, duration_seconds, difficulty, turn_count,
+        summary, tags, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+}
+
+/** INSERT params for conversation_sessions (single source of truth). */
+function sessionInsertParams(
+  id: string,
+  session: Omit<ConversationSession, 'id' | 'createdAt' | 'updatedAt'>,
+  now: string,
+): SqlParam[] {
+  return [
+    id,
+    session.learnerId,
+    session.mode,
+    session.title ?? null,
+    session.topic ?? null,
+    session.topicSource ?? null,
+    session.status,
+    session.startedAt,
+    session.endedAt ?? null,
+    session.durationSeconds ?? null,
+    session.difficulty ?? null,
+    session.turnCount ?? 0,
+    session.summary ?? null,
+    JSON.stringify(session.tags ?? []),
+    now,
+    now,
+  ];
+}
+
+/** INSERT SQL for conversation_turns (single source of truth). */
+function turnInsertSql(): string {
+  return `INSERT INTO conversation_turns (
+        id, session_id, speaker, text, audio_ref, detected_language,
+        sequence_number, started_at, ended_at, duration_ms, confidence,
+        metadata, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+}
+
+/** INSERT params for conversation_turns (id first, single source of truth). */
+function turnInsertParams(
+  sessionId: string,
+  turn: {
+    speaker: ConversationTurn['speaker'];
+    text: string;
+    turnIndex: number;
+    startedAt: string;
+    endedAt?: string;
+    durationMs?: number;
+    confidence?: number;
+    audioRef?: string;
+    detectedLanguage?: string;
+    metadata?: Record<string, unknown>;
+  },
+  now: string,
+): SqlParam[] {
+  return [
+    generateId(),
+    sessionId,
+    turn.speaker,
+    turn.text,
+    turn.audioRef ?? null,
+    turn.detectedLanguage ?? null,
+    turn.turnIndex,
+    turn.startedAt,
+    turn.endedAt ?? null,
+    turn.durationMs ?? null,
+    turn.confidence ?? null,
+    JSON.stringify(turn.metadata ?? {}),
+    now,
+    now,
+  ];
+}
+
 /** Build partial UPDATE SQL and params for a profile. */
 function buildProfileUpdate(
   id: string,
@@ -316,49 +445,20 @@ export class SQLiteConversationRepository implements ConversationRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
 
   async createSession(
-    session: Omit<ConversationSession, 'id' | 'createdAt' | 'updatedAt'>,
+    session: Omit<ConversationSession, 'id' | 'createdAt' | 'updatedAt'> & {
+      readonly id?: string;
+    },
   ): Promise<ConversationSession> {
-    const id = generateId();
+    // An explicit id lets callers persist with a deterministic domain identity
+    // (retry-safe conversation memory); otherwise a fresh id is generated.
+    const id = session.id ?? generateId();
     const now = nowIso();
-
-    // Validate required fields
-    if (!session.learnerId || !isValidUuid(session.learnerId)) {
-      throw new Error('Invalid learnerId');
-    }
-    if (!session.mode) {
-      throw new Error('mode is required');
-    }
-    if (!session.status) {
-      throw new Error('status is required');
-    }
-    if (!session.startedAt) {
-      throw new Error('startedAt is required');
-    }
+    assertValidSessionId(id);
+    assertValidSessionInput(session);
 
     await this.adapter.execute(
-      `INSERT INTO conversation_sessions (
-        id, learner_id, mode, title, topic, topic_source, status,
-        started_at, ended_at, duration_seconds, difficulty, turn_count,
-        summary, tags, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        session.learnerId,
-        session.mode,
-        session.title ?? null,
-        session.topic ?? null,
-        session.topicSource ?? null,
-        session.status,
-        session.startedAt,
-        session.endedAt ?? null,
-        session.durationSeconds ?? null,
-        session.difficulty ?? null,
-        session.turnCount ?? 0,
-        session.summary ?? null,
-        JSON.stringify(session.tags ?? []),
-        now,
-        now,
-      ],
+      sessionInsertSql(),
+      sessionInsertParams(id, session, now),
     );
 
     const rows = await this.adapter.query(
@@ -371,6 +471,47 @@ export class SQLiteConversationRepository implements ConversationRepository {
     }
 
     return rowToConversationSession(rows[0]);
+  }
+
+  /**
+   * Persist a COMPLETE conversation atomically (session + every turn) using the
+   * adapter transaction contract: if any step fails the whole write rolls back,
+   * so a partial conversation record can never be left behind. Combined with a
+   * caller-provided deterministic id this makes persistence retry-safe.
+   */
+  async persistConversation(input: PersistConversationInput): Promise<ConversationSession> {
+    const session = input.session;
+    const id = session.id ?? generateId();
+    const now = nowIso();
+    assertValidSessionId(id);
+    assertValidSessionInput(session);
+
+    const steps: { sql: string; params: SqlParam[] }[] = [];
+    steps.push({ sql: sessionInsertSql(), params: sessionInsertParams(id, session, now) });
+
+    for (const turn of input.turns) {
+      assertValidTurnInput({ ...turn, sessionId: id });
+      steps.push({ sql: turnInsertSql(), params: turnInsertParams(id, turn, now) });
+    }
+
+    // The completed status/endedAt/turnCount are written in the SAME transaction.
+    const completion = buildSessionUpdate(id, {
+      status: session.status,
+      turnCount: session.turnCount ?? input.turns.length,
+      ...(session.endedAt !== undefined && { endedAt: session.endedAt }),
+      ...(session.durationSeconds !== undefined && {
+        durationSeconds: session.durationSeconds,
+      }),
+    });
+    steps.push({ sql: completion.sql, params: completion.params });
+
+    await this.adapter.transaction(steps);
+
+    const stored = await this.getSession(id);
+    if (!stored) {
+      throw new Error('Failed to persist conversation session');
+    }
+    return stored;
   }
 
   async getSession(id: string): Promise<ConversationSession | null> {
@@ -453,26 +594,10 @@ export class SQLiteConversationRepository implements ConversationRepository {
     }
 
     await this.adapter.execute(
-      `INSERT INTO conversation_turns (
-        id, session_id, speaker, text, audio_ref, detected_language,
-        sequence_number, started_at, ended_at, duration_ms, confidence,
-        metadata, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      turnInsertSql(),
       [
         id,
-        turn.sessionId,
-        turn.speaker,
-        turn.text,
-        turn.audioRef ?? null,
-        turn.detectedLanguage ?? null,
-        turn.turnIndex,
-        turn.startedAt,
-        turn.endedAt ?? null,
-        turn.durationMs ?? null,
-        turn.confidence ?? null,
-        JSON.stringify(turn.metadata ?? {}),
-        now,
-        now,
+        ...turnInsertParams(turn.sessionId, turn, now).slice(1),
       ],
     );
 

@@ -8,6 +8,7 @@
 import type {
   CoachingContext,
   CoachingContextOptions,
+  CoachingRecentConversation,
   DashboardSnapshot,
   LearnerModel,
   LexicalSummary,
@@ -103,6 +104,8 @@ const DEMO_COACHING_CONTEXT: CoachingContext = {
   strengths: [],
   vocabularyFocus: [],
   expressionFocus: [],
+  // The demo learner has no persisted conversation memory.
+  recentConversations: [],
   recentProgress: null,
   dueReviewCount: 0,
   generatedAt: FIXED_DATE,
@@ -122,6 +125,7 @@ class DemoLearnerModel implements LearnerModel {
   readonly reviewQueue: readonly ReviewItem[] = [];
   readonly progress: readonly ProgressRecord[] = [];
   readonly latestProgress: ProgressRecord | null = null;
+  readonly recentConversations: readonly CoachingRecentConversation[] = [];
 
   async refresh(): Promise<void> {
     // No-op for demo

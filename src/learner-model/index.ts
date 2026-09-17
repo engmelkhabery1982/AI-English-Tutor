@@ -28,6 +28,7 @@ import type {
   ReviewItem,
 } from '../domain/models/learning';
 import type { AppRepositories } from '../repositories';
+import type { ConversationSession as PersistedConversationSession } from '../domain/models/conversation';
 
 export interface CoachingProfile {
   readonly learnerId: Uuid;
@@ -74,12 +75,31 @@ export interface CoachingExpressionFocus {
   readonly nextReviewAt: IsoDate | null;
 }
 
+/**
+ * Compact, read-only summary of ONE previously persisted conversation. It never
+ * carries transcripts: only what the existing coaching prompt needs to know that
+ * this topic/mode was practised before.
+ */
+export interface CoachingRecentConversation {
+  readonly sessionId: string;
+  readonly mode: ConversationMode;
+  readonly topic: string | null;
+  readonly startedAt: IsoDate;
+  readonly endedAt: IsoDate | null;
+  readonly turnCount: number;
+}
+
 export interface CoachingContext {
   readonly profile: CoachingProfile;
   readonly activeWeaknesses: readonly CoachingActiveWeakness[];
   readonly strengths: readonly CoachingStrength[];
   readonly vocabularyFocus: readonly CoachingVocabularyFocus[];
   readonly expressionFocus: readonly CoachingExpressionFocus[];
+  /**
+   * Recent persisted conversations (bounded, newest first). Optional for
+   * callers that compose a context without conversation history.
+   */
+  readonly recentConversations?: readonly CoachingRecentConversation[];
   readonly recentProgress: ProgressRecord | null;
   readonly dueReviewCount: number;
   readonly generatedAt: IsoDate;
@@ -90,7 +110,11 @@ export interface CoachingContextOptions {
   readonly strengthLimit?: number;
   readonly vocabularyLimit?: number;
   readonly expressionLimit?: number;
+  readonly conversationLimit?: number;
 }
+
+/** Maximum recent persisted conversations exposed to coaching (bounded). */
+export const DEFAULT_RECENT_CONVERSATION_LIMIT = 3;
 
 export interface WeaknessSummary {
   readonly total: number;
@@ -138,6 +162,11 @@ export interface LearnerModel {
   readonly reviewQueue: readonly ReviewItem[];
   readonly progress: readonly ProgressRecord[];
   readonly latestProgress: ProgressRecord | null;
+  /**
+   * Recent persisted conversations (bounded, newest first). Summaries only —
+   * full historical transcripts are never exposed to prompts.
+   */
+  readonly recentConversations: readonly CoachingRecentConversation[];
 
   /** Refresh the in-memory snapshot from repositories. */
   refresh(): Promise<void>;
@@ -232,6 +261,8 @@ interface LearnerModelSnapshot {
   readonly reviewQueue: readonly ReviewItem[];
   readonly progress: readonly ProgressRecord[];
   readonly latestProgress: ProgressRecord | null;
+  /** Most recent persisted conversations (bounded; no transcripts). */
+  readonly recentConversations: readonly CoachingRecentConversation[];
 }
 
 const DEFAULT_PROFILE: UserProfile = {
@@ -257,6 +288,7 @@ const DEFAULT_SNAPSHOT: LearnerModelSnapshot = {
   reviewQueue: [],
   progress: [],
   latestProgress: null,
+  recentConversations: [],
 };
 
 const ALL_WEAKNESS_STATUSES: readonly WeaknessStatus[] = [
@@ -425,6 +457,26 @@ function buildExpressionFocus(
   return applyPositiveLimit(combined, limit);
 }
 
+/**
+ * Bounded, failure-tolerant read of the most recent persisted conversations
+ * through the EXISTING conversation repository. Conversation memory must never
+ * break a learner-model refresh.
+ */
+async function loadRecentConversations(
+  repos: AppRepositories,
+  learnerId: string,
+): Promise<readonly PersistedConversationSession[]> {
+  try {
+    const sessions = await repos.conversations.listSessions(
+      learnerId,
+      DEFAULT_RECENT_CONVERSATION_LIMIT,
+    );
+    return Array.isArray(sessions) ? sessions : [];
+  } catch {
+    return [];
+  }
+}
+
 class ReadOnlyLearnerModel implements LearnerModel {
   private readonly repos: AppRepositories;
   private readonly subscribers = new Set<() => void>();
@@ -472,6 +524,10 @@ class ReadOnlyLearnerModel implements LearnerModel {
 
   get latestProgress(): ProgressRecord | null {
     return this.snapshot.latestProgress;
+  }
+
+  get recentConversations(): readonly CoachingRecentConversation[] {
+    return [...this.snapshot.recentConversations];
   }
 
   getActiveWeaknesses(): readonly LearnerWeakness[] {
@@ -641,12 +697,18 @@ class ReadOnlyLearnerModel implements LearnerModel {
 
     const dueReviewCount = this.snapshot.reviewQueue.length;
 
+    const recentConversations = applyPositiveLimit(
+      this.snapshot.recentConversations,
+      options?.conversationLimit ?? DEFAULT_RECENT_CONVERSATION_LIMIT,
+    );
+
     return {
       profile,
       activeWeaknesses,
       strengths,
       vocabularyFocus,
       expressionFocus,
+      recentConversations,
       recentProgress,
       dueReviewCount,
       generatedAt,
@@ -668,6 +730,7 @@ class ReadOnlyLearnerModel implements LearnerModel {
       reviewQueue,
       progress,
       latestProgress,
+      conversations,
     ] = await Promise.all([
       this.repos.weaknesses.listStrengths(learnerId),
       this.repos.weaknesses.listWeaknesses(learnerId),
@@ -678,6 +741,8 @@ class ReadOnlyLearnerModel implements LearnerModel {
       this.repos.review.listDue(learnerId, nowIso),
       this.repos.progress.list(learnerId),
       this.repos.progress.latest(learnerId),
+      // Bounded read: only the most recent persisted sessions are summarized.
+      loadRecentConversations(this.repos, learnerId),
     ]);
 
     this.snapshot = {
@@ -691,6 +756,14 @@ class ReadOnlyLearnerModel implements LearnerModel {
       reviewQueue,
       progress,
       latestProgress,
+      recentConversations: conversations.map((session) => ({
+        sessionId: session.id,
+        mode: session.mode,
+        topic: session.topic ?? null,
+        startedAt: session.startedAt,
+        endedAt: session.endedAt ?? null,
+        turnCount: session.turnCount,
+      })),
     };
 
     this.notifySubscribers();

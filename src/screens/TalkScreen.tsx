@@ -6,6 +6,7 @@ import { createDefaultPronunciationEngine } from '../pronunciation';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   ScrollView,
   StyleSheet,
@@ -15,10 +16,16 @@ import {
   View,
 } from 'react-native';
 import {
+  finalizeConversationWithReview,
+  replaceConversationWithMemory,
+  createConversationMemoryRecorder,
+  createConversationMemoryService,
+  type ConversationMemoryService,
   createTalkSession,
   createTalkVoiceCoordinator,
   createLearningPersistenceService,
   resolveTalkCoaching,
+  CONVERSATION_REVIEW_TITLE,
   resolveTalkTurnControls,
   TALK_REAL_AI_UNAVAILABLE_MESSAGE,
   describeVoiceTurn,
@@ -29,6 +36,8 @@ import {
   type ConversationSession,
   type ConversationTurn,
   type SpeechToTextProvider,
+  type ConversationMemoryRecorder,
+  type ConversationReview,
   type TalkCoachingComposition,
   type TalkCoachingResolution,
   type TalkCoachingSource,
@@ -109,6 +118,8 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const [coachingSource, setCoachingSource] = useState<TalkCoachingSource | null>(null);
   /** A session switch is running: no learner turn may start until it settles. */
   const [isSwitching, setIsSwitching] = useState<boolean>(false);
+  /** Post-conversation review of the conversation that just ended (or null). */
+  const [conversationReview, setConversationReview] = useState<ConversationReview | null>(null);
 
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>({
     state: 'idle',
@@ -139,6 +150,34 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const switchTokenRef = useRef<number>(0);
   /** Mirror of `isSwitching` for async callbacks that must not re-enter. */
   const coordinatorIsSwitchingRef = useRef<boolean>(false);
+  /**
+   * Conversation Learning Memory: the recorder owns the stable identity of the
+   * ACTIVE conversation, so persistence is exactly-once regardless of rerenders.
+   */
+  const memoryRecorderRef = useRef<ConversationMemoryRecorder | null>(null);
+  /** Real qualitative pronunciation evidence of the active conversation. */
+  const pronunciationLinesRef = useRef<readonly string[] | null>(null);
+  /** Mirror of `conversationReview !== null` for async callbacks. */
+  const reviewOpenRef = useRef<boolean>(false);
+  /**
+   * Learner-facing conversation memory service (existing SQLite repositories),
+   * bound to whichever real adapter is in use so the app never opens a second
+   * database connection for conversation memory.
+   */
+  const memoryServiceRef = useRef<{
+    readonly adapter?: DatabaseAdapter;
+    readonly service: ConversationMemoryService;
+  } | null>(null);
+  const getMemoryService = useCallback((): ConversationMemoryService => {
+    const adapter = coachingRef.current?.databaseAdapter ?? props?.databaseAdapter;
+    const current = memoryServiceRef.current;
+    if (current && current.adapter === adapter) {
+      return current.service;
+    }
+    const service = createConversationMemoryService({ databaseAdapter: adapter });
+    memoryServiceRef.current = { adapter, service };
+    return service;
+  }, [props?.databaseAdapter]);
   const pronunciationEngineRef = useRef<PronunciationEngine | null>(
     props?.pronunciationEngine ?? null,
   );
@@ -173,9 +212,15 @@ export default function TalkScreen(props?: TalkScreenProps) {
       if (!transcript) return;
 
       const outcome = await engine.analyzeSpokenTurn({ transcript, mode });
-      setPronunciationLines(outcome?.feedbackLines?.length ? outcome.feedbackLines : null);
+      const lines = outcome?.feedbackLines?.length ? outcome.feedbackLines : null;
+      pronunciationLinesRef.current = lines;
+      setPronunciationLines(lines);
+      // Real qualitative evidence only: recorded for the post-conversation
+      // review, never persisted as a new conversation turn.
+      memoryRecorderRef.current?.notePronunciationLines(lines);
     } catch {
       // Non-destructive: pronunciation analysis must never fail the turn.
+      pronunciationLinesRef.current = null;
       setPronunciationLines(null);
     }
   };
@@ -220,6 +265,35 @@ export default function TalkScreen(props?: TalkScreenProps) {
   );
 
   /**
+   * Finalizes ONE conversation (the session that is being replaced) through the
+   * existing conversation repository and derives its qualitative review from
+   * real evidence only. Local SQLite, fast, and never destructive: a persistence
+   * failure leaves the live conversation untouched and reports honestly.
+   */
+  const endConversation = useCallback(
+    async (
+      session: ConversationSession,
+      recorder: ConversationMemoryRecorder,
+      isRealAI: boolean,
+    ): Promise<ConversationReview | null> => {
+      try {
+        // One tested pipeline: persist exactly once, then derive the review
+        // from the persisted evidence (demo is never stored).
+        return await finalizeConversationWithReview({
+          session,
+          recorder,
+          isRealAI,
+          service: getMemoryService(),
+        });
+      } catch {
+        // Conversation memory must never make New Chat / mode change fail.
+        return null;
+      }
+    },
+    [getMemoryService],
+  );
+
+  /**
    * Starts a NEW conversation identity: cancels any active voice work (recording
    * / in-flight STT or AI work / playback), builds the session stack for the
    * requested mode+topic, and resets all conversation state.
@@ -240,6 +314,14 @@ export default function TalkScreen(props?: TalkScreenProps) {
       setIsOpening(false);
       setIsSwitching(true);
       coordinatorIsSwitchingRef.current = true;
+
+      // CONVERSATION LEARNING MEMORY: capture the outgoing conversation BEFORE
+      // the replacement begins. Its memory snapshot is taken only AFTER the
+      // atomic switch has abandoned it (see replaceConversationWithMemory), so
+      // in-flight STT/AI work of the old conversation can never enter memory.
+      const outgoingSession = sessionRef.current;
+      const outgoingRecorder = memoryRecorderRef.current;
+      const outgoingIsRealAI = providerInfoRef.current?.isRealAI ?? false;
 
       const coaching = coachingRef.current;
       const learnerModel = coaching?.learnerModel ?? null;
@@ -263,18 +345,36 @@ export default function TalkScreen(props?: TalkScreenProps) {
       );
 
       const coordinator = voiceCoordinatorRef.current;
-      if (coordinator) {
-        // ATOMIC switch: the old conversation's recorder/playback cleanup is
-        // awaited BEFORE the new session becomes active, and every cleanup write
-        // is generation guarded — an older reset can never clobber this session.
-        const installed = await coordinator.switchSession(bundle.session);
-        if (installed !== bundle.session) {
-          // Superseded (or the screen was disposed): the newer operation owns the
-          // coordinator and will settle the switch state itself.
-          return null;
-        }
-      } else {
+      // ATOMIC replacement ordered for memory integrity:
+      //   abandon + invalidate the OLD session -> await recorder/TTS teardown ->
+      //   finalize the OLD conversation from its now-stable committed history ->
+      //   derive its review. The replacement is activated by this screen only
+      //   afterwards, so review generation can never corrupt it.
+      const outcome = await replaceConversationWithMemory({
+        nextSession: bundle.session,
+        service: getMemoryService(),
+        outgoing:
+          outgoingSession && outgoingRecorder
+            ? {
+                session: outgoingSession,
+                recorder: outgoingRecorder,
+                isRealAI: outgoingIsRealAI,
+              }
+            : null,
+        ...(coordinator
+          ? { switchSession: (next: ConversationSession) => coordinator.switchSession(next) }
+          : {}),
+      });
+      if (!outcome.installed) {
+        // Superseded (or the screen was disposed): the newer operation owns the
+        // coordinator and will settle the switch state itself.
+        return null;
+      }
+      if (!coordinator) {
         getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
+      }
+      if (outcome.review && outcome.review.hasEvidence) {
+        setConversationReview(outcome.review);
       }
 
       // A newer switch superseded this one: install nothing. The newer switch
@@ -287,6 +387,10 @@ export default function TalkScreen(props?: TalkScreenProps) {
       providerInfoRef.current = bundle.providerInfo;
       setProviderKind(bundle.providerKind);
       setProviderInfo(bundle.providerInfo);
+      // A NEW conversation identity gets its OWN memory recorder, so evidence
+      // can never be attributed to the wrong conversation.
+      memoryRecorderRef.current = createConversationMemoryRecorder();
+      pronunciationLinesRef.current = null;
 
       setHistory([]);
       setLastFeedback(null);
@@ -303,7 +407,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
 
       return bundle.session;
     },
-    [getOrCreateVoiceCoordinator],
+    [endConversation, getOrCreateVoiceCoordinator],
   );
 
   /**
@@ -441,7 +545,13 @@ export default function TalkScreen(props?: TalkScreenProps) {
 
         const openingText = session.getHistory().at(-1)?.content ?? '';
         const coordinator = voiceCoordinatorRef.current;
-        if (openingText.trim().length > 0 && coordinator && !coordinator.getStatus().isMuted) {
+        if (
+          openingText.trim().length > 0 &&
+          coordinator &&
+          !coordinator.getStatus().isMuted &&
+          // Never talk over the post-conversation review.
+          !reviewOpenRef.current
+        ) {
           // Speak the real tutor turn. Never auto-opens the microphone.
           void coordinator.speakResponse(openingText);
         }
@@ -468,22 +578,54 @@ export default function TalkScreen(props?: TalkScreenProps) {
   }, [sessionEpoch]);
 
   // Clean up voice coordinator when component unmounts: stops the recorder and
-  // any playback, and discards late voice results.
+  // any playback, and discards late voice results. A conversation that already
+  // holds committed learner turns is finalized (best effort, exactly once) so
+  // leaving Talk does not lose real learning memory. Empty/demo conversations
+  // are never stored.
   useEffect(() => {
     return () => {
-      void voiceCoordinatorRef.current?.dispose();
+      const session = sessionRef.current;
+      const recorder = memoryRecorderRef.current;
+      const isRealAI = providerInfoRef.current?.isRealAI ?? false;
+      // Leaving Talk is terminal: the ACTIVE session must stop accepting work
+      // IMMEDIATELY. dispose() enforces this synchronously (it abandons the
+      // active session before its first await) and only then stops the recorder
+      // and playback, so an AI/STT result resolving during teardown can never
+      // commit a stale turn, feedback or vocabulary into a dead conversation.
+      const disposed = voiceCoordinatorRef.current?.dispose() ?? Promise.resolve();
+      // Belt-and-braces (idempotent) for the no-coordinator path: no voice work
+      // ever started, but a typed turn could still be in flight.
+      session?.abandon?.();
+      if (session && recorder && recorder.hasCommittedLearnerTurn(session)) {
+        void disposed.then(() => {
+          // Recording and playback are stopped: only now is the committed
+          // history stable enough to snapshot and finalize it.
+          void endConversation(session, recorder, isRealAI);
+        });
+      }
     };
-  }, []);
+  }, [endConversation]);
 
-  // Record feedback evidence in background
+  // Record feedback evidence in background.
+  //
+  // Ownership is deliberately split:
+  // - Conversation Learning Memory only ACCUMULATES the committed feedback for the
+  //   post-conversation review (no weakness/review mutation here).
+  // - The EXISTING LearningPersistenceService remains the single owner of
+  //   weakness/mistake/review mutation, so a correction is never counted twice.
+  // - Offline demo tutoring is never written into real learner memory.
   useEffect(() => {
-    if (lastFeedback) {
-      const learningPersistence = createLearningPersistenceService();
-      learningPersistence.recordFeedbackEvidence(lastFeedback).catch((err) => {
-        console.error('Failed to persist learning feedback:', err);
-      });
-    }
-  }, [lastFeedback]);
+    if (!lastFeedback) return;
+    memoryRecorderRef.current?.noteFeedback(lastFeedback);
+    // Real learner memory only: providerInfoRef is the live provider identity.
+    if (!(providerInfoRef.current?.isRealAI ?? false)) return;
+    const learningPersistence = createLearningPersistenceService(
+      coachingRef.current?.databaseAdapter,
+    );
+    learningPersistence.recordFeedbackEvidence(lastFeedback).catch((err) => {
+      console.error('Failed to persist learning feedback:', err);
+    });
+  }, [lastFeedback, providerInfo]);
 
   // Handle mode switch: drops the current conversation state; the conversation
   // effect then composes a fresh session in the new mode, which cancels any
@@ -666,6 +808,8 @@ export default function TalkScreen(props?: TalkScreenProps) {
       setStreamingText(null);
     }
   };
+
+  reviewOpenRef.current = conversationReview !== null;
 
   const isPreparing = coachingSource === null;
   // One place decides whether a learner turn may start right now: while the
@@ -1189,6 +1333,50 @@ export default function TalkScreen(props?: TalkScreenProps) {
           </Text>
         </TouchableOpacity>
       </View>
+
+      {/*
+        Post-conversation review: compact, qualitative and evidence-only. It
+        never shows a score, mastery or engagement metric, and it never saves
+        anything on its own.
+      */}
+      <Modal
+        visible={conversationReview !== null && conversationReview.hasEvidence}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setConversationReview(null)}
+      >
+        <View style={styles.reviewBackdrop}>
+          <View style={styles.reviewCard}>
+            <Text style={styles.reviewTitle}>{CONVERSATION_REVIEW_TITLE}</Text>
+            <Text style={styles.reviewSubtitle}>
+              {conversationReview?.topic
+                ? `Topic: ${conversationReview.topic}`
+                : `Mode: ${conversationReview?.mode ?? 'natural'}`}
+            </Text>
+            <Text style={styles.reviewNotice}>{conversationReview?.notice}</Text>
+            <ScrollView style={styles.reviewScroll} contentContainerStyle={styles.reviewScrollContent}>
+              {(conversationReview?.sections ?? []).map((section) => (
+                <View key={section.id} style={styles.reviewSection}>
+                  <Text style={styles.reviewSectionTitle}>{section.title}</Text>
+                  {section.items.map((item, index) => (
+                    <Text key={`${section.id}-${index}`} style={styles.reviewItem}>
+                      • {item}
+                    </Text>
+                  ))}
+                </View>
+              ))}
+            </ScrollView>
+            <TouchableOpacity
+              style={styles.reviewButton}
+              onPress={() => setConversationReview(null)}
+              accessibilityRole="button"
+              accessibilityLabel="Start new conversation"
+            >
+              <Text style={styles.reviewButtonText}>Start new conversation</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </KeyboardAvoidingView>
   );
 }
@@ -1817,5 +2005,72 @@ const styles = StyleSheet.create({
   composerInputDisabled: {
     backgroundColor: '#F3F4F6',
     color: '#6B7280',
+  },
+
+  reviewBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(17, 24, 39, 0.45)',
+    justifyContent: 'center',
+    paddingHorizontal: 20,
+  },
+  reviewCard: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    paddingHorizontal: 18,
+    paddingTop: 18,
+    paddingBottom: 14,
+    maxHeight: '80%',
+  },
+  reviewTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#111827',
+  },
+  reviewSubtitle: {
+    marginTop: 4,
+    fontSize: 13,
+    color: '#6B7280',
+  },
+  reviewNotice: {
+    marginTop: 10,
+    fontSize: 12,
+    color: '#4B5563',
+    backgroundColor: '#F3F4F6',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  reviewScroll: {
+    marginTop: 12,
+  },
+  reviewScrollContent: {
+    paddingBottom: 6,
+  },
+  reviewSection: {
+    marginBottom: 14,
+  },
+  reviewSectionTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#2563EB',
+    marginBottom: 4,
+  },
+  reviewItem: {
+    fontSize: 13,
+    color: '#374151',
+    lineHeight: 19,
+    marginBottom: 2,
+  },
+  reviewButton: {
+    marginTop: 8,
+    backgroundColor: '#2563EB',
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  reviewButtonText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '600',
   },
 });
