@@ -587,12 +587,19 @@ export default function TalkScreen(props?: TalkScreenProps) {
       const session = sessionRef.current;
       const recorder = memoryRecorderRef.current;
       const isRealAI = providerInfoRef.current?.isRealAI ?? false;
+      // Leaving Talk is terminal: the ACTIVE session must stop accepting work
+      // IMMEDIATELY. dispose() enforces this synchronously (it abandons the
+      // active session before its first await) and only then stops the recorder
+      // and playback, so an AI/STT result resolving during teardown can never
+      // commit a stale turn, feedback or vocabulary into a dead conversation.
       const disposed = voiceCoordinatorRef.current?.dispose() ?? Promise.resolve();
+      // Belt-and-braces (idempotent) for the no-coordinator path: no voice work
+      // ever started, but a typed turn could still be in flight.
+      session?.abandon?.();
       if (session && recorder && recorder.hasCommittedLearnerTurn(session)) {
         void disposed.then(() => {
-          // The screen is gone and voice work is stopped: the session can accept
-          // nothing more, so its committed history is stable for the snapshot.
-          session.abandon?.();
+          // Recording and playback are stopped: only now is the committed
+          // history stable enough to snapshot and finalize it.
           void endConversation(session, recorder, isRealAI);
         });
       }

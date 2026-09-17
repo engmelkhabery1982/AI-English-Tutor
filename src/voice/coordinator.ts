@@ -10,8 +10,10 @@
  *   it started. If the session is replaced (new chat / mode change) or the
  *   coordinator is disposed while the operation is in flight, the late STT/AI
  *   result is DISCARDED: nothing is submitted to the replacement session, nothing
- *   is spoken, and no history is written. A generation counter invalidates every
- *   late state write so the replacement session can never be mutated by old work.
+ *   is spoken, and no history is written. Disposal abandons the active session
+ *   BEFORE it awaits teardown, so a late result can never commit into it. A
+ *   generation counter invalidates every late state write so the replacement
+ *   session can never be mutated by old work.
  * - One learner utterance produces at most ONE submitted conversational turn:
  *   the transcribing state is entered before the recorder is stopped, and a
  *   re-entrant call is refused.
@@ -166,6 +168,8 @@ export class VoiceSessionCoordinator {
    */
   private generation: number = 0;
   private disposed: boolean = false;
+  /** Settlement of the (single) disposal, so repeated dispose() calls are safe. */
+  private disposalPromise: Promise<void> | null = null;
   /**
    * True while `switchSession()` is replacing the active conversation. New voice
    * work is refused during the switch so it can never be captured against a
@@ -752,16 +756,42 @@ export class VoiceSessionCoordinator {
   }
 
   /**
-   * Safe teardown (screen unmount): in-flight voice work is invalidated, an
-   * active recording is stopped and any playback is stopped. Late STT/AI
-   * results are discarded instead of being applied to a dead screen.
+   * Safe teardown (screen unmount): in-flight voice work is invalidated, the
+   * ACTIVE conversation session is closed immediately, an active recording is
+   * stopped and any playback is stopped. Late STT/AI results are discarded
+   * instead of being applied to a dead screen.
    *
-   * Disposal is terminal, so this IS allowed to write the final idle state.
+   * Ordering matters for exactly the same reason as `switchSession()`: an AI
+   * request already inside `session.send()` could resolve WHILE teardown is
+   * still awaiting recorder/playback cleanup, and — if the session were still
+   * writable — it would commit a stale learner/tutor turn, feedback and
+   * vocabulary side effects. So the active session is abandoned BEFORE the first
+   * await; the awaited cleanup then runs against an already non-writable session.
+   *
+   * Disposal is terminal and idempotent: it is allowed to write the final idle
+   * state, and a second call returns the same settlement promise without
+   * restarting teardown (the active session's abandonment is likewise idempotent).
    */
   async dispose(): Promise<void> {
+    const pending = this.disposalPromise;
+    if (pending) return pending;
+    const disposal = this.performDisposal();
+    this.disposalPromise = disposal;
+    return disposal;
+  }
+
+  /** One-shot disposal body (see dispose() for the ordering contract). */
+  private async performDisposal(): Promise<void> {
+    // 1. Terminal flag + invalidate every in-flight operation.
     this.disposed = true;
     this.generation += 1;
+    // 2. The ACTIVE session becomes non-writable IMMEDIATELY — before any
+    //    awaited teardown — so a late STT/AI result that resolves during cleanup
+    //    can never commit history, feedback or vocabulary persistence.
+    this.session.abandon?.();
+    // 3. Stop and await recorder/playback cleanup (writes no lifecycle state).
     await this.teardown();
+    // 4. Settle the terminal coordinator state.
     this.switching = false;
     this.processing = false;
     this.state = 'idle';

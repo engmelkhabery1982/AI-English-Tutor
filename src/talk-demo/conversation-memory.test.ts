@@ -94,6 +94,34 @@ function createDeferredProvider(): AIProvider & { resolveNext: (content: string,
   };
 }
 
+/**
+ * Provider that HOLDS the first `holdCount` requests and answers the rest at
+ * once. Lets a test release an in-flight answer by hand while every later probe
+ * fails fast (instead of hanging) if the session wrongly still accepts work.
+ */
+function createHeldThenImmediateProvider(holdCount: number, immediateReply: string) {
+  const pending: ((result: AIProviderResult) => void)[] = [];
+  let calls = 0;
+  return {
+    id: 'held-then-immediate-ai',
+    get heldCount() {
+      return pending.length;
+    },
+    resolveHeld(content: string, feedback: ConversationFeedback | null = null): void {
+      pending.shift()?.({ ok: true, response: { content, feedback } });
+    },
+    async generate(): Promise<AIProviderResult> {
+      calls += 1;
+      if (calls > holdCount) {
+        return { ok: true, response: { content: immediateReply } };
+      }
+      return new Promise<AIProviderResult>((resolve) => {
+        pending.push(resolve);
+      });
+    },
+  };
+}
+
 /** TTS whose stop() can be held open: models teardown still in progress. */
 class GatedTTS implements TextToSpeechProvider {
   readonly id = 'gated-tts';
@@ -246,6 +274,17 @@ async function seedLearner(adapter: SqlJsAdapter) {
   });
   return profile.id;
 }
+
+/** Distinct feedback used for the LATE (discarded) turn, so it is traceable. */
+const LATE_FEEDBACK: ConversationFeedback = {
+  vocabulary: {
+    headword: 'windfall',
+    type: 'word',
+    meaning: 'an unexpected amount of money or good fortune',
+    example: 'The bonus was a windfall.',
+  },
+  coachingNote: 'Late coaching note that must never be recorded.',
+};
 
 const CORRECTION_FEEDBACK: ConversationFeedback = {
   correction: {
@@ -1126,6 +1165,32 @@ describe('Conversation learning memory — persistence', () => {
       replacementIndex,
     );
 
+    // Leaving Talk (unmount): disposal closes the ACTIVE session before the
+    // memory is finalized, and the finalization waits for that disposal.
+    const unmountIndex = screenSource.indexOf(
+      'const disposed = voiceCoordinatorRef.current?.dispose()',
+    );
+    const finalizeAfterDisposalIndex = screenSource.indexOf('void disposed.then(() => {');
+    expect(unmountIndex).toBeGreaterThan(-1);
+    expect(finalizeAfterDisposalIndex).toBeGreaterThan(unmountIndex);
+    // The coordinator itself abandons the active session BEFORE awaiting teardown.
+    const coordinatorSource = readFileSync(
+      join(__dirname, '..', 'voice', 'coordinator.ts'),
+      'utf8',
+    );
+    const disposalIndex = coordinatorSource.indexOf('private async performDisposal(): Promise<void> {');
+    const abandonIndex = coordinatorSource.indexOf('this.session.abandon?.();', disposalIndex);
+    const teardownIndex = coordinatorSource.indexOf('await this.teardown();', disposalIndex);
+    expect(disposalIndex).toBeGreaterThan(-1);
+    expect(abandonIndex).toBeGreaterThan(disposalIndex);
+    expect(abandonIndex).toBeLessThan(teardownIndex);
+    // switchSession keeps its own abandon-before-teardown ordering.
+    const switchIndex2 = coordinatorSource.indexOf('async switchSession(');
+    const switchAbandon = coordinatorSource.indexOf('oldSession.abandon?.();', switchIndex2);
+    const switchTeardown = coordinatorSource.indexOf('await this.teardown();', switchIndex2);
+    expect(switchAbandon).toBeGreaterThan(-1);
+    expect(switchAbandon).toBeLessThan(switchTeardown);
+
     // A fresh recorder per conversation identity (exactly-once identity).
     expect(screenSource).toContain('memoryRecorderRef.current = createConversationMemoryRecorder()');
     // Leaving Talk with a meaningful conversation still stores it.
@@ -1645,6 +1710,146 @@ describe('Conversation learning memory — persistence', () => {
       const sessions = await repo.listSessions(learnerId);
       expect(sessions).toHaveLength(1);
       expect(await repo.listTurns(sessions[0].id)).toHaveLength(2);
+    });
+  });
+
+  describe('Terminal disposal (leaving Talk) — abandon before awaited teardown', () => {
+    it('39. disposal abandons the session first: a late AI answer never commits or persists', async () => {
+      const provider = createHeldThenImmediateProvider(2, 'Immediate reply while disposing.');
+      const savedVocabulary: unknown[] = [];
+      const session = buildSession(provider, {
+        onSaveVocabulary: async (vocab: unknown) => {
+          savedVocabulary.push(vocab);
+        },
+      });
+      const recorder = createConversationMemoryRecorder({ startedAt: NOW });
+      const service = createConversationMemoryService({ databaseAdapter: adapter, learnerId });
+
+      // 1. A committed turn pair already exists (real history to keep).
+      const committed = session.send({ userMessage: 'Yesterday I go to the office.' });
+      provider.resolveHeld('Nice! What happened next?', CORRECTION_FEEDBACK);
+      await committed;
+      expect(session.getHistory()).toHaveLength(2);
+      const committedFeedback = session.getLastFeedback();
+      expect(committedFeedback).not.toBeNull();
+      expect(session.getSavedVocabulary()).toHaveLength(1);
+
+      // 2. A second AI answer is held in flight when the learner leaves Talk.
+      const inFlight = session.send({ userMessage: 'Then I go home.' });
+
+      // 3. dispose() runs while teardown is held open (TTS stop never settles).
+      const tts = new GatedTTS();
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: createDemoSTTProvider(),
+        ttsProvider: tts,
+      });
+      tts.holdStop = true;
+      const disposal = coordinator.dispose();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      // 4. The ACTIVE session is already non-writable, before teardown finishes.
+      const lateAttempt = await session.send({ userMessage: 'Blocked during disposal.' });
+      expect(lateAttempt.ok).toBe(false);
+
+      // 5./6. The held AI answer resolves while disposal is still waiting: the
+      // stale learner AND tutor turn must not commit, and no feedback/vocabulary
+      // side effect may happen for them.
+      provider.resolveHeld('Late reply that must never be stored.', LATE_FEEDBACK);
+      const late = await inFlight;
+      expect(late.ok).toBe(false);
+      expect(session.getHistory()).toHaveLength(2);
+      // The committed feedback is untouched: no late feedback was accepted…
+      expect(session.getLastFeedback()).toBe(committedFeedback);
+      expect(session.getLastFeedback()).not.toBe(LATE_FEEDBACK);
+      // …and no late vocabulary was saved (only the committed one exists).
+      expect(session.getSavedVocabulary().map((item) => item.headword)).toEqual(['commute']);
+      expect(savedVocabulary).toHaveLength(1);
+
+      // 7. Teardown is released and disposal settles.
+      tts.holdStop = false;
+      tts.releaseStop();
+      await disposal;
+      expect(coordinator.getStatus().state).toBe('idle');
+
+      // 8. Only now is the memory finalized from the stable committed history.
+      const review = await finalizeConversationWithReview({
+        session,
+        recorder,
+        isRealAI: true,
+        service,
+        endedAt: LATER,
+      });
+      expect(review.persistence.ok).toBe(true);
+
+      // 9./10. Exactly the committed pair is persisted — no late content.
+      const repo = buildRepository(adapter);
+      const sessions = await repo.listSessions(learnerId);
+      expect(sessions).toHaveLength(1);
+      const turns = await repo.listTurns(sessions[0].id);
+      expect(turns).toHaveLength(2);
+      expect(turns.map((turn) => turn.text)).toEqual([
+        'Yesterday I go to the office.',
+        'Nice! What happened next?',
+      ]);
+      const persisted = JSON.stringify(turns);
+      expect(persisted).not.toContain('Late reply');
+      expect(persisted).not.toContain('Then I go home');
+      expect(persisted).not.toContain('Blocked during disposal');
+      expect(sessions[0].turnCount).toBe(2);
+
+      // 11. And no late vocabulary survived either: exactly the committed save.
+      expect(savedVocabulary).toHaveLength(1);
+      expect(JSON.stringify(savedVocabulary)).not.toContain('windfall');
+    });
+
+    it('40. a late STT result during disposal cannot enter the persisted memory', async () => {
+      const stt = createGatedSTT();
+      const session = buildSession(createStubProvider(['Unused reply.']));
+      const recorder = createConversationMemoryRecorder({ startedAt: NOW });
+      const service = createConversationMemoryService({ databaseAdapter: adapter, learnerId });
+      const tts = new GatedTTS();
+      const coordinator = createVoiceSessionCoordinator({
+        session,
+        recorder: createDemoAudioRecorder(),
+        sttProvider: stt,
+        ttsProvider: tts,
+      });
+
+      await coordinator.startRecording();
+      const pendingTurn = coordinator.stopRecordingAndProcess();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      tts.holdStop = true;
+      const disposal = coordinator.dispose();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+      // Already non-writable while teardown is still awaiting.
+      expect((await session.send({ userMessage: 'Blocked during disposal.' })).ok).toBe(false);
+
+      // The transcript arrives during disposal: it is discarded, not persisted.
+      stt.release('Late transcript during unmount.');
+      const turn = await pendingTurn;
+      expect(turn.ok).toBe(false);
+
+      tts.holdStop = false;
+      tts.releaseStop();
+      await disposal;
+
+      expect(session.getHistory()).toEqual([]);
+      const review = await finalizeConversationWithReview({
+        session,
+        recorder,
+        isRealAI: true,
+        service,
+        endedAt: LATER,
+      });
+      // Nothing meaningful happened: nothing is stored.
+      expect(review.persistence.ok).toBe(false);
+      expect(review.persistence.reason).toBe('empty');
+      const repo = buildRepository(adapter);
+      expect(await repo.listSessions(learnerId)).toHaveLength(0);
     });
   });
 
