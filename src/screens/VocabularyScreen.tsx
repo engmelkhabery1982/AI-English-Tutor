@@ -121,6 +121,7 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
 
   // Details modal + edit state
   const [selectedEntry, setSelectedEntry] = useState<WorkspaceEntry | null>(null);
+  const [pronunciationNotes, setPronunciationNotes] = useState<readonly string[]>([]);
   const [editMeaningIndex, setEditMeaningIndex] = useState<number | null>(null);
   const [editDefinition, setEditDefinition] = useState<string>('');
   const [editExamples, setEditExamples] = useState<string[]>([]);
@@ -128,6 +129,27 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
   const [isDeleting, setIsDeleting] = useState<boolean>(false);
 
   const serviceRef = useRef<VocabularyWorkspaceService | null>(props?.service ?? null);
+
+  // Linked pronunciation notes (from the existing learner weaknesses) for
+  // the details view. Read-only; never blocks the workspace.
+  useEffect(() => {
+    if (!selectedEntry) {
+      setPronunciationNotes([]);
+      return;
+    }
+    let active = true;
+    serviceRef.current
+      ?.getPronunciationNotes(selectedEntry)
+      .then((notes) => {
+        if (active) setPronunciationNotes(notes);
+      })
+      .catch(() => {
+        if (active) setPronunciationNotes([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedEntry]);
   const initialLoadDoneRef = useRef<boolean>(false);
 
   useEffect(() => {
@@ -727,6 +749,17 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
                   : ''}
               </Text>
 
+              {pronunciationNotes.length > 0 && (
+                <View style={styles.pronunciationNotesBox}>
+                  <Text style={styles.detailSectionLabel}>Pronunciation notes</Text>
+                  {pronunciationNotes.map((note, index) => (
+                    <Text key={index} style={styles.pronunciationNoteLine}>
+                      • {note}
+                    </Text>
+                  ))}
+                </View>
+              )}
+
               <Text style={styles.detailSectionLabel}>
                 Meanings ({selectedEntry.meaningCount})
               </Text>
@@ -1108,6 +1141,18 @@ const styles = StyleSheet.create({
     marginTop: 10,
     fontSize: 12,
     color: '#6B7280',
+  },
+  pronunciationNotesBox: {
+    backgroundColor: '#EEF4FF',
+    borderRadius: 10,
+    padding: 10,
+    marginTop: 10,
+  },
+  pronunciationNoteLine: {
+    fontSize: 13,
+    color: '#2C3E50',
+    lineHeight: 18,
+    marginTop: 2,
   },
   detailSectionLabel: {
     marginTop: 20,

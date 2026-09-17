@@ -18,6 +18,7 @@ import {
   SQLiteVocabularyRepository,
   SQLiteExpressionRepository,
   SQLiteReviewRepository,
+  SQLiteWeaknessRepository,
   deleteLexicalItemWithReviews,
 } from '../data/local/sqlite/repositories';
 import { createReviewService } from '../review/factory';
@@ -41,6 +42,7 @@ export function createVocabularyWorkspaceService(
     review: createReviewService(adapter),
     profile: new SQLiteUserProfileRepository(adapter),
     reviewCleanup: new SQLiteReviewRepository(adapter),
+    pronunciationNotes: new SQLiteWeaknessRepository(adapter),
     // Atomic delete: lexical item + matching review rows in ONE transaction.
     atomicDelete: (lexicalItemId, kind) =>
       deleteLexicalItemWithReviews(adapter, lexicalItemId, kind),

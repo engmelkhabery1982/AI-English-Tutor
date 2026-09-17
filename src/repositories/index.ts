@@ -19,7 +19,7 @@ import type {
   PronunciationWeakness,
   UserProfile,
 } from '../domain/models/learner';
-import type { EvidenceRef, WeaknessStatus } from '../domain/shared/types';
+import type { EvidenceRef, IsoDate, Uuid, WeaknessStatus } from '../domain/shared/types';
 import type {
   ExpressionItem,
   VocabularyItem,
@@ -87,12 +87,46 @@ export interface MistakeRepository {
   updateMistake(id: string, patch: Partial<Omit<GrammarMistake, 'id' | 'createdAt'>>): Promise<GrammarMistake>;
 }
 
+/** Input for recording one deduplicated pronunciation observation. */
+export interface PronunciationObservationInput {
+  readonly learnerId: Uuid;
+  /**
+   * Stable issue identity used for deduplication, e.g.
+   * "word_pronunciation:comfortable" or "ending:worked-ed".
+   * Repeated observations increase occurrence data instead of
+   * creating duplicate rows.
+   */
+  readonly identity: string;
+  /** Human-readable practice target, e.g. the word itself. */
+  readonly target: string;
+  /** Observed transcript snippet for this occurrence, when available. */
+  readonly exampleText?: string;
+  /** Extra context tags for this occurrence (e.g. "lexical:<id>"). */
+  readonly context?: string;
+  readonly at: IsoDate;
+}
+
+/** Result of recording one pronunciation observation. */
+export interface PronunciationObservationRecord {
+  readonly weakness: PronunciationWeakness;
+  /** True when this call created the weakness row (first observation). */
+  readonly created: boolean;
+}
+
 export interface PronunciationRepository {
   recordWeakness(
     weakness: Omit<PronunciationWeakness, 'id' | 'createdAt' | 'updatedAt'>,
   ): Promise<PronunciationWeakness>;
   listWeaknesses(learnerId: string, opts?: { resolved?: boolean; limit?: number }): Promise<readonly PronunciationWeakness[]>;
   markResolved(id: string, resolved: boolean): Promise<PronunciationWeakness>;
+  /**
+   * Record one pronunciation observation under a stable identity
+   * (issue type + normalized target). First call creates the row;
+   * repeated calls increment occurrence data instead of duplicating it.
+   * Read/write helper over the same pronunciation_weaknesses table;
+   * optional — backends may omit it.
+   */
+  recordObservation?(input: PronunciationObservationInput): Promise<PronunciationObservationRecord>;
 }
 
 export interface WeaknessRepository {

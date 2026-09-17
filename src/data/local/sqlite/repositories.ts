@@ -23,6 +23,8 @@ import type {
   ConversationActivityStats,
   LexicalBucketCounts,
   WeaknessStatusCounts,
+  PronunciationObservationInput,
+  PronunciationObservationRecord,
   MistakeRepository,
   PronunciationRepository,
   WeaknessRepository,
@@ -1037,6 +1039,74 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
     }
 
     return rowToPronunciationWeakness(rows[0]);
+  }
+
+  /**
+   * Record one pronunciation observation under a stable identity.
+   * First observation creates the row; repeated observations increment
+   * occurrence data (dedup by learner + target_sound identity).
+   */
+  async recordObservation(
+    input: PronunciationObservationInput,
+  ): Promise<PronunciationObservationRecord> {
+    if (!input.learnerId || !isValidUuid(input.learnerId)) {
+      throw new Error('Invalid learnerId');
+    }
+    if (!input.identity) {
+      throw new Error('identity is required');
+    }
+
+    const existingRows = await this.adapter.query(
+      `SELECT id FROM pronunciation_weaknesses WHERE learner_id = ? AND target_sound = ?`,
+      [input.learnerId, input.identity],
+    );
+
+    if (existingRows.length > 0) {
+      const id = existingRows[0].id as string;
+      const current = rowToPronunciationWeakness(
+        (await this.adapter.query(`SELECT * FROM pronunciation_weaknesses WHERE id = ?`, [id]))[0],
+      );
+
+      // Keep the most recent examples/contexts, bounded.
+      const wordExamples = [
+        ...(input.exampleText ? [input.exampleText] : []),
+        ...current.wordExamples,
+     ].slice(0, 10);
+      const contexts = Array.from(
+        new Set([...(input.context ? [input.context] : []), ...current.contexts]),
+      ).slice(0, 10);
+
+      await this.adapter.execute(
+        `UPDATE pronunciation_weaknesses SET
+          occurrence_count = occurrence_count + 1,
+          last_seen_at = ?,
+          word_examples = ?,
+          contexts = ?,
+          updated_at = ?
+        WHERE id = ?`,
+        [input.at, JSON.stringify(wordExamples), JSON.stringify(contexts), input.at, id],
+      );
+
+      const updatedRows = await this.adapter.query(
+        `SELECT * FROM pronunciation_weaknesses WHERE id = ?`,
+        [id],
+      );
+      return { weakness: rowToPronunciationWeakness(updatedRows[0]), created: false };
+    }
+
+    const created = await this.recordWeakness({
+      learnerId: input.learnerId,
+      targetSound: input.identity,
+      wordExamples: input.exampleText ? [input.exampleText] : [],
+      occurrenceCount: 1,
+      lastSeenAt: input.at,
+      firstSeenAt: input.at,
+      contexts: input.context ? [input.context] : [],
+      exampleTurnIds: [],
+      resolved: false,
+      notes: input.target,
+    });
+    return { weakness: created, created: true };
   }
 }
 

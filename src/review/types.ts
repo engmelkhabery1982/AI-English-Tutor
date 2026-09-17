@@ -13,7 +13,14 @@ export type ReviewExerciseType =
   | 'expression_use'
   | 'fill_the_gap'
   | 'sentence_correction'
-  | 'natural_phrasing';
+  | 'natural_phrasing'
+  /**
+   * Phase 1 pronunciation retraining: the learner repeats a target
+   * word/phrase aloud; the existing recorder/STT path transcribes the
+   * attempt and evaluation stays qualitative (transcript comparison —
+   * never an acoustic score).
+   */
+  | 'pronunciation_repeat';
 
 /** Qualitative evaluation result (no numeric scores) */
 export type QualitativeResult = 'correct' | 'partial' | 'incorrect';
