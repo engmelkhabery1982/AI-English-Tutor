@@ -1495,6 +1495,9 @@ describe('Voice-first lessons — architecture and scope discipline', () => {
     expect(screenSrc).toContain('Playing feedback…');
     expect(screenSrc).toContain('You said');
     expect(screenSrc).toContain('Hear feedback');
+    // The real replay count is preserved on the text path too.
+    expect(screenSrc).toContain('replayCount');
+    expect(screenSrc).toMatch(/submitListeningAnswer\(\s*exercise\.id,\s*answer,\s*currentStep\.id,\s*replayCount,?\s*\)/);
   });
 
   it('42. the feature introduces no new dependency', () => {

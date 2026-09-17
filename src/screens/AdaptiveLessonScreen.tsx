@@ -524,8 +524,15 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
     setErrorMessage(null);
     try {
       // The replay count from the voice layer is preserved where the existing
-      // API supports it (see the voice controller's listening submission).
-      const outcome = await service.submitListeningAnswer(exercise.id, answer, currentStep.id);
+      // API supports it: the same counter the voice submission uses is passed
+      // here, so a typed answer still records how often the audio was played.
+      const replayCount = voiceRef.current?.getStatus().replayCount;
+      const outcome = await service.submitListeningAnswer(
+        exercise.id,
+        answer,
+        currentStep.id,
+        replayCount,
+      );
       if (!outcome || outcome.result.kind === 'none') {
         setErrorMessage(outcome?.result.kind === 'none' ? outcome.result.message : 'Could not check that answer.');
         return;
