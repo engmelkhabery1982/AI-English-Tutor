@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  BASELINE_CHALLENGE,
   DEFAULT_MAX_TARGET_EXPRESSIONS,
   GENERAL_SCENARIO,
   PROFESSIONAL_LEVELS,
@@ -46,7 +47,7 @@ function collectScoreLikeKeys(value: unknown, path = '$'): string[] {
 }
 
 describe('scenario catalog', () => {
-  it('1. supports all required categories plus the full declared set', () => {
+  it('8. supports all required categories plus the full declared set', () => {
     expect(SCENARIOS.length).toBe(SCENARIO_CATEGORIES.length);
     for (const category of SCENARIO_CATEGORIES) {
       expect(getScenario(category), `missing scenario for "${category}"`).toBeDefined();
@@ -73,8 +74,28 @@ describe('scenario catalog', () => {
   });
 });
 
-describe('2. deterministic plan', () => {
-  it('produces identical plans for identical input, and does not mutate input', () => {
+describe('challenge ranks are valid', () => {
+  it('5. every exported ChallengeEvent has a finite numeric rank in range', () => {
+    const allEvents = [...SCENARIOS.flatMap((s) => s.challengeEvents), ...GENERAL_SCENARIO.challengeEvents];
+    for (const event of allEvents) {
+      expect(typeof event.minComplexityRank).toBe('number');
+      expect(Number.isFinite(event.minComplexityRank)).toBe(true);
+      expect(Number.isInteger(event.minComplexityRank)).toBe(true);
+      // Expected internal range: index into DIFFICULTY_ORDER (0..2).
+      expect(event.minComplexityRank).toBeGreaterThanOrEqual(0);
+      expect(event.minComplexityRank).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it('6. BASELINE_CHALLENGE has a valid numeric rank (simple => 0)', () => {
+    expect(typeof BASELINE_CHALLENGE.minComplexityRank).toBe('number');
+    expect(BASELINE_CHALLENGE.minComplexityRank).toBe(0);
+    expect(Number.isFinite(BASELINE_CHALLENGE.minComplexityRank)).toBe(true);
+  });
+});
+
+describe('deterministic plan', () => {
+  it('7. produces identical plans for identical input, and does not mutate input', () => {
     const input = {
       category: 'meeting' as ScenarioCategory,
       learner: { level: 'developing' as const, goals: ['meetings_and_updates' as const] },
@@ -93,9 +114,21 @@ describe('2. deterministic plan', () => {
     expect(plan.isFallback).toBe(true);
     expect(plan.title).toBe(GENERAL_SCENARIO.title);
   });
+
+  it('never silently replaces the requested category', () => {
+    for (const category of REQUIRED_CATEGORIES) {
+      const plan = planScenario({
+        category,
+        learner: { goals: ['interview'], profession: 'law', weaknesses: ['speaks too quickly'] },
+      });
+      expect(plan.category).toBe(category);
+      const expected = getScenario(category);
+      expect(plan.scenarioId).toBe(expected ? expected.id : GENERAL_SCENARIO.id);
+    }
+  });
 });
 
-describe('3-12. category-specific plans', () => {
+describe('category-specific plans', () => {
   const cases: readonly [ScenarioCategory, Partial<ScenarioPlan>][] = [
     ['meeting', { practiceType: 'structured_exchange' }],
     ['project_update', { practiceType: 'guided_dialogue' }],
@@ -123,12 +156,10 @@ describe('3-12. category-specific plans', () => {
   });
 });
 
-describe('13. general profession fallback', () => {
-  it('is profession-agnostic and never construction-specific', () => {
+describe('general profession fallback', () => {
+  it('is profession-agnostic and never industry-specific', () => {
     const plan = planScenario({ category: 'site_discussion' });
     const text = JSON.stringify(plan).toLowerCase();
-    // The catalog must stay general: no hard-coded trade/construction bias.
-    expect(text).not.toContain('concrete');
     expect(text).not.toContain('rebar');
     expect(text).not.toContain('excavator');
     expect(plan.isFallback).toBe(false);
@@ -140,33 +171,106 @@ describe('13. general profession fallback', () => {
   });
 });
 
-describe('14. learner goal influences the plan', () => {
-  it('reflects goals, profession, weaknesses and level in personalization', () => {
-    const plan = planScenario({
-      category: 'meeting',
-      learner: {
-        level: 'advanced',
-        goals: ['leadership', 'client_communication'],
-        profession: 'product management',
-        weaknesses: ['speaks too quickly'],
-      },
-    });
+describe('1. learner goals materially affect the generated plan', () => {
+  it('reorders speakingGoals when the goal maps to the category', () => {
+    const baseline = planScenario({ category: 'meeting' });
+    // "interview" does not map to meeting; "meetings_and_updates" does.
+    const off = planScenario({ category: 'meeting', learner: { goals: ['interviews'] } });
+    const on = planScenario({ category: 'meeting', learner: { goals: ['meetings_and_updates'] } });
 
-    const notes = plan.personalizationNotes.join(' ');
-    expect(notes).toContain('product management');
-    expect(notes).toContain('leadership');
-    expect(notes).toContain('speaks too quickly');
-    expect(plan.coachingMode).toBe('challenging');
+    const baselineIds = baseline.speakingGoals.map((g) => g.id);
+    const onIds = on.speakingGoals.map((g) => g.id);
+    // Same set of goals...
+    expect([...onIds].sort()).toEqual([...baselineIds].sort());
+    // ...but a material ORDER change: the matching goal is promoted to the front.
+    expect(on.speakingGoals[0].id).toBe('meetings_and_updates');
+    expect(onIds).not.toEqual(baselineIds);
+    // An irrelevant goal leaves the structure untouched.
+    expect(off.speakingGoals.map((g) => g.id)).toEqual(baselineIds);
   });
 
-  it('defaults to balanced coaching with no profile', () => {
-    const plan = planScenario({ category: 'meeting' });
-    expect(plan.coachingMode).toBe('balanced');
-    expect(plan.personalizationNotes.length).toBeGreaterThan(0);
+  it('a relevant goal changes plan structure, not just the notes string', () => {
+    const without = planScenario({ category: 'presentation' });
+    const withGoal = planScenario({ category: 'presentation', learner: { goals: ['presentations'] } });
+
+    // The speakingGoals array itself must differ.
+    expect(withGoal.speakingGoals).not.toEqual(without.speakingGoals);
+    expect(withGoal.speakingGoals[0].id).toBe('presentations');
   });
 });
 
-describe('15. difficulty influences challenge events', () => {
+describe('2. personalization notes never claim an adaptation that did not happen', () => {
+  it('no note claims goals were applied when no goal mapped to the category', () => {
+    const plan = planScenario({ category: 'meeting', learner: { goals: ['interviews'] } });
+    const notes = plan.personalizationNotes.join(' ').toLowerCase();
+    expect(notes).not.toContain('speaking goals reordered');
+    expect(plan.speakingGoals).toEqual(getScenario('meeting')?.speakingGoals);
+  });
+
+  it('claims a goal adaptation only when the plan actually changed', () => {
+    const plan = planScenario({ category: 'meeting', learner: { goals: ['meetings_and_updates'] } });
+    const notes = plan.personalizationNotes.join(' ').toLowerCase();
+    expect(notes).toContain('speaking goals reordered');
+    expect(plan.speakingGoals[0].id).toBe('meetings_and_updates');
+  });
+
+  it('makes no adaptation claims when the plan is identical to the defaults', () => {
+    const bare = planScenario({ category: 'reporting' });
+    const withNeutralProfile = planScenario({
+      category: 'reporting',
+      // A goal irrelevant to "reporting" and an unmappable weakness.
+      learner: { goals: ['interviews'], weaknesses: ['needs more confidence in general'] },
+    });
+    expect(withNeutralProfile.speakingGoals).toEqual(bare.speakingGoals);
+    expect(withNeutralProfile.languageGoals).toEqual(bare.languageGoals);
+    const notes = withNeutralProfile.personalizationNotes.join(' ').toLowerCase();
+    expect(notes).toContain('no deterministic mapping');
+    expect(notes).not.toContain('reordered');
+  });
+});
+
+describe('3. profession is context, not a false adaptation claim', () => {
+  it('does not claim examples/register were adapted', () => {
+    const plan = planScenario({ category: 'meeting', learner: { profession: 'software engineering' } });
+    const notes = plan.personalizationNotes.join(' ').toLowerCase();
+    expect(notes).not.toContain('adapted');
+    expect(notes).not.toContain('examples and register');
+    expect(notes).toContain('does not change');
+    expect(notes).toContain('software engineering');
+  });
+
+  it('carries profession as professionalContext without altering the scenario', () => {
+    const bare = planScenario({ category: 'meeting' });
+    const withProfession = planScenario({
+      category: 'meeting',
+      learner: { profession: '  software engineering  ' },
+    });
+    expect(withProfession.professionalContext).toBe('software engineering');
+    expect(withProfession.situation).toBe(bare.situation);
+    expect(withProfession.speakingGoals).toEqual(bare.speakingGoals);
+    expect(withProfession.languageGoals).toEqual(bare.languageGoals);
+  });
+});
+
+describe('4. weakness context is either materially used or honestly represented', () => {
+  it('materially emphasises a language goal for a mappable weakness', () => {
+    const bare = planScenario({ category: 'meeting' });
+    const plan = planScenario({ category: 'meeting', learner: { weaknesses: ['grammar accuracy'] } });
+    // The emphasised language goal is promoted to the front — a real change.
+    expect(plan.languageGoals[0].id).toBe('accuracy');
+    expect(plan.languageGoals).not.toEqual(bare.languageGoals);
+    expect(plan.personalizationNotes.join(' ')).toContain('Language goals reordered');
+  });
+
+  it('honestly reports an unmappable weakness as not applied', () => {
+    const plan = planScenario({ category: 'meeting', learner: { weaknesses: ['just wants to feel better'] } });
+    const notes = plan.personalizationNotes.join(' ');
+    expect(notes).toContain('no deterministic mapping');
+    expect(notes).not.toContain('Language goals reordered');
+  });
+});
+
+describe('difficulty influences challenge events', () => {
   it('includes more challenges as difficulty rises', () => {
     const simple = planScenario({ category: 'negotiation', learner: { scenarioDifficulty: 'simple' } });
     const complex = planScenario({ category: 'negotiation', learner: { scenarioDifficulty: 'complex' } });
@@ -190,7 +294,7 @@ describe('15. difficulty influences challenge events', () => {
   });
 });
 
-describe('16. target expressions are bounded', () => {
+describe('target expressions are bounded', () => {
   it('respects the default cap and an explicit cap', () => {
     const plan = planScenario({ category: 'negotiation' });
     expect(plan.targetExpressions.length).toBeLessThanOrEqual(DEFAULT_MAX_TARGET_EXPRESSIONS);
@@ -217,8 +321,8 @@ describe('16. target expressions are bounded', () => {
   });
 });
 
-describe('17-20. invariants', () => {
-  it('17. carries no scores or percentages anywhere', () => {
+describe('invariants', () => {
+  it('10. carries no scores or percentages anywhere', () => {
     for (const category of SCENARIO_CATEGORIES) {
       const plan = planScenario({
         category,
@@ -229,7 +333,7 @@ describe('17-20. invariants', () => {
     expect(collectScoreLikeKeys(SCENARIOS)).toEqual([]);
   });
 
-  it('17b. never maps levels to exam bands', () => {
+  it('never maps levels to exam bands', () => {
     const text = JSON.stringify(SCENARIOS).toUpperCase();
     expect(text).not.toContain('CEFR');
     expect(text).not.toMatch(/\bA1\b|\bA2\b|\bB1\b|\bB2\b|\bC1\b|\bC2\b/);
@@ -241,17 +345,15 @@ describe('17-20. invariants', () => {
     ]);
   });
 
-  it('18. planner is pure — plan depends only on its input', () => {
+  it('planner is pure — plan depends only on its input', () => {
     const first = planScenario({ category: 'reporting' });
-    // Re-planning many times yields the same object every time (no hidden state).
     for (let i = 0; i < 25; i += 1) {
       expect(planScenario({ category: 'reporting' })).toEqual(first);
     }
   });
 
-  it('19. does not require AI or network — the module imports nothing external', async () => {
+  it('9. does not require AI or network — the module imports nothing external', async () => {
     const moduleSource = await import('./index');
-    // The public surface exposes only pure functions and data.
     expect(typeof moduleSource.planScenario).toBe('function');
     expect(typeof moduleSource.getScenario).toBe('function');
     const moduleNames = Object.keys(moduleSource);
@@ -260,11 +362,10 @@ describe('17-20. invariants', () => {
     }
   });
 
-  it('20. does not persist — plan is a plain serialisable object', () => {
+  it('9b. does not persist — plan is a plain serialisable object', () => {
     const plan = planScenario({ category: 'presentation' });
     const roundTripped = JSON.parse(JSON.stringify(plan)) as ScenarioPlan;
     expect(roundTripped).toEqual(plan);
-    // No storage/persistence handles leak into the plan.
     const keys = Object.keys(plan);
     for (const key of keys) {
       expect(/save|store|persist|db|database|client/i.test(key)).toBe(false);
