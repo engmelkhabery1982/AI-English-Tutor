@@ -29,6 +29,7 @@
 import type { ConversationMode, IsoDate, WeaknessStatus } from '../domain/shared/types';
 import type { LearnerWeakness, PronunciationWeakness } from '../domain/models/learner';
 import type { ReviewItem } from '../domain/models/learning';
+import { recordPronunciationSuccess, type SuccessObservationRecorder } from '../reassessment';
 import type {
   PronunciationObservationInput,
   PronunciationObservationRecord,
@@ -59,6 +60,7 @@ export function observationIdentity(observation: PronunciationObservation): stri
 const MAX_PERSISTED_PER_TURN = 3;
 
 export interface PronunciationEngineDeps {
+  readonly successRecorder?: SuccessObservationRecorder;
   readonly provider: PronunciationProvider;
   readonly pronunciation: {
     /** Deduplicating observation recorder (existing repository method). */
@@ -186,6 +188,16 @@ export class PronunciationEngine {
       } catch {
         // Persistence failure must not corrupt the conversation flow.
       }
+    }
+
+    if (!analysis.insufficientEvidence && input.expectedText && persistable.length === 0 && this.deps.successRecorder) {
+      const refId = `pron:${input.expectedText.toLowerCase().trim().slice(0, 30)}`;
+      await recordPronunciationSuccess(this.deps.successRecorder, {
+        learnerId,
+        referenceId: refId,
+        context: input.context ?? 'target_sentence',
+        summary: `Clear pronunciation of target sentence: "${input.expectedText}"`,
+      });
     }
 
     return {

@@ -71,6 +71,7 @@ import {
   isTaskCompleted,
 } from './evidence';
 import { evaluateRepairTrigger } from './repair-policy';
+import { recordFluencySuccess, type SuccessObservationRecorder } from '../reassessment';
 import type {
   FluencyAttemptEvidence,
   FluencyAttemptResult,
@@ -111,6 +112,7 @@ export function practiceTypeForFluencyTask(task: FluencyTask): SpeakingPracticeT
  * ------------------------------------------------------------------ */
 
 export interface FluencyPracticeServiceDeps {
+  readonly successRecorder?: SuccessObservationRecorder;
   /** The EXISTING speaking service (owns conversation + persistence + memory). */
   readonly speaking: SpeakingPracticeService;
   readonly now?: () => IsoDate;
@@ -486,6 +488,14 @@ export class FluencyPracticeService {
         })
       ) {
         this.consecutiveStrong += 1;
+        if (this.deps.successRecorder) {
+          await recordFluencySuccess(this.deps.successRecorder, {
+            learnerId: (this.deps.speaking as any)?.learnerModel?.getCoachingContext?.()?.profile?.learnerId ?? 'learner',
+            referenceId: `fluency:${task.id}`,
+            context: `support:${this.supportLevel}`,
+            summary: `Strong fluency attempt on ${task.title}`,
+          });
+        }
       } else {
         this.consecutiveStrong = 0;
       }

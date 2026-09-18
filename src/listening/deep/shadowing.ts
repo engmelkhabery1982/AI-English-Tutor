@@ -23,6 +23,7 @@ import type { TextToSpeechProvider } from '../../providers/tts/types';
 import type { PronunciationTurnOutcome } from '../../pronunciation/types';
 import type { AudioRecorderService, AudioRecordingResult } from '../../voice/types';
 import { internalWordOverlap, normalizeAnswerText } from '../evaluator';
+import { recordShadowingSuccess, type SuccessObservationRecorder } from '../../reassessment';
 import type { ShadowingQualitativeResult, ShadowingSupportLevel } from './types';
 
 /** How many times a chunk may be repeated (bounded practice). */
@@ -194,6 +195,8 @@ export function evaluateShadowingLocally(
 
 
 export interface ShadowingAttemptInput {
+  readonly learnerId?: string;
+  readonly successRecorder?: SuccessObservationRecorder;
   readonly chunk: string;
   readonly transcript: string | null;
   /** The EXISTING pronunciation engine, when the app really has one. */
@@ -214,6 +217,14 @@ export async function runShadowingAttempt(
   const local = evaluateShadowingLocally(input.chunk, input.transcript);
   const transcript = local.transcript;
   const port = input.port;
+  if (input.successRecorder && input.learnerId && local.qualitative === 'matched') {
+    await recordShadowingSuccess(input.successRecorder, {
+      learnerId: input.learnerId,
+      referenceId: `shadowing:${input.chunk.toLowerCase().trim().slice(0, 30)}`,
+      context: 'shadowing_chunk',
+      summary: `Matched shadowing chunk: "${input.chunk}"`,
+    });
+  }
   if (!port || transcript === null) return local;
 
   try {

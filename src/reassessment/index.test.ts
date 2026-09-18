@@ -542,7 +542,7 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
       ...onboardingService,
       async beginDiagnostic(options?: Record<string, unknown>) {
         beginCount++;
-        return onboardingService.beginDiagnostic(options);
+        return onboardingService.beginDiagnostic(options as any);
       },
     };
 
@@ -661,5 +661,110 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
       const profile = await profileRepo.get();
       expect(profile.currentLevel).toBe('B1');
     }
+  });
+
+  // 22. concurrent keep vs accept race condition maintains absolute history/profile consistency
+  it('22. concurrent keep vs accept race condition maintains absolute history/profile consistency', async () => {
+    const handle = await service.beginReassessment();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
+    await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
+    await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
+    handle.session.advance();
+    handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+    handle.session.advance();
+    handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+
+    const { record } = await service.finishReassessment(handle);
+    expect(record).not.toBeNull();
+
+    if (record) {
+      const service1 = createReassessmentService({
+        adapter,
+        onboardingService,
+        historyRepository: new SQLiteReassessmentHistoryRepository(adapter),
+      });
+
+      const service2 = createReassessmentService({
+        adapter,
+        onboardingService,
+        historyRepository: new SQLiteReassessmentHistoryRepository(adapter),
+      });
+
+      // Keep runs first
+      const keepRes = await service1.keepCurrentLevel(record.id);
+      expect(keepRes.updated).toBe(false);
+      expect(keepRes.reason).toBe('kept');
+
+      // Accept runs afterward
+      const acceptRes = await service2.acceptReassessmentLevel(record.id);
+      expect(acceptRes.updated).toBe(false);
+      expect(acceptRes.reason).toBe('kept');
+
+      // History and profile MUST be consistent
+      const recordAfter = await historyRepo.getById(record.id);
+      expect(recordAfter?.decision).toBe('kept');
+
+      const profileAfter = await profileRepo.get();
+      expect(profileAfter.currentLevel).toBe('A2'); // Remains previous level!
+    }
+  });
+
+  // 23. real producer listening success creates strength and leaves existing weakness intact
+  it('23. real producer listening success creates strength and leaves existing weakness intact', async () => {
+    const { createListeningService } = await import('../listening');
+    const listeningService = createListeningService(adapter, {
+      successRecorder: service.successRecorder,
+    });
+
+    const exercise: any = {
+      id: 'ex-101',
+      learnerId,
+      type: 'listen_and_type',
+      difficulty: 'medium',
+      speakText: 'I heard meeting and deadline',
+      expectedAnswer: 'I heard meeting and deadline',
+      keyItems: ['meeting', 'deadline'],
+      source: 'general',
+      weaknessReferenceId: 'listening:detail_extraction',
+    };
+
+    // Evaluated as understood
+    await listeningService.evaluateAnswer(learnerId, exercise, 'I heard meeting and deadline');
+
+    const strengths = await weaknessRepo.listStrengths(learnerId);
+    expect(strengths.length).toBeGreaterThan(0);
+    expect(strengths[0].type).toBe('listening');
+  });
+
+  // 24. failed or insufficient outcomes do NOT create strength
+  it('24. failed or insufficient outcomes do NOT create strength', async () => {
+    const { createListeningService } = await import('../listening');
+    const listeningService = createListeningService(adapter, {
+      successRecorder: service.successRecorder,
+    });
+
+    const exercise: any = {
+      id: 'ex-102',
+      learnerId,
+      type: 'listen_and_type',
+      difficulty: 'medium',
+      speakText: 'budget report',
+      expectedAnswer: 'budget report',
+      keyItems: ['budget', 'report'],
+      source: 'general',
+      weaknessReferenceId: 'listening:budget',
+    };
+
+    // Wrong answer -> produces weakness, NOT strength
+    await listeningService.evaluateAnswer(learnerId, exercise, 'completely wrong text');
+
+    const strengths = await weaknessRepo.listStrengths(learnerId);
+    expect(strengths.find((s) => s.referenceId === 'listening:budget')).toBeUndefined();
   });
 });

@@ -37,6 +37,7 @@ import type {
   ListeningSessionSummary,
 } from './types';
 import { evaluateListeningAnswer } from './evaluator';
+import { recordListeningSuccess, type SuccessObservationRecorder } from '../reassessment';
 import { planListeningSession, stableReferenceId } from './generator';
 import type { ListeningGeneratedContentOptions } from './generator';
 import {
@@ -65,6 +66,7 @@ const MAX_EVIDENCE_ENTRIES = 20;
 const MAX_CONTEXTS = 10;
 
 export interface ListeningServiceDeps {
+  readonly successRecorder?: SuccessObservationRecorder;
   readonly weaknesses: {
     readonly listWeaknesses: WeaknessRepository['listWeaknesses'];
     readonly upsertWeakness: WeaknessRepository['upsertWeakness'];
@@ -385,7 +387,21 @@ export class ListeningService {
   ): Promise<void> {
     // General exercises still produce evidence when the learner struggles:
     // missed key items become listening weaknesses (deduplicated by identity).
-    if (!isProblemResult(evaluation.result)) return;
+    if (!isProblemResult(evaluation.result)) {
+      if (this.deps.successRecorder) {
+        const referenceId = exercise.weaknessReferenceId ?? stableReferenceId(`listening:${exercise.id}`);
+        const context = exercise.lexicalItemId
+          ? `lexical:${exercise.lexicalItemId}`
+          : persistenceTag(exercise);
+        await recordListeningSuccess(this.deps.successRecorder, {
+          learnerId,
+          referenceId,
+          context,
+          summary: evaluation.feedbackLines.join(' ') || 'Understood listening exercise content.',
+        });
+      }
+      return;
+    }
 
     const missedItems =
       evaluation.missedItems.length > 0

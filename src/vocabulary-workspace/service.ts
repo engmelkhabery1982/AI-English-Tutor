@@ -14,6 +14,7 @@
 
 import type { IsoDate, Meaning, MeaningReview, UsageExample } from '../domain/shared/types';
 import type { ExpressionItem, VocabularyItem } from '../domain/models/vocabulary';
+import { recordVocabularySuccess, type SuccessObservationRecorder } from '../reassessment';
 import type {
   ExpressionRepository,
   ReviewRepository,
@@ -188,6 +189,7 @@ export function resolvePracticeAction(decision: PracticeDecision): PracticeActio
 /** Editable content of one meaning (system-owned review data is never editable here). */
 /** Input for adding the FIRST meaning to a lexical item with no meanings yet. */
 export interface FirstMeaningInput {
+  readonly learnerId?: string;
   readonly entryId: string;
   readonly kind: WorkspaceItemKind;
   /** A real, learner-supplied definition — never a placeholder. */
@@ -215,6 +217,7 @@ export interface VocabularyWorkspaceRepositories {
 }
 
 export interface VocabularyWorkspaceServiceDeps extends VocabularyWorkspaceRepositories {
+  readonly successRecorder?: SuccessObservationRecorder;
   /** The EXISTING Adaptive Review service, used for practice availability. */
   readonly review?: Pick<ReviewService, 'planSession'>;
   /**
@@ -362,7 +365,16 @@ export class VocabularyWorkspaceService {
     if (!updated) {
       throw new Error('Item disappeared after update.');
     }
-    return toWorkspaceEntry(updated, input.kind, at);
+    const entryResult = toWorkspaceEntry(updated, input.kind, at);
+    if (this.deps.successRecorder && input.learnerId) {
+      await recordVocabularySuccess(this.deps.successRecorder, {
+        learnerId: input.learnerId,
+        referenceId: `lexical:${entryResult.title.toLowerCase().trim()}`,
+        context: `workspace:${entryResult.kind}`,
+        summary: `Demonstrated usage for ${entryResult.title}`,
+      });
+    }
+    return entryResult;
   }
 
   /**

@@ -143,8 +143,8 @@ export class SQLiteReassessmentHistoryRepository implements ReassessmentHistoryR
         params: [proposedLevel, now, id],
       },
       {
-        sql: `UPDATE learner_profile SET current_level = ?, updated_at = ? WHERE id = (SELECT learner_id FROM reassessment_history WHERE id = ?)`,
-        params: [proposedLevel, now, id],
+        sql: `UPDATE learner_profile SET current_level = ?, updated_at = ? WHERE id = (SELECT learner_id FROM reassessment_history WHERE id = ? AND decision = 'accepted' AND updated_at = ?)`,
+        params: [proposedLevel, now, id, now],
       },
     ];
 

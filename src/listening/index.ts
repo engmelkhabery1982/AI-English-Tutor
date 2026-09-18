@@ -24,6 +24,7 @@ import {
 } from '../data/local/sqlite/repositories';
 import { createPronunciationEngine } from '../pronunciation';
 import { ListeningService } from './service';
+import { createSuccessObservationRecorder, type SuccessObservationRecorder } from '../reassessment';
 
 export * from './types';
 export * from './evaluator';
@@ -54,7 +55,10 @@ function resolveDefaultListeningAI(): AIProvider | undefined {
 
 export function createListeningService(
   adapter: DatabaseAdapter,
-  options?: { aiProvider?: ListeningServiceDepsHint['aiProvider'] },
+  options?: {
+    aiProvider?: ListeningServiceDepsHint['aiProvider'];
+    successRecorder?: SuccessObservationRecorder;
+  },
 ): ListeningService {
   const weaknesses = new SQLiteWeaknessRepository(adapter);
   const review = new SQLiteReviewRepository(adapter);
@@ -84,6 +88,7 @@ export function createListeningService(
     // Explicitly injected provider wins; otherwise reuse the EXISTING
     // real provider composition (Gemini when configured, else none).
     aiProvider: options?.aiProvider ?? resolveDefaultListeningAI(),
+    successRecorder: options?.successRecorder ?? createSuccessObservationRecorder(weaknesses),
   });
 }
 
