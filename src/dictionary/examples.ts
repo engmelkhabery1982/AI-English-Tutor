@@ -1,9 +1,9 @@
 /**
  * src/dictionary/examples.ts
  *
- * Sense-aware examples and multi-meaning training plan generator.
- * Creates training items for ALL meaningful senses of a word so learners
- * master distinct senses without confusing or blending them.
+ * Sense-aware examples and grounded multi-meaning training plan generator.
+ * Creates training items ONLY from verified structured dictionary data.
+ * Never fabricates fallback example sentences or artificial distractors.
  */
 
 import type {
@@ -14,8 +14,12 @@ import type {
 } from './types';
 
 /**
- * Builds an engaging multi-sense training plan covering all distinct senses
- * of a headword.
+ * Builds a grounded training plan covering all distinct senses of a headword.
+ * Strictly enforces:
+ * - Uses only genuine example sentences from structured sense data (never generates pseudo-sentences).
+ * - Multi-sense items draw distractors exclusively from other real senses of the word.
+ * - Single-sense items do not fabricate distractors (distractorChoices is empty).
+ * - Senses lacking grounded examples are safely omitted.
  */
 export function buildMultiSenseTrainingPlan(entry: DictionaryEntry): MultiSenseTrainingPlan {
   const items: SensePracticeItem[] = [];
@@ -24,30 +28,39 @@ export function buildMultiSenseTrainingPlan(entry: DictionaryEntry): MultiSenseT
     const currentSense = entry.senses[i];
     const otherSenses = entry.senses.filter((_, idx) => idx !== i);
 
-    // Pick an example sentence from this sense or create a structured fallback
-    const example = currentSense.examples[0];
-    const promptSentence =
-      example?.english ||
-      (currentSense.collocations && currentSense.collocations[0]
-        ? `Example: They ${currentSense.collocations[0]}.`
-        : `Consider how "${entry.word}" is used when it means "${currentSense.distinction}".`);
-
-    const sentenceArabicTranslation =
-      example?.arabic || currentSense.arabicMeaning;
-
-    const correctChoice = `${currentSense.distinction} (${currentSense.arabicMeaning})`;
-
-    // Distractor choices are formed from the OTHER senses of this exact word
-    const distractorChoices: string[] = otherSenses.map(
-      (other) => `${other.distinction} (${other.arabicMeaning})`
+    // Pick a genuine grounded example from this sense with both English and Arabic
+    const groundedExample = currentSense.examples?.find(
+      (ex) =>
+        typeof ex.english === 'string' &&
+        ex.english.trim().length > 0 &&
+        typeof ex.arabic === 'string' &&
+        ex.arabic.trim().length > 0
     );
 
-    // If there are no other senses (single-sense word), provide sensible linguistic distractors
-    if (distractorChoices.length === 0) {
-      distractorChoices.push(
-        `Opposite meaning / unrelated action`,
-        `Literal physical translation in an inappropriate context`
+    // If a sense lacks grounded example material, omit that exercise
+    if (!groundedExample) {
+      continue;
+    }
+
+    const promptSentence = groundedExample.english.trim();
+    const sentenceArabicTranslation = groundedExample.arabic.trim();
+    const correctChoice = `${currentSense.distinction} (${currentSense.arabicMeaning})`;
+
+    let distractorChoices: string[] = [];
+    let comprehensionQuestion: string;
+    let isQualitativePractice = false;
+
+    if (otherSenses.length > 0) {
+      // Multi-sense word: distractors are formed strictly from other real senses
+      distractorChoices = otherSenses.map(
+        (other) => `${other.distinction} (${other.arabicMeaning})`
       );
+      comprehensionQuestion = `What is the specific meaning of "${entry.word}" in: "${promptSentence}"?`;
+    } else {
+      // Single-sense word: honest qualitative practice without fabricated distractors
+      distractorChoices = [];
+      isQualitativePractice = true;
+      comprehensionQuestion = `Review the usage of "${entry.word}" (${currentSense.distinction}) in context: "${promptSentence}".`;
     }
 
     const item: SensePracticeItem = {
@@ -59,10 +72,11 @@ export function buildMultiSenseTrainingPlan(entry: DictionaryEntry): MultiSenseT
       targetCollocation: currentSense.collocations?.[0],
       promptSentence,
       sentenceArabicTranslation,
-      comprehensionQuestion: `What is the specific meaning of "${entry.word}" in: "${promptSentence}"?`,
+      comprehensionQuestion,
       correctChoice,
       distractorChoices,
       explanation: `In this context, "${entry.word}" means "${currentSense.englishDefinition}" (${currentSense.arabicMeaning}). Key sense: ${currentSense.distinction}.`,
+      isQualitativePractice,
     };
 
     items.push(item);

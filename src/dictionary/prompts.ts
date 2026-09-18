@@ -45,20 +45,27 @@ Analyze the given English word and output a structured lexical breakdown.
 STRICT REQUIREMENTS:
 1. Arabic must be natural Modern Standard Arabic (الفصحى), accurate and context-appropriate.
 2. SENSES: Identify ALL common and meaningful senses of the word. Do NOT mix multiple meanings into one vague definition.
+   Every meaningful sense MUST have BOTH a genuine English definition AND a genuine Arabic meaning. NEVER copy one language into the other.
    Every meaningful sense must have:
    - senseId: unique identifier like "sense-1", "sense-2", etc.
    - partOfSpeech: "noun" | "verb" | "adjective" | "adverb" | "preposition" | "conjunction" | "pronoun" | "phrase" | "phrasal_verb" | "other"
    - distinction: concise label distinguishing this sense from other senses (e.g., "operate or manage", "physical movement on foot")
-   - englishDefinition: clear English explanation
-   - arabicMeaning: precise Arabic equivalent for THIS specific sense
+   - englishDefinition: clear English explanation (MUST be real English)
+   - arabicMeaning: precise Arabic equivalent for THIS specific sense (MUST be real Arabic)
    - examples: array of natural sentences demonstrating this sense, each with "english", "arabic" translation, and "context" (e.g. "business", "everyday conversation")
    - contexts: array of domain/context labels (e.g. ["business", "management"])
    - register: "formal" | "neutral" | "informal" | "slang" | "professional"
    - collocations: common collocations for this sense (e.g. ["run a company", "run a meeting"])
    - phrasalVerbs: relevant phrasal verbs connected to this sense or word if applicable
    - commonMistakes: genuine learner pitfalls if applicable (e.g. preposition confusion, false friends)
-3. Pronunciation: provide IPA and phonetic spelling if confident; otherwise null.
-4. Output MUST be ONLY valid JSON matching this schema:
+3. EXPRESSIONS: Provide key idioms, collocations, and phrasal verbs with their actual English and Arabic meanings:
+   - expression: the phrase or collocation
+   - englishMeaning: the genuine English meaning
+   - arabicMeaning: the genuine Arabic meaning in MSA
+   - type: "collocation" | "idiom" | "phrasal_verb" | "common_expression"
+   - exampleSentence: an optional authentic example sentence
+4. Pronunciation: provide IPA and phonetic spelling if confident; otherwise null.
+5. Output MUST be ONLY valid JSON matching this schema:
 {
   "word": "${cleanWord}",
   "pronunciation": {
@@ -81,6 +88,15 @@ STRICT REQUIREMENTS:
       "collocations": ["..."],
       "phrasalVerbs": ["..."],
       "commonMistakes": ["..."]
+    }
+  ],
+  "expressions": [
+    {
+      "expression": "...",
+      "englishMeaning": "...",
+      "arabicMeaning": "...",
+      "type": "collocation" | "idiom" | "phrasal_verb" | "common_expression",
+      "exampleSentence": "..."
     }
   ],
   "commonExpressions": ["..."],

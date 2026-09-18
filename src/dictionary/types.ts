@@ -67,6 +67,18 @@ export interface DictionaryPronunciation {
 }
 
 /**
+ * Structured expression, collocation, idiom, or phrasal verb carrying real semantic data.
+ */
+export interface DictionaryExpression {
+  readonly expression: string;
+  readonly englishMeaning: string;
+  readonly arabicMeaning: string;
+  readonly type?: 'collocation' | 'idiom' | 'phrasal_verb' | 'common_expression';
+  readonly exampleSentence?: string;
+  readonly context?: string;
+}
+
+/**
  * Comprehensive structured dictionary entry for a headword.
  */
 export interface DictionaryEntry {
@@ -74,6 +86,7 @@ export interface DictionaryEntry {
   readonly pronunciation?: DictionaryPronunciation | null;
   readonly primaryPartOfSpeech: DictionaryPartOfSpeech;
   readonly senses: readonly DictionarySense[];
+  readonly expressions?: readonly DictionaryExpression[];
   readonly commonExpressions?: readonly string[];
   readonly collocations?: readonly string[];
   readonly phrasalUses?: readonly string[];
@@ -142,6 +155,7 @@ export interface SensePracticeItem {
   readonly correctChoice: string;
   readonly distractorChoices: readonly string[];
   readonly explanation: string;
+  readonly isQualitativePractice?: boolean;
 }
 
 /**

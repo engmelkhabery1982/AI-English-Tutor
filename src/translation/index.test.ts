@@ -156,20 +156,41 @@ describe('Translation Core (Phase 1)', () => {
     }
   });
 
-  it('13. long-text chunking preserves every character/paragraph logically', () => {
-    const paragraph1 = 'First paragraph with some text about linguistics and artificial intelligence.';
-    const paragraph2 = 'Second paragraph delving into natural language processing and bilingual translation.';
-    const paragraph3 = 'Third paragraph summarizing the findings and concluding the research.';
-    const fullText = `${paragraph1}\n\n${paragraph2}\n\n${paragraph3}`;
+  it('13. long-text chunking guarantees EXACT character preservation without dropping or altering whitespace', () => {
+    const paragraph1 = '  First indented paragraph with \t tabs and spaces.';
+    const paragraph2 = 'Second paragraph\r\nwith Windows-style line breaks and   multiple   spaces.';
+    const paragraph3 = 'Third paragraph with emojis 🚀💡 and Arabic diacritics: كَتَبَ، قَرَأَ، دَرَسَ.\n\n\nTriple newline above.';
+    const fullText = `${paragraph1}\n\n${paragraph2}\r\n\r\n${paragraph3}`;
 
-    const chunks = chunkLongText(fullText, { maxChunkSize: 100 });
+    const chunks = chunkLongText(fullText, { maxChunkSize: 60 });
     expect(chunks.length).toBeGreaterThanOrEqual(3);
 
-    // Verify all chunks together contain the original text content
-    const combined = chunks.map((c) => c.text).join('\n\n');
-    expect(combined).toContain('First paragraph');
-    expect(combined).toContain('Second paragraph');
-    expect(combined).toContain('Third paragraph');
+    // Invariant: chunks.map(c => c.text).join('') === originalText
+    const reconstructed = chunks.map((c) => c.text).join('');
+    expect(reconstructed).toBe(fullText);
+
+    // Invariant: startOffset and endOffset match exact slice positions in source text
+    for (const chunk of chunks) {
+      expect(fullText.slice(chunk.startOffset, chunk.endOffset)).toBe(chunk.text);
+      expect(chunk.characterCount).toBe(chunk.text.length);
+    }
+  });
+
+  it('13b. exact text preservation on complex inputs (markdown, code, long tokens without spaces)', () => {
+    const complexText =
+      '# Heading 1\n\n```typescript\nfunction test() {\n\tconst a = 1;\n\treturn a;\n}\n```\n\n' +
+      '* List item 1\n* List item 2\n\n' +
+      'A_very_long_unbroken_token_exceeding_standard_chunk_boundaries_abcdefghijklmnopqrstuvwxyz0123456789\n\n' +
+      'Trailing spaces after this line.    \n\nFinal words.';
+
+    const chunks = chunkLongText(complexText, { maxChunkSize: 45 });
+    expect(chunks.length).toBeGreaterThan(1);
+
+    expect(chunks.map((c) => c.text).join('')).toBe(complexText);
+
+    for (const chunk of chunks) {
+      expect(complexText.slice(chunk.startOffset, chunk.endOffset)).toBe(chunk.text);
+    }
   });
 
   it('14. chunk order is strictly preserved', () => {

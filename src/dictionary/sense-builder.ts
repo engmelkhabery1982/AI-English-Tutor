@@ -9,6 +9,7 @@ import type {
   ContextCertainty,
   ContextualMeaningResult,
   DictionaryEntry,
+  DictionaryExpression,
   DictionaryLearningCandidates,
   DictionaryPartOfSpeech,
   DictionaryRegister,
@@ -179,8 +180,9 @@ export function parseDictionaryEntry(rawText: string, fallbackWord: string): Dic
             ? (s.translation as string).trim()
             : '';
 
-      // Must have at least an English definition or Arabic meaning
-      if (!englishDefinition && !arabicMeaning) return;
+      // Must have BOTH genuine English definition AND genuine Arabic meaning
+      // Never substitute or copy one language into the other
+      if (!englishDefinition || !arabicMeaning) return;
 
       const examples = normalizeSenseExamples(s.examples, senseId);
       const contexts = normalizeStringArray(s.contexts);
@@ -193,8 +195,8 @@ export function parseDictionaryEntry(rawText: string, fallbackWord: string): Dic
         senseId,
         partOfSpeech,
         distinction,
-        englishDefinition: englishDefinition || arabicMeaning,
-        arabicMeaning: arabicMeaning || englishDefinition,
+        englishDefinition,
+        arabicMeaning,
         examples,
         contexts: contexts.length > 0 ? contexts : ['general'],
         register,
@@ -223,6 +225,60 @@ export function parseDictionaryEntry(rawText: string, fallbackWord: string): Dic
       parsed.primaryPartOfSpeech ?? senses[0]?.partOfSpeech
     );
 
+    // Parse structured expressions carrying real semantic data
+    const expressions: DictionaryExpression[] = [];
+    if (Array.isArray(parsed.expressions)) {
+      for (const item of parsed.expressions) {
+        if (typeof item === 'object' && item !== null) {
+          const raw = item as Record<string, unknown>;
+          const expr = typeof raw.expression === 'string' ? raw.expression.trim() : '';
+          const enMeaning =
+            typeof raw.englishMeaning === 'string'
+              ? raw.englishMeaning.trim()
+              : typeof raw.meaning === 'string'
+                ? (raw.meaning as string).trim()
+                : '';
+          const arMeaning =
+            typeof raw.arabicMeaning === 'string'
+              ? raw.arabicMeaning.trim()
+              : typeof raw.arabic === 'string'
+                ? (raw.arabic as string).trim()
+                : '';
+
+          // Only include when genuine expression, englishMeaning, and arabicMeaning exist
+          if (expr && enMeaning && arMeaning) {
+            const rawType = typeof raw.type === 'string' ? raw.type.trim().toLowerCase() : '';
+            const type: DictionaryExpression['type'] =
+              rawType === 'idiom' ||
+              rawType === 'phrasal_verb' ||
+              rawType === 'common_expression' ||
+              rawType === 'collocation'
+                ? (rawType as DictionaryExpression['type'])
+                : 'collocation';
+
+            const exampleSentence =
+              typeof raw.exampleSentence === 'string' && raw.exampleSentence.trim().length > 0
+                ? raw.exampleSentence.trim()
+                : undefined;
+
+            const context =
+              typeof raw.context === 'string' && raw.context.trim().length > 0
+                ? raw.context.trim()
+                : undefined;
+
+            expressions.push({
+              expression: expr,
+              englishMeaning: enMeaning,
+              arabicMeaning: arMeaning,
+              type,
+              exampleSentence,
+              context,
+            });
+          }
+        }
+      }
+    }
+
     const commonExpressions = normalizeStringArray(parsed.commonExpressions);
     const collocations = normalizeStringArray(parsed.collocations);
     const phrasalUses = normalizeStringArray(parsed.phrasalUses);
@@ -233,6 +289,7 @@ export function parseDictionaryEntry(rawText: string, fallbackWord: string): Dic
       pronunciation,
       primaryPartOfSpeech,
       senses,
+      expressions: expressions.length > 0 ? expressions : undefined,
       commonExpressions: commonExpressions.length > 0 ? commonExpressions : undefined,
       collocations: collocations.length > 0 ? collocations : undefined,
       phrasalUses: phrasalUses.length > 0 ? phrasalUses : undefined,
@@ -360,39 +417,19 @@ export function buildLearningCandidates(entry: DictionaryEntry): DictionaryLearn
 
   const expressionCandidates: SaveExpressionCandidate[] = [];
 
-  // Add collocations
-  if (entry.collocations) {
-    for (const coll of entry.collocations) {
-      expressionCandidates.push({
-        expression: coll,
-        type: 'collocation',
-        meaning: `Common collocation with '${entry.word}'`,
-        arabicMeaning: `تعبير متلازم شائع مع '${entry.word}'`,
-      });
-    }
-  }
-
-  // Add expressions
-  if (entry.commonExpressions) {
-    for (const expr of entry.commonExpressions) {
-      expressionCandidates.push({
-        expression: expr,
-        type: 'common_expression',
-        meaning: `Idiomatic or common expression: '${expr}'`,
-        arabicMeaning: `تعبير اصطلاحي شائع: '${expr}'`,
-      });
-    }
-  }
-
-  // Add phrasal uses
-  if (entry.phrasalUses) {
-    for (const phr of entry.phrasalUses) {
-      expressionCandidates.push({
-        expression: phr,
-        type: 'phrasal_verb',
-        meaning: `Phrasal usage of '${entry.word}': '${phr}'`,
-        arabicMeaning: `فعل مركب من '${entry.word}': '${phr}'`,
-      });
+  // Expose SaveExpressionCandidate ONLY when real semantic meaning data exists
+  // Never invent placeholder English or Arabic meanings
+  if (entry.expressions) {
+    for (const expr of entry.expressions) {
+      if (expr.expression && expr.englishMeaning && expr.arabicMeaning) {
+        expressionCandidates.push({
+          expression: expr.expression,
+          type: expr.type ?? 'collocation',
+          meaning: expr.englishMeaning,
+          arabicMeaning: expr.arabicMeaning,
+          exampleSentence: expr.exampleSentence,
+        });
+      }
     }
   }
 

@@ -116,6 +116,8 @@ export interface TextChunk {
   readonly index: number;
   readonly text: string;
   readonly characterCount: number;
+  readonly startOffset: number;
+  readonly endOffset: number;
 }
 
 /**
