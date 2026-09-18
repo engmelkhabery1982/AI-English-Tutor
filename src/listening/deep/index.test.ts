@@ -1404,7 +1404,7 @@ describe('DeepListeningPanel lifecycle & voice composition hardening', () => {
     );
     expect(screenSource).toContain('shadowingTokenRef');
     expect(screenSource).toContain('resolveVoiceInput');
-    expect(screenSource).toContain('shadowing.controller.dispose()');
+    expect(screenSource).toContain('activeController?.dispose()');
     expect(screenSource).toContain('ttsRef.current?.stop()');
   });
 });

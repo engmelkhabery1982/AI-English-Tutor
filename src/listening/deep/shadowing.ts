@@ -324,6 +324,7 @@ export class ShadowingSession {
     transcript: string | null,
     port?: ShadowingPronunciationPort,
     now?: string,
+    checkStale?: () => boolean,
   ): Promise<ShadowingAttempt> {
     const outcome = await runShadowingAttempt({
       chunk: this.chunk,
@@ -331,6 +332,9 @@ export class ShadowingSession {
       ...(port !== undefined ? { port } : {}),
       ...(now !== undefined ? { now } : {}),
     });
+    if (checkStale?.()) {
+      return outcome;
+    }
     if (outcome.judged) {
       this.attempts += 1;
       this.lastAttempt = outcome;
@@ -547,8 +551,17 @@ export class ShadowingVoiceController {
     if (this.disposed || this.generation !== token) {
       return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
     }
-    if (this.submitOverride) return this.submitOverride(transcript);
-    return this.session.submit(transcript, this.port, this.now);
+    const checkStale = () => this.disposed || this.generation !== token;
+    let result: ShadowingAttempt;
+    if (this.submitOverride) {
+      result = await this.submitOverride(transcript);
+    } else {
+      result = await this.session.submit(transcript, this.port, this.now, checkStale);
+    }
+    if (checkStale()) {
+      return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+    }
+    return result;
   }
 
   /** Abandon the recording without transcribing or judging anything. */

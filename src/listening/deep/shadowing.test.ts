@@ -759,4 +759,84 @@ describe('Blocker 3 — Stale voice work & controller lifecycle', () => {
     expect('ok' in res && res.ok === false).toBe(true);
     expect(session.attemptCount).toBe(0);
   });
+
+  it('dispose while pronunciation analysis pending => late pronunciation result does NOT mutate session attemptCount/support', async () => {
+    const recorder = fakeRecorder();
+    const stt = fakeStt(async () => ({ ok: true, transcript: CHUNK }));
+
+    let resolvePronunciation: ((value: PronunciationTurnOutcome | null) => void) | null = null;
+    const slowPort: ShadowingPronunciationPort = {
+      analyzeSpokenTurn: async () => new Promise((resolve) => {
+        resolvePronunciation = resolve;
+      }),
+    };
+
+    const session = sessionWith({ baseSupport: 'full_transcript' });
+    const controller = new ShadowingVoiceController(session, {
+      recorder,
+      stt,
+      port: slowPort,
+      now: NOW,
+    });
+
+    await controller.startRecording();
+    const judgePromise = controller.stopAndJudge();
+
+    // STT completes fast, pronunciation analysis is now pending
+    expect(session.attemptCount).toBe(0);
+    expect(session.support).toBe('full_transcript');
+
+    // Dispose controller while pronunciation is pending
+    await controller.dispose();
+
+    // Late pronunciation resolves
+    if (resolvePronunciation) {
+      (resolvePronunciation as (value: PronunciationTurnOutcome | null) => void)(outcome());
+    }
+
+    const res = await judgePromise;
+
+    // Controller reports failure/busy
+    expect('ok' in res && res.ok === false).toBe(true);
+
+    // Attempt count remains 0, qualitative history/support remains unchanged, no feedback committed
+    expect(session.attemptCount).toBe(0);
+    expect(session.support).toBe('full_transcript');
+    expect(session.transcript).toBeNull();
+
+    // Replacement activity controller works normally
+    const session2 = sessionWith({ baseSupport: 'full_transcript' });
+    const controller2 = new ShadowingVoiceController(session2, {
+      recorder: fakeRecorder(),
+      stt: fakeStt(async () => ({ ok: true, transcript: CHUNK })),
+      port: fakePort(outcome()),
+      now: NOW,
+    });
+
+    await controller2.startRecording();
+    const res2 = await controller2.stopAndJudge();
+    expect('ok' in res2).toBe(false);
+    expect(session2.attemptCount).toBe(1);
+    expect(session2.support).toBe('partial_transcript');
+  });
+
+  it('unmount/replacement disposes exact old controller and stops recorder', async () => {
+    const recorder = fakeRecorder();
+    const stt = fakeStt(async () => ({ ok: true, transcript: CHUNK }));
+    const session1 = sessionWith();
+    const controller1 = new ShadowingVoiceController(session1, { recorder, stt, now: NOW });
+
+    await controller1.startRecording();
+    expect(recorder.isRecording()).toBe(true);
+
+    await controller1.dispose();
+    expect(recorder.isRecording()).toBe(false);
+
+    const session2 = sessionWith();
+    const controller2 = new ShadowingVoiceController(session2, { recorder, stt, now: NOW });
+    await controller2.startRecording();
+    expect(recorder.isRecording()).toBe(true);
+    await controller2.dispose();
+  });
+
 });

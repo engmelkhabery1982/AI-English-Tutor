@@ -130,6 +130,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
   const ttsRef = useRef<TextToSpeechProvider | null>(props.ttsProvider ?? null);
   const capabilityRef = useRef<SpeechRateCapability>(resolveSpeechRateCapability(props.ttsProvider));
   const shadowingTokenRef = useRef<number>(0);
+  const controllerRef = useRef<ShadowingVoiceController | null>(null);
   /** The current shadowing practice session (state so the UI really re-renders). */
   const [shadowing, setShadowing] = useState<{
     readonly session: ShadowingSession;
@@ -211,6 +212,17 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
     void start();
   }, [start]);
 
+  // Unmount cleanup: dispose active shadowing controller and stop active TTS
+  useEffect(() => {
+    return () => {
+      shadowingTokenRef.current += 1;
+      const activeController = controllerRef.current;
+      controllerRef.current = null;
+      void activeController?.dispose();
+      void ttsRef.current?.stop();
+    };
+  }, []);
+
   /**
    * The honest multi-speaker note for the current activity: one synthesized
    * voice is never presented as several real voices.
@@ -229,11 +241,12 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
     let active = true;
     const token = (shadowingTokenRef.current += 1);
 
+    const oldController = controllerRef.current;
+    controllerRef.current = null;
+    void oldController?.dispose();
+
     if (!activity || activity.taskType !== 'shadowing') {
-      setShadowing((prev) => {
-        if (prev) void prev.controller.dispose();
-        return null;
-      });
+      setShadowing(null);
       setIsRecording(false);
       setShadowingResult(null);
       return;
@@ -265,10 +278,8 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
         submit: (transcript: string) => service.submitShadowingAttempt(session, transcript),
       });
 
-      setShadowing((prev) => {
-        if (prev) void prev.controller.dispose();
-        return { session, controller };
-      });
+      controllerRef.current = controller;
+      setShadowing({ session, controller });
       setIsRecording(false);
       setShadowingResult(null);
     })();
@@ -276,6 +287,9 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
     return () => {
       active = false;
       shadowingTokenRef.current += 1;
+      const c = controllerRef.current;
+      controllerRef.current = null;
+      void c?.dispose();
     };
   }, [activity, props.recorder, props.stt, service]);
 
@@ -405,9 +419,9 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
   const handleNext = (): void => {
     setErrorMessage(null);
     shadowingTokenRef.current += 1;
-    if (shadowing) {
-      void shadowing.controller.dispose();
-    }
+    const activeController = controllerRef.current ?? shadowing?.controller;
+    controllerRef.current = null;
+    void activeController?.dispose();
     void ttsRef.current?.stop();
 
     if (stepIndex + 1 < steps.length) {
