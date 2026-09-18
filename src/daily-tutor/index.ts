@@ -39,6 +39,7 @@ export * from './planner';
 export * from './completion';
 export * from './navigation';
 export * from './view';
+export * from './launch';
 export * from './service';
 
 /**

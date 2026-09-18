@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useState, useRef } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
@@ -9,15 +9,23 @@ import {
   View,
 } from 'react-native';
 import type { ViewStyle } from 'react-native';
-import { useNavigation, useRoute } from '@react-navigation/native';
+import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 import type { ReviewService } from '../review/service';
 import { createReviewService } from '../review/factory';
 import type { ReviewItemCandidate, EvaluationResult, ReviewDashboardSummary } from '../review/types';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { LearnerWeakness } from '../domain/models/learner';
-import type { DailyTutorReviewLaunch } from '../daily-tutor';
-import { reportDailyTutorCompletion } from '../daily-tutor';
+import type { DailyTutorReviewLaunch, DailyTutorLaunchState } from '../daily-tutor';
+import {
+  DAILY_TUTOR_LAUNCH_IDLE,
+  beginStandaloneSession,
+  captureDailyTutorLaunch,
+  clearDailyTutorReturn,
+  endDailyTutorVisit,
+  finishDailyTutorWorkflow,
+  reportDailyTutorCompletion,
+} from '../daily-tutor';
 import {
   SQLiteUserProfileRepository,
 } from '../data/local/sqlite/repositories';
@@ -133,7 +141,40 @@ export interface ReviewScreenProps {
 export default function ReviewScreen(props?: ReviewScreenProps) {
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
   const route = useRoute() as { readonly params?: { readonly dailyTutor?: DailyTutorReviewLaunch } };
-  const dailyTutorRef = route.params?.dailyTutor;
+
+  /**
+   * ONE-SHOT Daily Tutor launch context. React Navigation keeps params
+   * attached to a TAB route, so the `dailyTutor` param is captured ONCE
+   * into local state and immediately CONSUMED (cleared from the route).
+   * The captured context lives only for that child workflow; a later
+   * standalone open of this tab has NO Daily Tutor behavior.
+   */
+  const [dailyLaunch, setDailyLaunch] = useState<DailyTutorLaunchState<DailyTutorReviewLaunch>>(
+    DAILY_TUTOR_LAUNCH_IDLE,
+  );
+  /** Auto-start guard: at most one auto-start per Daily Tutor activity. */
+  const dailyAutoStartedRef = useRef<string | null>(null);
+  const routeLaunch = route.params?.dailyTutor;
+  useEffect(() => {
+    if (!routeLaunch) return;
+    setDailyLaunch((current) => captureDailyTutorLaunch(current, { dailyTutor: routeLaunch }).state);
+    // A fresh Daily Tutor launch may auto-start its bounded workflow, even
+    // when the very same activity is relaunched after an abandoned attempt.
+    dailyAutoStartedRef.current = null;
+    // ONE-SHOT: consume the launch param from the tab route.
+    navigation.setParams({ dailyTutor: undefined });
+  }, [routeLaunch, navigation]);
+  /** The captured context of the ACTIVE Daily Tutor workflow, if any. */
+  const dailyTutorRef = dailyLaunch.active;
+  // Leaving the tab ends the Daily Tutor VISIT affordance, but an active
+  // workflow keeps its captured ref until its real completion.
+  useFocusEffect(
+    useCallback(() => {
+      return () => {
+        setDailyLaunch((current) => clearDailyTutorReturn(current));
+      };
+    }, []),
+  );
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [isDemoMode, setIsDemoMode] = useState<boolean>(props?.initialDemoMode ?? false);
@@ -368,7 +409,6 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
    * flow itself is completely unchanged — this only triggers the existing
    * start handler with the bounded options.
    */
-  const dailyAutoStartedRef = useRef<string | null>(null);
   useEffect(() => {
     if (!dailyTutorRef || isDemoMode) return;
     if (sessionState !== 'dashboard' || loading || hasNoProfile) return;
@@ -501,7 +541,9 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       }
       // Daily Tutor handshake: report the REAL review completion (real mode
       // only — demo items are never real practice). Exiting early never
-      // reaches this point, so an unfinished review never completes.
+      // reaches this point, so an unfinished review never completes. The
+      // captured launch is ONE-SHOT: once its workflow really completed and
+      // reported, it is consumed — a later session in this tab is standalone.
       if (dailyTutorRef && !isDemoMode) {
         reportDailyTutorCompletion({
           ref: {
@@ -512,6 +554,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           completedAt: new Date().toISOString(),
           itemsPracticed: sessionCandidates.length,
         });
+        setDailyLaunch((current) => finishDailyTutorWorkflow(current));
       }
       setSessionState('completed');
     }
@@ -519,6 +562,9 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
 
   const handleExitSession = () => {
     setSessionState('dashboard');
+    // Leaving the session ends any Daily Tutor visit context — later use of
+    // this tab is standalone.
+    setDailyLaunch((current) => endDailyTutorVisit(current));
     loadDashboardMetrics();
   };
 
@@ -588,7 +634,12 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
               styles.startSessionButton,
               (hasNoProfile && !isDemoMode) && styles.startSessionButtonDisabled
             ]}
-            onPress={() => void handleStartSession()}
+            onPress={() => {
+              // A user-started session is NEVER the Daily Tutor workflow:
+              // clear any lingering launch context, then start normally.
+              setDailyLaunch((current) => beginStandaloneSession(current));
+              void handleStartSession();
+            }}
             disabled={hasNoProfile && !isDemoMode}
             accessibilityRole="button"
             id="start_review_button"
@@ -868,10 +919,13 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
         >
           <Text style={styles.doneButtonText}>Return to Dashboard</Text>
         </TouchableOpacity>
-        {dailyTutorRef ? (
+        {dailyLaunch.showReturn ? (
           <TouchableOpacity
             style={styles.doneButton}
-            onPress={() => navigation.navigate('DailyTutor')}
+            onPress={() => {
+              setDailyLaunch((current) => endDailyTutorVisit(current));
+              navigation.navigate('DailyTutor');
+            }}
           >
             <Text style={styles.doneButtonText}>Back to today&apos;s practice</Text>
           </TouchableOpacity>

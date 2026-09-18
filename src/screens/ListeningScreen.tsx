@@ -27,7 +27,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { useNavigation, useRoute } from '@react-navigation/native';
+import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 import type { TextToSpeechProvider } from '../talk-demo';
 import type { ListeningService } from '../listening';
@@ -37,8 +37,16 @@ import type {
   ListeningEvaluation,
   ListeningExercise,
 } from '../listening';
-import type { DailyTutorActivityRef } from '../daily-tutor';
-import { reportDailyTutorCompletion } from '../daily-tutor';
+import type { DailyTutorActivityRef, DailyTutorLaunchState } from '../daily-tutor';
+import {
+  DAILY_TUTOR_LAUNCH_IDLE,
+  beginStandaloneSession,
+  captureDailyTutorLaunch,
+  clearDailyTutorReturn,
+  endDailyTutorVisit,
+  finishDailyTutorWorkflow,
+  reportDailyTutorCompletion,
+} from '../daily-tutor';
 
 export interface ListeningScreenProps {
   /** Injectable service (tests/composition); defaults to the real factory. */
@@ -71,10 +79,41 @@ interface SessionState {
 
 export default function ListeningScreen(props?: ListeningScreenProps) {
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
-  // Daily Tutor handshake: present ONLY when the Daily Tutor launched this
-  // screen; standalone use of the Listening tab never sets it.
   const route = useRoute() as { readonly params?: { readonly dailyTutor?: DailyTutorActivityRef } };
-  const dailyTutorRef = route.params?.dailyTutor;
+
+  /**
+   * ONE-SHOT Daily Tutor launch context. React Navigation keeps params
+   * attached to a TAB route, so the `dailyTutor` param is captured ONCE
+   * into local state and immediately CONSUMED (cleared from the route).
+   * The captured context lives only for that child workflow; a later
+   * standalone open of this tab has NO Daily Tutor behavior.
+   */
+  const [dailyLaunch, setDailyLaunch] = useState<DailyTutorLaunchState<DailyTutorActivityRef>>(
+    DAILY_TUTOR_LAUNCH_IDLE,
+  );
+  /** Auto-start guard: at most one auto-start per Daily Tutor activity. */
+  const dailyAutoStartedRef = useRef<string | null>(null);
+  const routeLaunch = route.params?.dailyTutor;
+  useEffect(() => {
+    if (!routeLaunch) return;
+    setDailyLaunch((current) => captureDailyTutorLaunch(current, { dailyTutor: routeLaunch }).state);
+    // A fresh Daily Tutor launch may auto-start its workflow, even when the
+    // very same activity is relaunched after an abandoned attempt.
+    dailyAutoStartedRef.current = null;
+    // ONE-SHOT: consume the launch param from the tab route.
+    navigation.setParams({ dailyTutor: undefined });
+  }, [routeLaunch, navigation]);
+  /** The captured context of the ACTIVE Daily Tutor workflow, if any. */
+  const dailyTutorRef = dailyLaunch.active;
+  // Leaving the tab ends the Daily Tutor VISIT affordance, but an active
+  // workflow keeps its captured ref until its real completion.
+  useFocusEffect(
+    useCallback(() => {
+      return () => {
+        setDailyLaunch((current) => clearDailyTutorReturn(current));
+      };
+    }, []),
+  );
   const [session, setSession] = useState<SessionState | null>(null);
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [answer, setAnswer] = useState<string>('');
@@ -155,12 +194,21 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
   }, [difficulty, isStarting]);
 
   /**
+   * A user-started session is NEVER the Daily Tutor workflow: clear any
+   * lingering launch context (no auto-start, no completion report, no
+   * return affordance), then start through the existing handler.
+   */
+  const handleStartSession = useCallback(() => {
+    setDailyLaunch((current) => beginStandaloneSession(current));
+    void startSession();
+  }, [startSession]);
+
+  /**
    * Daily Tutor launch: when this screen was opened by the Daily Tutor, start
    * the existing listening session automatically (once per activity). The
    * Listening Engine remains the owner of the session — this only triggers
    * the existing start handler.
    */
-  const dailyAutoStartedRef = useRef<string | null>(null);
   useEffect(() => {
     if (!dailyTutorRef) return;
     if (!serviceReady || session || sessionDone) return;
@@ -314,13 +362,16 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
     }
     // Daily Tutor handshake: report the REAL listening completion with the
     // real exercise count. Exiting mid-session never reaches this point, so
-    // an unfinished listening activity never completes.
+    // an unfinished listening activity never completes. The captured launch
+    // is ONE-SHOT: once its workflow really completed and reported, it is
+    // consumed — a later session in this tab is standalone.
     if (dailyTutorRef) {
       reportDailyTutorCompletion({
         ref: dailyTutorRef,
         completedAt: new Date().toISOString(),
         itemsPracticed: session.exercises.length,
       });
+      setDailyLaunch((current) => finishDailyTutorWorkflow(current));
     }
   };
 
@@ -357,7 +408,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
 
         <TouchableOpacity
           style={[styles.startButton, isStarting && styles.startButtonDisabled]}
-          onPress={startSession}
+          onPress={handleStartSession}
           disabled={isStarting}
           testID="start_listening_button"
           accessibilityRole="button"
@@ -386,13 +437,16 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
             understood · {problemCount} to retrain later
           </Text>
           <Text style={styles.sourceNote}>{session.sourceNote}</Text>
-          <TouchableOpacity style={styles.startButton} onPress={startSession}>
+          <TouchableOpacity style={styles.startButton} onPress={handleStartSession}>
             <Text style={styles.startButtonText}>Practice again</Text>
           </TouchableOpacity>
-          {dailyTutorRef ? (
+          {dailyLaunch.showReturn ? (
             <TouchableOpacity
               style={styles.startButton}
-              onPress={() => navigation.navigate('DailyTutor')}
+              onPress={() => {
+                setDailyLaunch((current) => endDailyTutorVisit(current));
+                navigation.navigate('DailyTutor');
+              }}
             >
               <Text style={styles.startButtonText}>Back to today&apos;s practice</Text>
             </TouchableOpacity>

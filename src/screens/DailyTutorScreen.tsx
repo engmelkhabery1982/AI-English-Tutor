@@ -164,7 +164,8 @@ export default function DailyTutorScreen(props?: DailyTutorScreenProps) {
       );
       if (!current) return;
       const started = await service.startActivity(current.id);
-      if (started) {
+      // Real unmount during the await: no state write afterwards.
+      if (started && !unmountedRef.current) {
         setSession(started);
       }
       const route = await service.getChildRoute(current.id);
@@ -174,7 +175,9 @@ export default function DailyTutorScreen(props?: DailyTutorScreenProps) {
       // Navigation/launch failure changes nothing; the learner can retry.
     } finally {
       startingRef.current = false;
-      setIsBusy(false);
+      if (!unmountedRef.current) {
+        setIsBusy(false);
+      }
     }
   }, [navigation, session]);
 
@@ -199,7 +202,9 @@ export default function DailyTutorScreen(props?: DailyTutorScreenProps) {
       // A failed skip changes nothing.
     } finally {
       skippingRef.current = false;
-      setIsBusy(false);
+      if (!unmountedRef.current) {
+        setIsBusy(false);
+      }
     }
   }, [session]);
 

@@ -346,7 +346,12 @@ function buildCandidates(input: DailyTutorPlanningInput): ActivityCandidate[] {
     push({
       kind: 'review',
       title: `Quick review — ${limit} due ${limit === 1 ? 'item' : 'items'}`,
-      reason: `${input.dueOtherReviewCount} review ${input.dueOtherReviewCount === 1 ? 'item is' : 'items are'} due (grammar, pronunciation, listening).`,
+      // TARGET FIDELITY: without a kind filter the existing Review flow
+      // builds its own balanced pool from everything due (review items,
+      // weaknesses, vocabulary, expressions) — so the reason states the
+      // real due evidence but never claims WHICH categories the session
+      // will train.
+      reason: `${input.dueOtherReviewCount} review ${input.dueOtherReviewCount === 1 ? 'item is' : 'items are'} due — the existing Review flow will choose the bounded due subset.`,
       target: { reviewLimit: limit },
       priority: 100 + Math.min(input.dueOtherReviewCount, 20) * 2,
       family: 'review',

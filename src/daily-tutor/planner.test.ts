@@ -579,6 +579,37 @@ describe('target fidelity: the plan never claims a target the child cannot train
     expect(expressions!.title).toBe('Review 3 due expressions');
   });
 
+  it('generic review: due evidence only — never claims which categories the session trains', () => {
+    const plan = planDailyTutorSession(emptyInput({ dueOtherReviewCount: 3 }));
+    const review = plan.activities.find((a) => a.kind === 'review');
+    expect(review).toBeDefined();
+    // The bounded subset is requested WITHOUT a kind filter — the existing
+    // Review flow chooses the due items itself.
+    expect(review!.target).toEqual({ reviewLimit: 3 });
+    expect(review!.reason).toContain('3 review items are due');
+    expect(review!.reason).toContain(
+      'the existing Review flow will choose the bounded due subset',
+    );
+    // No unclaimable category promises.
+    expect(review!.reason).not.toContain('grammar');
+    expect(review!.reason).not.toContain('pronunciation');
+    expect(review!.reason).not.toContain('listening');
+  });
+
+  it('vocabulary/expression reviews keep their real kind-specific bounded path (accuracy preserved)', () => {
+    const plan = planDailyTutorSession(
+      emptyInput({ dueVocabularyCount: 4, dueExpressionCount: 2 }),
+    );
+    const vocabulary = plan.activities.find((a) => a.kind === 'vocabulary')!;
+    const expressions = plan.activities.find((a) => a.kind === 'expressions')!;
+    // These ARE conditioned on the kind (the Review flow filters by it), so
+    // the specific claims stay.
+    expect(vocabulary.target).toEqual({ reviewKind: 'vocabulary', reviewLimit: 4 });
+    expect(expressions.target).toEqual({ reviewKind: 'expression', reviewLimit: 2 });
+    expect(vocabulary.reason).toContain('4 saved words are due for review');
+    expect(expressions.reason).toContain('2 saved expressions are due for review');
+  });
+
   it('pronunciation: no specific target or curriculum skill is claimed (engine self-plans)', () => {
     const evidence = { unresolvedPronunciationCount: 3, pronunciationTargets: ['th sound', 'r/l'] };
     const plan = planDailyTutorSession(emptyInput(evidence));
