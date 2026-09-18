@@ -349,6 +349,7 @@ describe('child routes match the REAL navigator hierarchy', () => {
       'DailyTutor',
       'AdaptiveLesson',
       'DeepSpeaking',
+      'FluencyPractice',
       'ProfessionalEnglish',
       'Onboarding',
     ]);

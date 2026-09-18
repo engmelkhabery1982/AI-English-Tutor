@@ -24,6 +24,7 @@ describe('route tables (single source of truth)', () => {
       'DailyTutor',
       'AdaptiveLesson',
       'DeepSpeaking',
+      'FluencyPractice',
       'ProfessionalEnglish',
       'Onboarding',
     ]);
