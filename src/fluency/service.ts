@@ -488,14 +488,7 @@ export class FluencyPracticeService {
         })
       ) {
         this.consecutiveStrong += 1;
-        if (this.deps.successRecorder) {
-          await recordFluencySuccess(this.deps.successRecorder, {
-            learnerId: (this.deps.speaking as any)?.learnerModel?.getCoachingContext?.()?.profile?.learnerId ?? 'learner',
-            referenceId: `fluency:${task.id}`,
-            context: `support:${this.supportLevel}`,
-            summary: `Strong fluency attempt on ${task.title}`,
-          });
-        }
+        await this.persistStrongAttemptSuccess(task);
       } else {
         this.consecutiveStrong = 0;
       }
@@ -568,6 +561,53 @@ export class FluencyPracticeService {
       errorMessage:
         'The conversation changed before this attempt finished, so it was discarded. Nothing was added to the new task.',
     };
+  }
+
+  /* --------------------------- evidence ------------------------------- */
+
+  /**
+   * Persist success evidence for ONE committed strong attempt.
+   *
+   * WP-4 identity integrity: the learner id comes from the OWNING speaking
+   * service (`speaking.getLearnerId()`, a narrow accessor over the existing
+   * learner model). There is NO `as any` reach-through and NO placeholder
+   * fallback:
+   * - demo/offline practice (`isRealAI === false`) writes no trusted strength;
+   * - a failed AI attempt and a stale attempt never reach this method;
+   * - an unavailable learner id writes NOTHING — no fabricated learner row.
+   *
+   * Persistence failure is non-destructive: a recorder error never breaks the
+   * practice or the committed attempt the learner already made.
+   */
+  private async persistStrongAttemptSuccess(task: FluencyTask): Promise<void> {
+    const recorder = this.deps.successRecorder;
+    if (!recorder) return;
+    // Demo practice is counted, never trusted: no evaluative strength.
+    if (!this.isRealAI) return;
+    const learnerId = this.resolveLearnerId();
+    if (!learnerId) return;
+    try {
+      await recordFluencySuccess(recorder, {
+        learnerId,
+        referenceId: `fluency:${task.id}`,
+        context: `support:${this.supportLevel}`,
+        summary: `Strong fluency attempt on ${task.title}`,
+      });
+    } catch {
+      // Evidence persistence never breaks the learner's practice.
+    }
+  }
+
+  /**
+   * The REAL learner id from the owning speaking service, or null when it is
+   * unavailable. Never a fallback value, never a guess.
+   */
+  private resolveLearnerId(): string | null {
+    try {
+      return this.deps.speaking.getLearnerId();
+    } catch {
+      return null;
+    }
   }
 
   /* --------------------- feedback → repeat → next --------------------- */
@@ -733,12 +773,26 @@ export class FluencyPracticeService {
  * Composition factory
  * ------------------------------------------------------------------ */
 
+export interface CreateFluencyPracticeServiceOptions {
+  readonly now?: () => IsoDate;
+  /**
+   * The EXISTING success-observation recorder (WP-4 evidence symmetry).
+   *
+   * Supplying it lets a REAL strong attempt on a REAL learner id persist
+   * strength evidence. Omitting it persists NOTHING — which is the honest
+   * default: the fluency layer never invents a recorder, a learner id or a
+   * strength row.
+   */
+  readonly successRecorder?: SuccessObservationRecorder;
+}
+
 export function createFluencyPracticeService(
   speaking: SpeakingPracticeService,
-  options?: { readonly now?: () => IsoDate },
+  options?: CreateFluencyPracticeServiceOptions,
 ): FluencyPracticeService {
   return new FluencyPracticeService({
     speaking,
     ...(options?.now ? { now: options.now } : {}),
+    ...(options?.successRecorder ? { successRecorder: options.successRecorder } : {}),
   });
 }

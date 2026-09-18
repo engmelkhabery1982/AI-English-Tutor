@@ -10,6 +10,14 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+// @ts-ignore -- node built-ins are available in the vitest runtime; the app tsconfig targets Expo.
+import { readFileSync } from 'node:fs';
+// @ts-ignore -- see above.
+import { dirname, join } from 'node:path';
+// @ts-ignore -- see above.
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 import type {
   AIProvider,
@@ -38,6 +46,12 @@ import {
 import { createDefaultFluencyService } from './index';
 import { getFluencyTask } from './tasks';
 import { MAX_ROUNDS_PER_TASK } from './tasks';
+import { SqlJsAdapter } from '../data/local/sqlite/SqlJsAdapter';
+import {
+  SQLiteUserProfileRepository,
+  SQLiteWeaknessRepository,
+} from '../data/local/sqlite/repositories';
+import { createSuccessObservationRecorder } from '../reassessment';
 
 const NOW = '2026-09-18T10:00:00.000Z';
 const LEARNER_ID = '11111111-1111-4111-8111-111111111111';
@@ -895,5 +909,233 @@ describe('fluency transfer and completion', () => {
     const started = await fluency.startTask(TASK_ID);
     expect(started.supportLevel).toBe('supported');
     expect(fluency.getSnapshot().supportLevel).toBe('supported');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * WP-4 evidence integrity — Blocker 3: fluency may NEVER fabricate a
+ * learner identity. The learner id comes from the owning speaking service
+ * (`speaking.getLearnerId()`), and strength rows are read back from the
+ * EXISTING learner-strength store (real recorder, real SQLite repository).
+ * ------------------------------------------------------------------ */
+
+describe('WP-4 fluency success evidence identity (Blocker 3)', () => {
+  function coachingWithLearnerId(learnerId: string): CoachingContext {
+    const coaching = makeCoaching();
+    return { ...coaching, profile: { ...coaching.profile, learnerId } };
+  }
+
+  /**
+   * Real speaking stack + the EXISTING success recorder over a real local
+   * database that holds a REAL learner profile row (strength rows are
+   * keyed by the learner id, so the fixture must be honest).
+   */
+  async function composeWithEvidence(options: {
+    /** Explicit identity for the learner MODEL ('' = identity unavailable). */
+    readonly learnerId?: string;
+    readonly disableAI?: boolean;
+    readonly scripts?: readonly AIProviderResult[];
+  }): Promise<{
+    readonly fluency: FluencyPracticeService;
+    readonly speaking: SpeakingPracticeService;
+    readonly weaknesses: SQLiteWeaknessRepository;
+    /** The REAL persisted learner id (what strength rows would be keyed by). */
+    readonly persistedLearnerId: string;
+    /** Simulate the identity becoming unavailable while practice continues. */
+    readonly setLearnerId: (learnerId: string) => void;
+  }> {
+    const adapter = new SqlJsAdapter();
+    await adapter.init();
+    const weaknesses = new SQLiteWeaknessRepository(adapter);
+    const profileRepo = new SQLiteUserProfileRepository(adapter);
+    const profile = await profileRepo.update({
+      displayName: 'Fluency Evidence Tester',
+      currentLevel: 'A1',
+      targetLevel: 'B2',
+      learningGoals: [],
+      preferredModes: [],
+    });
+    let currentLearnerId = options.learnerId ?? profile.id;
+    const learnerModel: LearnerModel = {
+      ...createLearnerModelStub(coachingWithLearnerId(currentLearnerId)),
+      getCoachingContext: () => coachingWithLearnerId(currentLearnerId),
+    };
+    const speaking = new SpeakingPracticeService({
+      learnerModel,
+      ...(options.disableAI
+        ? { disableAI: true }
+        : { aiProvider: createScriptedProvider(options.scripts ?? []).provider }),
+      memoryService: createMemoryHarness().service,
+      learningPersistence: createLearningHarness().service,
+      now: () => NOW,
+    });
+    const fluency = createFluencyPracticeService(speaking, {
+      now: () => NOW,
+      successRecorder: createSuccessObservationRecorder(weaknesses),
+    });
+    return {
+      fluency,
+      speaking,
+      weaknesses,
+      persistedLearnerId: profile.id,
+      setLearnerId: (next: string) => {
+        currentLearnerId = next;
+      },
+    };
+  }
+
+  it('real learner id + real strong attempt persists strength for that learner', async () => {
+    const { fluency, speaking, weaknesses, persistedLearnerId } = await composeWithEvidence({
+      scripts: [
+        okResponse('Welcome. Please begin the task.'),
+        okResponse('Good, no correction.'),
+      ],
+    });
+    // The owning service exposes the REAL learner id (no reach-through).
+    expect(speaking.getLearnerId()).toBe(persistedLearnerId);
+
+    await fluency.startTask(TASK_ID);
+    const attempt = await fluency.submitAttempt({ transcript: STRONG_TRANSCRIPT });
+    expect(attempt.ok).toBe(true);
+    expect(fluency.getSnapshot().consecutiveStrongAttempts).toBe(1);
+
+    const strengths = await weaknesses.listStrengths(persistedLearnerId);
+    expect(strengths).toHaveLength(1);
+    expect(strengths[0].learnerId).toBe(persistedLearnerId);
+    expect(strengths[0].type).toBe('fluency');
+    expect(strengths[0].referenceId).toBe(`fluency:${TASK_ID}`);
+    await fluency.dispose();
+  });
+
+  it('an identity that disappears mid-practice => NO strength row (never fabricated)', async () => {
+    const {
+      fluency,
+      speaking,
+      weaknesses,
+      persistedLearnerId,
+      setLearnerId,
+    } = await composeWithEvidence({
+      scripts: [
+        okResponse('Welcome. Please begin the task.'),
+        okResponse('Good, no correction.'),
+      ],
+    });
+    await fluency.startTask(TASK_ID);
+    expect(speaking.getLearnerId()).toBe(persistedLearnerId);
+
+    // The learner identity becomes unavailable while the practice continues.
+    setLearnerId('');
+    expect(speaking.getLearnerId()).toBeNull();
+
+    const attempt = await fluency.submitAttempt({ transcript: STRONG_TRANSCRIPT });
+    // The strong attempt is still counted honestly…
+    expect(attempt.ok).toBe(true);
+    expect(fluency.getSnapshot().consecutiveStrongAttempts).toBe(1);
+    // …but no strength row is invented for an unknown learner.
+    expect(await weaknesses.listStrengths(persistedLearnerId)).toHaveLength(0);
+    expect(await weaknesses.listStrengths('learner')).toHaveLength(0);
+    expect(await weaknesses.listStrengths('')).toHaveLength(0);
+    await fluency.dispose();
+  });
+
+  it('with no learner id at all the practice refuses honestly and writes nothing', async () => {
+    const { fluency, weaknesses, persistedLearnerId } = await composeWithEvidence({
+      learnerId: '',
+    });
+    await expect(fluency.startTask(TASK_ID)).rejects.toThrow(/profile/i);
+    expect(fluency.getSnapshot().attemptNumber).toBe(0);
+    expect(await weaknesses.listStrengths(persistedLearnerId)).toHaveLength(0);
+    await fluency.dispose();
+  });
+
+  it('demo mode creates NO trusted strength', async () => {
+    const { fluency, weaknesses, persistedLearnerId } = await composeWithEvidence({
+      disableAI: true,
+    });
+
+    const started = await fluency.startTask(TASK_ID);
+    expect(started.isRealAI).toBe(false);
+    expect(await fluency.submitAttempt({ transcript: STRONG_TRANSCRIPT })).toMatchObject({
+      ok: true,
+    });
+    fluency.requestRepeat();
+    expect(await fluency.submitAttempt({ transcript: STRONG_TRANSCRIPT })).toMatchObject({
+      ok: true,
+    });
+
+    expect(await weaknesses.listStrengths(persistedLearnerId)).toHaveLength(0);
+    await fluency.dispose();
+  });
+
+  it('a failed AI attempt creates no strength', async () => {
+    const { fluency, weaknesses, persistedLearnerId } = await composeWithEvidence({
+      scripts: [
+        okResponse('Welcome. Please begin the task.'),
+        failedResponse('Tutor down.'),
+      ],
+    });
+    await fluency.startTask(TASK_ID);
+    const failed = await fluency.submitAttempt({ transcript: STRONG_TRANSCRIPT });
+    expect(failed.ok).toBe(false);
+    expect(fluency.getSnapshot().attemptNumber).toBe(0);
+
+    expect(await weaknesses.listStrengths(persistedLearnerId)).toHaveLength(0);
+    await fluency.dispose();
+  });
+
+  it('a stale attempt creates no strength (even when its content was strong)', async () => {
+    const adapter = new SqlJsAdapter();
+    await adapter.init();
+    const weaknesses = new SQLiteWeaknessRepository(adapter);
+    const manual = createManualProvider();
+    const speaking = new SpeakingPracticeService({
+      learnerModel: createLearnerModelStub(makeCoaching()),
+      aiProvider: manual.provider,
+      memoryService: createMemoryHarness().service,
+      learningPersistence: createLearningHarness().service,
+      now: () => NOW,
+    });
+    const fluency = createFluencyPracticeService(speaking, {
+      now: () => NOW,
+      successRecorder: createSuccessObservationRecorder(weaknesses),
+    });
+
+    const starting = fluency.startTask(TASK_ID);
+    await flush();
+    manual.resolveNext(okResponse('Welcome. Please begin the task.'));
+    await starting;
+
+    const attempt = fluency.submitAttempt({ transcript: STRONG_TRANSCRIPT });
+    await flush();
+    expect(manual.pendingCount()).toBe(1);
+
+    // New Task invalidates the in-flight attempt…
+    const next = fluency.startTask(OTHER_TASK_ID);
+    await flush();
+    // …and the late (strong, uncorrected) reply arrives now.
+    manual.resolveNext(okResponse('Late strong reply.'));
+    const stale = await attempt;
+    expect(stale.ok).toBe(false);
+    if (stale.ok) throw new Error('stale attempt unexpectedly committed');
+
+    manual.resolveNext(okResponse('Welcome to the next task.'));
+    await next;
+
+    expect(await weaknesses.listStrengths(LEARNER_ID)).toHaveLength(0);
+    await fluency.dispose();
+  });
+
+  it('the fluency module contains no unsafe identity lookup or placeholder learner', () => {
+    const source = readFileSync(join(__dirname, 'service.ts'), 'utf8');
+    // Comments may DOCUMENT the removed pattern; code must not use it.
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    expect(code).not.toContain('as any');
+    expect(code).not.toContain("'learner'");
+    expect(code).not.toContain('learnerModel');
+    // The identity comes from the owning service only.
+    expect(code).toContain('getLearnerId');
+    expect(code).toContain('successRecorder');
   });
 });

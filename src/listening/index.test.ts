@@ -44,6 +44,10 @@ import {
 } from './evaluator';
 import { createListeningService, MAX_SESSION_EXERCISES } from './index';
 import type { ListeningExercise } from './types';
+import {
+  createSuccessObservationRecorder,
+  type SuccessObservationRecorder,
+} from '../reassessment';
 import type { AIProvider, AIProviderResult } from '../providers/ai/types';
 import { ProgressDashboardService } from '../progress-dashboard/service';
 import { VocabularyWorkspaceService } from '../vocabulary-workspace/service';
@@ -88,7 +92,12 @@ async function createContext(): Promise<TestContext> {
 
 function createService(
   ctx: TestContext,
-  options?: { aiProvider?: AIProvider; withProgress?: boolean },
+  options?: {
+    aiProvider?: AIProvider;
+    withProgress?: boolean;
+    /** WP-4: the EXISTING success-observation recorder (strength evidence). */
+    successRecorder?: SuccessObservationRecorder;
+  },
 ): ListeningService {
   return new ListeningService({
     weaknesses: {
@@ -107,6 +116,7 @@ function createService(
     progress: options?.withProgress === false ? undefined : ctx.progress,
     aiProvider: options?.aiProvider,
     profile: ctx.profileRepo,
+    ...(options?.successRecorder ? { successRecorder: options.successRecorder } : {}),
   });
 }
 
@@ -1118,5 +1128,188 @@ describe('First-meaning completion via the existing workspace', () => {
     expect(listeningSrc).toContain('you can add one in the Vocabulary tab');
     // Still no placeholder definitions anywhere.
     expect(listeningSrc).not.toContain('Heard in:');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-4 evidence integrity — Blocker 1: listening success may ONLY come from a
+// positive comprehension result, through the REAL evaluateAnswer() path.
+// ---------------------------------------------------------------------------
+describe('WP-4 listening success evidence integrity (Blocker 1)', () => {
+  function withRecorder(ctx: TestContext, aiProvider?: AIProvider): ListeningService {
+    return createService(ctx, {
+      successRecorder: createSuccessObservationRecorder(ctx.weaknesses),
+      ...(aiProvider ? { aiProvider } : {}),
+    });
+  }
+
+  it('understood creates strength evidence with the REAL learner id', async () => {
+    const ctx = await createContext();
+    const service = withRecorder(ctx);
+    const ex = exercise({
+      type: 'listen_and_type',
+      weaknessReferenceId: 'listening:wp4-understood',
+    });
+
+    const { evaluation } = await service.evaluateAnswer(
+      ctx.learnerId,
+      ex,
+      'We need to meet the deadline by Friday',
+      { now: NOW },
+    );
+    expect(evaluation.result).toBe('understood');
+
+    const strengths = await ctx.weaknesses.listStrengths(ctx.learnerId);
+    expect(strengths).toHaveLength(1);
+    expect(strengths[0].learnerId).toBe(ctx.learnerId);
+    expect(strengths[0].type).toBe('listening');
+    expect(strengths[0].referenceId).toBe('listening:wp4-understood');
+    // No weakness is fabricated for a positive result.
+    expect(await ctx.weaknesses.listWeaknesses(ctx.learnerId, 50)).toHaveLength(0);
+  });
+
+  it('insufficient_evidence NEVER creates strength (missing judgement is not success)', async () => {
+    const ctx = await createContext();
+    const service = withRecorder(ctx);
+    const ex = exercise({
+      type: 'listen_and_type',
+      weaknessReferenceId: 'listening:wp4-insufficient',
+    });
+
+    const { evaluation } = await service.evaluateAnswer(ctx.learnerId, ex, '   ', {
+      now: NOW,
+    });
+    expect(evaluation.result).toBe('insufficient_evidence');
+
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+    // Incomplete evidence is neither success NOR failure evidence.
+    expect(await ctx.weaknesses.listWeaknesses(ctx.learnerId, 50)).toHaveLength(0);
+  });
+
+  it('partial / missed_key_meaning / misunderstood NEVER create strength', async () => {
+    const ctx = await createContext();
+    const service = withRecorder(ctx);
+
+    const cases: ReadonlyArray<{ readonly answer: string; readonly expected: string; readonly ref: string }> = [
+      { answer: 'We need the friday', expected: 'partial', ref: 'listening:wp4-partial' },
+      { answer: 'totally different', expected: 'missed_key_meaning', ref: 'listening:wp4-missed' },
+      { answer: 'deadline', expected: 'misunderstood', ref: 'listening:wp4-misunderstood' },
+    ];
+
+    for (const entry of cases) {
+      const ex = exercise({
+        type: 'listen_and_type',
+        weaknessReferenceId: entry.ref,
+      });
+      const { evaluation } = await service.evaluateAnswer(ctx.learnerId, ex, entry.answer, {
+        now: NOW,
+      });
+      expect(evaluation.result).toBe(entry.expected);
+    }
+
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+    // The failure-side evidence lifecycle is untouched: every problem result
+    // still produced its weakness row.
+    const weaknesses = await ctx.weaknesses.listWeaknesses(ctx.learnerId, 50);
+    expect(weaknesses.map((w) => w.referenceId).sort()).toEqual(
+      cases.map((entry) => entry.ref).sort(),
+    );
+  });
+
+  it('mostly_understood creates NO strength (incomplete comprehension is not positive evidence)', async () => {
+    const ctx = await createContext();
+    // The AI judge explicitly reports 'mostly_understood' here.
+    const service = withRecorder(ctx, fakeAI());
+    const ex = exercise({
+      type: 'listen_and_answer',
+      weaknessReferenceId: 'listening:wp4-mostly',
+    });
+
+    const { evaluation } = await service.evaluateAnswer(
+      ctx.learnerId,
+      ex,
+      'The meeting is important',
+      { now: NOW },
+    );
+    expect(evaluation.result).toBe('mostly_understood');
+    expect(evaluation.evaluatedBy).toBe('ai');
+
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+  });
+
+  it('strength and weakness coexist without erasing each other', async () => {
+    const ctx = await createContext();
+    const service = withRecorder(ctx);
+
+    const strong = exercise({
+      id: '1ef907b7-6c12-4ead-8f9a-c97bd31e00031',
+      type: 'listen_and_type',
+      weaknessReferenceId: 'listening:wp4-strong',
+    });
+    const weak = exercise({
+      id: '1ef907b7-6c12-4ead-8f9a-c97bd31e00032',
+      type: 'listen_and_type',
+      weaknessReferenceId: 'listening:wp4-weak',
+    });
+
+    const strongResult = await service.evaluateAnswer(
+      ctx.learnerId,
+      strong,
+      'We need to meet the deadline by Friday',
+      { now: NOW },
+    );
+    const weakResult = await service.evaluateAnswer(ctx.learnerId, weak, 'totally different', {
+      now: NOW,
+    });
+    expect(strongResult.evaluation.result).toBe('understood');
+    expect(weakResult.evaluation.result).toBe('missed_key_meaning');
+
+    const strengths = await ctx.weaknesses.listStrengths(ctx.learnerId);
+    const weaknesses = await ctx.weaknesses.listWeaknesses(ctx.learnerId, 50);
+    expect(strengths.map((s) => s.referenceId)).toEqual(['listening:wp4-strong']);
+    expect(weaknesses.map((w) => w.referenceId)).toEqual(['listening:wp4-weak']);
+  });
+
+  it('repeated understood attempts deduplicate into ONE bounded strength row', async () => {
+    const ctx = await createContext();
+    const service = withRecorder(ctx);
+    const ex = exercise({
+      type: 'listen_and_type',
+      weaknessReferenceId: 'listening:wp4-repeat',
+    });
+
+    for (let i = 0; i < 12; i += 1) {
+      const { evaluation } = await service.evaluateAnswer(
+        ctx.learnerId,
+        ex,
+        'We need to meet the deadline by Friday',
+        { now: NOW },
+      );
+      expect(evaluation.result).toBe('understood');
+    }
+
+    const strengths = await ctx.weaknesses.listStrengths(ctx.learnerId);
+    expect(strengths).toHaveLength(1);
+    expect(strengths[0].referenceId).toBe('listening:wp4-repeat');
+    expect(strengths[0].contexts.length).toBeLessThanOrEqual(5);
+    expect(strengths[0].evidence.length).toBeLessThanOrEqual(10);
+  });
+
+  it('a service without a recorder persists no strength (never fabricated plumbing)', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, { withProgress: false });
+    const ex = exercise({
+      type: 'listen_and_type',
+      weaknessReferenceId: 'listening:wp4-no-recorder',
+    });
+
+    const { evaluation } = await service.evaluateAnswer(
+      ctx.learnerId,
+      ex,
+      'We need to meet the deadline by Friday',
+      { now: NOW },
+    );
+    expect(evaluation.result).toBe('understood');
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
   });
 });

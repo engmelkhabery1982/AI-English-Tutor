@@ -114,6 +114,30 @@ function isProblemResult(result: ListeningResultCategory): boolean {
   );
 }
 
+/**
+ * WP-4 evidence integrity: true ONLY for a result that is itself positive
+ * evidence of comprehension.
+ *
+ * - 'understood' is the single category the evaluator reaches from a real
+ *   POSITIVE signal: the answer matched the material exactly (or an explicit
+ *   acceptable variant), so comprehension was demonstrated, not inferred.
+ * - 'mostly_understood' is deliberately NOT success evidence: the evaluator
+ *   can return it from a partial word-overlap ratio (with missed key items)
+ *   or from an open-ended/model answer. It describes incomplete
+ *   comprehension, so claiming strength from it would be inference.
+ * - 'partial' / 'missed_key_meaning' / 'misunderstood' are problems.
+ * - 'insufficient_evidence' means NO usable evidence exists (empty answer,
+ *   unjudgeable turn). Absence of a judgment is never evidence of success,
+ *   so it can neither create a weakness NOR a strength row.
+ *
+ * The previous "anything that is not a problem creates strength" rule let
+ * 'insufficient_evidence' fabricate a strength claim; that is exactly what
+ * this predicate removes.
+ */
+function createsSuccessEvidence(result: ListeningResultCategory): boolean {
+  return result === 'understood';
+}
+
 function persistenceTag(exercise: ListeningExercise): string {
   return `exercise:${exercise.type}`;
 }
@@ -331,17 +355,31 @@ export class ListeningService {
    * only owner of pronunciation evidence); without that path — or without a
    * transcript — the judgement stays local and qualitative, and nothing at all
    * is persisted.
+   *
+   * WP-4 evidence integrity: this is the PRODUCTION path the app really uses
+   * (DeepListeningPanel → ShadowingVoiceController → here → session). The
+   * owning service resolves the REAL learner id through the EXISTING profile
+   * repository and passes ONLY that narrow identity plus its own success
+   * recorder into the session (which stays repository-free). No profile →
+   * no identity → no strength row; a matched, non-stale attempt may persist
+   * strength evidence.
    */
   async submitShadowingAttempt(
     session: ShadowingSession,
     transcript: string | null,
     opts?: { now?: IsoDate; checkStale?: () => boolean },
   ): Promise<ShadowingAttempt> {
+    // The real learner id — never a fallback, never fabricated.
+    const learnerId = await this.resolveLearnerId();
     return session.submit(
       transcript,
       this.deps.pronunciation,
       opts?.now,
       opts?.checkStale,
+      {
+        ...(learnerId ? { learnerId } : {}),
+        ...(this.deps.successRecorder ? { successRecorder: this.deps.successRecorder } : {}),
+      },
     );
   }
 
@@ -388,7 +426,11 @@ export class ListeningService {
     // General exercises still produce evidence when the learner struggles:
     // missed key items become listening weaknesses (deduplicated by identity).
     if (!isProblemResult(evaluation.result)) {
-      if (this.deps.successRecorder) {
+      // WP-4 evidence integrity: ONLY a positive comprehension result may
+      // create strength evidence. Incomplete or absent evidence
+      // ('insufficient_evidence') and 'mostly_understood' write NOTHING —
+      // a missing judgment is never a success claim.
+      if (createsSuccessEvidence(evaluation.result) && this.deps.successRecorder) {
         const referenceId = exercise.weaknessReferenceId ?? stableReferenceId(`listening:${exercise.id}`);
         const context = exercise.lexicalItemId
           ? `lexical:${exercise.lexicalItemId}`

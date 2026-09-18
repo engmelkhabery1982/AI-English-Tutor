@@ -23,6 +23,7 @@ import {
   createDefaultSpeakingService,
   type SpeakingPracticeService,
 } from '../deep-speaking';
+import type { SuccessObservationRecorder } from '../reassessment';
 import {
   FluencyPracticeService,
   createFluencyPracticeService,
@@ -53,10 +54,20 @@ export async function createDefaultFluencyService(): Promise<FluencyPracticeServ
 /** Test/composition seam: build a fluency service over any speaking service. */
 export function createFluencyServiceFor(
   speaking: SpeakingPracticeService,
-  options?: { readonly now?: () => IsoDate },
+  options?: {
+    readonly now?: () => IsoDate;
+    /**
+     * The EXISTING success-observation recorder. The learner id is still
+     * resolved by the owning speaking service — the caller supplies evidence
+     * plumbing only, never an identity, so no learner id can be fabricated
+     * here.
+     */
+    readonly successRecorder?: SuccessObservationRecorder;
+  },
 ): FluencyPracticeService {
   return new FluencyPracticeService({
     speaking,
     ...(options?.now ? { now: options.now } : {}),
+    ...(options?.successRecorder ? { successRecorder: options.successRecorder } : {}),
   });
 }

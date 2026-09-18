@@ -41,6 +41,7 @@ import type {
 } from '../repositories';
 import type {
   PronunciationAnalysis,
+  PronunciationEvidenceSource,
   PronunciationObservation,
   PronunciationProvider,
   PronunciationTurnOutcome,
@@ -58,6 +59,55 @@ export function observationIdentity(observation: PronunciationObservation): stri
 
 /** Max observations persisted per turn — never flood storage. */
 const MAX_PERSISTED_PER_TURN = 3;
+
+/**
+ * Evidence levels that can ground a POSITIVE pronunciation claim.
+ *
+ * - 'acoustic' / 'transcript_comparison' / 'stt_substitution' / 'practice_result'
+ *   are observed evidence about the learner's production.
+ * - 'ai_explanation_only' is explicitly inference, never evidence.
+ * - 'learner_self_report' is not an evaluated signal about production, so it
+ *   cannot justify a strength claim either.
+ */
+const SUPPORTED_POSITIVE_EVIDENCE_SOURCES: readonly PronunciationEvidenceSource[] = [
+  'acoustic',
+  'transcript_comparison',
+  'stt_substitution',
+  'practice_result',
+];
+
+/**
+ * WP-4 evidence integrity: does this analysis carry an EXPLICIT POSITIVE
+ * pronunciation signal from the EXISTING provider contract?
+ *
+ * The contract's positive signal is `overallIntelligibility === 'clear'`: the
+ * provider must have ASSERTED that the production was clear from a supported
+ * evidence source. The previous rule ("not insufficient + zero negative
+ * observations") treated the mere ABSENCE of a weakness as success, which is
+ * inference — a provider that reports nothing, or only inference-only
+ * coaching, produced no positive evidence at all.
+ *
+ * Everything below must hold:
+ * - the analysis is not `insufficientEvidence` (no invented judgement);
+ * - a real transcript AND a known expected target exist (nothing to compare
+ *   against → nothing to claim);
+ * - the provider explicitly reported `overallIntelligibility: 'clear'`;
+ * - that judgement rests on a supported observed evidence source.
+ *
+ * When any of these is missing the engine persists NO pronunciation strength:
+ * omitting the success evidence is always better than fabricating it. No new
+ * provider metric is introduced — this reads the existing contract only.
+ */
+function hasExplicitPositiveSignal(
+  analysis: PronunciationAnalysis,
+  input: { transcript: string; expectedText?: string },
+): boolean {
+  if (analysis.insufficientEvidence) return false;
+  if (analysis.overallIntelligibility !== 'clear') return false;
+  if (!input.transcript.trim()) return false;
+  if (!input.expectedText?.trim()) return false;
+  return SUPPORTED_POSITIVE_EVIDENCE_SOURCES.includes(analysis.evidenceLevel);
+}
 
 export interface PronunciationEngineDeps {
   readonly successRecorder?: SuccessObservationRecorder;
@@ -190,14 +240,27 @@ export class PronunciationEngine {
       }
     }
 
-    if (!analysis.insufficientEvidence && input.expectedText && persistable.length === 0 && this.deps.successRecorder) {
-      const refId = `pron:${input.expectedText.toLowerCase().trim().slice(0, 30)}`;
-      await recordPronunciationSuccess(this.deps.successRecorder, {
-        learnerId,
-        referenceId: refId,
-        context: input.context ?? 'target_sentence',
-        summary: `Clear pronunciation of target sentence: "${input.expectedText}"`,
-      });
+    // WP-4 evidence integrity: a success claim requires an EXPLICIT POSITIVE
+    // SIGNAL in the provider contract — never the mere absence of negative
+    // observations. See `hasExplicitPositiveSignal`.
+    const positiveSignalTarget = input.expectedText?.trim();
+    if (
+      this.deps.successRecorder &&
+      persistable.length === 0 &&
+      positiveSignalTarget &&
+      hasExplicitPositiveSignal(analysis, input)
+    ) {
+      const refId = `pron:${positiveSignalTarget.toLowerCase().slice(0, 30)}`;
+      try {
+        await recordPronunciationSuccess(this.deps.successRecorder, {
+          learnerId,
+          referenceId: refId,
+          context: input.context ?? 'target_sentence',
+          summary: `Clear pronunciation of target sentence: "${input.expectedText}"`,
+        });
+      } catch {
+        // Evidence persistence must never break the conversation flow.
+      }
     }
 
     return {
