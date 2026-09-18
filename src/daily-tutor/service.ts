@@ -43,14 +43,16 @@
  */
 
 import { planCurriculum } from '../curriculum';
-import { getSkill } from '../curriculum/catalog';
 import type {
   CurriculumPlan,
   CurriculumPlannerInput,
   SkillEvidenceSnapshot,
-  SkillLifecycleState,
 } from '../curriculum/types';
 import type { LearnerModel } from '../learner-model';
+import {
+  activeDifficultySkillIds,
+  projectCurriculumEvidence,
+} from '../learning-progression';
 import { parseWeaknessIdentity } from '../listening/generator';
 import {
   SCENARIO_CATEGORIES,
@@ -71,7 +73,6 @@ import { toDateKey } from './date';
 import {
   planDailyTutorSession,
   mapLearningGoalsToCurriculumHints,
-  weaknessStatusPriority,
 } from './planner';
 import { buildChildRoute } from './navigation';
 import type { DailyTutorChildRoute, BuildChildRouteExtras } from './navigation';
@@ -102,7 +103,12 @@ const NO_PROFILE_MESSAGE =
 const UNAVAILABLE_MESSAGE =
   'Your daily practice could not be prepared right now. Nothing was changed.';
 
-/** The slice of the EXISTING learner model the Daily Tutor reads. */
+/**
+ * The slice of the EXISTING learner model the Daily Tutor reads.
+ *
+ * `vocabulary` / `expressions` are the SAME already-loaded rows the shared
+ * curriculum evidence projection consumes — reading them adds no query.
+ */
 export type DailyTutorModelPort = Pick<
   LearnerModel,
   | 'refresh'
@@ -111,6 +117,8 @@ export type DailyTutorModelPort = Pick<
   | 'getDueReview'
   | 'weaknesses'
   | 'pronunciationWeaknesses'
+  | 'vocabulary'
+  | 'expressions'
 >;
 
 export interface DailyTutorServiceDeps {
@@ -449,9 +457,12 @@ export class DailyTutorService {
       .filter((target): target is string => Boolean(target && target.length > 0));
 
     // EXISTING curriculum planner as an input (priority logic, lifecycle
-    // ordering and prerequisites stay owned by Curriculum).
+    // ordering and prerequisites stay owned by Curriculum). WP-1: the evidence
+    // now comes from the ONE shared deterministic projection, and the active
+    // difficulty ids are derived from that same projection — never from a
+    // second, parallel mapping.
     const curriculumEvidence = this.buildCurriculumEvidence();
-    const activeWeaknessSkillIds = this.activeWeaknessSkillIds();
+    const activeWeaknessSkillIds = activeDifficultySkillIds(curriculumEvidence);
     const recentRecords = await this.deps.repository
       .listRecentSessions(learnerId, RECENT_SESSION_LIMIT)
       .catch(() => [] as readonly DailyTutorSessionRecord[]);
@@ -521,62 +532,23 @@ export class DailyTutorService {
   }
 
   /**
-   * Honest curriculum evidence: pronunciation weaknesses whose identity maps
-   * to a real catalog skill, with the lifecycle state of the linked learner
-   * weakness. Nothing else can be mapped to a skill without fabricating.
+   * Honest curriculum evidence through the ONE shared deterministic projection.
+   *
+   * WP-1 replaced the previous Daily-Tutor-specific pronunciation-only mapping
+   * with the shared `projectCurriculumEvidence`: it classifies every source
+   * mapping explicitly (SUPPORTED / DEAD / UNMAPPABLE), never guesses a
+   * skillId, never projects a learner strength, and emits at most one snapshot
+   * per skillId. It is PURE over the ALREADY-LOADED rows below — no query, no
+   * AI, no clock and no write.
    */
   private buildCurriculumEvidence(): readonly SkillEvidenceSnapshot[] {
-    const pronunciationRows = new Map(
-      this.deps.learnerModel.pronunciationWeaknesses.map((row) => [row.id, row]),
-    );
-    const best = new Map<
-      string,
-      { status: string; lastSeenAt: string; evidenceCount: number }
-    >();
-    for (const weakness of this.deps.learnerModel.weaknesses) {
-      if (weakness.type !== 'pronunciation') continue;
-      const row = pronunciationRows.get(weakness.referenceId);
-      if (!row) continue;
-      const identity = (row.notes?.trim() || row.targetSound || '').trim();
-      const parsed = parseWeaknessIdentity(identity);
-      const skillId = parsed?.kind ?? row.targetSound.trim();
-      if (!skillId || !getSkill(skillId)) continue; // Not a catalog skill — never fabricate.
-      const current = best.get(skillId);
-      if (!current || weaknessStatusPriority(weakness.status) > weaknessStatusPriority(current.status)) {
-        best.set(skillId, {
-          status: weakness.status,
-          lastSeenAt: weakness.lastSeenAt,
-          evidenceCount: weakness.occurrenceCount,
-        });
-      }
-    }
-    return Array.from(best.entries()).map(([skillId, entry]) => ({
-      skillId,
-      lifecycleState: entry.status as SkillLifecycleState,
-      lastObservedAt: entry.lastSeenAt,
-      evidenceCount: entry.evidenceCount,
-    }));
-  }
-
-  /** Skill ids with a REAL active (unresolved, non-stable) pronunciation weakness. */
-  private activeWeaknessSkillIds(): string[] {
-    const pronunciationRows = new Map(
-      this.deps.learnerModel.pronunciationWeaknesses.map((row) => [row.id, row]),
-    );
-    const ids = new Set<string>();
-    for (const weakness of this.deps.learnerModel.getActiveWeaknesses()) {
-      if (weakness.type !== 'pronunciation') continue;
-      if (weakness.status === 'stable' || weakness.status === 'mastered') continue;
-      const row = pronunciationRows.get(weakness.referenceId);
-      if (!row) continue;
-      const identity = (row.notes?.trim() || row.targetSound || '').trim();
-      const parsed = parseWeaknessIdentity(identity);
-      const skillId = parsed?.kind ?? row.targetSound.trim();
-      if (skillId && getSkill(skillId)) {
-        ids.add(skillId);
-      }
-    }
-    return Array.from(ids);
+    const model = this.deps.learnerModel;
+    return projectCurriculumEvidence({
+      weaknesses: model.weaknesses ?? [],
+      pronunciationWeaknesses: model.pronunciationWeaknesses ?? [],
+      vocabulary: model.vocabulary ?? [],
+      expressions: model.expressions ?? [],
+    });
   }
 
   /** Persisted-shape insert input for a freshly planned day. */
