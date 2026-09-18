@@ -622,4 +622,157 @@ describe('Dictionary Core (Phase 1)', () => {
       expect(item.comprehensionQuestion).toContain('Review the usage of');
     }
   });
+
+  describe('Contextual meaning honesty and known-sense validation', () => {
+    const completeContext = {
+      word: 'run',
+      sentence: 'She runs a clinic.',
+      selectedSenseId: 'run-manage',
+      distinction: 'manage or operate',
+      arabicMeaning: 'يدير',
+      englishExplanation: 'Here, run means to manage an organization.',
+      whyFits: 'The direct object is a clinic, which is an organization being managed.',
+      certainty: 'clear',
+      alternativeSense: null,
+    };
+
+    it('rejects contextual output missing required evidence fields or valid certainty', () => {
+      expect(
+        parseContextualMeaning(
+          JSON.stringify({ ...completeContext, whyFits: '' }),
+          'run',
+          'She runs a clinic.'
+        )
+      ).toBeNull();
+
+      expect(
+        parseContextualMeaning(
+          JSON.stringify({ ...completeContext, certainty: '92%' }),
+          'run',
+          'She runs a clinic.'
+        )
+      ).toBeNull();
+
+      expect(
+        parseContextualMeaning(
+          JSON.stringify({ ...completeContext, arabicMeaning: '' }),
+          'run',
+          'She runs a clinic.'
+        )
+      ).toBeNull();
+
+      expect(
+        parseContextualMeaning(
+          JSON.stringify({ ...completeContext, englishExplanation: '' }),
+          'run',
+          'She runs a clinic.'
+        )
+      ).toBeNull();
+
+      const valid = parseContextualMeaning(
+        JSON.stringify(completeContext),
+        'run',
+        'She runs a clinic.'
+      );
+      expect(valid?.selectedSenseId).toBe('run-manage');
+      expect(valid?.certainty).toBe('clear');
+    });
+
+    it('accepts a selectedSenseId that exists in supplied known senses', async () => {
+      const entry = parseDictionaryEntry(multiSenseRunJson, 'run');
+      expect(entry).not.toBeNull();
+      if (!entry) return;
+
+      const service = createDictionaryService(
+        createMockAIProvider(() => ({
+          ok: true,
+          response: { content: JSON.stringify(completeContext) },
+        }))
+      );
+      const result = await service.resolveMeaningInContext({
+        word: 'run',
+        sentence: 'She runs a clinic.',
+        knownSenses: entry.senses,
+      });
+
+      expect(result.certainty).toBe('clear');
+      expect(result.selectedSenseId).toBe('run-manage');
+    });
+
+    it('rejects an unknown selectedSenseId safely when known senses are supplied', async () => {
+      const entry = parseDictionaryEntry(multiSenseRunJson, 'run');
+      expect(entry).not.toBeNull();
+      if (!entry) return;
+
+      const service = createDictionaryService(
+        createMockAIProvider(() => ({
+          ok: true,
+          response: {
+            content: JSON.stringify({ ...completeContext, selectedSenseId: 'run-hallucinated' }),
+          },
+        }))
+      );
+      const result = await service.resolveMeaningInContext({
+        word: 'run',
+        sentence: 'She runs a clinic.',
+        knownSenses: entry.senses,
+      });
+
+      expect(result.certainty).toBe('insufficient_context');
+      expect(result.selectedSenseId).toBeUndefined();
+      expect(result.alternativeSense).toBeNull();
+    });
+
+    it('omits an alternativeSense whose id is outside supplied known senses', async () => {
+      const entry = parseDictionaryEntry(multiSenseRunJson, 'run');
+      expect(entry).not.toBeNull();
+      if (!entry) return;
+
+      const response = {
+        ...completeContext,
+        certainty: 'ambiguous',
+        alternativeSense: {
+          senseId: 'run-invented',
+          distinction: 'invented option',
+          arabicMeaning: 'معنى بديل',
+          englishExplanation: 'An alternative interpretation.',
+          reason: 'The sentence could be read another way.',
+        },
+      };
+
+      const service = createDictionaryService(
+        createMockAIProvider(() => ({
+          ok: true,
+          response: { content: JSON.stringify(response) },
+        }))
+      );
+      const result = await service.resolveMeaningInContext({
+        word: 'run',
+        sentence: 'She runs a clinic.',
+        knownSenses: entry.senses,
+      });
+
+      expect(result.selectedSenseId).toBe('run-manage');
+      expect(result.alternativeSense).toBeNull();
+    });
+
+    it('leaves contextual sense ids unchanged when no knownSenses are supplied', async () => {
+      const service = createDictionaryService(
+        createMockAIProvider(() => ({
+          ok: true,
+          response: {
+            content: JSON.stringify({ ...completeContext, selectedSenseId: 'free-form-sense' }),
+          },
+        }))
+      );
+      const result = await service.resolveMeaningInContext({
+        word: 'run',
+        sentence: 'She runs a clinic.',
+      });
+
+      expect(result.certainty).toBe('clear');
+      expect(result.selectedSenseId).toBe('free-form-sense');
+    });
+  });
+
 });
