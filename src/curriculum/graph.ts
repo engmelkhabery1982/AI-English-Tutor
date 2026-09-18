@@ -187,18 +187,53 @@ export function validateSkillGraph(
   return { valid: issues.length === 0, issues };
 }
 
+/** Struggle states that keep a prerequisite unresolved. */
+const UNRESOLVED_STATES = new Set([
+  'relapsed',
+  'confirmed',
+  'active_training',
+  'repeated',
+  'observed',
+]);
+
 /**
- * Direct prerequisite ids of a skill that are "unresolved" given a map of
- * lifecycle states. A prerequisite is unresolved when its state is one of the
- * struggle states; resolved when improving/stable/mastered (or absent).
+ * Prerequisite ids that are "unresolved" given a map of lifecycle states.
+ *
+ * A prerequisite is unresolved when its evidenced state is a struggle state.
+ * It is resolved when improving / stable / mastered, and non-blocking when
+ * there is no evidence.
+ *
+ * When `prerequisitesOf` is supplied, unresolved ancestors along the
+ * prerequisite chain are included as well (cycle-safe, deterministic).
+ * Direct-only behaviour is preserved when it is omitted.
  */
 export function unresolvedPrerequisites(
   prerequisites: readonly string[],
   stateOf: (skillId: string) => string | undefined,
+  prerequisitesOf?: (skillId: string) => readonly string[] | undefined,
 ): readonly string[] {
-  const UNRESOLVED = new Set(['relapsed', 'confirmed', 'active_training', 'repeated', 'observed']);
-  return prerequisites.filter((id) => {
+  if (!prerequisitesOf) {
+    return prerequisites.filter((id) => {
+      const state = stateOf(id);
+      return state !== undefined && UNRESOLVED_STATES.has(state);
+    });
+  }
+
+  const found: string[] = [];
+  const seen = new Set<string>();
+  const visit = (id: string): void => {
+    if (seen.has(id)) return;
+    seen.add(id);
     const state = stateOf(id);
-    return state !== undefined && UNRESOLVED.has(state);
-  });
+    if (state !== undefined && UNRESOLVED_STATES.has(state)) {
+      found.push(id);
+    }
+    for (const next of prerequisitesOf(id) ?? []) {
+      visit(next);
+    }
+  };
+  for (const id of prerequisites) {
+    visit(id);
+  }
+  return found;
 }

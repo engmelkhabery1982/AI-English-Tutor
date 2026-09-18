@@ -43,7 +43,8 @@ import {
   type SkillDomain,
   type SkillLifecycleState,
 } from './types';
-import { SKILL_CATALOG, type SkillNode } from './catalog';
+import type { SkillNode } from './types';
+import { SKILL_CATALOG, getSkill } from './catalog';
 import { unresolvedPrerequisites } from './graph';
 
 /** Default cap on how many skills a plan recommends. */
@@ -179,7 +180,11 @@ function buildCandidates(options: BuildOptions): Candidate[] {
       return;
     }
 
-    const blockedBy = unresolvedPrerequisites(node.prerequisites, (id) => stateMap.get(id));
+    const blockedBy = unresolvedPrerequisites(
+      node.prerequisites,
+      (id) => stateMap.get(id),
+      (id) => getSkill(id)?.prerequisites,
+    );
     const blocked = blockedBy.length > 0;
 
     let priority = hasEvidence
@@ -211,8 +216,8 @@ function buildCandidates(options: BuildOptions): Candidate[] {
     }
 
     if (blocked) {
-      // Demote below any blocker while still allowing inclusion if space allows.
-      priority -= 100;
+      // Keep lifecycle priority so the skill remains visible; ordering below
+      // places every unresolved ancestor ahead of this dependent.
       reasons.push({
         code: 'prerequisite_for_blocked',
         message: `Blocked by unresolved prerequisite(s): ${blockedBy.join(', ')}.`,
@@ -246,6 +251,10 @@ function buildCandidates(options: BuildOptions): Candidate[] {
   });
 
   candidates.sort((a, b) => {
+    const aBlocksB = a.blockedBy.includes(b.skillId) === false && b.blockedBy.includes(a.skillId);
+    const bBlocksA = b.blockedBy.includes(a.skillId) === false && a.blockedBy.includes(b.skillId);
+    if (aBlocksB && !bBlocksA) return -1;
+    if (bBlocksA && !aBlocksB) return 1;
     if (b.priority !== a.priority) return b.priority - a.priority;
     if (a.domainRank !== b.domainRank) return a.domainRank - b.domainRank;
     return a.index - b.index;
