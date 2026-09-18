@@ -236,7 +236,9 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     // (the saved preferences are never rolled back), and it never claims the
     // profile was untouched.
     try {
-      const handle = await service.beginDiagnostic();
+      const handle = props?.isReassessment && props?.reassessmentService
+        ? await props.reassessmentService.beginReassessment()
+        : await service.beginDiagnostic();
       handleRef.current = handle;
       const token = handle.session.getCurrentStepToken();
       handle.session.markProfileStepDone(token);

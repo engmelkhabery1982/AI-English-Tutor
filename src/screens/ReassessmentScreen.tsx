@@ -89,34 +89,9 @@ export default function ReassessmentScreen({
     };
   }, [service, learnerId]);
 
-  const startReassessment = async (_force = false) => {
-    // Increment generation so any late async response from prior run is ignored
+  const startReassessment = (_force = false) => {
     generationRef.current += 1;
-    const currentGen = generationRef.current;
-
-    // Second reassessment invalidates first
-    if (handleRef.current) {
-      handleRef.current.session.abandon();
-      handleRef.current = null;
-    }
-
-    setLoading(true);
-    try {
-      const handle = await service.beginReassessment();
-      if (!mountedRef.current || generationRef.current !== currentGen) {
-        handle.session.abandon();
-        return;
-      }
-
-      handleRef.current = handle;
-      setInProgress(true);
-    } catch {
-      // Graceful handling
-    } finally {
-      if (mountedRef.current && generationRef.current === currentGen) {
-        setLoading(false);
-      }
-    }
+    setInProgress(true);
   };
 
   if (loading) {

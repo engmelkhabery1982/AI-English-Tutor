@@ -7,9 +7,10 @@
  * - Deterministic record identity prevents duplicate rows upon retry/double finish.
  * - Decisions ('accepted' or 'kept') are terminal and mutually exclusive:
  *   once 'accepted', a decision cannot flip to 'kept', and vice versa.
+ * - Decision updates are atomic across history + profile using database transactions.
  */
 
-import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import type { DatabaseAdapter, SqlStep } from '../data/local/sqlite/DatabaseAdapter';
 import type { CefrLevelInput } from '../domain/shared/types';
 import { nowIso } from '../shared/time';
 import type {
@@ -22,6 +23,13 @@ export interface ReassessmentHistoryRepository {
   saveRecord(
     record: Partial<ReassessmentRecord> & Omit<ReassessmentRecord, 'createdAt' | 'updatedAt'>,
   ): Promise<ReassessmentRecord>;
+  acceptAndApplyLevel(
+    id: string,
+    proposedLevel: CefrLevelInput,
+  ): Promise<{ readonly record: ReassessmentRecord | null; readonly updated: boolean }>;
+  keepCurrentLevel(
+    id: string,
+  ): Promise<{ readonly record: ReassessmentRecord | null; readonly updated: boolean }>;
   updateDecision(
     id: string,
     decision: ReassessmentDecision,
@@ -70,8 +78,6 @@ function rowToRecord(row: Record<string, unknown>): ReassessmentRecord {
 }
 
 export class SQLiteReassessmentHistoryRepository implements ReassessmentHistoryRepository {
-  private inFlightUpdates = new Set<string>();
-
   constructor(private readonly adapter: DatabaseAdapter) {}
 
   async saveRecord(
@@ -117,41 +123,72 @@ export class SQLiteReassessmentHistoryRepository implements ReassessmentHistoryR
     return saved;
   }
 
-  async updateDecision(
+  async acceptAndApplyLevel(
     id: string,
-    decision: ReassessmentDecision,
-    acceptedLevel?: CefrLevelInput | null,
+    proposedLevel: CefrLevelInput,
   ): Promise<{ readonly record: ReassessmentRecord | null; readonly updated: boolean }> {
     const existing = await this.getById(id);
     if (!existing) {
       return { record: null, updated: false };
     }
 
-    // TERMINAL DECISION GUARD:
-    // Once 'accepted' or 'kept', decision is terminal and mutually exclusive. It CANNOT flip!
     if (existing.decision === 'accepted' || existing.decision === 'kept') {
       return { record: existing, updated: false };
     }
 
-    if (this.inFlightUpdates.has(id)) {
-      const after = await this.getById(id);
-      return { record: after, updated: false };
+    const now = nowIso();
+    const steps: SqlStep[] = [
+      {
+        sql: `UPDATE reassessment_history SET decision = 'accepted', accepted_level = ?, updated_at = ? WHERE id = ? AND decision = 'pending'`,
+        params: [proposedLevel, now, id],
+      },
+      {
+        sql: `UPDATE learner_profile SET current_level = ?, updated_at = ? WHERE id = (SELECT learner_id FROM reassessment_history WHERE id = ?)`,
+        params: [proposedLevel, now, id],
+      },
+    ];
+
+    const results = await this.adapter.transaction(steps);
+    const updated = results[0].rowsAffected === 1;
+    const updatedRecord = await this.getById(id);
+    return { record: updatedRecord, updated };
+  }
+
+  async keepCurrentLevel(
+    id: string,
+  ): Promise<{ readonly record: ReassessmentRecord | null; readonly updated: boolean }> {
+    const existing = await this.getById(id);
+    if (!existing) {
+      return { record: null, updated: false };
     }
 
-    this.inFlightUpdates.add(id);
-    try {
-      const now = nowIso();
-      await this.adapter.execute(
-        `UPDATE reassessment_history SET decision = ?, accepted_level = ?, updated_at = ? WHERE id = ? AND decision = 'pending'`,
-        [decision, acceptedLevel ?? null, now, id],
-      );
-
-      const updatedRecord = await this.getById(id);
-      const updated = existing.decision === 'pending' && updatedRecord?.decision === decision;
-      return { record: updatedRecord, updated };
-    } finally {
-      this.inFlightUpdates.delete(id);
+    if (existing.decision === 'accepted' || existing.decision === 'kept') {
+      return { record: existing, updated: false };
     }
+
+    const now = nowIso();
+    const steps: SqlStep[] = [
+      {
+        sql: `UPDATE reassessment_history SET decision = 'kept', accepted_level = ?, updated_at = ? WHERE id = ? AND decision = 'pending'`,
+        params: [existing.previousLevel, now, id],
+      },
+    ];
+
+    const results = await this.adapter.transaction(steps);
+    const updated = results[0].rowsAffected === 1;
+    const updatedRecord = await this.getById(id);
+    return { record: updatedRecord, updated };
+  }
+
+  async updateDecision(
+    id: string,
+    decision: ReassessmentDecision,
+    acceptedLevel?: CefrLevelInput | null,
+  ): Promise<{ readonly record: ReassessmentRecord | null; readonly updated: boolean }> {
+    if (decision === 'accepted' && acceptedLevel) {
+      return this.acceptAndApplyLevel(id, acceptedLevel);
+    }
+    return this.keepCurrentLevel(id);
   }
 
   async getById(id: string): Promise<ReassessmentRecord | null> {

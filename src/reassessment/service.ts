@@ -10,7 +10,6 @@
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
-  SQLiteUserProfileRepository,
   SQLiteWeaknessRepository,
 } from '../data/local/sqlite/repositories';
 import type { LearnerModel } from '../learner-model';
@@ -314,9 +313,8 @@ export function createReassessmentService(
         return { updated: false, currentLevel: existingRecord.previousLevel, reason: 'not-estimated' };
       }
 
-      const updateResult = await resolved.historyRepo.updateDecision(
+      const updateResult = await resolved.historyRepo.acceptAndApplyLevel(
         recordId,
-        'accepted',
         existingRecord.proposedLevel,
       );
 
@@ -328,8 +326,7 @@ export function createReassessmentService(
         };
       }
 
-      const profileRepo = new SQLiteUserProfileRepository(resolved.adapter);
-      await profileRepo.update({ currentLevel: existingRecord.proposedLevel });
+
 
       if (deps.learnerModel) {
         try {
@@ -368,11 +365,7 @@ export function createReassessmentService(
         };
       }
 
-      const updateResult = await resolved.historyRepo.updateDecision(
-        recordId,
-        'kept',
-        existingRecord.previousLevel,
-      );
+      const updateResult = await resolved.historyRepo.keepCurrentLevel(recordId);
 
       if (!updateResult.updated) {
         return {
@@ -382,12 +375,9 @@ export function createReassessmentService(
         };
       }
 
-      const profileRepo = new SQLiteUserProfileRepository(resolved.adapter);
-      const profile = await profileRepo.get();
-
       return {
         updated: false,
-        currentLevel: profile?.currentLevel ?? existingRecord.previousLevel,
+        currentLevel: existingRecord.previousLevel,
         reason: 'kept',
       };
     },

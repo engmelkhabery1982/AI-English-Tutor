@@ -1,7 +1,7 @@
 /**
  * src/reassessment/index.test.ts
  *
- * WP-4 — Evidence Symmetry & Reassessment Tests (18 Blockers Coverage).
+ * WP-4 — Evidence Symmetry & Reassessment Hardened Tests.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -18,7 +18,6 @@ import { createConversationOrchestrator } from '../conversation-orchestrator';
 import { createConversationSession } from '../conversation-session';
 import { createDemoLearnerModel } from '../talk-demo/demo-learner-model';
 import type { AIProvider } from '../providers/ai/types';
-import { generateId } from '../shared/id';
 import { nowIso } from '../shared/time';
 import { generateAbilityChangeReport, mapTypeToDomain } from './change-report';
 import { SQLiteReassessmentHistoryRepository } from './history-repository';
@@ -111,7 +110,6 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
   // 2. no Finish-only fake reassessment
   it('2. no Finish-only fake reassessment', async () => {
     const handle = await service.beginReassessment();
-    // Cannot finish without resolving required steps
     const { result } = await service.finishReassessment(handle);
     expect(result).toBeNull();
   });
@@ -121,11 +119,9 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
     const handle1 = await service.beginReassessment();
     const token1 = handle1.session.getCurrentStepToken();
 
-    // Second reassessment started
     const handle2 = await service.beginReassessment();
     expect(handle1.session.getStatus()).toBe('abandoned');
 
-    // Trying to use handle1 with token1 is rejected
     const marked = handle1.session.markProfileStepDone(token1);
     expect(marked).toBe(false);
 
@@ -146,7 +142,7 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
     const handle = await service.beginReassessment();
     const staleToken = handle.session.getCurrentStepToken();
 
-    handle.session.advance(); // step moved on
+    handle.session.advance();
 
     const res = await onboardingService.recordPronunciation(
       handle,
@@ -227,7 +223,6 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
     const { result, record: r1 } = await service.finishReassessment(handle);
     expect(r1).not.toBeNull();
 
-    // Re-saving with same deterministic ID
     if (result && r1) {
       const saved2 = await historyRepo.saveRecord({
         id: r1.id,
@@ -279,13 +274,12 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
       const profileAfterAccept = await profileRepo.get();
       expect(profileAfterAccept.currentLevel).toBe(record.proposedLevel);
 
-      // Attempt to flip to keep
       const second = await service.keepCurrentLevel(record.id);
       expect(second.updated).toBe(false);
       expect(second.reason).toBe('already-accepted');
 
       const profileAfterKeep = await profileRepo.get();
-      expect(profileAfterKeep.currentLevel).toBe(record.proposedLevel); // Stays at accepted level!
+      expect(profileAfterKeep.currentLevel).toBe(record.proposedLevel);
     }
   });
 
@@ -316,13 +310,12 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
       expect(first.updated).toBe(false);
       expect(first.reason).toBe('kept');
 
-      // Attempt to flip to accept
       const second = await service.acceptReassessmentLevel(record.id);
       expect(second.updated).toBe(false);
       expect(second.reason).toBe('kept');
 
       const profile = await profileRepo.get();
-      expect(profile.currentLevel).toBe('A2'); // Stays at kept level!
+      expect(profile.currentLevel).toBe('A2');
     }
   });
 
@@ -481,7 +474,7 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
         referenceId: 'g:1',
         source: 'conversation_session',
         context: 'Great job!',
-        evidence: { kind: 'observation', id: generateId(), at: nowIso(), summary: 'Great job!' },
+        evidence: { kind: 'observation', id: 'obs-1', at: nowIso(), summary: 'Great job!' },
       },
       {
         learnerId,
@@ -489,7 +482,7 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
         referenceId: 'g:2',
         source: 'conversation_session',
         context: 'Session finished',
-        evidence: { kind: 'observation', id: generateId(), at: nowIso(), summary: 'Session finished' },
+        evidence: { kind: 'observation', id: 'obs-2', at: nowIso(), summary: 'Session finished' },
       },
       {
         learnerId,
@@ -497,7 +490,7 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
         referenceId: 'l:1',
         source: 'listening_service',
         context: '',
-        evidence: { kind: 'observation', id: generateId(), at: nowIso(), summary: '' },
+        evidence: { kind: 'observation', id: 'obs-3', at: nowIso(), summary: '' },
       },
     ];
 
@@ -540,5 +533,133 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
     expect(elig.available).toBe(false);
     expect(elig.reason).toBe('insufficient_evidence');
     expect(elig.message).toContain('Not enough practice evidence');
+  });
+
+  // 19. single diagnostic handle ownership (no orphan handles)
+  it('19. single diagnostic handle ownership (no orphan handles)', async () => {
+    let beginCount = 0;
+    const trackingOnboardingService = {
+      ...onboardingService,
+      async beginDiagnostic(options?: Record<string, unknown>) {
+        beginCount++;
+        return onboardingService.beginDiagnostic(options);
+      },
+    };
+
+    const trackingService = createReassessmentService({
+      adapter,
+      onboardingService: trackingOnboardingService,
+      historyRepository: historyRepo,
+      successRecorder: createSuccessObservationRecorder(weaknessRepo),
+    });
+
+    const handle = await trackingService.beginReassessment();
+    expect(beginCount).toBe(1);
+    expect(handle.session.getStatus()).toBe('in_progress');
+
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
+    await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
+    await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
+    handle.session.advance();
+    handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+    handle.session.advance();
+    handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+
+    const finishResult = await trackingService.finishReassessment(handle);
+    expect(finishResult.record).not.toBeNull();
+    expect(beginCount).toBe(1);
+  });
+
+  // 20. atomic level acceptance rolls back on database failure
+  it('20. atomic level acceptance rolls back on database failure', async () => {
+    const handle = await service.beginReassessment();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
+    await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
+    await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
+    handle.session.advance();
+    handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+    handle.session.advance();
+    handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+
+    const { record } = await service.finishReassessment(handle);
+    expect(record).not.toBeNull();
+
+    if (record) {
+      const failingAdapter = Object.create(adapter);
+      failingAdapter.transaction = async () => {
+        throw new Error('Database disk write error');
+      };
+
+      const failingRepo = new SQLiteReassessmentHistoryRepository(failingAdapter as unknown as DatabaseAdapter);
+
+      await expect(failingRepo.acceptAndApplyLevel(record.id, 'B1')).rejects.toThrow('Database disk write error');
+
+      const checkRecord = await historyRepo.getById(record.id);
+      expect(checkRecord?.decision).toBe('pending');
+
+      const profile = await profileRepo.get();
+      expect(profile.currentLevel).toBe('A2');
+    }
+  });
+
+  // 21. concurrent acceptance across TWO independent service instances uses rowsAffected
+  it('21. concurrent acceptance across TWO independent service instances uses rowsAffected', async () => {
+    const handle = await service.beginReassessment();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
+    await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
+    await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
+    handle.session.advance();
+    handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+    handle.session.advance();
+    handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+
+    const { record } = await service.finishReassessment(handle);
+    expect(record).not.toBeNull();
+
+    if (record) {
+      const service1 = createReassessmentService({
+        adapter,
+        onboardingService,
+        historyRepository: new SQLiteReassessmentHistoryRepository(adapter),
+      });
+
+      const service2 = createReassessmentService({
+        adapter,
+        onboardingService,
+        historyRepository: new SQLiteReassessmentHistoryRepository(adapter),
+      });
+
+      const [res1, res2] = await Promise.all([
+        service1.acceptReassessmentLevel(record.id),
+        service2.acceptReassessmentLevel(record.id),
+      ]);
+
+      const winners = (res1.updated ? 1 : 0) + (res2.updated ? 1 : 0);
+      expect(winners).toBe(1);
+
+      const recordAfter = await historyRepo.getById(record.id);
+      expect(recordAfter?.decision).toBe('accepted');
+
+      const profile = await profileRepo.get();
+      expect(profile.currentLevel).toBe('B1');
+    }
   });
 });
