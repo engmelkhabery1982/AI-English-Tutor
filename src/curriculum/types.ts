@@ -210,6 +210,7 @@ export type CurriculumReasonCode =
   | 'repeated'
   | 'observed'
   | 'improving_in_rotation'
+  | 'stable_maintenance'
   | 'prerequisite_for_blocked'
   | 'learning_goal_domain'
   | 'new_skill'
