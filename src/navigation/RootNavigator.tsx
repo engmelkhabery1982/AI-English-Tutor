@@ -5,7 +5,9 @@ import { createStackNavigator } from '@react-navigation/stack';
 import { Text } from 'react-native';
 
 import type { SpeakingPracticeSeed, SpeakingPracticeType, SpeakingProfessionalScenario } from '../deep-speaking';
+import type { DailyTutorActivityRef } from '../daily-tutor';
 import HomeScreen from '../screens/HomeScreen';
+import DailyTutorScreen from '../screens/DailyTutorScreen';
 import DeepSpeakingScreen from '../screens/DeepSpeakingScreen';
 import ProfessionalEnglishScreen from '../screens/ProfessionalEnglishScreen';
 import TalkScreen from '../screens/TalkScreen';
@@ -25,18 +27,25 @@ import OnboardingScreen from '../screens/OnboardingScreen';
  *   └── Root stack
  *       ├── MainTabs (the EXISTING bottom-tab layout, unchanged)
  *       │     Home | Talk | Listening | Vocabulary | Review | Progress | Settings
- *       ├── AdaptiveLesson  ← pushed from Home → "Today's Practice"
+ *       ├── DailyTutor      ← pushed from Home → "Today's Practice" (the Daily
+ *       │                      Tutor hub; launches existing activities and
+ *       │                      applies their real completion handshake)
+ *       ├── AdaptiveLesson  ← pushed from Home → "Adaptive lesson"
+ *       │                      (and from the Daily Tutor with a completion ref)
  *       ├── DeepSpeaking    ← pushed from Home → "Speaking practice"
- *       │                      (and optionally from a speaking lesson step)
+ *       │                      (and optionally from a speaking lesson step or
+ *       │                      the Daily Tutor with a completion ref)
+ *       ├── ProfessionalEnglish
  *       └── Onboarding      ← pushed from Home/Settings → diagnostic assessment
  *
- * The stack exists so an adaptive lesson is a pushed destination (with a real
- * back action) rather than an eighth tab. It uses @react-navigation/stack,
- * which is ALREADY a declared dependency of this project — no new package is
+ * The stack exists so these are pushed destinations (with a real back
+ * action) rather than extra tabs. It uses @react-navigation/stack, which is
+ * ALREADY a declared dependency of this project — no new package is
  * introduced, and no existing tab, screen or route is changed.
  *
- * The Talk tab hosts the full Conversation Engine stack; the adaptive lesson
- * screen orchestrates the existing systems and never duplicates them.
+ * The Talk tab hosts the full Conversation Engine stack; the Daily Tutor and
+ * the adaptive lesson screen orchestrate the existing systems and never
+ * duplicate them.
  */
 const Tab = createBottomTabNavigator();
 const Stack = createStackNavigator();
@@ -44,17 +53,34 @@ const Stack = createStackNavigator();
 /** Routes of the root stack (typed for navigation.navigate calls). */
 export type RootStackParamList = {
   MainTabs: undefined;
-  AdaptiveLesson: undefined;
+  /**
+   * Daily Tutor session hub. Additive: it orchestrates existing activities
+   * (Review / Listening / Adaptive Lesson / Deep Speaking) and owns only the
+   * daily session state — never the learning engines themselves.
+   */
+  DailyTutor: undefined;
+  /**
+   * Adaptive Lesson. The optional dailyTutor ref is the completion
+   * handshake from the Daily Tutor; standalone use passes nothing and is
+   * unchanged.
+   */
+  AdaptiveLesson:
+    | {
+        readonly dailyTutor?: DailyTutorActivityRef;
+      }
+    | undefined;
   /**
    * Deep Speaking Practice / Speaking Coach. The optional seed lets a speaking
    * lesson step start a full practice on the SAME material — the inline lesson
-   * path stays available when Deep Speaking is not.
+   * path stays available when Deep Speaking is not. The optional dailyTutor
+   * ref is the completion handshake from the Daily Tutor.
    */
   DeepSpeaking:
     | {
         readonly seed?: SpeakingPracticeSeed;
         readonly practiceType?: SpeakingPracticeType;
         readonly professionalScenario?: SpeakingProfessionalScenario;
+        readonly dailyTutor?: DailyTutorActivityRef;
       }
     | undefined;
   /** Professional English scenario picker (content layer; starts Deep Speaking). */
@@ -97,9 +123,14 @@ export default function RootNavigator() {
       >
         <Stack.Screen name="MainTabs" component={MainTabs} options={{ headerShown: false }} />
         <Stack.Screen
+          name="DailyTutor"
+          component={DailyTutorScreen}
+          options={{ title: "Today's Practice", headerBackTitle: 'Home' }}
+        />
+        <Stack.Screen
           name="AdaptiveLesson"
           component={AdaptiveLessonScreen}
-          options={{ title: "Today's Practice", headerBackTitle: 'Home' }}
+          options={{ title: 'Adaptive lesson', headerBackTitle: 'Home' }}
         />
         <Stack.Screen
           name="DeepSpeaking"

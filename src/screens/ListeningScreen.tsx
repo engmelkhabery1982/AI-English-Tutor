@@ -27,6 +27,8 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { useNavigation, useRoute } from '@react-navigation/native';
+import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 import type { TextToSpeechProvider } from '../talk-demo';
 import type { ListeningService } from '../listening';
 import { createDefaultListeningService } from '../listening';
@@ -35,6 +37,8 @@ import type {
   ListeningEvaluation,
   ListeningExercise,
 } from '../listening';
+import type { DailyTutorActivityRef } from '../daily-tutor';
+import { reportDailyTutorCompletion } from '../daily-tutor';
 
 export interface ListeningScreenProps {
   /** Injectable service (tests/composition); defaults to the real factory. */
@@ -66,6 +70,11 @@ interface SessionState {
 }
 
 export default function ListeningScreen(props?: ListeningScreenProps) {
+  const navigation = useNavigation<NavigationProp<ParamListBase>>();
+  // Daily Tutor handshake: present ONLY when the Daily Tutor launched this
+  // screen; standalone use of the Listening tab never sets it.
+  const route = useRoute() as { readonly params?: { readonly dailyTutor?: DailyTutorActivityRef } };
+  const dailyTutorRef = route.params?.dailyTutor;
   const [session, setSession] = useState<SessionState | null>(null);
   const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [answer, setAnswer] = useState<string>('');
@@ -86,13 +95,18 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
     problems: 0,
     understood: 0,
   });
+  /** Drives the Daily Tutor auto-start once the shared service exists. */
+  const [serviceReady, setServiceReady] = useState<boolean>(props?.service !== undefined);
 
   useEffect(() => {
     if (serviceRef.current) return;
     let active = true;
     createDefaultListeningService()
       .then((service) => {
-        if (active) serviceRef.current = service;
+        if (active) {
+          serviceRef.current = service;
+          setServiceReady(true);
+        }
       })
       .catch(() => {
         if (active) setErrorMessage('Listening practice could not be loaded. Please try again.');
@@ -139,6 +153,21 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
       setIsStarting(false);
     }
   }, [difficulty, isStarting]);
+
+  /**
+   * Daily Tutor launch: when this screen was opened by the Daily Tutor, start
+   * the existing listening session automatically (once per activity). The
+   * Listening Engine remains the owner of the session — this only triggers
+   * the existing start handler.
+   */
+  const dailyAutoStartedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!dailyTutorRef) return;
+    if (!serviceReady || session || sessionDone) return;
+    if (dailyAutoStartedRef.current === dailyTutorRef.activityId) return;
+    dailyAutoStartedRef.current = dailyTutorRef.activityId;
+    void startSession();
+  }, [dailyTutorRef, serviceReady, session, sessionDone, startSession]);
 
   const resetExerciseState = () => {
     setAnswer('');
@@ -283,6 +312,16 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
         // Non-destructive: the summary is still shown.
       }
     }
+    // Daily Tutor handshake: report the REAL listening completion with the
+    // real exercise count. Exiting mid-session never reaches this point, so
+    // an unfinished listening activity never completes.
+    if (dailyTutorRef) {
+      reportDailyTutorCompletion({
+        ref: dailyTutorRef,
+        completedAt: new Date().toISOString(),
+        itemsPracticed: session.exercises.length,
+      });
+    }
   };
 
   // ---------- Empty / start state ----------
@@ -350,6 +389,14 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
           <TouchableOpacity style={styles.startButton} onPress={startSession}>
             <Text style={styles.startButtonText}>Practice again</Text>
           </TouchableOpacity>
+          {dailyTutorRef ? (
+            <TouchableOpacity
+              style={styles.startButton}
+              onPress={() => navigation.navigate('DailyTutor')}
+            >
+              <Text style={styles.startButtonText}>Back to today&apos;s practice</Text>
+            </TouchableOpacity>
+          ) : null}
         </View>
       </View>
     );

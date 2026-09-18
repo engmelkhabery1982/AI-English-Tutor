@@ -55,6 +55,8 @@ import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 
 import type { ConversationSession, ConversationTurn } from '../conversation-session';
 import type { ConversationFeedback } from '../providers/ai';
+import type { DailyTutorActivityRef } from '../daily-tutor';
+import { reportDailyTutorCompletion } from '../daily-tutor';
 import {
   createTalkVoiceCoordinator,
   describeVoiceTurn,
@@ -111,6 +113,12 @@ export interface DeepSpeakingScreenProps {
       readonly seed?: SpeakingPracticeSeed;
       readonly practiceType?: SpeakingPracticeType;
       readonly professionalScenario?: SpeakingProfessionalScenario;
+      /**
+       * Daily Tutor completion handshake ref. Present ONLY when the Daily
+       * Tutor launched this practice; standalone use never sets it and is
+       * completely unchanged.
+       */
+      readonly dailyTutor?: DailyTutorActivityRef;
     };
   };
 }
@@ -161,6 +169,10 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
   const professionalScenario =
     props?.professionalScenario ?? props?.route?.params?.professionalScenario;
   const preferredPracticeType = props?.practiceType ?? props?.route?.params?.practiceType;
+  // Daily Tutor handshake: present only when the Daily Tutor launched this
+  // practice. The real completion report happens in handleCompletePractice —
+  // navigating here (or going back early) never completes anything.
+  const dailyTutorRef = props?.route?.params?.dailyTutor;
 
   const [phase, setPhaseState] = useState<DeepSpeakingPhase>('loading');
   const [plan, setPlan] = useState<SpeakingPracticePlan | null>(null);
@@ -567,6 +579,17 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
       setHistory([]);
       setLastFeedback(null);
       updatePhase('summary');
+      // Daily Tutor handshake: report the REAL completion (the child's own
+      // summary) — never on open, and only when launched by the Daily Tutor.
+      // The real learner-turn count travels with it; a zero-turn finish is
+      // reported honestly as such and completes nothing.
+      if (dailyTutorRef) {
+        reportDailyTutorCompletion({
+          ref: dailyTutorRef,
+          completedAt: completed.generatedAt,
+          itemsPracticed: completed.learnerTurns,
+        });
+      }
     } catch (error) {
       if (unmountedRef.current || restartTokenRef.current !== token) return;
       setErrorMessage(

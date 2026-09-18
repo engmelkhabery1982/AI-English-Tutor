@@ -52,17 +52,21 @@ describe('SQLite schema migrations (sql.js)', () => {
     expect(tableNames).toContain('review_items');
     expect(tableNames).toContain('review_history');
     expect(tableNames).toContain('progress_records');
+    expect(tableNames).toContain('daily_tutor_sessions');
+    expect(tableNames).toContain('daily_tutor_activities');
   });
 
   it('records schema version in schema_migrations', async () => {
     const rows = await adapter.query(`SELECT version, description FROM schema_migrations ORDER BY version`);
-    expect(rows).toHaveLength(3);
+    expect(rows).toHaveLength(4);
     expect(rows[0].version).toBe(1);
     expect(rows[0].description).toBe(SCHEMA_MIGRATIONS[0].description);
     expect(rows[1].version).toBe(2);
     expect(rows[1].description).toBe(SCHEMA_MIGRATIONS[1].description);
     expect(rows[2].version).toBe(3);
     expect(rows[2].description).toBe(SCHEMA_MIGRATIONS[2].description);
+    expect(rows[3].version).toBe(4);
+    expect(rows[3].description).toBe(SCHEMA_MIGRATIONS[3].description);
   });
 
   it('reports current schema version correctly', async () => {
@@ -74,13 +78,13 @@ describe('SQLite schema migrations (sql.js)', () => {
     // Run migrations again
     await runMigrations(adapter);
 
-    // Version should still be 3
+    // Version should still be 4
     const version = await getSchemaVersion(adapter);
-    expect(version).toBe(3);
+    expect(version).toBe(4);
 
-    // schema_migrations should still have only three rows
+    // schema_migrations should still have only four rows
     const rows = await adapter.query(`SELECT COUNT(*) as count FROM schema_migrations`);
-    expect(rows[0].count).toBe(3);
+    expect(rows[0].count).toBe(4);
   });
 
   it('enforces foreign keys (PRAGMA foreign_keys = ON)', async () => {
@@ -311,11 +315,13 @@ describe('SQLite schema migrations (sql.js)', () => {
     expect(indexNames).toContain('idx_lexical_items_learner_term_type');
     expect(indexNames).toContain('idx_review_items_learner_due');
     expect(indexNames).toContain('idx_progress_records_learner_date');
+    expect(indexNames).toContain('idx_daily_tutor_sessions_learner_date');
+    expect(indexNames).toContain('idx_daily_tutor_activities_session');
   });
 
   describe('Migration version 2: expression metadata', () => {
-    it('CURRENT_SCHEMA_VERSION is 3', async () => {
-      expect(CURRENT_SCHEMA_VERSION).toBe(3);
+    it('CURRENT_SCHEMA_VERSION is 4', async () => {
+      expect(CURRENT_SCHEMA_VERSION).toBe(4);
     });
 
     it('migration v2 exists with correct description', async () => {
@@ -393,16 +399,16 @@ describe('SQLite schema migrations (sql.js)', () => {
       await runMigrations(adapter);
 
       const versionBefore = await getSchemaVersion(adapter);
-      expect(versionBefore).toBe(3);
+      expect(versionBefore).toBe(4);
 
       // Run migrations again
       await runMigrations(adapter);
 
       const versionAfter = await getSchemaVersion(adapter);
-      expect(versionAfter).toBe(3);
+      expect(versionAfter).toBe(4);
 
       const rows = await adapter.query(`SELECT COUNT(*) as count FROM schema_migrations`);
-      expect(rows[0].count).toBe(3);
+      expect(rows[0].count).toBe(4);
     });
 
     it('fresh database applies v1 then v2 successfully', async () => {
@@ -410,10 +416,10 @@ describe('SQLite schema migrations (sql.js)', () => {
       await freshAdapter.init();
 
       const version = await getSchemaVersion(freshAdapter);
-      expect(version).toBe(3);
+      expect(version).toBe(4);
 
       const rows = await freshAdapter.query(`SELECT version FROM schema_migrations ORDER BY version`);
-      expect(rows).toHaveLength(3);
+      expect(rows).toHaveLength(4);
       expect(rows[0].version).toBe(1);
       expect(rows[1].version).toBe(2);
 
@@ -463,6 +469,147 @@ describe('SQLite schema migrations (sql.js)', () => {
       );
       expect(rows).toHaveLength(1);
       expect(rows[0].evidence_log).toBe('[]');
+    });
+  });
+
+  describe('Migration version 4: Daily Tutor storage', () => {
+    it('migration v4 exists with correct description and additive steps', () => {
+      const v4 = SCHEMA_MIGRATIONS.find((m) => m.version === 4);
+      expect(v4).toBeDefined();
+      expect(v4!.description).toBe('Additive Daily Tutor storage: daily_tutor_sessions + daily_tutor_activities');
+      // Additive only: CREATE TABLE/INDEX IF NOT EXISTS — no ALTER/DROP on
+      // existing tables, no destructive change anywhere in v4.
+      expect(v4!.steps.length).toBeGreaterThanOrEqual(4);
+      for (const step of v4!.steps) {
+        expect(step.sql).not.toMatch(/DROP\s+TABLE/i);
+        expect(step.sql).not.toMatch(/ALTER\s+TABLE\s+(?!daily_tutor)/i);
+      }
+      const sqls = v4!.steps.map((s) => s.sql).join('\n');
+      expect(sqls).toContain('CREATE TABLE IF NOT EXISTS daily_tutor_sessions');
+      expect(sqls).toContain('CREATE TABLE IF NOT EXISTS daily_tutor_activities');
+      expect(sqls).toContain('CREATE INDEX IF NOT EXISTS idx_daily_tutor_sessions_learner_date');
+      expect(sqls).toContain('CREATE INDEX IF NOT EXISTS idx_daily_tutor_activities_session');
+    });
+
+    it('fresh database creates daily_tutor_sessions with the expected shape', async () => {
+      const freshAdapter = new SqlJsAdapter(':memory:');
+      await freshAdapter.init();
+
+      const columns = await freshAdapter.query(`PRAGMA table_info(daily_tutor_sessions)`);
+      const byName = new Map(columns.map((c) => [c.name as string, c]));
+      const names = Array.from(byName.keys());
+      expect(names).toEqual(
+        expect.arrayContaining([
+          'id', 'learner_id', 'date_key', 'status', 'headline', 'source_mode',
+          'estimated_minutes', 'created_at', 'started_at', 'completed_at', 'updated_at',
+        ]),
+      );
+      // Learner FK + one-session-per-learner-per-day uniqueness.
+      const uniqueIndexes = await freshAdapter.query(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_tutor_sessions'`,
+      );
+      expect(uniqueIndexes[0].sql).toContain('UNIQUE(learner_id, date_key)');
+      expect(uniqueIndexes[0].sql).toContain('REFERENCES learner_profile(id) ON DELETE CASCADE');
+      // Honest counts only: minutes is an INTEGER estimate, nothing else.
+      expect(byName.get('estimated_minutes')!.type).toBe('INTEGER');
+    });
+
+    it('fresh database creates daily_tutor_activities with the expected shape', async () => {
+      const freshAdapter = new SqlJsAdapter(':memory:');
+      await freshAdapter.init();
+
+      const columns = await freshAdapter.query(`PRAGMA table_info(daily_tutor_activities)`);
+      const byName = new Map(columns.map((c) => [c.name as string, c]));
+      const names = Array.from(byName.keys());
+      expect(names).toEqual(
+        expect.arrayContaining([
+          'id', 'session_id', 'order_index', 'kind', 'title', 'reason',
+          'estimated_minutes', 'target', 'status', 'started_at', 'completed_at',
+          'practiced_items', 'created_at', 'updated_at',
+        ]),
+      );
+      expect(byName.get('practiced_items')!.type).toBe('INTEGER');
+      // Activity order is stable and unique within a session.
+      const tableSql = await freshAdapter.query(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_tutor_activities'`,
+      );
+      expect(tableSql[0].sql).toContain('UNIQUE(session_id, order_index)');
+      expect(tableSql[0].sql).toContain('REFERENCES daily_tutor_sessions(id) ON DELETE CASCADE');
+    });
+
+    it('inserts a full daily session row and its ordered activities', async () => {
+      const now = new Date().toISOString();
+      await createLearner();
+      await adapter.execute(
+        `INSERT INTO daily_tutor_sessions
+          (id, learner_id, date_key, status, headline, source_mode, estimated_minutes,
+           created_at, started_at, completed_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ['dt-1', 'learner-1', '2026-09-18', 'in_progress', 'Plan', 'balanced', 18,
+          now, now, null, now],
+      );
+      await adapter.execute(
+        `INSERT INTO daily_tutor_activities
+          (id, session_id, order_index, kind, title, reason, estimated_minutes, target,
+           status, started_at, completed_at, practiced_items, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ['dta-1', 'dt-1', 0, 'review', 'Review', 'Due', 5, '{}', 'pending', null, null, null, now, now],
+      );
+      await adapter.execute(
+        `INSERT INTO daily_tutor_activities
+          (id, session_id, order_index, kind, title, reason, estimated_minutes, target,
+           status, started_at, completed_at, practiced_items, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ['dta-2', 'dt-1', 1, 'listening', 'Listen', 'Practice', 5, '{"a":1}', 'completed', now, now, 4, now, now],
+      );
+
+      const sessions = await adapter.query(`SELECT * FROM daily_tutor_sessions WHERE id = 'dt-1'`);
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].date_key).toBe('2026-09-18');
+      expect(sessions[0].status).toBe('in_progress');
+
+      const activities = await adapter.query(
+        `SELECT * FROM daily_tutor_activities WHERE session_id = 'dt-1' ORDER BY order_index`,
+      );
+      expect(activities).toHaveLength(2);
+      expect(activities[0].order_index).toBe(0);
+      expect(activities[0].practiced_items).toBeNull();
+      expect(activities[1].practiced_items).toBe(4);
+    });
+
+    it('enforces UNIQUE(learner_id, date_key) on daily_tutor_sessions', async () => {
+      const now = new Date().toISOString();
+      await createLearner();
+      const insert = `INSERT INTO daily_tutor_sessions
+          (id, learner_id, date_key, status, headline, source_mode, estimated_minutes,
+           created_at, started_at, completed_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+      await adapter.execute(insert,
+        ['dt-1', 'learner-1', '2026-09-18', 'planned', 'Plan', 'balanced', 18, now, null, null, now]);
+      // A second session for the SAME learner + date must be rejected.
+      await expect(
+        adapter.execute(insert,
+          ['dt-2', 'learner-1', '2026-09-18', 'planned', 'Plan', 'balanced', 18, now, null, null, now]),
+      ).rejects.toThrow();
+      // A different date for the same learner is fine.
+      await expect(
+        adapter.execute(insert,
+          ['dt-3', 'learner-1', '2026-09-19', 'planned', 'Plan', 'balanced', 18, now, null, null, now]),
+      ).resolves.toBeDefined();
+    });
+
+    it('rejects a daily activity for a non-existent session (FK enforced)', async () => {
+      const now = new Date().toISOString();
+      await createLearner();
+      await expect(
+        adapter.execute(
+          `INSERT INTO daily_tutor_activities
+            (id, session_id, order_index, kind, title, reason, estimated_minutes, target,
+             status, started_at, completed_at, practiced_items, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ['dta-x', 'no-such-session', 0, 'review', 'Review', 'Due', 5, '{}', 'pending', null, null, null, now, now],
+        ),
+      ).rejects.toThrow();
     });
   });
 });
