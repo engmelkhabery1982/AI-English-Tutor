@@ -163,10 +163,36 @@ export function createDictionaryService(aiProvider: AIProvider): DictionaryServi
             sentence: cleanSentence,
             arabicMeaning: '',
             englishExplanation: 'Failed to parse contextual meaning response.',
-            whyFits: 'AI response was malformed.',
+            whyFits: 'AI response was malformed or lacked required evidence.',
             certainty: 'insufficient_context',
             alternativeSense: null,
           };
+        }
+
+        if (input.knownSenses && input.knownSenses.length > 0) {
+          const knownSenseIds = new Set(input.knownSenses.map((sense) => sense.senseId));
+
+          if (parsed.selectedSenseId && !knownSenseIds.has(parsed.selectedSenseId)) {
+            return {
+              word: cleanWord,
+              sentence: cleanSentence,
+              arabicMeaning: '',
+              englishExplanation: 'The returned sense did not match the supplied known senses.',
+              whyFits: 'AI returned an unknown sense identifier.',
+              certainty: 'insufficient_context',
+              alternativeSense: null,
+            };
+          }
+
+          if (
+            parsed.alternativeSense?.senseId &&
+            !knownSenseIds.has(parsed.alternativeSense.senseId)
+          ) {
+            return {
+              ...parsed,
+              alternativeSense: null,
+            };
+          }
         }
 
         return parsed;
