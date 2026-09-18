@@ -13,6 +13,7 @@ export type {
   CurriculumReasonCode,
   CurriculumRecommendation,
   LearningGoalHint,
+  PlannerSkillStatus,
   PracticeMode,
   SkillDomain,
   SkillEvidenceSnapshot,
@@ -43,5 +44,6 @@ export {
 export {
   DEFAULT_MAX_ITEMS,
   GOAL_DOMAIN_WEIGHTS,
+  isSupportedDomain,
   planCurriculum,
 } from './planner';
