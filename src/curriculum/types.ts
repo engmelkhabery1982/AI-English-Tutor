@@ -213,15 +213,32 @@ export type CurriculumReasonCode =
   | 'prerequisite_for_blocked'
   | 'learning_goal_domain'
   | 'new_skill'
-  | 'domain_focus';
+  | 'domain_focus'
+  | 'active_weakness'
+  | 'recently_practised';
+
+/**
+ * Planner-only qualitative status. Deliberately DISTINCT from the learning
+ * lifecycle: `unobserved` means the planner has no evidence at all, so it is
+ * never fabricated as the real `observed` evidence state.
+ */
+export type PlannerSkillStatus = 'evidenced' | 'unobserved';
 
 /** One recommended skill in the plan. */
 export interface CurriculumRecommendation {
   readonly skillId: string;
   readonly domain: SkillDomain;
   readonly title: string;
-  /** Lifecycle state used for this recommendation (qualitative). */
-  readonly lifecycleState: SkillLifecycleState;
+  /**
+   * The EVIDENCED lifecycle state, or `null` when the learner has no evidence
+   * for this skill. A no-evidence skill is never fabricated as `observed`.
+   */
+  readonly lifecycleState: SkillLifecycleState | null;
+  /**
+   * Planner-only status. `unobserved` distinguishes a brand-new skill from one
+   * with real (even if minimal) evidence.
+   */
+  readonly status: PlannerSkillStatus;
   readonly reasons: readonly CurriculumReason[];
   /** Skill ids that blocked this item, if any. */
   readonly blockedByPrerequisites: readonly string[];
