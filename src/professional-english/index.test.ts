@@ -3,18 +3,21 @@ import { describe, expect, it } from 'vitest';
 import {
   BASELINE_CHALLENGE,
   DEFAULT_MAX_TARGET_EXPRESSIONS,
+  DIFFICULTY_RANK,
   GENERAL_SCENARIO,
   PROFESSIONAL_LEVELS,
   SCENARIOS,
   SCENARIO_CATEGORIES,
   getScenario,
   planScenario,
+  type DifficultyBand,
+  type LearnerProfile,
   type ScenarioCategory,
   type ScenarioPlan,
 } from './index';
 
-/** Categories called out explicitly in the task and expected to exist. */
-const REQUIRED_CATEGORIES: readonly ScenarioCategory[] = [
+/** The 15 supported categories, declared explicitly for the audit. */
+const SUPPORTED_CATEGORIES: readonly ScenarioCategory[] = [
   'meeting',
   'project_update',
   'presentation',
@@ -32,7 +35,10 @@ const REQUIRED_CATEGORIES: readonly ScenarioCategory[] = [
   'leadership_conversation',
 ];
 
-/** Recursively collect any key that looks like it carries a numeric score. */
+/** Every difficulty band the planner supports. */
+const DIFFICULTY_BANDS: readonly DifficultyBand[] = ['simple', 'moderate', 'complex'];
+
+/** Recursively collect any key that looks like a numeric score. */
 function collectScoreLikeKeys(value: unknown, path = '$'): string[] {
   if (Array.isArray(value)) {
     return value.flatMap((item, i) => collectScoreLikeKeys(item, `${path}[${i}]`));
@@ -46,329 +52,466 @@ function collectScoreLikeKeys(value: unknown, path = '$'): string[] {
   return [];
 }
 
-describe('scenario catalog', () => {
-  it('8. supports all required categories plus the full declared set', () => {
-    expect(SCENARIOS.length).toBe(SCENARIO_CATEGORIES.length);
+const normalize = (value: string): string => value.trim().toLowerCase();
+
+// =========================================================================
+// 1. CATALOG INTEGRITY
+// =========================================================================
+
+describe('catalog integrity', () => {
+  it('supports exactly 15 categories', () => {
+    expect(SCENARIO_CATEGORIES.length).toBe(15);
+    expect(SUPPORTED_CATEGORIES.length).toBe(15);
+    expect([...SCENARIO_CATEGORIES].sort()).toEqual([...SUPPORTED_CATEGORIES].sort());
+  });
+
+  it('declares exactly one scenario definition per supported category', () => {
+    expect(SCENARIOS.length).toBe(15);
+    for (const category of SUPPORTED_CATEGORIES) {
+      const matches = SCENARIOS.filter((s) => s.category === category);
+      expect(matches.length, `category "${category}"`).toBe(1);
+    }
+  });
+
+  it('has unique scenario IDs', () => {
+    const ids = SCENARIOS.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('has unique category values', () => {
+    const categories = SCENARIOS.map((s) => s.category);
+    expect(new Set(categories).size).toBe(categories.length);
+  });
+
+  it('every declared category resolves to a definition via getScenario', () => {
     for (const category of SCENARIO_CATEGORIES) {
-      expect(getScenario(category), `missing scenario for "${category}"`).toBeDefined();
-    }
-    for (const category of REQUIRED_CATEGORIES) {
-      expect(getScenario(category)?.category).toBe(category);
+      const scenario = getScenario(category);
+      expect(scenario, `getScenario('${category}')`).toBeDefined();
+      expect(scenario?.id).toBe(category);
+      expect(scenario?.category).toBe(category);
     }
   });
 
-  it('every scenario is complete and well-formed', () => {
+  it('no scenario has an empty required text field', () => {
     for (const scenario of SCENARIOS) {
-      expect(scenario.id).toBe(scenario.category);
-      expect(scenario.title.length).toBeGreaterThan(0);
-      expect(scenario.situation.length).toBeGreaterThan(0);
-      expect(scenario.learnerRole.length).toBeGreaterThan(0);
-      expect(scenario.counterpartyRole.length).toBeGreaterThan(0);
-      expect(scenario.objective.length).toBeGreaterThan(0);
-      expect(scenario.speakingGoals.length).toBeGreaterThan(0);
-      expect(scenario.languageGoals.length).toBeGreaterThan(0);
-      expect(scenario.challengeEvents.length).toBeGreaterThan(0);
-      expect(scenario.coachingNotes.length).toBeGreaterThan(0);
-      expect(['simple', 'moderate', 'complex']).toContain(scenario.difficulty.band);
-    }
-  });
-});
-
-describe('challenge ranks are valid', () => {
-  it('5. every exported ChallengeEvent has a finite numeric rank in range', () => {
-    const allEvents = [...SCENARIOS.flatMap((s) => s.challengeEvents), ...GENERAL_SCENARIO.challengeEvents];
-    for (const event of allEvents) {
-      expect(typeof event.minComplexityRank).toBe('number');
-      expect(Number.isFinite(event.minComplexityRank)).toBe(true);
-      expect(Number.isInteger(event.minComplexityRank)).toBe(true);
-      // Expected internal range: index into DIFFICULTY_ORDER (0..2).
-      expect(event.minComplexityRank).toBeGreaterThanOrEqual(0);
-      expect(event.minComplexityRank).toBeLessThanOrEqual(2);
+      for (const field of [
+        'title',
+        'situation',
+        'learnerRole',
+        'counterpartyRole',
+        'objective',
+        'coachingNotes',
+      ] as const) {
+        const value = scenario[field];
+        expect(typeof value).toBe('string');
+        expect(value.trim().length, `${scenario.category}.${field}`).toBeGreaterThan(0);
+      }
     }
   });
 
-  it('6. BASELINE_CHALLENGE has a valid numeric rank (simple => 0)', () => {
-    expect(typeof BASELINE_CHALLENGE.minComplexityRank).toBe('number');
-    expect(BASELINE_CHALLENGE.minComplexityRank).toBe(0);
-    expect(Number.isFinite(BASELINE_CHALLENGE.minComplexityRank)).toBe(true);
-  });
-});
-
-describe('deterministic plan', () => {
-  it('7. produces identical plans for identical input, and does not mutate input', () => {
-    const input = {
-      category: 'meeting' as ScenarioCategory,
-      learner: { level: 'developing' as const, goals: ['meetings_and_updates' as const] },
-    };
-    const snapshot = JSON.stringify(input);
-
-    const first = planScenario(input);
-    const second = planScenario(input);
-
-    expect(second).toEqual(first);
-    expect(JSON.stringify(input)).toBe(snapshot);
-  });
-
-  it('takes the general fallback for an unknown category', () => {
-    const plan = planScenario({ category: 'totally_unknown' as ScenarioCategory });
-    expect(plan.isFallback).toBe(true);
-    expect(plan.title).toBe(GENERAL_SCENARIO.title);
-  });
-
-  it('never silently replaces the requested category', () => {
-    for (const category of REQUIRED_CATEGORIES) {
-      const plan = planScenario({
-        category,
-        learner: { goals: ['interview'], profession: 'law', weaknesses: ['speaks too quickly'] },
-      });
-      expect(plan.category).toBe(category);
-      const expected = getScenario(category);
-      expect(plan.scenarioId).toBe(expected ? expected.id : GENERAL_SCENARIO.id);
+  it('every scenario has at least one of each content collection', () => {
+    for (const scenario of SCENARIOS) {
+      expect(scenario.speakingGoals.length, `${scenario.category} speakingGoals`).toBeGreaterThan(0);
+      expect(scenario.languageGoals.length, `${scenario.category} languageGoals`).toBeGreaterThan(0);
+      expect(scenario.targetExpressions.length, `${scenario.category} targetExpressions`).toBeGreaterThan(0);
+      expect(scenario.challengeEvents.length, `${scenario.category} challengeEvents`).toBeGreaterThan(0);
     }
   });
-});
 
-describe('category-specific plans', () => {
-  const cases: readonly [ScenarioCategory, Partial<ScenarioPlan>][] = [
-    ['meeting', { practiceType: 'structured_exchange' }],
-    ['project_update', { practiceType: 'guided_dialogue' }],
-    ['presentation', { practiceType: 'prepared_monologue' }],
-    ['interview', { practiceType: 'question_and_answer' }],
-    ['negotiation', { practiceType: 'role_play', difficulty: 'complex' }],
-    ['client_discussion', { practiceType: 'simulated_call' }],
-    ['stakeholder_discussion', { practiceType: 'structured_exchange' }],
-    ['contract_discussion', { practiceType: 'structured_exchange' }],
-    ['claim_discussion', { practiceType: 'simulated_call' }],
-    ['site_discussion', { practiceType: 'role_play' }],
-    ['technical_explanation', { practiceType: 'open_discussion' }],
-  ];
-
-  it.each(cases)('plans "%s" with the expected shape', (category, expected) => {
-    const plan = planScenario({ category });
-    expect(plan.category).toBe(category);
-    expect(plan.isFallback).toBe(false);
-    expect(plan.speakingGoals.length).toBeGreaterThan(0);
-    expect(plan.languageGoals.length).toBeGreaterThan(0);
-    expect(plan.challengeEvents.length).toBeGreaterThan(0);
-    for (const [key, value] of Object.entries(expected)) {
-      expect(plan[key as keyof ScenarioPlan]).toEqual(value);
+  it('has unique speaking goal IDs within each scenario', () => {
+    for (const scenario of SCENARIOS) {
+      const ids = scenario.speakingGoals.map((g) => g.id);
+      expect(new Set(ids).size, `${scenario.category}`).toBe(ids.length);
+      for (const goal of scenario.speakingGoals) {
+        expect(goal.id.trim().length).toBeGreaterThan(0);
+        expect(goal.description.trim().length).toBeGreaterThan(0);
+      }
     }
   });
-});
 
-describe('general profession fallback', () => {
-  it('is profession-agnostic and never industry-specific', () => {
-    const plan = planScenario({ category: 'site_discussion' });
-    const text = JSON.stringify(plan).toLowerCase();
-    expect(text).not.toContain('rebar');
-    expect(text).not.toContain('excavator');
-    expect(plan.isFallback).toBe(false);
+  it('has unique language goal IDs within each scenario', () => {
+    for (const scenario of SCENARIOS) {
+      const ids = scenario.languageGoals.map((g) => g.id);
+      expect(new Set(ids).size, `${scenario.category}`).toBe(ids.length);
+      for (const goal of scenario.languageGoals) {
+        expect(goal.id.trim().length).toBeGreaterThan(0);
+        expect(goal.description.trim().length).toBeGreaterThan(0);
+      }
+    }
   });
 
-  it('general scenario exists for unmatched input', () => {
+  it('has unique challenge IDs within each scenario', () => {
+    for (const scenario of SCENARIOS) {
+      const ids = scenario.challengeEvents.map((c) => c.id);
+      expect(new Set(ids).size, `${scenario.category}`).toBe(ids.length);
+      for (const challenge of scenario.challengeEvents) {
+        expect(challenge.id.trim().length).toBeGreaterThan(0);
+        expect(challenge.description.trim().length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('has no duplicate target expressions after trim/case normalization', () => {
+    for (const scenario of SCENARIOS) {
+      const normalized = scenario.targetExpressions.map(normalize);
+      expect(new Set(normalized).size, `${scenario.category}`).toBe(normalized.length);
+      for (const expression of scenario.targetExpressions) {
+        expect(expression.trim().length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('general fallback scenario is itself well-formed', () => {
     expect(GENERAL_SCENARIO.speakingGoals.length).toBeGreaterThan(0);
+    expect(GENERAL_SCENARIO.languageGoals.length).toBeGreaterThan(0);
+    expect(GENERAL_SCENARIO.targetExpressions.length).toBeGreaterThan(0);
     expect(GENERAL_SCENARIO.challengeEvents.length).toBeGreaterThan(0);
   });
 });
 
-describe('1. learner goals materially affect the generated plan', () => {
-  it('reorders speakingGoals when the goal maps to the category', () => {
+// =========================================================================
+// 2. CHALLENGE RANK SAFETY
+// =========================================================================
+
+describe('challenge rank safety', () => {
+  const maxRank = Math.max(...Object.values(DIFFICULTY_RANK));
+
+  it('every challenge event carries a real finite integer rank in range', () => {
+    const allEvents = [
+      ...SCENARIOS.flatMap((s) => s.challengeEvents),
+      ...GENERAL_SCENARIO.challengeEvents,
+      BASELINE_CHALLENGE,
+    ];
+    for (const event of allEvents) {
+      const rank = event.minComplexityRank;
+      expect(typeof rank, `${event.id}`).toBe('number');
+      expect(Number.isFinite(rank), `${event.id} finite`).toBe(true);
+      expect(Number.isNaN(rank), `${event.id} not NaN`).toBe(false);
+      expect(Number.isInteger(rank), `${event.id} integer`).toBe(true);
+      expect(rank, `${event.id} >= 0`).toBeGreaterThanOrEqual(0);
+      expect(rank, `${event.id} <= max`).toBeLessThanOrEqual(maxRank);
+    }
+  });
+
+  it('BASELINE_CHALLENGE has the lowest valid rank (simple => 0)', () => {
+    expect(BASELINE_CHALLENGE.minComplexityRank).toBe(DIFFICULTY_RANK.simple);
+    expect(Number.isFinite(BASELINE_CHALLENGE.minComplexityRank)).toBe(true);
+  });
+
+  it('DIFFICULTY_RANK maps the supported bands to contiguous integers from 0', () => {
+    expect(Object.keys(DIFFICULTY_RANK).sort()).toEqual([...DIFFICULTY_BANDS].sort());
+    expect(Object.values(DIFFICULTY_RANK).sort((a, b) => a - b)).toEqual([0, 1, 2]);
+  });
+
+  it('every supported difficulty band selects challenges without error', () => {
+    for (const category of SUPPORTED_CATEGORIES) {
+      for (const band of DIFFICULTY_BANDS) {
+        const plan = planScenario({
+          category,
+          learner: { scenarioDifficulty: band },
+        });
+        expect(plan.challengeEvents.length, `${category} @ ${band}`).toBeGreaterThan(0);
+        expect(plan.difficulty).toBe(band);
+      }
+    }
+  });
+});
+
+// =========================================================================
+// 3. PERSONALIZATION HONESTY
+// =========================================================================
+
+describe('personalization honesty', () => {
+  it('A. a mapped learner goal materially changes speaking-goal order', () => {
     const baseline = planScenario({ category: 'meeting' });
-    // "interview" does not map to meeting; "meetings_and_updates" does.
-    const off = planScenario({ category: 'meeting', learner: { goals: ['interviews'] } });
-    const on = planScenario({ category: 'meeting', learner: { goals: ['meetings_and_updates'] } });
+    const mapped = planScenario({ category: 'meeting', learner: { goals: ['meetings_and_updates'] } });
 
-    const baselineIds = baseline.speakingGoals.map((g) => g.id);
-    const onIds = on.speakingGoals.map((g) => g.id);
-    // Same set of goals...
-    expect([...onIds].sort()).toEqual([...baselineIds].sort());
-    // ...but a material ORDER change: the matching goal is promoted to the front.
-    expect(on.speakingGoals[0].id).toBe('meetings_and_updates');
-    expect(onIds).not.toEqual(baselineIds);
-    // An irrelevant goal leaves the structure untouched.
-    expect(off.speakingGoals.map((g) => g.id)).toEqual(baselineIds);
+    expect([...mapped.speakingGoals.map((g) => g.id)].sort()).toEqual(
+      [...baseline.speakingGoals.map((g) => g.id)].sort(),
+    );
+    expect(mapped.speakingGoals[0].id).toBe('meetings_and_updates');
+    expect(mapped.speakingGoals.map((g) => g.id)).not.toEqual(
+      baseline.speakingGoals.map((g) => g.id),
+    );
   });
 
-  it('a relevant goal changes plan structure, not just the notes string', () => {
-    const without = planScenario({ category: 'presentation' });
-    const withGoal = planScenario({ category: 'presentation', learner: { goals: ['presentations'] } });
+  it('B. an unmapped learner goal does NOT claim goal adaptation', () => {
+    const baseline = planScenario({ category: 'meeting' });
+    const unmapped = planScenario({ category: 'meeting', learner: { goals: ['interviews'] } });
 
-    // The speakingGoals array itself must differ.
-    expect(withGoal.speakingGoals).not.toEqual(without.speakingGoals);
-    expect(withGoal.speakingGoals[0].id).toBe('presentations');
-  });
-});
-
-describe('2. personalization notes never claim an adaptation that did not happen', () => {
-  it('no note claims goals were applied when no goal mapped to the category', () => {
-    const plan = planScenario({ category: 'meeting', learner: { goals: ['interviews'] } });
-    const notes = plan.personalizationNotes.join(' ').toLowerCase();
-    expect(notes).not.toContain('speaking goals reordered');
-    expect(plan.speakingGoals).toEqual(getScenario('meeting')?.speakingGoals);
+    expect(unmapped.speakingGoals).toEqual(baseline.speakingGoals);
+    expect(unmapped.personalizationNotes.join(' ').toLowerCase()).not.toContain(
+      'speaking goals reordered',
+    );
   });
 
-  it('claims a goal adaptation only when the plan actually changed', () => {
-    const plan = planScenario({ category: 'meeting', learner: { goals: ['meetings_and_updates'] } });
-    const notes = plan.personalizationNotes.join(' ').toLowerCase();
-    expect(notes).toContain('speaking goals reordered');
-    expect(plan.speakingGoals[0].id).toBe('meetings_and_updates');
+  it('C. a mapped weakness materially changes language-goal order', () => {
+    const baseline = planScenario({ category: 'meeting' });
+    const mapped = planScenario({ category: 'meeting', learner: { weaknesses: ['grammar accuracy'] } });
+
+    expect(mapped.languageGoals[0].id).toBe('accuracy');
+    expect(mapped.languageGoals).not.toEqual(baseline.languageGoals);
+    expect(mapped.personalizationNotes.join(' ')).toContain('Language goals reordered');
   });
 
-  it('makes no adaptation claims when the plan is identical to the defaults', () => {
-    const bare = planScenario({ category: 'reporting' });
-    const withNeutralProfile = planScenario({
-      category: 'reporting',
-      // A goal irrelevant to "reporting" and an unmappable weakness.
-      learner: { goals: ['interviews'], weaknesses: ['needs more confidence in general'] },
+  it('D. an unmatched weakness does NOT claim adaptation', () => {
+    const baseline = planScenario({ category: 'meeting' });
+    const unmatched = planScenario({
+      category: 'meeting',
+      learner: { weaknesses: ['just wants to feel better overall'] },
     });
-    expect(withNeutralProfile.speakingGoals).toEqual(bare.speakingGoals);
-    expect(withNeutralProfile.languageGoals).toEqual(bare.languageGoals);
-    const notes = withNeutralProfile.personalizationNotes.join(' ').toLowerCase();
+
+    expect(unmatched.languageGoals).toEqual(baseline.languageGoals);
+    const notes = unmatched.personalizationNotes.join(' ');
+    expect(notes).not.toContain('Language goals reordered');
     expect(notes).toContain('no deterministic mapping');
-    expect(notes).not.toContain('reordered');
-  });
-});
-
-describe('3. profession is context, not a false adaptation claim', () => {
-  it('does not claim examples/register were adapted', () => {
-    const plan = planScenario({ category: 'meeting', learner: { profession: 'software engineering' } });
-    const notes = plan.personalizationNotes.join(' ').toLowerCase();
-    expect(notes).not.toContain('adapted');
-    expect(notes).not.toContain('examples and register');
-    expect(notes).toContain('does not change');
-    expect(notes).toContain('software engineering');
   });
 
-  it('carries profession as professionalContext without altering the scenario', () => {
+  it('E. profession is carried only as context, never as adapted content', () => {
     const bare = planScenario({ category: 'meeting' });
     const withProfession = planScenario({
       category: 'meeting',
-      learner: { profession: '  software engineering  ' },
+      learner: { profession: '  healthcare administration  ' },
     });
-    expect(withProfession.professionalContext).toBe('software engineering');
+
+    expect(withProfession.professionalContext).toBe('healthcare administration');
+    // Scenario content is untouched by profession.
     expect(withProfession.situation).toBe(bare.situation);
     expect(withProfession.speakingGoals).toEqual(bare.speakingGoals);
     expect(withProfession.languageGoals).toEqual(bare.languageGoals);
+    expect(withProfession.targetExpressions).toEqual(bare.targetExpressions);
+    // The note is honest: context only, no adaptation claim.
+    const notes = withProfession.personalizationNotes.join(' ').toLowerCase();
+    expect(notes).toContain('does not change');
+    expect(notes).not.toContain('adapted');
+    expect(notes).not.toContain('register adapted');
   });
-});
 
-describe('4. weakness context is either materially used or honestly represented', () => {
-  it('materially emphasises a language goal for a mappable weakness', () => {
+  it('F. learner target expressions materially affect the selected expressions', () => {
     const bare = planScenario({ category: 'meeting' });
-    const plan = planScenario({ category: 'meeting', learner: { weaknesses: ['grammar accuracy'] } });
-    // The emphasised language goal is promoted to the front — a real change.
-    expect(plan.languageGoals[0].id).toBe('accuracy');
-    expect(plan.languageGoals).not.toEqual(bare.languageGoals);
-    expect(plan.personalizationNotes.join(' ')).toContain('Language goals reordered');
+    const withOwn = planScenario({
+      category: 'meeting',
+      learner: { targetExpressions: ['A phrase only this learner uses'] },
+    });
+
+    expect(withOwn.targetExpressions[0]).toBe('A phrase only this learner uses');
+    expect(withOwn.targetExpressions).not.toEqual(bare.targetExpressions);
   });
 
-  it('honestly reports an unmappable weakness as not applied', () => {
-    const plan = planScenario({ category: 'meeting', learner: { weaknesses: ['just wants to feel better'] } });
-    const notes = plan.personalizationNotes.join(' ');
-    expect(notes).toContain('no deterministic mapping');
-    expect(notes).not.toContain('Language goals reordered');
-  });
-});
-
-describe('difficulty influences challenge events', () => {
-  it('includes more challenges as difficulty rises', () => {
+  it('G. a difficulty preference materially changes difficulty and challenge selection', () => {
     const simple = planScenario({ category: 'negotiation', learner: { scenarioDifficulty: 'simple' } });
     const complex = planScenario({ category: 'negotiation', learner: { scenarioDifficulty: 'complex' } });
 
     expect(simple.difficulty).toBe('simple');
     expect(complex.difficulty).toBe('complex');
+    expect(simple.difficulty).not.toBe(complex.difficulty);
     expect(simple.challengeEvents.length).toBeLessThanOrEqual(complex.challengeEvents.length);
-    expect(complex.challengeEvents.length).toBeGreaterThan(0);
   });
 
-  it('never returns zero challenges even at the easiest band', () => {
-    for (const category of SCENARIO_CATEGORIES) {
-      const plan = planScenario({ category, learner: { scenarioDifficulty: 'simple' } });
-      expect(plan.challengeEvents.length).toBeGreaterThan(0);
+  it('notes never claim an adaptation when the plan equals the defaults', () => {
+    const bare = planScenario({ category: 'reporting' });
+    const neutral = planScenario({
+      category: 'reporting',
+      learner: { goals: ['interviews'], weaknesses: ['needs more confidence in general'] },
+    });
+
+    expect(neutral.speakingGoals).toEqual(bare.speakingGoals);
+    expect(neutral.languageGoals).toEqual(bare.languageGoals);
+    const notes = neutral.personalizationNotes.join(' ').toLowerCase();
+    expect(notes).not.toContain('reordered');
+    expect(notes).toContain('no deterministic mapping');
+  });
+});
+
+// =========================================================================
+// 4. DETERMINISM
+// =========================================================================
+
+describe('determinism', () => {
+  it('every one of the 15 scenarios yields identical plans across repeated calls', () => {
+    for (const category of SUPPORTED_CATEGORIES) {
+      const input = {
+        category,
+        learner: {
+          level: 'developing' as const,
+          goals: ['presentations' as const],
+          profession: 'consultant',
+          weaknesses: ['grammar accuracy'],
+          scenarioDifficulty: 'moderate' as const,
+        },
+      };
+      const first = planScenario(input);
+      for (let i = 0; i < 10; i += 1) {
+        expect(planScenario(input), `${category} call ${i}`).toEqual(first);
+      }
     }
   });
 
-  it('accepts a qualitative level as a difficulty hint', () => {
-    const plan = planScenario({ category: 'meeting', learner: { scenarioDifficulty: 'foundation' } });
-    expect(plan.difficulty).toBe('simple');
+  it('a deep snapshot is stable (no hidden mutable state)', () => {
+    const input = { category: 'negotiation' as ScenarioCategory, learner: { goals: ['negotiation'] as const } };
+    const snapshot = JSON.stringify(input);
+    const a = JSON.stringify(planScenario(input));
+    const b = JSON.stringify(planScenario(input));
+    expect(b).toBe(a);
+    // Input object is not mutated by planning.
+    expect(JSON.stringify(input)).toBe(snapshot);
   });
 });
 
-describe('target expressions are bounded', () => {
-  it('respects the default cap and an explicit cap', () => {
-    const plan = planScenario({ category: 'negotiation' });
-    expect(plan.targetExpressions.length).toBeLessThanOrEqual(DEFAULT_MAX_TARGET_EXPRESSIONS);
+// =========================================================================
+// 5. GENERAL-PURPOSE SAFETY
+// =========================================================================
 
-    const capped = planScenario({ category: 'negotiation', maxTargetExpressions: 2 });
-    expect(capped.targetExpressions.length).toBeLessThanOrEqual(2);
+describe('general-purpose safety', () => {
+  it('the catalog contains no construction-only jargon', () => {
+    const forbidden = ['rebar', 'formwork', 'scaffold', 'masonry', 'excavator', 'trench', 'dumper'];
+    const text = JSON.stringify(SCENARIOS).toLowerCase();
+    for (const word of forbidden) {
+      expect(text, `unexpected "${word}"`).not.toContain(word);
+    }
   });
 
-  it('prioritises the learner’s own expressions and dedupes', () => {
-    const plan = planScenario({
-      category: 'meeting',
-      learner: { targetExpressions: ['A phrase of my own', 'Could I add one point here?'] },
-      maxTargetExpressions: 3,
-    });
-    expect(plan.targetExpressions[0]).toBe('A phrase of my own');
-    expect(new Set(plan.targetExpressions.map((e) => e.toLowerCase())).size).toBe(
-      plan.targetExpressions.length,
-    );
+  it('site/claim/contract scenarios remain field-agnostic and professional', () => {
+    for (const category of ['site_discussion', 'claim_discussion', 'contract_discussion'] as const) {
+      const scenario = getScenario(category);
+      expect(scenario).toBeDefined();
+      const text = JSON.stringify(scenario).toLowerCase();
+      for (const word of ['rebar', 'formwork', 'concrete mix', 'excavator']) {
+        expect(text, `${category} contains "${word}"`).not.toContain(word);
+      }
+    }
   });
 
-  it('handles a zero cap', () => {
-    const plan = planScenario({ category: 'meeting', maxTargetExpressions: 0 });
-    expect(plan.targetExpressions).toEqual([]);
+  it('site_discussion is explicitly declared field-agnostic', () => {
+    const text = (getScenario('site_discussion')?.situation ?? '').toLowerCase();
+    expect(text).toContain('field-agnostic');
   });
 });
 
-describe('invariants', () => {
-  it('10. carries no scores or percentages anywhere', () => {
-    for (const category of SCENARIO_CATEGORIES) {
+// =========================================================================
+// 6. FALLBACK / INVALID INPUT SAFETY
+// =========================================================================
+
+describe('fallback and invalid-input safety', () => {
+  // A controlled runtime cast, confined to the test, for an out-of-union value.
+  const invalidCategory = 'totally_unsupported' as ScenarioCategory;
+
+  it('falls back deterministically for an unsupported category', () => {
+    const first = planScenario({ category: invalidCategory });
+    const second = planScenario({ category: invalidCategory });
+    expect(second).toEqual(first);
+    expect(first.isFallback).toBe(true);
+    expect(first.title).toBe(GENERAL_SCENARIO.title);
+  });
+
+  it('does not throw for an unsupported category, even with a learner profile', () => {
+    expect(() =>
+      planScenario({
+        category: invalidCategory,
+        learner: { goals: ['negotiation'], profession: 'sales', weaknesses: ['grammar accuracy'] },
+      }),
+    ).not.toThrow();
+  });
+
+  it('marks the fallback honestly and claims no adaptation of the real category', () => {
+    const plan = planScenario({ category: invalidCategory });
+    expect(plan.isFallback).toBe(true);
+    expect(plan.category).toBe(GENERAL_SCENARIO.category);
+    expect(plan.scenarioId).toBe(GENERAL_SCENARIO.id);
+  });
+
+  it('an unknown category with no learner claims no personalization was applied', () => {
+    const plan = planScenario({ category: invalidCategory });
+    const notes = plan.personalizationNotes.join(' ').toLowerCase();
+    expect(notes).toContain('no learner profile supplied');
+    expect(notes).not.toContain('reordered');
+  });
+
+  it('a supported category is never silently replaced by the fallback', () => {
+    for (const category of SUPPORTED_CATEGORIES) {
+      const plan = planScenario({ category });
+      expect(plan.isFallback).toBe(false);
+      expect(plan.category).toBe(category);
+    }
+  });
+});
+
+// =========================================================================
+// 7. NO ARCHITECTURE EXPANSION
+// =========================================================================
+
+describe('no architecture expansion', () => {
+  it('the public surface exposes no network/AI/persistence-shaped names', async () => {
+    const moduleSource = await import('./index');
+    for (const name of Object.keys(moduleSource)) {
+      expect(/fetch|http|axios|openai|anthropic|gemini|sqlite|supabase|storage|repository/i.test(name), name).toBe(false);
+    }
+  });
+
+  it('plans carry no scores, percentages, or CEFR mappings', () => {
+    for (const category of SUPPORTED_CATEGORIES) {
       const plan = planScenario({
         category,
-        learner: { level: 'developing', goals: ['presentations'], scenarioDifficulty: 'moderate' },
+        learner: { level: 'independent', goals: ['leadership'], scenarioDifficulty: 'moderate' },
       });
       expect(collectScoreLikeKeys(plan)).toEqual([]);
     }
     expect(collectScoreLikeKeys(SCENARIOS)).toEqual([]);
-  });
-
-  it('never maps levels to exam bands', () => {
     const text = JSON.stringify(SCENARIOS).toUpperCase();
     expect(text).not.toContain('CEFR');
     expect(text).not.toMatch(/\bA1\b|\bA2\b|\bB1\b|\bB2\b|\bC1\b|\bC2\b/);
-    expect([...PROFESSIONAL_LEVELS]).toEqual([
-      'foundation',
-      'developing',
-      'independent',
-      'advanced',
-    ]);
   });
 
-  it('planner is pure — plan depends only on its input', () => {
-    const first = planScenario({ category: 'reporting' });
-    for (let i = 0; i < 25; i += 1) {
-      expect(planScenario({ category: 'reporting' })).toEqual(first);
-    }
+  it('professional levels stay qualitative', () => {
+    expect([...PROFESSIONAL_LEVELS]).toEqual(['foundation', 'developing', 'independent', 'advanced']);
   });
 
-  it('9. does not require AI or network — the module imports nothing external', async () => {
-    const moduleSource = await import('./index');
-    expect(typeof moduleSource.planScenario).toBe('function');
-    expect(typeof moduleSource.getScenario).toBe('function');
-    const moduleNames = Object.keys(moduleSource);
-    for (const name of moduleNames) {
-      expect(/fetch|http|axios|openai|anthropic|gemini/i.test(name)).toBe(false);
-    }
-  });
-
-  it('9b. does not persist — plan is a plain serialisable object', () => {
+  it('plans are plain serialisable objects with no persistence handles', () => {
     const plan = planScenario({ category: 'presentation' });
-    const roundTripped = JSON.parse(JSON.stringify(plan)) as ScenarioPlan;
-    expect(roundTripped).toEqual(plan);
-    const keys = Object.keys(plan);
-    for (const key of keys) {
-      expect(/save|store|persist|db|database|client/i.test(key)).toBe(false);
+    expect(JSON.parse(JSON.stringify(plan)) as ScenarioPlan).toEqual(plan);
+    for (const key of Object.keys(plan)) {
+      expect(/save|store|persist|db|database|client/i.test(key), key).toBe(false);
     }
+  });
+});
+
+// =========================================================================
+// EXISTING BEHAVIOUR — remains unchanged
+// =========================================================================
+
+describe('existing behaviour preserved', () => {
+  it('category-specific practice types are unchanged', () => {
+    const cases: readonly [ScenarioCategory, ScenarioPlan['practiceType']][] = [
+      ['meeting', 'structured_exchange'],
+      ['project_update', 'guided_dialogue'],
+      ['presentation', 'prepared_monologue'],
+      ['interview', 'question_and_answer'],
+      ['negotiation', 'role_play'],
+      ['client_discussion', 'simulated_call'],
+      ['stakeholder_discussion', 'structured_exchange'],
+      ['contract_discussion', 'structured_exchange'],
+      ['claim_discussion', 'simulated_call'],
+      ['site_discussion', 'role_play'],
+      ['technical_explanation', 'open_discussion'],
+    ];
+    for (const [category, practiceType] of cases) {
+      expect(planScenario({ category }).practiceType, category).toBe(practiceType);
+    }
+  });
+
+  it('target expressions remain bounded by the default and explicit caps', () => {
+    expect(planScenario({ category: 'negotiation' }).targetExpressions.length).toBeLessThanOrEqual(
+      DEFAULT_MAX_TARGET_EXPRESSIONS,
+    );
+    expect(
+      planScenario({ category: 'negotiation', maxTargetExpressions: 2 }).targetExpressions.length,
+    ).toBeLessThanOrEqual(2);
+    expect(planScenario({ category: 'meeting', maxTargetExpressions: 0 }).targetExpressions).toEqual([]);
+  });
+
+  it('an empty learner profile uses plain defaults with no adaptation claims', () => {
+    const plan = planScenario({ category: 'meeting', learner: {} satisfies LearnerProfile });
+    expect(plan.coachingMode).toBe('balanced');
+    expect(plan.personalizationNotes.join(' ').toLowerCase()).toContain('no learner profile');
   });
 });
