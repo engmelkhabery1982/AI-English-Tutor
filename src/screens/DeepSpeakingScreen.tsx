@@ -861,6 +861,12 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
         >
           <Text style={styles.primaryButtonText}>Practise again</Text>
         </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.secondaryButton}
+          onPress={() => navigation.navigate('FluencyPractice')}
+        >
+          <Text style={styles.secondaryButtonText}>Try Fluency & Automaticity Practice</Text>
+        </TouchableOpacity>
         <TouchableOpacity style={styles.linkButton} onPress={() => navigation.goBack()}>
           <Text style={styles.linkText}>Back</Text>
         </TouchableOpacity>

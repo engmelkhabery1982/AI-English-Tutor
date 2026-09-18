@@ -27,6 +27,7 @@ import ListeningScreen from '../screens/ListeningScreen';
 import SettingsScreen from '../screens/SettingsScreen';
 import AdaptiveLessonScreen from '../screens/AdaptiveLessonScreen';
 import OnboardingScreen from '../screens/OnboardingScreen';
+import FluencyPracticeScreen from '../screens/FluencyPracticeScreen';
 
 // Re-exported for callers that import the param list types from the
 // navigator module (the definitions live in ./routes, the single source).
@@ -121,6 +122,11 @@ const ROOT_SCREENS: readonly RootScreenDef[] = [
     name: 'DeepSpeaking',
     component: DeepSpeakingScreen,
     options: { title: 'Speaking practice', headerBackTitle: 'Home' },
+  },
+  {
+    name: 'FluencyPractice',
+    component: FluencyPracticeScreen,
+    options: { title: 'Fluency Practice', headerBackTitle: 'Home' },
   },
   {
     name: 'ProfessionalEnglish',

@@ -155,6 +155,10 @@ export default function HomeScreen(props?: HomeScreenProps) {
     navigation.navigate('DeepSpeaking');
   };
 
+  const openFluencyPractice = () => {
+    navigation.navigate('FluencyPractice');
+  };
+
   const openProfessionalEnglish = () => {
     navigation.navigate('ProfessionalEnglish');
   };
@@ -335,6 +339,9 @@ export default function HomeScreen(props?: HomeScreenProps) {
         </Text>
         <TouchableOpacity style={styles.primaryButton} onPress={openSpeakingPractice}>
           <Text style={styles.primaryButtonText}>Start speaking practice</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.secondaryButton} onPress={openFluencyPractice}>
+          <Text style={styles.secondaryButtonText}>Start fluency & automaticity practice</Text>
         </TouchableOpacity>
       </View>
 

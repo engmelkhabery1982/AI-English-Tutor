@@ -34,6 +34,7 @@ export const ROOT_STACK_ROUTES = [
   'DailyTutor',
   'AdaptiveLesson',
   'DeepSpeaking',
+  'FluencyPractice',
   'ProfessionalEnglish',
   'Onboarding',
 ] as const;
@@ -91,6 +92,7 @@ export type RootStackParamList = {
         readonly dailyTutor?: DailyTutorActivityRef;
       }
     | undefined;
+  FluencyPractice: { readonly taskId?: string } | undefined;
   ProfessionalEnglish: undefined;
   Onboarding: undefined;
 };
