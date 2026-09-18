@@ -13,6 +13,7 @@ import type { ConversationMode } from '../domain/shared/types';
 import type {
   SpeakingPracticePlan,
   SpeakingPracticeType,
+  SpeakingProfessionalScenario,
   SpeakingTurnGoal,
   SpeakingTurnGoalKind,
 } from './types';
@@ -174,6 +175,79 @@ export const TURN_GOAL_INSTRUCTIONS: Readonly<Record<SpeakingTurnGoalKind, strin
 };
 
 /* ------------------------------------------------------------------ *
+ * Professional scenario (content layer) prompts
+ * ------------------------------------------------------------------ */
+
+/**
+ * Tutor opening instruction for a professional scenario practice. It is sent
+ * through the EXISTING session.openConversation() exactly like every other
+ * scenario prompt — an instruction to the tutor, never learner speech.
+ */
+export function buildProfessionalScenarioPrompt(
+  scenario: SpeakingProfessionalScenario,
+): string {
+  const parts: string[] = [
+    `Professional scenario practice: "${scenario.title}".`,
+    `You play the "${scenario.counterpartyRole}".`,
+    `The learner plays the "${scenario.learnerRole}".`,
+    `Situation: ${scenario.situation}`,
+    `The learner's objective: ${scenario.objective}`,
+    'Open in character with one short, natural line or question that starts the scenario.',
+  ];
+  return parts.join(' ');
+}
+
+/**
+ * Bounded scenario context appended to the EXISTING coaching system prompt so
+ * the tutor keeps conducting the scenario across the whole conversation.
+ *
+ * Challenge events are guidance only: the tutor may use one naturally if the
+ * conversation reaches that point. It never announces them, never forces them,
+ * and they never create an extra AI request or interrupt a turn.
+ */
+export function buildProfessionalScenarioContext(
+  scenario: SpeakingProfessionalScenario,
+): string {
+  const lines: string[] = [];
+  lines.push('=== PROFESSIONAL SCENARIO ===');
+  lines.push(`Scenario: ${scenario.title}`);
+  lines.push(`Situation: ${scenario.situation}`);
+  lines.push(`Your role: ${scenario.counterpartyRole}`);
+  lines.push(`Learner's role: ${scenario.learnerRole}`);
+  lines.push(`Learner's objective: ${scenario.objective}`);
+  lines.push(`Difficulty: ${scenario.difficulty}`);
+  lines.push(`Coaching posture: ${scenario.coachingPosture}`);
+  lines.push(`Coaching notes: ${scenario.coachingNotes}`);
+  if (scenario.speakingGoals.length > 0) {
+    lines.push('Create natural opportunities for the learner to practise:');
+    for (const goal of scenario.speakingGoals) {
+      lines.push(`- ${goal.description}`);
+    }
+  }
+  if (scenario.languageGoals.length > 0) {
+    lines.push('Useful language to coach when it fits:');
+    for (const goal of scenario.languageGoals) {
+      lines.push(`- ${goal.description}`);
+    }
+  }
+  if (scenario.challengeEvents.length > 0) {
+    lines.push(
+      'Possible scenario developments (guidance only: use one naturally ONLY if the conversation reaches that point; never announce, force or interrupt for them):',
+    );
+    for (const event of scenario.challengeEvents) {
+      lines.push(`- ${event.description}`);
+    }
+  }
+  if (scenario.professionalContext) {
+    lines.push(
+      `Professional background (context only — do not assume it unless the learner says so): "${scenario.professionalContext}"`,
+    );
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
+/* ------------------------------------------------------------------ *
  * Coaching system-prompt augmentation
  * ------------------------------------------------------------------ */
 
@@ -220,6 +294,13 @@ export function buildSpeakingCoachingPrompt(
   if (plan.recentMemoryNote) {
     lines.push(`Recent context: ${plan.recentMemoryNote}`);
     lines.push('');
+  }
+
+  // Additive (Professional English): scenario content is carried by the plan;
+  // without it this block never appears and the prompt is byte-identical to
+  // the pre-existing behaviour.
+  if (plan.professionalScenario) {
+    lines.push(buildProfessionalScenarioContext(plan.professionalScenario));
   }
 
   lines.push(`Turn goal for your next reply: ${currentTurnGoal.goal.replace(/_/g, ' ')}`);

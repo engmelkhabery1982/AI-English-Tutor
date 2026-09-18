@@ -115,6 +115,10 @@ export default function HomeScreen(props?: HomeScreenProps) {
     navigation.navigate('DeepSpeaking');
   };
 
+  const openProfessionalEnglish = () => {
+    navigation.navigate('ProfessionalEnglish');
+  };
+
   const renderReady = (today: Extract<AdaptiveTodayPractice, { status: 'ready' }>) => {
     const plan = today.plan;
     const modeLabel =
@@ -252,6 +256,22 @@ export default function HomeScreen(props?: HomeScreenProps) {
         </Text>
         <TouchableOpacity style={styles.primaryButton} onPress={openSpeakingPractice}>
           <Text style={styles.primaryButtonText}>Start speaking practice</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.card}>
+        <View style={styles.cardHeader}>
+          <Text style={styles.cardTitle}>Professional English</Text>
+          <View style={styles.pill}>
+            <Text style={styles.pillText}>Workplace</Text>
+          </View>
+        </View>
+        <Text style={styles.body}>
+          Practise meetings, interviews, negotiations and other workplace scenarios. The
+          existing speaking coach runs the conversation.
+        </Text>
+        <TouchableOpacity style={styles.primaryButton} onPress={openProfessionalEnglish}>
+          <Text style={styles.primaryButtonText}>Start professional English</Text>
         </TouchableOpacity>
       </View>
 

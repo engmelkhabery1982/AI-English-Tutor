@@ -77,6 +77,7 @@ import {
   type SpeakingPracticeSource,
   type SpeakingPracticeSummary,
   type SpeakingPracticeType,
+  type SpeakingProfessionalScenario,
 } from '../deep-speaking';
 
 /** One started practice session (the service's own handle shape). */
@@ -102,8 +103,16 @@ export interface DeepSpeakingScreenProps {
   readonly seed?: SpeakingPracticeSeed;
   /** Optional preferred practice type for the first plan. */
   readonly practiceType?: SpeakingPracticeType;
+  /** Additive: Professional English scenario content for the first plan. */
+  readonly professionalScenario?: SpeakingProfessionalScenario;
   /** Route params (when pushed through the navigator with a seed). */
-  readonly route?: { readonly params?: { readonly seed?: SpeakingPracticeSeed } };
+  readonly route?: {
+    readonly params?: {
+      readonly seed?: SpeakingPracticeSeed;
+      readonly practiceType?: SpeakingPracticeType;
+      readonly professionalScenario?: SpeakingProfessionalScenario;
+    };
+  };
 }
 
 const SOURCE_LABELS: Readonly<Record<SpeakingPracticeSource, string>> = {
@@ -149,6 +158,9 @@ const VOICE_IDLE_STATUS: VoiceStatus = {
 export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
   const seed = props?.seed ?? props?.route?.params?.seed;
+  const professionalScenario =
+    props?.professionalScenario ?? props?.route?.params?.professionalScenario;
+  const preferredPracticeType = props?.practiceType ?? props?.route?.params?.practiceType;
 
   const [phase, setPhaseState] = useState<DeepSpeakingPhase>('loading');
   const [plan, setPlan] = useState<SpeakingPracticePlan | null>(null);
@@ -215,7 +227,8 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
       try {
         const result = await service.planPractice({
           ...(seed ? { seed } : {}),
-          ...(props?.practiceType ? { practiceType: props.practiceType } : {}),
+          ...(preferredPracticeType ? { practiceType: preferredPracticeType } : {}),
+          ...(professionalScenario ? { professionalScenario } : {}),
         });
         if (unmountedRef.current || restartTokenRef.current !== token) return;
         if (result.status === 'planned') {
@@ -238,7 +251,7 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
         updatePhase('loading');
       }
     },
-    [props?.practiceType, seed, updatePhase],
+    [preferredPracticeType, professionalScenario, seed, updatePhase],
   );
 
   useEffect(() => {
@@ -705,7 +718,11 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
 
         {plan.targetExpressions.length > 0 ? (
           <View style={styles.card}>
-            <Text style={styles.sectionTitle}>Expressions from your own vocabulary</Text>
+            <Text style={styles.sectionTitle}>
+              {plan.professionalScenario
+                ? 'Target expressions'
+                : 'Expressions from your own vocabulary'}
+            </Text>
             {plan.targetExpressions.map((item) => (
               <View key={item.itemId} style={styles.listBlock}>
                 <Text style={styles.listLineStrong}>{item.headword}</Text>
@@ -793,6 +810,11 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
               : 'This practice is finished.'}
           </Text>
           {summary ? <Text style={styles.sourceNote}>{summary.notice}</Text> : null}
+          {plan?.professionalScenario ? (
+            <Text style={styles.sourceNote}>
+              Professional scenario: {plan.professionalScenario.title}
+            </Text>
+          ) : null}
         </View>
 
         {summary
