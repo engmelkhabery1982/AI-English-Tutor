@@ -26,6 +26,7 @@ import { ListeningService } from './service';
 
 export * from './types';
 export * from './evaluator';
+export * from './ai-material';
 export * from './generator';
 export * from './service';
 

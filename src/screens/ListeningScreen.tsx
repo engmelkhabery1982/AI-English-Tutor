@@ -174,7 +174,13 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
         );
         return;
       }
-      const result = await service.startSession(learner, { difficulty });
+      // This is the real exercise-serving path, so it opts in to ONE bounded
+      // generated exercise per session; generation never blocks the session
+      // (the engine falls back to its deterministic material immediately).
+      const result = await service.startSession(learner, {
+        difficulty,
+        allowGeneratedContent: true,
+      });
       if (result.exercises.length === 0) {
         setSession(null);
         setErrorMessage(result.sourceNote);

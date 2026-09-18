@@ -74,6 +74,23 @@ export interface ListeningExercise {
   readonly weaknessReferenceId?: string;
   /** Short learning tip shown with feedback. */
   readonly explanation?: string;
+  /**
+   * Honest content provenance of THIS exercise's material: whether real
+   * learner evidence materially shaped it. `source` above describes WHERE the
+   * material came from; this describes how personalized it really is.
+   */
+  readonly contentProvenance?: 'personalized' | 'mixed' | 'general';
+  /**
+   * How the material was produced. 'deterministic' means the existing local
+   * builders; 'ai' means validated generated material.
+   */
+  readonly materialOrigin?: 'deterministic' | 'ai';
+  /**
+   * The deterministic ContentRequest key the material was generated for.
+   * Present only on generated material; it exists so later work can re-serve
+   * or cache material without changing this contract.
+   */
+  readonly requestKey?: string;
 }
 
 /** Qualitative evaluation of one answer (no numeric scores anywhere). */
