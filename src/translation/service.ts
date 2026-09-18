@@ -146,11 +146,12 @@ export function createTranslationService(aiProvider: AIProvider): TranslationSer
     text: string,
     options?: TranslationOptions
   ): Promise<TranslationResult> {
-    const cleanText = (text || '').trim();
-    if (!cleanText) {
+    const rawText = text ?? '';
+    const semanticText = rawText.trim();
+    if (!semanticText) {
       return {
         ok: false,
-        originalText: text,
+        originalText: rawText,
         error: {
           code: 'empty_input',
           message: 'Cannot translate empty text.',
@@ -159,18 +160,18 @@ export function createTranslationService(aiProvider: AIProvider): TranslationSer
     }
 
     const direction: TranslationDirection =
-      options?.direction ?? detectLanguageDirection(cleanText);
+      options?.direction ?? detectLanguageDirection(semanticText);
     const style = options?.style ?? 'natural';
     const arabicVariety = options?.arabicVariety ?? 'msa';
 
     try {
-      const request = buildTextTranslationRequest(cleanText, options);
+      const request = buildTextTranslationRequest(semanticText, options);
       const result: AIProviderResult = await aiProvider.generate(request);
 
       if (!result.ok) {
         return {
           ok: false,
-          originalText: cleanText,
+          originalText: rawText,
           error: {
             code: 'ai_unavailable',
             message: result.error?.message || 'AI provider was unable to generate translation.',
@@ -184,7 +185,7 @@ export function createTranslationService(aiProvider: AIProvider): TranslationSer
       if (!jsonStr) {
         return {
           ok: false,
-          originalText: cleanText,
+          originalText: rawText,
           error: {
             code: 'invalid_response',
             message: 'Failed to extract valid JSON translation from AI response.',
@@ -199,7 +200,7 @@ export function createTranslationService(aiProvider: AIProvider): TranslationSer
       if (!translatedText) {
         return {
           ok: false,
-          originalText: cleanText,
+          originalText: rawText,
           error: {
             code: 'invalid_response',
             message: 'AI response lacked translatedText content.',
@@ -227,7 +228,7 @@ export function createTranslationService(aiProvider: AIProvider): TranslationSer
       const learningCandidates = normalizeLearningCandidates(parsed.learningCandidates);
 
       const successData: TranslationSuccess = {
-        originalText: cleanText,
+        originalText: rawText,
         translatedText,
         direction,
         style,
@@ -246,7 +247,7 @@ export function createTranslationService(aiProvider: AIProvider): TranslationSer
     } catch (err) {
       return {
         ok: false,
-        originalText: cleanText,
+        originalText: rawText,
         error: {
           code: 'unknown',
           message: err instanceof Error ? err.message : 'Unknown translation failure.',
