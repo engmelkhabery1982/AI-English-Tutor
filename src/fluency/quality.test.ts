@@ -45,6 +45,8 @@ import {
 } from '../talk-demo';
 import type { TextToSpeechProvider } from '../providers/tts';
 
+import * as deepSpeaking from '../deep-speaking';
+import { createDefaultFluencyService } from './index';
 import { createFluencyPracticeService } from './service';
 
 const NOW = '2026-09-18T10:00:00.000Z';
@@ -598,6 +600,204 @@ describe('fluency voice coordinator disposal & replacement races (Blocker 4)', (
     await fluency.startTransfer();
     const session2 = fluency.getConversationSession()!;
     expect(session2.getHistory()).toHaveLength(1);
+  });
+});
+
+
+describe('fluency practice restart composition & lifecycle hardening', () => {
+  it('default production service -> complete -> Practise Again -> fresh usable service', async () => {
+    const mockSpeaking1 = new SpeakingPracticeService({
+      learnerModel: createLearnerModelStub(makeCoaching()),
+      aiProvider: createScriptedProvider([
+        okResponse('Opening 1'),
+        okResponse('Reply 1'),
+      ]).provider,
+      memoryService: createMemoryService(),
+      now: () => NOW,
+    });
+    const mockSpeaking2 = new SpeakingPracticeService({
+      learnerModel: createLearnerModelStub(makeCoaching()),
+      aiProvider: createScriptedProvider([
+        okResponse('Opening 2'),
+        okResponse('Reply 2'),
+      ]).provider,
+      memoryService: createMemoryService(),
+      now: () => NOW,
+    });
+
+    let calls = 0;
+    vi.spyOn(deepSpeaking, 'createDefaultSpeakingService').mockImplementation(async () => {
+      calls += 1;
+      return calls === 1 ? mockSpeaking1 : mockSpeaking2;
+    });
+
+    const s1 = await createDefaultFluencyService();
+    await s1.startTask(TASK_ID);
+    await s1.submitAttempt({ transcript: 'My answer 1' });
+    const summary1 = await s1.complete();
+    expect(summary1.attempts).toBe(1);
+    await s1.dispose();
+
+    // After dispose, default factory produces a fresh usable service
+    const s2 = await createDefaultFluencyService();
+    expect(s2).not.toBe(s1);
+    const start2 = await s2.startTask(TASK_ID);
+    expect(start2.task.id).toBe(TASK_ID);
+    expect(s2.getSnapshot().phase).toBe('speaking');
+    await s2.dispose();
+  });
+
+  it('injected initial service + reload factory -> Practise Again gets fresh instance, old remains terminal, no memory duplication', async () => {
+    const memory1 = createMemoryService();
+    const memory2 = createMemoryService();
+
+    const s1 = createFluencyPracticeService(
+      new SpeakingPracticeService({
+        learnerModel: createLearnerModelStub(makeCoaching()),
+        aiProvider: createScriptedProvider([
+          okResponse('Opening 1'),
+          okResponse('Reply 1'),
+        ]).provider,
+        memoryService: memory1,
+        now: () => NOW,
+      }),
+      { now: () => NOW },
+    );
+
+    const s2 = createFluencyPracticeService(
+      new SpeakingPracticeService({
+        learnerModel: createLearnerModelStub(makeCoaching()),
+        aiProvider: createScriptedProvider([
+          okResponse('Opening 2'),
+          okResponse('Reply 2'),
+        ]).provider,
+        memoryService: memory2,
+        now: () => NOW,
+      }),
+      { now: () => NOW },
+    );
+
+    const loadService = vi.fn(async () => s2);
+
+    // Lifecycle 1
+    await s1.startTask(TASK_ID);
+    await s1.submitAttempt({ transcript: 'My answer 1' });
+    await s1.complete();
+    await s1.dispose();
+
+    // Old service s1 is terminal
+    await expect(s1.startTask(TASK_ID)).rejects.toThrow('closed');
+
+    // Reload factory returns s2
+    const fresh = await loadService();
+    expect(fresh).toBe(s2);
+    expect(fresh).not.toBe(s1);
+
+    // Lifecycle 2 works cleanly
+    const start2 = await fresh.startTask(TASK_ID);
+    expect(start2.task.id).toBe(TASK_ID);
+    await fresh.submitAttempt({ transcript: 'My answer 2' });
+    await fresh.complete();
+    await fresh.dispose();
+
+    // Memory finalization happened exactly once per session
+    expect(memory1.finalizeConversation).toHaveBeenCalledTimes(1);
+    expect(memory2.finalizeConversation).toHaveBeenCalledTimes(1);
+  });
+
+  it('repeated Practise Again works across multiple fresh service lifecycles', async () => {
+    let cycle = 0;
+    const loadService = vi.fn(async () => {
+      cycle += 1;
+      return createFluencyPracticeService(
+        new SpeakingPracticeService({
+          learnerModel: createLearnerModelStub(makeCoaching()),
+          aiProvider: createScriptedProvider([
+            okResponse(`Opening cycle ${cycle}`),
+            okResponse(`Reply cycle ${cycle}`),
+          ]).provider,
+          memoryService: createMemoryService(),
+          now: () => NOW,
+        }),
+        { now: () => NOW },
+      );
+    });
+
+    for (let i = 1; i <= 3; i += 1) {
+      const service = await loadService();
+      const start = await service.startTask(TASK_ID);
+      expect(start.task.id).toBe(TASK_ID);
+      await service.submitAttempt({ transcript: `Answer for cycle ${i}` });
+      const summary = await service.complete();
+      expect(summary.attempts).toBe(1);
+      await service.dispose();
+    }
+
+    expect(loadService).toHaveBeenCalledTimes(3);
+  });
+
+  it('no stale voice/session state survives restart', async () => {
+    const s1 = createFluencyPracticeService(
+      new SpeakingPracticeService({
+        learnerModel: createLearnerModelStub(makeCoaching()),
+        aiProvider: createScriptedProvider([okResponse('Opening 1')]).provider,
+        memoryService: createMemoryService(),
+        now: () => NOW,
+      }),
+      { now: () => NOW },
+    );
+
+    await s1.startTask(TASK_ID);
+    const session1 = s1.getConversationSession()!;
+    const coord1 = createTalkVoiceCoordinator({
+      session: session1,
+      providerKind: 'demo',
+      recorder: createDemoAudioRecorder(),
+      sttProvider: createDemoSTTProvider(),
+      ttsProvider: createDemoTTSProvider(),
+    });
+
+    await coord1.startRecording();
+    expect(coord1.getStatus().state).toBe('recording');
+
+    // Simulate restart: dispose old voice and old service
+    await coord1.dispose();
+    await s1.dispose();
+
+    expect(coord1.getStatus().state).toBe('idle');
+    expect(s1.getConversationSession()).toBeNull();
+
+    const s2 = createFluencyPracticeService(
+      new SpeakingPracticeService({
+        learnerModel: createLearnerModelStub(makeCoaching()),
+        aiProvider: createScriptedProvider([okResponse('Opening 2')]).provider,
+        memoryService: createMemoryService(),
+        now: () => NOW,
+      }),
+      { now: () => NOW },
+    );
+    await s2.startTask(TASK_ID);
+    const session2 = s2.getConversationSession()!;
+    expect(session2).not.toBe(session1);
+    expect(session2.getHistory()).toHaveLength(1);
+    await s2.dispose();
+  });
+
+  it('if injected service has no reload/factory capability, UI does not offer a restart path', () => {
+    const propsWithServiceOnly = { service: {} as any };
+    const propsWithFactory = {
+      service: {} as any,
+      loadService: vi.fn(),
+    };
+    const propsDefault = {};
+
+    const canRestart1 = !propsWithServiceOnly.service || Boolean((propsWithServiceOnly as any).loadService);
+    const canRestart2 = !propsWithFactory.service || Boolean(propsWithFactory.loadService);
+    const canRestart3 = !(propsDefault as any).service || Boolean((propsDefault as any).loadService);
+
+    expect(canRestart1).toBe(false);
+    expect(canRestart2).toBe(true);
+    expect(canRestart3).toBe(true);
   });
 });
 

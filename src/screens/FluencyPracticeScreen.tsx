@@ -614,6 +614,12 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
   }, [disposeVoice, isSubmitting, updatePhase]);
 
   const handlePracticeAgain = useCallback(async (): Promise<void> => {
+    const canPracticeAgain = !props?.service || Boolean(props?.loadService);
+    if (!canPracticeAgain) {
+      setErrorMessage('This practice session is complete. Use Back to return.');
+      return;
+    }
+
     const token = (restartTokenRef.current += 1);
     const service = serviceRef.current;
     completingRef.current = false;
@@ -629,6 +635,7 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
     if (unmountedRef.current || restartTokenRef.current !== token) return;
 
     sessionRef.current = null;
+    serviceRef.current = null;
     setSummary(null);
     setSnapshot(null);
     setHistory([]);
@@ -644,30 +651,22 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
     setErrorMessage(null);
     setVoiceStatus(VOICE_IDLE_STATUS);
     voiceStatusRef.current = VOICE_IDLE_STATUS;
-    // A disposed fluency service cannot start new tasks: compose is owned by
-    // the caller, so "again" needs a fresh service. When the service was
-    // injected (tests/embedding) the caller re-injects; otherwise reload.
-    if (!props?.service) {
-      serviceRef.current = null;
-      try {
-        const fresh = await (props?.loadService ?? createDefaultFluencyService)();
-        if (unmountedRef.current || restartTokenRef.current !== token) return;
-        serviceRef.current = fresh;
-        setTasks(fresh.listTasks());
-      } catch (error) {
-        if (unmountedRef.current || restartTokenRef.current !== token) return;
-        setLoadMessage(
-          error instanceof Error
-            ? error.message
-            : 'Fluency practice is unavailable right now.',
-        );
-        updatePhase('loading');
-        return;
-      }
-    } else {
-      setTasks(service?.listTasks() ?? []);
+
+    try {
+      const fresh = await (props?.loadService ?? createDefaultFluencyService)();
+      if (unmountedRef.current || restartTokenRef.current !== token) return;
+      serviceRef.current = fresh;
+      setTasks(fresh.listTasks());
+      updatePhase('task_pick');
+    } catch (error) {
+      if (unmountedRef.current || restartTokenRef.current !== token) return;
+      setLoadMessage(
+        error instanceof Error
+          ? error.message
+          : 'Fluency practice is unavailable right now.',
+      );
+      updatePhase('loading');
     }
-    updatePhase('task_pick');
   }, [disposeVoice, props?.loadService, props?.service, updatePhase]);
 
   /* ------------------------------ teardown ----------------------------- */
@@ -799,12 +798,14 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
 
         {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
 
-        <TouchableOpacity
-          style={styles.primaryButton}
-          onPress={() => void handlePracticeAgain()}
-        >
-          <Text style={styles.primaryButtonText}>Practise again</Text>
-        </TouchableOpacity>
+        {(!props?.service || Boolean(props?.loadService)) ? (
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={() => void handlePracticeAgain()}
+          >
+            <Text style={styles.primaryButtonText}>Practise again</Text>
+          </TouchableOpacity>
+        ) : null}
         <TouchableOpacity style={styles.linkButton} onPress={() => navigation.goBack()}>
           <Text style={styles.linkText}>Back</Text>
         </TouchableOpacity>
