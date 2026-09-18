@@ -14,7 +14,7 @@ import {
   buildTextTranslationRequest,
   detectLanguageDirection,
 } from './prompts';
-import { chunkLongText, reconstructLongText } from './chunking';
+import { chunkLongText, reconstructLongText, splitChunkWhitespace } from './chunking';
 import type {
   ChunkingOptions,
   DocumentTranslationRequest,
@@ -262,12 +262,12 @@ export function createTranslationService(aiProvider: AIProvider): TranslationSer
       text: string,
       options?: TranslationOptions & ChunkingOptions
     ): Promise<TranslatedLongTextResult> {
-      const cleanText = (text || '').trim();
-      const direction = options?.direction ?? detectLanguageDirection(cleanText);
+      const rawText = text ?? '';
+      const direction = options?.direction ?? detectLanguageDirection(rawText);
 
-      if (!cleanText) {
+      if (rawText.length === 0) {
         return {
-          originalText: text,
+          originalText: rawText,
           translatedText: '',
           direction,
           chunks: [],
@@ -276,22 +276,42 @@ export function createTranslationService(aiProvider: AIProvider): TranslationSer
         };
       }
 
-      const chunks: TextChunk[] = chunkLongText(cleanText, options);
+      const chunks: TextChunk[] = chunkLongText(rawText, options);
       const translatedChunks: TranslatedTextChunk[] = [];
       const failedIndexes: number[] = [];
 
       for (const chunk of chunks) {
-        const chunkResult = await translateTextInternal(chunk.text, options);
-        if (chunkResult.ok) {
+        const { leadingWhitespace, content, trailingWhitespace } = splitChunkWhitespace(chunk.text);
+
+        // If chunk contains only whitespace, preserve it exactly without invoking AI
+        if (content.length === 0) {
           translatedChunks.push({
             chunkId: chunk.chunkId,
             index: chunk.index,
             originalText: chunk.text,
-            translatedText: chunkResult.data.translatedText,
+            translatedText: chunk.text,
+            success: true,
+          });
+          continue;
+        }
+
+        // Translate only the semantic content
+        const chunkResult = await translateTextInternal(content, options);
+
+        if (chunkResult.ok) {
+          // Reattach original structural whitespace around translated content
+          const translatedContent = chunkResult.data.translatedText.trim();
+          const reconstructedChunkText = `${leadingWhitespace}${translatedContent}${trailingWhitespace}`;
+
+          translatedChunks.push({
+            chunkId: chunk.chunkId,
+            index: chunk.index,
+            originalText: chunk.text,
+            translatedText: reconstructedChunkText,
             success: true,
           });
         } else {
-          // Failure preserves original chunk text honestly
+          // Failure preserves exact original source slice
           failedIndexes.push(chunk.index);
           translatedChunks.push({
             chunkId: chunk.chunkId,
@@ -307,7 +327,7 @@ export function createTranslationService(aiProvider: AIProvider): TranslationSer
       const translatedText = reconstructLongText(translatedChunks);
 
       return {
-        originalText: cleanText,
+        originalText: rawText,
         translatedText,
         direction,
         chunks: translatedChunks,

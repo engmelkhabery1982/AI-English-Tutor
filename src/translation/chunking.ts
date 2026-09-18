@@ -24,7 +24,7 @@ export function chunkLongText(text: string, options?: ChunkingOptions): TextChun
     return [];
   }
 
-  const maxChunkSize = Math.max(100, options?.maxChunkSize ?? DEFAULT_MAX_CHUNK_SIZE);
+  const maxChunkSize = Math.max(10, options?.maxChunkSize ?? DEFAULT_MAX_CHUNK_SIZE);
 
   // If text already fits within maxChunkSize, return single chunk with exact offsets
   if (text.length <= maxChunkSize) {
@@ -180,5 +180,45 @@ export function validateChunkSequence(chunks: readonly TextChunk[]): {
     valid: !hasDuplicates && isStrictlySequential,
     hasDuplicates,
     isStrictlySequential,
+  };
+}
+
+/**
+ * Splits a chunk into leading structural whitespace, semantic content, and trailing structural whitespace.
+ * Strictly guarantees: leadingWhitespace + content + trailingWhitespace === rawText.
+ */
+export function splitChunkWhitespace(rawText: string): {
+  readonly leadingWhitespace: string;
+  readonly content: string;
+  readonly trailingWhitespace: string;
+} {
+  if (!rawText || rawText.length === 0) {
+    return { leadingWhitespace: '', content: '', trailingWhitespace: '' };
+  }
+
+  const leadingMatch = rawText.match(/^\s*/);
+  const leadingWhitespace = leadingMatch ? leadingMatch[0] : '';
+
+  // If the entire chunk is whitespace, there is no semantic content
+  if (leadingWhitespace.length === rawText.length) {
+    return {
+      leadingWhitespace,
+      content: '',
+      trailingWhitespace: '',
+    };
+  }
+
+  const trailingMatch = rawText.match(/\s*$/);
+  const trailingWhitespace = trailingMatch ? trailingMatch[0] : '';
+
+  const content = rawText.slice(
+    leadingWhitespace.length,
+    rawText.length - trailingWhitespace.length
+  );
+
+  return {
+    leadingWhitespace,
+    content,
+    trailingWhitespace,
   };
 }

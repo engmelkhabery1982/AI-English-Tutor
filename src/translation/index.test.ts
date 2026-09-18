@@ -363,4 +363,212 @@ describe('Translation Core (Phase 1)', () => {
     const req = capturedRequest as ConversationRequest | null;
     expect(req?.systemPrompt).toContain('professional translator');
   });
+
+  describe('Service Long-Text Source Fidelity Regression Tests', () => {
+    function createMockTranslatingProvider(customHandler?: (text: string) => string | null) {
+      return createMockAIProvider((req) => {
+        const userMsg = req.messages?.[0]?.content || '';
+        const match = userMsg.match(/Translate the following text:\s*\n*"""\s*([\s\S]*?)\s*"""/i);
+        const textToTranslate = match ? match[1].trim() : userMsg.trim();
+
+        if (customHandler) {
+          const handled = customHandler(textToTranslate);
+          if (handled === null) {
+            return {
+              ok: false,
+              error: { code: 'failed', message: 'Translation failed', retryable: false },
+            };
+          }
+          return {
+            ok: true,
+            response: {
+              content: JSON.stringify({
+                translatedText: handled,
+                direction: 'en-to-ar',
+                style: 'natural',
+                arabicVariety: 'msa',
+                alternatives: [],
+                learningNotes: [],
+              }),
+            },
+          };
+        }
+
+        return {
+          ok: true,
+          response: {
+            content: JSON.stringify({
+              translatedText: `ترجمة: ${textToTranslate}`,
+              direction: 'en-to-ar',
+              style: 'natural',
+              arabicVariety: 'msa',
+              alternatives: [],
+              learningNotes: [],
+            }),
+          },
+        };
+      });
+    }
+
+    it('service regression: 1. translateLongText originalText exactly equals raw input', async () => {
+      const rawInput =
+        '   \n\n\tLeading spaces, tabs, and newlines before text.\n\nSecond paragraph here.   \n\n';
+      const service = createTranslationService(createMockTranslatingProvider());
+      const result = await service.translateLongText(rawInput, { maxChunkSize: 50 });
+
+      expect(result.originalText).toBe(rawInput);
+      expect(result.chunks.map((c) => c.originalText).join('')).toBe(rawInput);
+    });
+
+    it('service regression: 2. input with leading newlines remains represented', async () => {
+      const rawInput = '\n\n\nFirst paragraph starting after three newlines.\n\nSecond paragraph.';
+      const service = createTranslationService(createMockTranslatingProvider());
+      const result = await service.translateLongText(rawInput, { maxChunkSize: 45 });
+
+      expect(result.originalText).toBe(rawInput);
+      expect(result.translatedText.startsWith('\n\n\n')).toBe(true);
+      expect(result.chunks[0].originalText.startsWith('\n\n\n')).toBe(true);
+      expect(result.chunks[0].translatedText.startsWith('\n\n\n')).toBe(true);
+      expect(result.chunks.map((c) => c.originalText).join('')).toBe(rawInput);
+    });
+
+    it('service regression: 3. trailing newlines remain represented', async () => {
+      const rawInput =
+        'First paragraph content.\n\nFinal paragraph ending with four trailing newlines.\n\n\n\n';
+      const service = createTranslationService(createMockTranslatingProvider());
+      const result = await service.translateLongText(rawInput, { maxChunkSize: 45 });
+
+      expect(result.originalText).toBe(rawInput);
+      expect(result.translatedText.endsWith('\n\n\n\n')).toBe(true);
+      const lastChunk = result.chunks[result.chunks.length - 1];
+      expect(lastChunk.originalText.endsWith('\n\n\n\n')).toBe(true);
+      expect(lastChunk.translatedText.endsWith('\n\n\n\n')).toBe(true);
+      expect(result.chunks.map((c) => c.originalText).join('')).toBe(rawInput);
+    });
+
+    it('service regression: 4. multiple blank lines do not collapse', async () => {
+      const rawInput = 'Paragraph one.\n\n\n\n\nParagraph two with four blank lines above.';
+      const service = createTranslationService(createMockTranslatingProvider());
+      const result = await service.translateLongText(rawInput, { maxChunkSize: 30 });
+
+      expect(result.originalText).toBe(rawInput);
+      expect(result.translatedText).toContain('\n\n\n\n\n');
+      expect(result.chunks.map((c) => c.originalText).join('')).toBe(rawInput);
+    });
+
+    it('service regression: 5. tabs/indentation survive structurally', async () => {
+      const rawInput = '\t\tCode block or indented paragraph.\n\n\tNext line indented with tab.';
+      const service = createTranslationService(createMockTranslatingProvider());
+      const result = await service.translateLongText(rawInput, { maxChunkSize: 35 });
+
+      expect(result.originalText).toBe(rawInput);
+      expect(result.translatedText.startsWith('\t\t')).toBe(true);
+      expect(result.translatedText).toContain('\n\n\t');
+      expect(result.chunks.map((c) => c.originalText).join('')).toBe(rawInput);
+    });
+
+    it('service regression: 6. CRLF structure is preserved', async () => {
+      const rawInput =
+        'First line with CRLF.\r\n\r\nSecond line with CRLF.\r\n\r\nThird line.\r\n';
+      const service = createTranslationService(createMockTranslatingProvider());
+      const result = await service.translateLongText(rawInput, { maxChunkSize: 35 });
+
+      expect(result.originalText).toBe(rawInput);
+      expect(result.translatedText).toContain('\r\n\r\n');
+      expect(result.translatedText.endsWith('\r\n')).toBe(true);
+      expect(result.chunks.map((c) => c.originalText).join('')).toBe(rawInput);
+    });
+
+    it('service regression: 7. chunk boundaries do not concatenate paragraphs', async () => {
+      const p1 =
+        'First paragraph describing fundamental principles of cognitive linguistics.';
+      const p2 =
+        'Second paragraph examining bilingual semantic transfer and syntactic alignment.';
+      const p3 =
+        'Third paragraph evaluating machine translation fluency and fidelity metrics.';
+      const rawInput = `${p1}\n\n${p2}\n\n${p3}`;
+
+      const service = createTranslationService(
+        createMockTranslatingProvider((text) => {
+          if (text.includes('cognitive linguistics')) return 'الفقرة الأولى عن اللسانيات الإدراكية.';
+          if (text.includes('bilingual semantic')) return 'الفقرة الثانية عن النقل الدلالي ثنائي اللغة.';
+          if (text.includes('evaluating machine')) return 'الفقرة الثالثة عن تقييم دقة الترجمة الآلية.';
+          return `ترجمة: ${text}`;
+        })
+      );
+
+      const result = await service.translateLongText(rawInput, { maxChunkSize: 85 });
+
+      expect(result.chunks.length).toBeGreaterThanOrEqual(3);
+      expect(result.originalText).toBe(rawInput);
+      expect(result.chunks.map((c) => c.originalText).join('')).toBe(rawInput);
+
+      // Paragraphs must NOT be concatenated directly
+      expect(result.translatedText).not.toContain('اللسانيات الإدراكية.الفقرة الثانية');
+      expect(result.translatedText).not.toContain('ثنائي اللغة.الفقرة الثالثة');
+      // Must preserve paragraph breaks between all translated chunks
+      const translatedParagraphs = result.translatedText.split(/\n\n+/);
+      expect(translatedParagraphs.length).toBe(3);
+    });
+
+    it('service regression: 8. failed chunk preserves exact original source slice', async () => {
+      const p1 = 'First successful paragraph.';
+      const p2 = 'Second paragraph that causes failure.';
+      const p3 = 'Third successful paragraph.';
+      const rawInput = `${p1}\n\n${p2}\n\n${p3}`;
+
+      const service = createTranslationService(
+        createMockTranslatingProvider((text) => {
+          if (text.includes('causes failure')) return null; // simulate failure
+          return `مترجم: ${text}`;
+        })
+      );
+
+      const result = await service.translateLongText(rawInput, { maxChunkSize: 35 });
+
+      expect(result.overallSuccess).toBe(false);
+      expect(result.failedChunkIndexes.length).toBeGreaterThanOrEqual(1);
+
+      // Source invariant remains intact
+      expect(result.originalText).toBe(rawInput);
+      expect(result.chunks.map((c) => c.originalText).join('')).toBe(rawInput);
+
+      // The failed chunk preserves exact original slice in translatedText
+      const failedChunk = result.chunks.find((c) => !c.success);
+      expect(failedChunk).toBeDefined();
+      if (failedChunk) {
+        expect(failedChunk.translatedText).toBe(failedChunk.originalText);
+        expect(failedChunk.originalText).toContain('Second paragraph that causes failure.');
+        expect(result.translatedText).toContain(failedChunk.originalText);
+      }
+    });
+
+    it('service regression: 9. mixed Arabic/English input remains structurally intact', async () => {
+      const rawInput =
+        'Introductory English section.\n\n' +
+        'فقرة باللغة العربية تشرح المفاهيم الأساسية.\n\n' +
+        'Mixed closing section: الذكاء الاصطناعي (AI) and modern NLP models.\n\n';
+
+      const service = createTranslationService(createMockTranslatingProvider());
+      const result = await service.translateLongText(rawInput, { maxChunkSize: 50 });
+
+      expect(result.originalText).toBe(rawInput);
+      expect(result.chunks.map((c) => c.originalText).join('')).toBe(rawInput);
+      expect(result.translatedText.endsWith('\n\n')).toBe(true);
+      expect(result.translatedText).toContain('\n\n');
+      const paragraphs = result.translatedText.trim().split(/\n\n+/);
+      expect(paragraphs.length).toBe(3);
+    });
+
+    it('handles pure whitespace in translateLongText without error and preserves structure', async () => {
+      const rawInput = '   \n\n\t   \r\n\r\n   ';
+      const service = createTranslationService(createMockTranslatingProvider());
+      const result = await service.translateLongText(rawInput);
+
+      expect(result.originalText).toBe(rawInput);
+      expect(result.translatedText).toBe(rawInput);
+      expect(result.chunks.map((c) => c.originalText).join('')).toBe(rawInput);
+      expect(result.overallSuccess).toBe(true);
+    });
+  });
 });
