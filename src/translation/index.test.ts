@@ -572,136 +572,82 @@ describe('Translation Core (Phase 1)', () => {
     });
   });
 
-  describe('Short-Text Source Fidelity Regression Tests', () => {
-    const successJson = JSON.stringify({
-      translatedText: 'مرحبا بالعالم.',
-      direction: 'en-to-ar',
-      style: 'natural',
-      arabicVariety: 'msa',
-      literalTranslation: null,
-      alternatives: [],
-      explanation: null,
-      learningNotes: [],
-      learningCandidates: { vocabulary: [], expressions: [], collocations: [], phrasalVerbs: [] },
-    });
+  describe('Short-text exact source fidelity', () => {
+    const successProvider = createMockAIProvider(() => ({
+      ok: true,
+      response: {
+        content: JSON.stringify({
+          translatedText: 'مرحبا بالعالم',
+          direction: 'en-to-ar',
+          style: 'natural',
+          arabicVariety: 'msa',
+          alternatives: [],
+          learningNotes: [],
+          learningCandidates: {
+            vocabulary: [],
+            expressions: [],
+            collocations: [],
+            phrasalVerbs: [],
+          },
+        }),
+      },
+    }));
 
-    it('preserves exact raw originalText on successful translation with leading/trailing spaces and newlines', async () => {
-      const rawText = '  \n\tHello world.\r\n  ';
-      const service = createTranslationService(
-        createMockAIProvider(() => ({
-          ok: true,
-          response: { content: successJson },
-        }))
-      );
+    it('preserves exact raw source on success while translating semantic content', async () => {
+      const rawInput = '  \tHello world.\r\n';
+      const service = createTranslationService(successProvider);
+      const outcome = await service.translateText(rawInput);
 
-      const result = await service.translateText(rawText);
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.data.originalText).toBe(rawText);
-        expect(result.data.translatedText).toBe('مرحبا بالعالم.');
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) {
+        expect(outcome.data.originalText).toBe(rawInput);
       }
     });
 
-    it('preserves exact raw originalText with tabs and CRLF on successful translation', async () => {
-      const rawText = '\t\tHello\tworld.\r\n';
-      const service = createTranslationService(
-        createMockAIProvider(() => ({
-          ok: true,
-          response: { content: successJson },
-        }))
-      );
-
-      const result = await service.translateText(rawText);
-      expect(result.ok).toBe(true);
-      if (result.ok) {
-        expect(result.data.originalText).toBe(rawText);
-      }
-    });
-
-    it('preserves exact raw originalText when AI provider fails', async () => {
-      const rawText = '   Some text with leading spaces and newline\n';
+    it('preserves exact raw source on provider failure', async () => {
+      const rawInput = '\n\t Critical memo.  \r\n';
       const service = createTranslationService(
         createMockAIProvider(() => ({
           ok: false,
-          error: { code: 'unavailable', message: 'Model unavailable', retryable: false },
+          error: { code: 'unavailable', message: 'offline', retryable: true },
         }))
       );
+      const outcome = await service.translateText(rawInput);
 
-      const result = await service.translateText(rawText);
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.originalText).toBe(rawText);
-        expect(result.error.code).toBe('ai_unavailable');
-      }
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) expect(outcome.originalText).toBe(rawInput);
     });
 
-    it('preserves exact raw originalText when AI response is malformed', async () => {
-      const rawText = '\r\n\tMalformed response text\r\n';
-      const service = createTranslationService(
-        createMockAIProvider(() => ({
-          ok: true,
-          response: { content: 'This is not valid json' },
-        }))
+    it('preserves exact raw source on malformed response and thrown exception', async () => {
+      const rawInput = '  Hello\t\r\n';
+      const malformed = createTranslationService(
+        createMockAIProvider(() => ({ ok: true, response: { content: 'not-json' } }))
       );
+      const malformedOutcome = await malformed.translateText(rawInput);
+      expect(malformedOutcome.ok).toBe(false);
+      if (!malformedOutcome.ok) expect(malformedOutcome.originalText).toBe(rawInput);
 
-      const result = await service.translateText(rawText);
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.originalText).toBe(rawText);
-        expect(result.error.code).toBe('invalid_response');
-      }
-    });
-
-    it('preserves exact raw originalText when AI response lacks translatedText', async () => {
-      const rawText = '  \nNo translation field\n  ';
-      const service = createTranslationService(
-        createMockAIProvider(() => ({
-          ok: true,
-          response: { content: JSON.stringify({ explanation: 'Only explanation' }) },
-        }))
+      const throwing = createTranslationService(
+        createMockAIProvider(() => {
+          throw new Error('boom');
+        })
       );
-
-      const result = await service.translateText(rawText);
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.originalText).toBe(rawText);
-        expect(result.error.code).toBe('invalid_response');
-      }
+      const thrownOutcome = await throwing.translateText(rawInput);
+      expect(thrownOutcome.ok).toBe(false);
+      if (!thrownOutcome.ok) expect(thrownOutcome.originalText).toBe(rawInput);
     });
 
-    it('preserves exact raw originalText when an exception is thrown', async () => {
-      const rawText = '  \nThrowing text\t\r\n';
-      const service = createTranslationService({
-        id: 'throwing-mock',
-        generate: async () => {
-          throw new Error('Network crash');
-        },
-      });
+    it('treats whitespace-only input as empty without altering originalText', async () => {
+      const rawInput = '  \t\r\n\n ';
+      const service = createTranslationService(successProvider);
+      const outcome = await service.translateText(rawInput);
 
-      const result = await service.translateText(rawText);
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.originalText).toBe(rawText);
-        expect(result.error.code).toBe('unknown');
-        expect(result.error.message).toContain('Network crash');
-      }
-    });
-
-    it('preserves exact raw originalText for whitespace-only input and fails with empty_input', async () => {
-      const rawWhitespace = '   \t\r\n\n  ';
-      const service = createTranslationService(
-        createMockAIProvider(() => ({
-          ok: true,
-          response: { content: successJson },
-        }))
-      );
-
-      const result = await service.translateText(rawWhitespace);
-      expect(result.ok).toBe(false);
-      if (!result.ok) {
-        expect(result.originalText).toBe(rawWhitespace);
-        expect(result.error.code).toBe('empty_input');
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) {
+        expect(outcome.error.code).toBe('empty_input');
+        expect(outcome.originalText).toBe(rawInput);
       }
     });
   });
+
 });

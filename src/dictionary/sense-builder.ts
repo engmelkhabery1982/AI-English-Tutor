@@ -316,20 +316,26 @@ export function parseContextualMeaning(
     const parsed = JSON.parse(jsonStr) as Record<string, unknown>;
 
     const arabicMeaning =
-      typeof parsed.arabicMeaning === 'string' ? parsed.arabicMeaning.trim() : '';
+      typeof parsed.arabicMeaning === 'string' && parsed.arabicMeaning.trim().length > 0
+        ? parsed.arabicMeaning.trim()
+        : '';
     const englishExplanation =
-      typeof parsed.englishExplanation === 'string' ? parsed.englishExplanation.trim() : '';
+      typeof parsed.englishExplanation === 'string' && parsed.englishExplanation.trim().length > 0
+        ? parsed.englishExplanation.trim()
+        : '';
     const whyFits =
-      typeof parsed.whyFits === 'string' ? parsed.whyFits.trim() : '';
+      typeof parsed.whyFits === 'string' && parsed.whyFits.trim().length > 0
+        ? parsed.whyFits.trim()
+        : '';
+
     const rawCertainty =
       typeof parsed.certainty === 'string' ? parsed.certainty.toLowerCase().trim() : '';
-
-    // Must have genuine arabicMeaning, englishExplanation, whyFits, and valid certainty
-    if (!arabicMeaning || !englishExplanation || !whyFits) {
-      return null;
-    }
-
-    if (!ALLOWED_CERTAINTIES.includes(rawCertainty as ContextCertainty)) {
+    if (
+      !arabicMeaning ||
+      !englishExplanation ||
+      !whyFits ||
+      !ALLOWED_CERTAINTIES.includes(rawCertainty as ContextCertainty)
+    ) {
       return null;
     }
     const certainty = rawCertainty as ContextCertainty;
@@ -344,14 +350,20 @@ export function parseContextualMeaning(
         ? parsed.distinction.trim()
         : undefined;
 
-    let alternativeSense: ContextualMeaningResult['alternativeSense'] = null;
+    let alternativeSense = null;
     if (typeof parsed.alternativeSense === 'object' && parsed.alternativeSense !== null) {
       const alt = parsed.alternativeSense as Record<string, unknown>;
-      const altArabic = typeof alt.arabicMeaning === 'string' ? alt.arabicMeaning.trim() : '';
-      const altEn = typeof alt.englishExplanation === 'string' ? alt.englishExplanation.trim() : '';
-      const altReason = typeof alt.reason === 'string' ? alt.reason.trim() : '';
+      const altArabic =
+        typeof alt.arabicMeaning === 'string' && alt.arabicMeaning.trim().length > 0
+          ? alt.arabicMeaning.trim()
+          : '';
+      const altEn =
+        typeof alt.englishExplanation === 'string' && alt.englishExplanation.trim().length > 0
+          ? alt.englishExplanation.trim()
+          : '';
+      const altReason =
+        typeof alt.reason === 'string' && alt.reason.trim().length > 0 ? alt.reason.trim() : '';
 
-      // Only include alternativeSense when its required semantic fields are sufficiently present
       if (altArabic && altEn && altReason) {
         alternativeSense = {
           senseId:

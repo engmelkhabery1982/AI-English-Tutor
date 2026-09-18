@@ -163,24 +163,22 @@ export function createDictionaryService(aiProvider: AIProvider): DictionaryServi
             sentence: cleanSentence,
             arabicMeaning: '',
             englishExplanation: 'Failed to parse contextual meaning response.',
-            whyFits: 'AI response was malformed or lacked required semantic justification.',
+            whyFits: 'AI response was malformed or lacked required evidence.',
             certainty: 'insufficient_context',
             alternativeSense: null,
           };
         }
 
-        // Validate returned sense IDs against known senses when known senses are supplied
         if (input.knownSenses && input.knownSenses.length > 0) {
-          const knownSenseIds = new Set(input.knownSenses.map((s) => s.senseId));
+          const knownSenseIds = new Set(input.knownSenses.map((sense) => sense.senseId));
 
           if (parsed.selectedSenseId && !knownSenseIds.has(parsed.selectedSenseId)) {
             return {
               word: cleanWord,
               sentence: cleanSentence,
               arabicMeaning: '',
-              englishExplanation:
-                'The AI returned a sense ID that did not match the supplied known senses.',
-              whyFits: 'Sense ID mismatch with known senses.',
+              englishExplanation: 'The returned sense did not match the supplied known senses.',
+              whyFits: 'AI returned an unknown sense identifier.',
               certainty: 'insufficient_context',
               alternativeSense: null,
             };
