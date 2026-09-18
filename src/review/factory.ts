@@ -18,10 +18,17 @@ import {
   SQLitePronunciationRepository,
 } from '../data/local/sqlite/repositories';
 import { ReviewService } from './service';
-import { createDemoAIProvider } from '../providers/ai/demo';
-import { createGeminiAIProvider } from '../providers/ai/gemini';
-import { getGeminiApiKey } from '../talk-demo';
+import { resolveReviewAIProvider } from './providers';
 
+/**
+ * Composes the Review service on the canonical database.
+ *
+ * Real mode WITHOUT a configured AI provider no longer falls back to the
+ * offline demo tutor: the EXISTING deterministic local evaluators grade the
+ * item, and nothing scripted is ever presented as an evaluation of the
+ * learner's real answer. Demo AI is reachable only through explicit Demo Mode
+ * (the surface advertises it and demo practice is never persisted).
+ */
 export function createReviewService(adapter: DatabaseAdapter, isDemo: boolean = false): ReviewService {
   const repos = {
     profile: new SQLiteUserProfileRepository(adapter),
@@ -37,17 +44,9 @@ export function createReviewService(adapter: DatabaseAdapter, isDemo: boolean = 
     progress: new SQLiteProgressRepository(adapter),
   };
 
-  if (isDemo) {
-    const provider = createDemoAIProvider();
-    return new ReviewService(repos, provider);
-  }
-
-  const key = getGeminiApiKey();
-  if (key) {
-    const provider = createGeminiAIProvider({ apiKey: key });
-    return new ReviewService(repos, provider);
-  } else {
-    const provider = createDemoAIProvider();
-    return new ReviewService(repos, provider);
-  }
+  // Same honest resolution the screen uses for voice: real key → Gemini;
+  // explicit demo → demo; otherwise NO scripted provider (deterministic local
+  // evaluation only).
+  const aiProvider = resolveReviewAIProvider({ isDemo });
+  return new ReviewService(repos, aiProvider);
 }

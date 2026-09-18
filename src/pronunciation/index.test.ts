@@ -601,9 +601,13 @@ describe('Review integration', () => {
     // Structural: ReviewScreen still wires the existing recorder + STT and
     // only fills the answer box from the transcript (no silent auto-submit).
     const source = readFileSync(join(__dirname, '../screens/ReviewScreen.tsx'), 'utf8');
+    // The EXISTING recorder + the EXISTING Review voice controller (one voice
+    // architecture; no second recorder/STT stack was introduced).
     expect(source).toContain('createExpoAudioRecorder');
-    expect(source).toContain('setUserAnswer(sttRes.transcript)');
-    expect(source).not.toMatch(/setUserAnswer\(sttRes\.transcript\)[^;]*;[^]*?handleSubmitAnswer\(\)/);
+    expect(source).toContain('ReviewVoiceController');
+    // The transcript only ever fills the answer box — never a silent auto-submit.
+    expect(source).toContain('setUserAnswer(status.transcript)');
+    expect(source).not.toMatch(/setUserAnswer\(status\.transcript\)[^;]*;[^]*?handleSubmitAnswer\(\)/);
 
     // Behavioral: an STT-style transcript evaluates qualitatively (no score).
     const ctx = await createContext();

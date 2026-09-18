@@ -681,6 +681,32 @@ describe('Adaptive Review Suite', () => {
     expect(candidates).toHaveLength(0);
   });
 
+  it('19b. real mode without a key grades locally — never with the demo tutor', async () => {
+    const { createReviewService } = await import('./factory');
+    const realService = createReviewService(createStubDatabaseAdapter(), false);
+
+    const candidate: ReviewItemCandidate = {
+      id: 'open-ended-1',
+      learnerId,
+      kind: 'grammar',
+      referenceId: 'open-ended-1',
+      exerciseType: 'sentence_correction',
+      prompt: 'Fix this.',
+      contextSentence: 'I am interested on learning English.',
+      expectedAnswer: 'I am interested in learning English.',
+      dueAt: now,
+      consecutiveCorrect: 0,
+      reviewCount: 0,
+    };
+
+    const evalResult = await realService.evaluateAnswer(candidate, 'I am interested in learning English.');
+
+    // The offline demo tutor's scripted verdicts are NOT real evaluation.
+    expect(evalResult.feedback).not.toBe('Good job!');
+    expect(evalResult.explanation).not.toBe('Demo explanation.');
+    expect(evalResult.result).toBe('correct');
+  });
+
   it('20. explicit demo toggle configures demo AI provider', async () => {
     const { createReviewService } = await import('./factory');
     const demoService = createReviewService(createStubDatabaseAdapter(), true);
@@ -731,9 +757,13 @@ describe('Adaptive Review Suite', () => {
     expect(controller.isRecording).toBe(true);
     
     // stop
-    await controller.toggleRecording();
+    const status = await controller.toggleRecording();
     expect(controller.isRecording).toBe(false);
     expect(controller.userAnswer).toBe('Spoken Answer');
+    // The transcript is DELIVERED to the caller (the screen fills the answer
+    // box) — it is never auto-submitted or persisted by the controller.
+    expect(status.transcript).toBe('Spoken Answer');
+    expect(status.error).toBeNull();
   });
 
   it('22. voice answer is NOT auto-submitted', async () => {

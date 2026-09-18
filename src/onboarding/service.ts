@@ -75,6 +75,12 @@ const MISSING_LABELS = {
 const UNAVAILABLE_LISTENING_MESSAGE = 'Listening practice is unavailable right now.';
 const UNAVAILABLE_PRONUNCIATION_MESSAGE =
   'Pronunciation analysis was not available for this session.';
+/**
+ * Offline demo speech recognition returns a scripted transcript: it is
+ * practice only and can never be trusted as pronunciation evidence.
+ */
+const DEMO_PRONUNCIATION_UNAVAILABLE_MESSAGE =
+  'Voice practice ran in offline demo mode, so pronunciation was not assessed.';
 
 export interface OnboardingServiceDeps {
   /** Existing database composition (adapter / learner model). */
@@ -166,8 +172,13 @@ export interface OnboardingService {
      * The step token captured when the recording STARTED. Evidence is recorded
      * only against that step: if the diagnostic moved on in the meantime, the
      * late transcript is discarded instead of being attached to another step.
+     *
+     * `transcriptFromVoice` marks a transcript that came out of the voice
+     * coordinator's speech-recognition path. Such a transcript is only trusted
+     * when that path is REAL: offline demo recognition returns a scripted
+     * transcript, so it can never become pronunciation evidence.
      */
-    options?: { readonly stepToken?: number },
+    options?: { readonly stepToken?: number; readonly transcriptFromVoice?: boolean },
   ): Promise<{ readonly observed: boolean }>;
 
   /** Finalizes the diagnostic ONLY when required steps are resolved. */
@@ -547,6 +558,14 @@ export function createOnboardingService(deps: OnboardingServiceDeps = {}): Onboa
       const token = options?.stepToken ?? handle.session.getCurrentStepToken();
       if (handle.session.getCurrentStepId() !== 'pronunciation') {
         // The step is no longer the pronunciation step: discard, record nothing.
+        return { observed: false };
+      }
+      if (options?.transcriptFromVoice && handle.providerKind !== 'gemini') {
+        // Offline demo speech recognition returns a SCRIPTED transcript: it is
+        // practice only (the whole conversation part is flagged 'demo' and is
+        // excluded from the estimate), and it can never be trusted as
+        // pronunciation evidence — no fabricated strength or weakness.
+        handle.session.markPronunciationUnavailable(DEMO_PRONUNCIATION_UNAVAILABLE_MESSAGE, token);
         return { observed: false };
       }
       const target = (expectedText ?? handle.pronunciationTask.sentence).trim();
