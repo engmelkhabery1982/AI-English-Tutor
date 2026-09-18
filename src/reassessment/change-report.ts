@@ -7,8 +7,9 @@
  * shifts (stronger, weaker, mixed, insufficient, unchanged).
  *
  * NO FAKE SCORES OR PERCENTAGES:
- * Reports grounded qualitative observations only (e.g. "Listening comprehension
- * appears stronger in multi-speaker tasks").
+ * Reports grounded qualitative observations only.
+ * Specific claims (multi-speaker, fast speech, longer turns, phoneme patterns) are made
+ * ONLY when explicitly supported by referenceId, context, or notes.
  */
 
 import type { LearnerStrength, LearnerWeakness } from '../domain/models/learner';
@@ -42,7 +43,7 @@ export function generateAbilityChangeReport(
     evaluateDomain('pronunciation', strengths, activeWeaknesses, currentResult, previousRecord),
     evaluateDomain('grammar', strengths, activeWeaknesses, currentResult, previousRecord),
     evaluateDomain('vocabulary', strengths, activeWeaknesses, currentResult, previousRecord),
-  ];
+  ].filter((d): d is DomainAbilityChange => d !== null);
 
   const hasSufficientEvidence = domains.some((d) => d.status !== 'insufficient');
 
@@ -75,7 +76,7 @@ function evaluateDomain(
   currentResult?: DiagnosticResult | null,
   previousRecord?: ReassessmentRecord | null,
 ): DomainAbilityChange {
-  // Filter strengths and weaknesses for this domain
+  // Filter strengths and weaknesses for this domain, ignoring items with null mapped domain
   const domainStrengths = strengths.filter((s) => mapTypeToDomain(s.type) === domain);
   const domainWeaknesses = activeWeaknesses.filter((w) => mapTypeToDomain(w.type) === domain);
 
@@ -93,7 +94,7 @@ function evaluateDomain(
     evidenceDetails.push(`${domainStrengths.length} demonstrated strengths coexist with ${domainWeaknesses.length} active focus areas.`);
   } else if (hasStrengths && !hasWeaknesses) {
     status = 'stronger';
-    summary = `${capitalize(domain)} evidence is stronger with consistent demonstrated performance.`;
+    summary = `Recent evidence shows demonstrated ${domain} ability in evaluated contexts.`;
     for (const s of domainStrengths.slice(-2)) {
       if (s.notes) evidenceDetails.push(s.notes);
     }
@@ -108,25 +109,34 @@ function evaluateDomain(
     summary = `${capitalize(domain)} performance remains stable with no major changes observed.`;
   }
 
-  // Domain-specific custom qualitative descriptions
-  if (domain === 'listening') {
-    if (status === 'stronger') {
-      summary = 'Listening comprehension appears stronger in multi-speaker and varied speech tasks.';
-    } else if (status === 'mixed') {
-      summary = 'Main-idea comprehension is consistent, though fast or connected speech remains challenging.';
+  // Domain-specific claims ONLY if explicitly supported by referenceId, contexts, or notes!
+  const combinedText = domainStrengths
+    .map((s) => `${s.referenceId} ${s.contexts.join(' ')} ${s.notes ?? ''}`)
+    .join(' ')
+    .toLowerCase();
+
+  if (domain === 'listening' && status === 'stronger') {
+    if (combinedText.includes('multi_speaker') || combinedText.includes('multi-speaker')) {
+      summary = 'Listening comprehension appears stronger in multi-speaker tasks.';
+    } else if (combinedText.includes('fast_speech') || combinedText.includes('fast speech')) {
+      summary = 'Maintains listening comprehension in fast speech tasks.';
+    } else {
+      summary = 'Recent evidence shows demonstrated listening ability in some contexts.';
     }
-  } else if (domain === 'pronunciation') {
-    if (status === 'stronger') {
-      summary = 'Pronunciation evidence is more consistent for previously weak sound patterns.';
-    }
-  } else if (domain === 'speaking') {
-    if (status === 'stronger') {
+  } else if (domain === 'speaking' && status === 'stronger') {
+    if (combinedText.includes('sustained_turn') || combinedText.includes('longer spoken turns') || combinedText.includes('reduced scaffolding')) {
       summary = 'Sustains longer spoken turns with reduced reliance on scaffolding.';
+    } else {
+      summary = 'Recent evidence shows demonstrated speaking ability in natural conversation.';
     }
-  } else if (domain === 'grammar') {
-    if (status === 'insufficient') {
-      summary = 'Insufficient evidence to determine a change in grammar ability.';
+  } else if (domain === 'pronunciation' && status === 'stronger') {
+    if (combinedText.includes('pron:') || combinedText.includes('phoneme:')) {
+      summary = 'Pronunciation evidence is more consistent for target sounds.';
+    } else {
+      summary = 'Recent evidence shows demonstrated pronunciation consistency in evaluated turns.';
     }
+  } else if (domain === 'grammar' && status === 'insufficient') {
+    summary = 'Insufficient evidence to determine a change in grammar ability.';
   }
 
   return {
@@ -137,9 +147,9 @@ function evaluateDomain(
   };
 }
 
-function mapTypeToDomain(
+export function mapTypeToDomain(
   type: string,
-): 'listening' | 'speaking' | 'pronunciation' | 'grammar' | 'vocabulary' {
+): 'listening' | 'speaking' | 'pronunciation' | 'grammar' | 'vocabulary' | null {
   switch (type) {
     case 'listening':
       return 'listening';
@@ -152,8 +162,10 @@ function mapTypeToDomain(
       return 'vocabulary';
     case 'fluency':
     case 'confidence':
-    default:
       return 'speaking';
+    default:
+      // DO NOT default unknown types to speaking! Return null to exclude unsupported types.
+      return null;
   }
 }
 

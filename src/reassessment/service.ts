@@ -14,10 +14,11 @@ import {
   SQLiteWeaknessRepository,
 } from '../data/local/sqlite/repositories';
 import type { LearnerModel } from '../learner-model';
-import type { DiagnosticHandle, DiagnosticLevelDecision, DiagnosticResult, OnboardingService } from '../onboarding';
-import { createOnboardingServiceOn } from '../onboarding';
 import type { ConversationMode } from '../domain/shared/types';
 import type { LearnerStrength, LearnerWeakness } from '../domain/models/learner';
+import type { DiagnosticHandle, DiagnosticLevelDecision, DiagnosticResult, OnboardingService } from '../onboarding';
+import { createOnboardingServiceOn } from '../onboarding';
+import { nowIso } from '../shared/time';
 import { generateAbilityChangeReport } from './change-report';
 import {
   SQLiteReassessmentHistoryRepository,
@@ -77,6 +78,7 @@ export function createReassessmentService(
   let onboardingInstance = deps.onboardingService ?? null;
   let historyRepoInstance = deps.historyRepository ?? null;
   let successRecorderInstance = deps.successRecorder ?? null;
+  let activeHandle: DiagnosticHandle | null = null;
 
   async function resolveDependencies() {
     if (!adapterInstance && !onboardingInstance) {
@@ -141,13 +143,25 @@ export function createReassessmentService(
       const history = await resolved.historyRepo.listHistory(learnerId, 1);
       const weaknessRepo = new SQLiteWeaknessRepository(resolved.adapter);
       const strengths = await weaknessRepo.listStrengths(learnerId);
+      const weaknesses = await weaknessRepo.listWeaknesses(learnerId);
+
+      const totalEvidenceCount = strengths.length + weaknesses.length;
 
       if (history.length === 0) {
-        // Brand new / no previous reassessment record
+        if (totalEvidenceCount < 3) {
+          return {
+            available: false,
+            reason: 'insufficient_evidence',
+            message: 'Not enough practice evidence collected yet.',
+            newEvidenceCount: totalEvidenceCount,
+          };
+        }
+
         return {
           available: true,
           reason: 'sufficient_evidence',
-          message: 'Initial reassessment available.',
+          message: 'Initial reassessment available based on accumulated practice evidence.',
+          newEvidenceCount: totalEvidenceCount,
         };
       }
 
@@ -178,13 +192,42 @@ export function createReassessmentService(
       if (!resolved.onboarding) {
         throw new Error('Onboarding service unavailable for reassessment');
       }
-      return resolved.onboarding.beginDiagnostic(options);
+
+      if (activeHandle) {
+        activeHandle.session.abandon();
+        activeHandle = null;
+      }
+
+      const handle = await resolved.onboarding.beginDiagnostic(options);
+      activeHandle = handle;
+      return handle;
     },
 
     async finishReassessment(handle) {
       const resolved = await resolveDependencies();
       if (!resolved.onboarding) {
         throw new Error('Onboarding service unavailable');
+      }
+
+      const snapshot = handle.session.snapshot();
+      const recordId = `reassess_${snapshot.learnerId}_${snapshot.startedAt}`;
+
+      // Check if a record for this exact handle run was already saved (retry / duplicate finish safety)
+      if (resolved.historyRepo) {
+        const existingRecord = await resolved.historyRepo.getById(recordId);
+        if (existingRecord) {
+          let outcomeResult = await resolved.onboarding.buildResult(handle);
+          if (!outcomeResult) {
+            outcomeResult = await resolved.onboarding.finishDiagnostic(handle);
+          }
+          const report = generateAbilityChangeReport({
+            strengths: [],
+            weaknesses: [],
+            currentResult: outcomeResult,
+            previousRecord: existingRecord,
+          });
+          return { result: outcomeResult, record: existingRecord, report };
+        }
       }
 
       const result = await resolved.onboarding.finishDiagnostic(handle);
@@ -200,7 +243,6 @@ export function createReassessmentService(
         };
       }
 
-      // Read current strengths and weaknesses for qualitative change report
       let strengths: LearnerStrength[] = [];
       let weaknesses: LearnerWeakness[] = [];
       let previousRecord: ReassessmentRecord | null = null;
@@ -224,6 +266,7 @@ export function createReassessmentService(
       let record: ReassessmentRecord | null = null;
       if (resolved.historyRepo) {
         record = await resolved.historyRepo.saveRecord({
+          id: recordId,
           learnerId: result.learnerId,
           assessmentKind: 'reassessment',
           status: result.estimate.status,
@@ -234,7 +277,7 @@ export function createReassessmentService(
           acceptedLevel: null,
           basis: result.estimate.basis,
           qualitativeSummary: report,
-          generatedAt: result.generatedAt,
+          generatedAt: result.generatedAt ?? nowIso(),
         });
       }
 
@@ -247,32 +290,46 @@ export function createReassessmentService(
         return { updated: false, currentLevel: 'unknown', reason: 'persistence-failed' };
       }
 
-      const record = await resolved.historyRepo.getById(recordId);
-      if (!record) {
+      const existingRecord = await resolved.historyRepo.getById(recordId);
+      if (!existingRecord) {
         return { updated: false, currentLevel: 'unknown', reason: 'persistence-failed' };
       }
 
-      // Exactly-once acceptance check
-      if (record.decision === 'accepted') {
+      if (existingRecord.decision === 'accepted') {
         return {
           updated: false,
-          currentLevel: record.acceptedLevel ?? record.proposedLevel,
+          currentLevel: existingRecord.acceptedLevel ?? existingRecord.proposedLevel,
           reason: 'already-accepted',
         };
       }
+      if (existingRecord.decision === 'kept') {
+        return {
+          updated: false,
+          currentLevel: existingRecord.previousLevel,
+          reason: 'terminal_decision',
+        };
+      }
 
-      if (record.status !== 'estimated' || record.proposedLevel === 'unknown') {
-        return { updated: false, currentLevel: record.previousLevel, reason: 'not-estimated' };
+      if (existingRecord.status !== 'estimated' || existingRecord.proposedLevel === 'unknown') {
+        return { updated: false, currentLevel: existingRecord.previousLevel, reason: 'not-estimated' };
+      }
+
+      const updateResult = await resolved.historyRepo.updateDecision(
+        recordId,
+        'accepted',
+        existingRecord.proposedLevel,
+      );
+
+      if (!updateResult.updated) {
+        return {
+          updated: false,
+          currentLevel: updateResult.record?.acceptedLevel ?? updateResult.record?.previousLevel ?? 'unknown',
+          reason: 'terminal_decision',
+        };
       }
 
       const profileRepo = new SQLiteUserProfileRepository(resolved.adapter);
-      await profileRepo.update({ currentLevel: record.proposedLevel });
-
-      await resolved.historyRepo.updateDecision(
-        recordId,
-        'accepted',
-        record.proposedLevel,
-      );
+      await profileRepo.update({ currentLevel: existingRecord.proposedLevel });
 
       if (deps.learnerModel) {
         try {
@@ -284,7 +341,7 @@ export function createReassessmentService(
 
       return {
         updated: true,
-        currentLevel: record.proposedLevel,
+        currentLevel: existingRecord.proposedLevel,
         reason: 'accepted',
       };
     },
@@ -295,23 +352,42 @@ export function createReassessmentService(
         return { updated: false, currentLevel: 'unknown', reason: 'persistence-failed' };
       }
 
-      const record = await resolved.historyRepo.getById(recordId);
-      if (!record) {
+      const existingRecord = await resolved.historyRepo.getById(recordId);
+      if (!existingRecord) {
         return { updated: false, currentLevel: 'unknown', reason: 'persistence-failed' };
       }
 
-      if (record.decision === 'kept') {
-        return { updated: false, currentLevel: record.previousLevel, reason: 'kept' };
+      if (existingRecord.decision === 'kept') {
+        return { updated: false, currentLevel: existingRecord.previousLevel, reason: 'kept' };
+      }
+      if (existingRecord.decision === 'accepted') {
+        return {
+          updated: false,
+          currentLevel: existingRecord.acceptedLevel ?? existingRecord.proposedLevel,
+          reason: 'terminal_decision',
+        };
       }
 
-      await resolved.historyRepo.updateDecision(recordId, 'kept', record.previousLevel);
+      const updateResult = await resolved.historyRepo.updateDecision(
+        recordId,
+        'kept',
+        existingRecord.previousLevel,
+      );
+
+      if (!updateResult.updated) {
+        return {
+          updated: false,
+          currentLevel: updateResult.record?.previousLevel ?? 'unknown',
+          reason: 'terminal_decision',
+        };
+      }
 
       const profileRepo = new SQLiteUserProfileRepository(resolved.adapter);
       const profile = await profileRepo.get();
 
       return {
         updated: false,
-        currentLevel: profile?.currentLevel ?? record.previousLevel,
+        currentLevel: profile?.currentLevel ?? existingRecord.previousLevel,
         reason: 'kept',
       };
     },

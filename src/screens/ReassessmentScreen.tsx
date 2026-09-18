@@ -3,12 +3,16 @@
  *
  * WP-4 Periodic Reassessment Mobile-First Screen.
  *
- * REUSES the existing onboarding diagnostic flow and components.
+ * REUSES the existing onboarding diagnostic workflow/components/handlers.
  * NO FAKE SCORES OR PERCENTAGES.
  * LEVEL CHANGE REQUIRES EXPLICIT ACCEPTANCE: "Use this level" or "Keep my current level".
+ * REAL LIFECYCLE & STALE-RUN PROTECTIONS:
+ * - Second reassessment invalidates and abandons the first run.
+ * - Unmount/exit invalidates current run.
+ * - Late STT/pronunciation/AI results from old run cannot mutate state.
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
@@ -21,16 +25,10 @@ import {
 import {
   createReassessmentService,
   type ReassessmentEligibility,
-  type ReassessmentRecord,
   type ReassessmentService,
-  type QualitativeChangeReport,
 } from '../reassessment';
-import {
-  describeConfidence,
-  describeEstimate,
-  type DiagnosticHandle,
-  type DiagnosticResult,
-} from '../onboarding';
+import type { DiagnosticHandle } from '../onboarding';
+import OnboardingScreen from './OnboardingScreen';
 
 export interface ReassessmentScreenProps {
   readonly service?: ReassessmentService;
@@ -47,26 +45,27 @@ export default function ReassessmentScreen({
     () => injectedService ?? createReassessmentService(),
   );
 
+  const mountedRef = useRef(true);
+  const generationRef = useRef(0);
+  const handleRef = useRef<DiagnosticHandle | null>(null);
+
   const [loading, setLoading] = useState(true);
   const [eligibility, setEligibility] = useState<ReassessmentEligibility | null>(null);
-  const [handle, setHandle] = useState<DiagnosticHandle | null>(null);
   const [inProgress, setInProgress] = useState(false);
-  const [result, setResult] = useState<DiagnosticResult | null>(null);
-  const [record, setRecord] = useState<ReassessmentRecord | null>(null);
-  const [report, setReport] = useState<QualitativeChangeReport | null>(null);
-  const [decisionOutcome, setDecisionOutcome] = useState<string | null>(null);
 
   useEffect(() => {
-    let active = true;
+    mountedRef.current = true;
+    const currentGen = generationRef.current;
+
     (async () => {
       setLoading(true);
       try {
         const elig = await service.checkEligibility(learnerId);
-        if (active) {
+        if (mountedRef.current && generationRef.current === currentGen) {
           setEligibility(elig);
         }
       } catch {
-        if (active) {
+        if (mountedRef.current && generationRef.current === currentGen) {
           setEligibility({
             available: true,
             reason: 'manual_request',
@@ -74,68 +73,49 @@ export default function ReassessmentScreen({
           });
         }
       } finally {
-        if (active) setLoading(false);
+        if (mountedRef.current && generationRef.current === currentGen) {
+          setLoading(false);
+        }
       }
     })();
+
     return () => {
-      active = false;
+      mountedRef.current = false;
+      // Exit / unmount invalidates current diagnostic handle
+      if (handleRef.current) {
+        handleRef.current.session.abandon();
+        handleRef.current = null;
+      }
     };
   }, [service, learnerId]);
 
-  const startReassessment = async () => {
+  const startReassessment = async (force = false) => {
+    // Increment generation so any late async response from prior run is ignored
+    generationRef.current += 1;
+    const currentGen = generationRef.current;
+
+    // Second reassessment invalidates first
+    if (handleRef.current) {
+      handleRef.current.session.abandon();
+      handleRef.current = null;
+    }
+
     setLoading(true);
     try {
-      const h = await service.beginReassessment();
-      setHandle(h);
+      const handle = await service.beginReassessment();
+      if (!mountedRef.current || generationRef.current !== currentGen) {
+        handle.session.abandon();
+        return;
+      }
+
+      handleRef.current = handle;
       setInProgress(true);
     } catch {
-      // Handle error gracefully
+      // Graceful handling
     } finally {
-      setLoading(false);
-    }
-  };
-
-  const finishReassessment = async () => {
-    if (!handle) return;
-    setLoading(true);
-    try {
-      const outcome = await service.finishReassessment(handle);
-      setResult(outcome.result);
-      setRecord(outcome.record);
-      setReport(outcome.report);
-      setInProgress(false);
-    } catch {
-      setInProgress(false);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleAcceptLevel = async () => {
-    if (!record) return;
-    setLoading(true);
-    try {
-      const res = await service.acceptReassessmentLevel(record.id);
-      if (res.updated) {
-        setDecisionOutcome(`Working level updated to ${res.currentLevel}.`);
-      } else if (res.reason === 'already-accepted') {
-        setDecisionOutcome(`Level ${res.currentLevel} already accepted.`);
-      } else {
-        setDecisionOutcome(`Level kept at ${res.currentLevel}.`);
+      if (mountedRef.current && generationRef.current === currentGen) {
+        setLoading(false);
       }
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleKeepLevel = async () => {
-    if (!record) return;
-    setLoading(true);
-    try {
-      const res = await service.keepCurrentLevel(record.id);
-      setDecisionOutcome(`Current level retained (${res.currentLevel}).`);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -143,80 +123,19 @@ export default function ReassessmentScreen({
     return (
       <View style={styles.centered}>
         <ActivityIndicator size="large" color="#0066CC" />
-        <Text style={styles.loadingText}>Loading reassessment...</Text>
+        <Text style={styles.loadingText}>Checking reassessment eligibility...</Text>
       </View>
     );
   }
 
-  if (result && record && report) {
+  // Reuses the REAL onboarding diagnostic workflow components and step handlers!
+  if (inProgress) {
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-        <Text style={styles.headerTitle}>Reassessment Complete</Text>
-
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Proposed Working Level</Text>
-          <Text style={styles.levelBadge}>{result.estimate.level}</Text>
-          <Text style={styles.confidenceText}>
-            {describeConfidence(result.estimate.confidence)}
-          </Text>
-          <Text style={styles.descriptionText}>
-            {describeEstimate(result.estimate)}
-          </Text>
-        </View>
-
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Qualitative Ability Change Summary</Text>
-          <Text style={styles.overallSummary}>{report.overallSummary}</Text>
-
-          {report.domains.map((d) => (
-            <View key={d.domain} style={styles.domainRow}>
-              <Text style={styles.domainName}>
-                {d.domain.toUpperCase()}: <Text style={styles.domainStatus}>[{d.status}]</Text>
-              </Text>
-              <Text style={styles.domainSummary}>{d.summary}</Text>
-            </View>
-          ))}
-        </View>
-
-        {decisionOutcome ? (
-          <View style={styles.outcomeCard}>
-            <Text style={styles.outcomeText}>{decisionOutcome}</Text>
-
-            {onFinish && (
-              <TouchableOpacity style={styles.primaryButton} onPress={onFinish}>
-                <Text style={styles.buttonText}>Continue</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        ) : (
-          <View style={styles.actionRow}>
-            <TouchableOpacity style={styles.primaryButton} onPress={handleAcceptLevel}>
-              <Text style={styles.buttonText}>Use this level ({result.estimate.level})</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity style={styles.secondaryButton} onPress={handleKeepLevel}>
-              <Text style={styles.secondaryButtonText}>
-                Keep my current level ({result.profile.currentLevel})
-              </Text>
-            </TouchableOpacity>
-          </View>
-        )}
-      </ScrollView>
-    );
-  }
-
-  if (inProgress && handle) {
-    return (
-      <View style={styles.container}>
-        <Text style={styles.headerTitle}>Diagnostic Reassessment in Progress</Text>
-        <Text style={styles.descriptionText}>
-          Step: {handle.session.getCurrentStepId()}
-        </Text>
-
-        <TouchableOpacity style={styles.primaryButton} onPress={finishReassessment}>
-          <Text style={styles.buttonText}>Finish Reassessment</Text>
-        </TouchableOpacity>
-      </View>
+      <OnboardingScreen
+        isReassessment={true}
+        reassessmentService={service}
+        onFinish={onFinish}
+      />
     );
   }
 
@@ -231,7 +150,10 @@ export default function ReassessmentScreen({
         </Text>
 
         {eligibility?.available ? (
-          <TouchableOpacity style={styles.primaryButton} onPress={startReassessment}>
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={() => startReassessment(false)}
+          >
             <Text style={styles.buttonText}>Start Reassessment</Text>
           </TouchableOpacity>
         ) : (
@@ -240,7 +162,10 @@ export default function ReassessmentScreen({
               Not enough new evidence yet. Continue your daily practice in Talk, Listening, and
               Adaptive Lessons!
             </Text>
-            <TouchableOpacity style={styles.secondaryButton} onPress={() => startReassessment()}>
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={() => startReassessment(true)}
+            >
               <Text style={styles.secondaryButtonText}>Reassess Anyway</Text>
             </TouchableOpacity>
           </View>
@@ -289,54 +214,11 @@ const styles = StyleSheet.create({
     color: '#2D3748',
     marginBottom: 10,
   },
-  levelBadge: {
-    fontSize: 32,
-    fontWeight: '800',
-    color: '#0066CC',
-    marginVertical: 6,
-  },
-  confidenceText: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#4A5568',
-    marginBottom: 8,
-  },
   descriptionText: {
     fontSize: 15,
     color: '#4A5568',
     lineHeight: 22,
     marginBottom: 12,
-  },
-  overallSummary: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1A202C',
-    marginBottom: 14,
-  },
-  domainRow: {
-    marginBottom: 12,
-    paddingTop: 8,
-    borderTopWidth: 1,
-    borderTopColor: '#EDF2F7',
-  },
-  domainName: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: '#2B6CB0',
-  },
-  domainStatus: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#718096',
-  },
-  domainSummary: {
-    fontSize: 14,
-    color: '#4A5568',
-    marginTop: 4,
-  },
-  actionRow: {
-    marginTop: 10,
-    gap: 12,
   },
   primaryButton: {
     backgroundColor: '#0066CC',
@@ -375,19 +257,5 @@ const styles = StyleSheet.create({
     color: '#718096',
     lineHeight: 20,
     marginBottom: 10,
-  },
-  outcomeCard: {
-    backgroundColor: '#EBF8FF',
-    borderRadius: 12,
-    padding: 18,
-    borderWidth: 1,
-    borderColor: '#BEE3F8',
-    alignItems: 'center',
-  },
-  outcomeText: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#2B6CB0',
-    marginBottom: 12,
   },
 });

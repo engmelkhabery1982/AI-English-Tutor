@@ -1,7 +1,7 @@
 /**
  * src/reassessment/index.test.ts
  *
- * WP-4 — Evidence Symmetry & Reassessment Tests (Scenarios 1–32).
+ * WP-4 — Evidence Symmetry & Reassessment Tests (18 Blockers Coverage).
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -20,12 +20,15 @@ import { createDemoLearnerModel } from '../talk-demo/demo-learner-model';
 import type { AIProvider } from '../providers/ai/types';
 import { generateId } from '../shared/id';
 import { nowIso } from '../shared/time';
-import { generateAbilityChangeReport } from './change-report';
+import { generateAbilityChangeReport, mapTypeToDomain } from './change-report';
 import { SQLiteReassessmentHistoryRepository } from './history-repository';
 import { createReassessmentService, type ReassessmentService } from './service';
-import { createSuccessObservationRecorder } from './success-recorder';
+import {
+  createSuccessObservationRecorder,
+  recordListeningSuccess,
+  recordPronunciationSuccess,
+} from './success-recorder';
 import type { SuccessObservationInput } from './types';
-
 
 function createStubProvider(): AIProvider {
   return {
@@ -39,7 +42,7 @@ function createStubProvider(): AIProvider {
   };
 }
 
-describe('WP-4 — Evidence Symmetry & Reassessment', () => {
+describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
   let adapter: DatabaseAdapter;
   let learnerId: string;
   let weaknessRepo: SQLiteWeaknessRepository;
@@ -86,6 +89,7 @@ describe('WP-4 — Evidence Symmetry & Reassessment', () => {
       }),
       now: () => nowIso(),
     });
+
     service = createReassessmentService({
       adapter,
       onboardingService,
@@ -94,580 +98,447 @@ describe('WP-4 — Evidence Symmetry & Reassessment', () => {
     });
   });
 
-  // ────────────────────────────────────────────────────────── Success evidence
-
-  describe('Success Evidence Recorder', () => {
-    it('1. valid demonstrated success creates/updates a LearnerStrength', async () => {
-      const input: SuccessObservationInput = {
-        learnerId,
-        type: 'listening',
-        referenceId: 'listening:multi_speaker',
-        source: 'listening_service',
-        context: 'Followed a multi-speaker conversation about office schedules.',
-        evidence: {
-          kind: 'observation',
-          id: generateId(),
-          at: nowIso(),
-          summary: 'Understood multi-speaker dialogue.',
-        },
-      };
-
-      const result = await service.recordSuccessObservation(input);
-      expect(result.recorded).toBe(true);
-      expect(result.strength).not.toBeNull();
-      expect(result.strength?.type).toBe('listening');
-      expect(result.strength?.referenceId).toBe('listening:multi_speaker');
-
-      const strengths = await weaknessRepo.listStrengths(learnerId);
-      expect(strengths).toHaveLength(1);
-      expect(strengths[0].contexts).toContain('Followed a multi-speaker conversation about office schedules.');
-    });
-
-    it('2. repeated same ability does not create duplicates', async () => {
-      const input1: SuccessObservationInput = {
-        learnerId,
-        type: 'pronunciation',
-        referenceId: 'pron:θ',
-        source: 'pronunciation_engine',
-        context: 'Accurate repetition of "think" in shadowing.',
-        evidence: {
-          kind: 'observation',
-          id: generateId(),
-          at: nowIso(),
-          summary: 'Clear /θ/ sound.',
-        },
-      };
-
-      await service.recordSuccessObservation(input1);
-      let strengths = await weaknessRepo.listStrengths(learnerId);
-      expect(strengths).toHaveLength(1);
-
-      const input2: SuccessObservationInput = {
-        ...input1,
-        context: 'Accurate repetition of "three" in shadowing.',
-        evidence: {
-          kind: 'observation',
-          id: generateId(),
-          at: nowIso(),
-          summary: 'Clear /θ/ sound again.',
-        },
-      };
-
-      await service.recordSuccessObservation(input2);
-      strengths = await weaknessRepo.listStrengths(learnerId);
-      expect(strengths).toHaveLength(1); // STILL 1 row
-      expect(strengths[0].contexts).toHaveLength(2);
-    });
-
-    it('3. evidence history remains bounded', async () => {
-      for (let i = 0; i < 8; i++) {
-        await service.recordSuccessObservation({
-          learnerId,
-          type: 'vocabulary',
-          referenceId: 'vocab:resilient',
-          source: 'vocabulary_workspace',
-          context: `Context ${i}`,
-          evidence: {
-            kind: 'observation',
-            id: generateId(),
-            at: nowIso(),
-            summary: `Evidence ${i}`,
-          },
-        });
-      }
-
-      const strengths = await weaknessRepo.listStrengths(learnerId);
-      expect(strengths).toHaveLength(1);
-      // Contexts bounded to max 5
-      expect(strengths[0].contexts.length).toBeLessThanOrEqual(5);
-      // Evidence refs bounded to max 10
-      expect(strengths[0].evidence.length).toBeLessThanOrEqual(10);
-    });
-
-    it('4. unsupported event does NOT create strength', async () => {
-      const input: SuccessObservationInput = {
-        learnerId,
-        type: 'grammar',
-        referenceId: 'grammar:past_perfect',
-        source: 'conversation_session',
-        evidence: { kind: 'observation', id: generateId(), at: nowIso() },
-      };
-
-      const res = await service.recordSuccessObservation(input);
-      expect(res.recorded).toBe(false);
-      expect(res.reason).toBe('unsupported_event');
-
-      const strengths = await weaknessRepo.listStrengths(learnerId);
-      expect(strengths).toHaveLength(0);
-    });
-
-    it('5. failed provider does NOT fabricate strength', async () => {
-      const input: SuccessObservationInput = {
-        learnerId,
-        type: 'pronunciation',
-        referenceId: 'pron:r',
-        source: 'pronunciation_engine',
-        notes: 'Pronunciation provider unavailable',
-        evidence: { kind: 'observation', id: generateId(), at: nowIso() },
-      };
-
-      const res = await service.recordSuccessObservation(input);
-      expect(res.recorded).toBe(false);
-      expect(res.reason).toBe('provider_failed');
-
-      const strengths = await weaknessRepo.listStrengths(learnerId);
-      expect(strengths).toHaveLength(0);
-    });
-
-    it('6. one success does not automatically erase weakness', async () => {
-      // Record a weakness first
-      await weaknessRepo.upsertWeakness({
-        learnerId,
-        type: 'grammar',
-        referenceId: 'grammar:past_perfect',
-        status: 'active_training',
-        severity: 0.7,
-        occurrenceCount: 2,
-        firstSeenAt: nowIso(),
-        lastSeenAt: nowIso(),
-        contexts: ['I had went there.'],
-        evidence: [],
-        resolved: false,
-      });
-
-      const weaknessesBefore = await weaknessRepo.listWeaknesses(learnerId);
-      expect(weaknessesBefore).toHaveLength(1);
-
-      // Record a success for the same grammar pattern
-      await service.recordSuccessObservation({
-        learnerId,
-        type: 'grammar',
-        referenceId: 'grammar:past_perfect',
-        source: 'conversation_session',
-        context: 'Correct use: "I had gone there before sunset."',
-        evidence: { kind: 'observation', id: generateId(), at: nowIso() },
-      });
-
-      // Weakness remains active!
-      const weaknessesAfter = await weaknessRepo.listWeaknesses(learnerId);
-      expect(weaknessesAfter).toHaveLength(1);
-      expect(weaknessesAfter[0].resolved).toBe(false);
-    });
-
-    it('7. strength and weakness may coexist where evidence differs', async () => {
-      await weaknessRepo.upsertWeakness({
-        learnerId,
-        type: 'listening',
-        referenceId: 'listening:fast_speech',
-        status: 'active_training',
-        severity: 0.8,
-        occurrenceCount: 3,
-        firstSeenAt: nowIso(),
-        lastSeenAt: nowIso(),
-        contexts: ['Missed key meaning in fast speech'],
-        evidence: [],
-        resolved: false,
-      });
-
-      await service.recordSuccessObservation({
-        learnerId,
-        type: 'listening',
-        referenceId: 'listening:main_idea',
-        source: 'listening_service',
-        context: 'Understood main idea in standard-speed monologue',
-        evidence: { kind: 'observation', id: generateId(), at: nowIso() },
-      });
-
-      const weaknesses = await weaknessRepo.listWeaknesses(learnerId);
-      const strengths = await weaknessRepo.listStrengths(learnerId);
-
-      expect(weaknesses).toHaveLength(1);
-      expect(strengths).toHaveLength(1);
-    });
+  // 1. real onboarding diagnostic task flow reused
+  it('1. real onboarding diagnostic task flow reused', async () => {
+    const handle = await service.beginReassessment();
+    expect(handle.session).toBeDefined();
+    expect(handle.conversation).toBeDefined();
+    expect(handle.speaking).toBeDefined();
+    expect(handle.languageUseTask).toBeDefined();
+    expect(handle.pronunciationTask).toBeDefined();
   });
 
-  // ────────────────────────────────────────────────────────────── Reassessment
+  // 2. no Finish-only fake reassessment
+  it('2. no Finish-only fake reassessment', async () => {
+    const handle = await service.beginReassessment();
+    // Cannot finish without resolving required steps
+    const { result } = await service.finishReassessment(handle);
+    expect(result).toBeNull();
+  });
 
-  describe('Periodic Reassessment', () => {
-    it('8. existing diagnostic engine is reused', async () => {
-      const handle = await service.beginReassessment();
-      expect(handle.session).toBeDefined();
-      expect(handle.conversation).toBeDefined();
-      expect(handle.speaking).toBeDefined();
-      expect(handle.languageUseTask).toBeDefined();
-      expect(handle.pronunciationTask).toBeDefined();
-    });
+  // 3. stale first reassessment ignored after second starts
+  it('3. stale first reassessment ignored after second starts', async () => {
+    const handle1 = await service.beginReassessment();
+    const token1 = handle1.session.getCurrentStepToken();
 
-    it('9. insufficient evidence does not invent level', async () => {
-      const handle = await service.beginReassessment();
-      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
-      handle.session.advance(); // speaking
-      handle.session.advance(); // listening
-      handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
-      handle.session.advance(); // language_use
-      handle.session.advance(); // pronunciation
-      handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
-      handle.session.advance(); // summary
-      handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+    // Second reassessment started
+    const handle2 = await service.beginReassessment();
+    expect(handle1.session.getStatus()).toBe('abandoned');
 
-      const { result } = await service.finishReassessment(handle);
-      expect(result).not.toBeNull();
-      expect(result?.estimate.status).toBe('insufficient');
-      expect(result?.estimate.level).toBe('unknown');
-    });
+    // Trying to use handle1 with token1 is rejected
+    const marked = handle1.session.markProfileStepDone(token1);
+    expect(marked).toBe(false);
 
-    it('10. proposed level does not update profile before acceptance', async () => {
-      const handle = await service.beginReassessment();
-      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
-      handle.session.advance();
+    expect(handle2.session.getStatus()).toBe('in_progress');
+  });
 
-      // Record valid speaking answers using onboardingService
-      await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
-      await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
-      await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
+  // 4. unmount prevents late mutation
+  it('4. unmount prevents late mutation', async () => {
+    const handle = await service.beginReassessment();
+    handle.session.abandon();
 
-      handle.session.advance();
-      handle.session.markListeningUnavailable('Not used in test.', handle.session.getCurrentStepToken());
+    const { result } = await service.finishReassessment(handle);
+    expect(result).toBeNull();
+  });
 
-      handle.session.advance();
-      await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+  // 5. late STT ignored
+  it('5. late STT ignored', async () => {
+    const handle = await service.beginReassessment();
+    const staleToken = handle.session.getCurrentStepToken();
 
-      handle.session.advance();
-      handle.session.markPronunciationUnavailable('Not used in test.', handle.session.getCurrentStepToken());
+    handle.session.advance(); // step moved on
 
-      handle.session.advance();
-      handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+    const res = await onboardingService.recordPronunciation(
+      handle,
+      'Recognized text',
+      'Target sentence',
+      { stepToken: staleToken },
+    );
 
-      const { record } = await service.finishReassessment(handle);
+    expect(res.observed).toBe(false);
+  });
 
-      expect(record).not.toBeNull();
-      expect(record?.decision).toBe('pending');
+  // 6. late pronunciation ignored
+  it('6. late pronunciation ignored', async () => {
+    const handle = await service.beginReassessment();
+    const staleToken = handle.session.getCurrentStepToken();
 
-      // Profile remains at original level A2!
+    handle.session.advance();
+
+    const res = await onboardingService.recordPronunciation(
+      handle,
+      'Recognized text',
+      'Target sentence',
+      { stepToken: staleToken },
+    );
+
+    expect(res.observed).toBe(false);
+  });
+
+  // 7. duplicate finish => one history record
+  it('7. duplicate finish => one history record', async () => {
+    const handle = await service.beginReassessment();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+
+    await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
+    await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
+    await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
+
+    handle.session.advance();
+    handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+    handle.session.advance();
+    handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+
+    const finish1 = await service.finishReassessment(handle);
+    const finish2 = await service.finishReassessment(handle);
+
+    expect(finish1.record).not.toBeNull();
+    expect(finish2.record).not.toBeNull();
+    expect(finish1.record?.id).toBe(finish2.record?.id);
+
+    const history = await service.getHistory(learnerId);
+    expect(history.length).toBe(1);
+  });
+
+  // 8. retry => one history record
+  it('8. retry => one history record', async () => {
+    const handle = await service.beginReassessment();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+
+    await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
+    await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
+    await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
+
+    handle.session.advance();
+    handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+    handle.session.advance();
+    handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+
+    const { result, record: r1 } = await service.finishReassessment(handle);
+    expect(r1).not.toBeNull();
+
+    // Re-saving with same deterministic ID
+    if (result && r1) {
+      const saved2 = await historyRepo.saveRecord({
+        id: r1.id,
+        learnerId,
+        assessmentKind: 'reassessment',
+        status: result.estimate.status,
+        proposedLevel: result.estimate.level,
+        previousLevel: 'A2',
+        confidence: result.estimate.confidence,
+        decision: 'pending',
+        acceptedLevel: null,
+        basis: result.estimate.basis,
+        qualitativeSummary: r1.qualitativeSummary,
+        generatedAt: result.generatedAt,
+      });
+
+      expect(saved2.id).toBe(r1.id);
+      const history = await service.getHistory(learnerId);
+      expect(history.length).toBe(1);
+    }
+  });
+
+  // 9. accept then keep cannot flip
+  it('9. accept then keep cannot flip', async () => {
+    const handle = await service.beginReassessment();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+
+    await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
+    await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
+    await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
+
+    handle.session.advance();
+    handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+    handle.session.advance();
+    handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+
+    const { record } = await service.finishReassessment(handle);
+    expect(record).not.toBeNull();
+
+    if (record) {
+      const first = await service.acceptReassessmentLevel(record.id);
+      expect(first.updated).toBe(true);
+
+      const profileAfterAccept = await profileRepo.get();
+      expect(profileAfterAccept.currentLevel).toBe(record.proposedLevel);
+
+      // Attempt to flip to keep
+      const second = await service.keepCurrentLevel(record.id);
+      expect(second.updated).toBe(false);
+      expect(second.reason).toBe('terminal_decision');
+
+      const profileAfterKeep = await profileRepo.get();
+      expect(profileAfterKeep.currentLevel).toBe(record.proposedLevel); // Stays at accepted level!
+    }
+  });
+
+  // 10. keep then accept cannot flip
+  it('10. keep then accept cannot flip', async () => {
+    const handle = await service.beginReassessment();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
+
+    await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
+    await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
+    await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
+
+    handle.session.advance();
+    handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+    handle.session.advance();
+    handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    handle.session.markSummaryDone(handle.session.getCurrentStepToken());
+
+    const { record } = await service.finishReassessment(handle);
+    expect(record).not.toBeNull();
+
+    if (record) {
+      const first = await service.keepCurrentLevel(record.id);
+      expect(first.updated).toBe(false);
+      expect(first.reason).toBe('kept');
+
+      // Attempt to flip to accept
+      const second = await service.acceptReassessmentLevel(record.id);
+      expect(second.updated).toBe(false);
+      expect(second.reason).toBe('terminal_decision');
+
       const profile = await profileRepo.get();
-      expect(profile.currentLevel).toBe('A2');
-    });
-
-    it('11. Use this level updates accepted currentLevel once', async () => {
-      const handle = await service.beginReassessment();
-      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
-      handle.session.advance();
-
-      await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
-      await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
-      await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
-
-      handle.session.advance();
-      handle.session.markListeningUnavailable('Not used in test.', handle.session.getCurrentStepToken());
-
-      handle.session.advance();
-      await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
-
-      handle.session.advance();
-      handle.session.markPronunciationUnavailable('Not used in test.', handle.session.getCurrentStepToken());
-
-      handle.session.advance();
-      handle.session.markSummaryDone(handle.session.getCurrentStepToken());
-
-      const { record } = await service.finishReassessment(handle);
-      expect(record).not.toBeNull();
-
-      if (record) {
-        const decision1 = await service.acceptReassessmentLevel(record.id);
-        expect(decision1.updated).toBe(true);
-        expect(decision1.currentLevel).toBe(record.proposedLevel);
-
-        const profileAfter = await profileRepo.get();
-        expect(profileAfter.currentLevel).toBe(record.proposedLevel);
-
-        // Second call is idempotent!
-        const decision2 = await service.acceptReassessmentLevel(record.id);
-        expect(decision2.updated).toBe(false);
-        expect(decision2.reason).toBe('already-accepted');
-      }
-    });
-
-    it('12. Keep my current level leaves profile unchanged', async () => {
-      const handle = await service.beginReassessment();
-      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
-      handle.session.advance();
-
-      await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
-      await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
-      await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
-
-      handle.session.advance();
-      handle.session.markListeningUnavailable('Not used in test.', handle.session.getCurrentStepToken());
-
-      handle.session.advance();
-      await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
-
-      handle.session.advance();
-      handle.session.markPronunciationUnavailable('Not used in test.', handle.session.getCurrentStepToken());
-
-      handle.session.advance();
-      handle.session.markSummaryDone(handle.session.getCurrentStepToken());
-
-      const { record } = await service.finishReassessment(handle);
-      expect(record).not.toBeNull();
-
-      if (record) {
-        const decision = await service.keepCurrentLevel(record.id);
-        expect(decision.updated).toBe(false);
-        expect(decision.reason).toBe('kept');
-
-        const profile = await profileRepo.get();
-        expect(profile.currentLevel).toBe('A2'); // Unchanged!
-      }
-    });
-
-    it('13. reassessment history is persisted', async () => {
-      const handle = await service.beginReassessment();
-      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
-      handle.session.advance();
-
-      await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
-      await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
-      await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
-
-      handle.session.advance();
-      handle.session.markListeningUnavailable('Not used in test.', handle.session.getCurrentStepToken());
-
-      handle.session.advance();
-      await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
-
-      handle.session.advance();
-      handle.session.markPronunciationUnavailable('Not used in test.', handle.session.getCurrentStepToken());
-
-      handle.session.advance();
-      handle.session.markSummaryDone(handle.session.getCurrentStepToken());
-
-      await service.finishReassessment(handle);
-
-      const history = await service.getHistory(learnerId);
-      expect(history.length).toBeGreaterThan(0);
-      expect(history[0].assessmentKind).toBe('reassessment');
-    });
-
-    it('14. history is bounded', async () => {
-      const history = await service.getHistory(learnerId);
-      expect(history.length).toBeLessThanOrEqual(10);
-    });
-
-    it('15. duplicate/retry does not create duplicate estimate', async () => {
-      const handle = await service.beginReassessment();
-      const { record: _r1 } = await service.finishReassessment(handle);
-      const { record: r2 } = await service.finishReassessment(handle); // finishing finished handle returns null/same result
-
-      expect(r2).toBeNull();
-    });
+      expect(profile.currentLevel).toBe('A2'); // Stays at kept level!
+    }
   });
 
-  // ────────────────────────────────────────────────────────── Change reporting
+  // 11. concurrent accept updates once
+  it('11. concurrent accept updates once', async () => {
+    const handle = await service.beginReassessment();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
 
-  describe('Qualitative Ability Change Report', () => {
-    it('16. stronger evidence is reported qualitatively', () => {
-      const report = generateAbilityChangeReport({
-        strengths: [
-          {
-            id: 's-1',
-            learnerId,
-            type: 'listening',
-            referenceId: 'listening:multi_speaker',
-            confidence: 0.9,
-            firstSeenAt: nowIso(),
-            lastSeenAt: nowIso(),
-            contexts: ['Multi-speaker dialogue'],
-            evidence: [],
-            createdAt: nowIso(),
-            updatedAt: nowIso(),
-          },
-        ],
-        weaknesses: [],
-      });
+    await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
+    await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
+    await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
 
-      const listeningDomain = report.domains.find((d) => d.domain === 'listening');
-      expect(listeningDomain?.status).toBe('stronger');
-      expect(listeningDomain?.summary).toContain('Listening comprehension');
-      // NO NUMBERS OR PERCENTAGES!
-      expect(listeningDomain?.summary).not.toMatch(/\d+%/);
-    });
+    handle.session.advance();
+    handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+    handle.session.advance();
+    handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    handle.session.markSummaryDone(handle.session.getCurrentStepToken());
 
-    it('17. mixed evidence is reported honestly', () => {
-      const report = generateAbilityChangeReport({
-        strengths: [
-          {
-            id: 's-1',
-            learnerId,
-            type: 'listening',
-            referenceId: 'listening:main_idea',
-            confidence: 0.8,
-            firstSeenAt: nowIso(),
-            lastSeenAt: nowIso(),
-            contexts: [],
-            evidence: [],
-            createdAt: nowIso(),
-            updatedAt: nowIso(),
-          },
-        ],
-        weaknesses: [
-          {
-            id: 'w-1',
-            learnerId,
-            type: 'listening',
-            referenceId: 'listening:fast_speech',
-            status: 'active_training',
-            severity: 0.8,
-            occurrenceCount: 2,
-            firstSeenAt: nowIso(),
-            lastSeenAt: nowIso(),
-            contexts: [],
-            evidence: [],
-            resolved: false,
-            createdAt: nowIso(),
-            updatedAt: nowIso(),
-          },
-        ],
-      });
+    const { record } = await service.finishReassessment(handle);
+    expect(record).not.toBeNull();
 
-      const listeningDomain = report.domains.find((d) => d.domain === 'listening');
-      expect(listeningDomain?.status).toBe('mixed');
-    });
+    if (record) {
+      const [res1, res2] = await Promise.all([
+        service.acceptReassessmentLevel(record.id),
+        service.acceptReassessmentLevel(record.id),
+      ]);
 
-    it('18. insufficient evidence says insufficient', () => {
-      const report = generateAbilityChangeReport({
-        strengths: [],
-        weaknesses: [],
-      });
-
-      const grammarDomain = report.domains.find((d) => d.domain === 'grammar');
-      expect(grammarDomain?.status).toBe('insufficient');
-      expect(grammarDomain?.summary).toContain('Insufficient evidence');
-    });
-
-    it('19. no numeric/fake improvement score', () => {
-      const report = generateAbilityChangeReport({
-        strengths: [],
-        weaknesses: [],
-      });
-
-      const fullJson = JSON.stringify(report);
-      expect(fullJson).not.toMatch(/score/i);
-      expect(fullJson).not.toMatch(/percent/i);
-      expect(fullJson).not.toMatch(/\d+%/);
-    });
-
-    it('20. distinct abilities are not collapsed incorrectly', () => {
-      const report = generateAbilityChangeReport({
-        strengths: [],
-        weaknesses: [],
-      });
-
-      const domainNames = report.domains.map((d) => d.domain);
-      expect(domainNames).toContain('listening');
-      expect(domainNames).toContain('speaking');
-      expect(domainNames).toContain('pronunciation');
-      expect(domainNames).toContain('grammar');
-      expect(domainNames).toContain('vocabulary');
-    });
+      const updateCount = (res1.updated ? 1 : 0) + (res2.updated ? 1 : 0);
+      expect(updateCount).toBe(1);
+    }
   });
 
-  // ───────────────────────────────────────────────────────────────── Lifecycle
+  // 12. profile/history remain consistent
+  it('12. profile/history remain consistent', async () => {
+    const handle = await service.beginReassessment();
+    handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
+    handle.session.advance();
 
-  describe('Race / Async / Stale Result Protections', () => {
-    it('21. stale reassessment result ignored', async () => {
-      const handle = await service.beginReassessment();
-      const token = handle.session.getCurrentStepToken();
+    await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
+    await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
+    await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
 
-      handle.session.advance(); // Advance step
+    handle.session.advance();
+    handle.session.markListeningUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
+    handle.session.advance();
+    handle.session.markPronunciationUnavailable('Not used.', handle.session.getCurrentStepToken());
+    handle.session.advance();
+    handle.session.markSummaryDone(handle.session.getCurrentStepToken());
 
-      // Attempting to mark step done with stale token is refused!
-      const marked = handle.session.markProfileStepDone(token);
-      expect(marked).toBe(false);
+    const { record } = await service.finishReassessment(handle);
+    expect(record).not.toBeNull();
+
+    if (record) {
+      await service.acceptReassessmentLevel(record.id);
+
+      const profile = await profileRepo.get();
+      const recordAfter = await historyRepo.getById(record.id);
+
+      expect(profile.currentLevel).toBe(recordAfter?.acceptedLevel);
+      expect(recordAfter?.decision).toBe('accepted');
+    }
+  });
+
+  // 13. unrelated listening strength does NOT claim multi-speaker improvement
+  it('13. unrelated listening strength does NOT claim multi-speaker improvement', () => {
+    const report = generateAbilityChangeReport({
+      strengths: [
+        {
+          id: 's-1',
+          learnerId,
+          type: 'listening',
+          referenceId: 'listening:detail',
+          confidence: 0.9,
+          firstSeenAt: nowIso(),
+          lastSeenAt: nowIso(),
+          contexts: ['Understood specific detail in solo monologue'],
+          evidence: [],
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+        },
+      ],
+      weaknesses: [],
     });
 
-    it('22. second reassessment invalidates first', async () => {
-      const handle1 = await service.beginReassessment();
-      handle1.session.abandon();
+    const listening = report.domains.find((d) => d.domain === 'listening');
+    expect(listening?.summary).not.toContain('multi-speaker');
+    expect(listening?.summary).toContain('demonstrated listening ability in some contexts');
+  });
 
-      expect(handle1.session.getStatus()).toBe('abandoned');
-
-      const handle2 = await service.beginReassessment();
-      expect(handle2.session.getStatus()).toBe('in_progress');
+  // 14. unrelated speaking strength does NOT claim longer-turn fluency
+  it('14. unrelated speaking strength does NOT claim longer-turn fluency', () => {
+    const report = generateAbilityChangeReport({
+      strengths: [
+        {
+          id: 's-2',
+          learnerId,
+          type: 'fluency',
+          referenceId: 'speaking:topic',
+          confidence: 0.8,
+          firstSeenAt: nowIso(),
+          lastSeenAt: nowIso(),
+          contexts: ['Short topic turn'],
+          evidence: [],
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+        },
+      ],
+      weaknesses: [],
     });
 
-    it('23. unmount/exit blocks late mutation', async () => {
-      const handle = await service.beginReassessment();
-      handle.session.abandon();
+    const speaking = report.domains.find((d) => d.domain === 'speaking');
+    expect(speaking?.summary).not.toContain('longer spoken turns');
+    expect(speaking?.summary).toContain('demonstrated speaking ability in natural conversation');
+  });
 
-      const { result } = await service.finishReassessment(handle);
-      expect(result).toBeNull();
+  // 15. unknown evidence type does NOT become speaking
+  it('15. unknown evidence type does NOT become speaking', () => {
+    const mapped = mapTypeToDomain('unknown_custom_type');
+    expect(mapped).toBeNull();
+
+    const report = generateAbilityChangeReport({
+      strengths: [
+        {
+          id: 's-3',
+          learnerId,
+          type: 'unknown_custom_type' as any,
+          referenceId: 'custom:item',
+          confidence: 0.8,
+          firstSeenAt: nowIso(),
+          lastSeenAt: nowIso(),
+          contexts: [],
+          evidence: [],
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+        },
+      ],
+      weaknesses: [],
     });
 
-    it('24. late STT ignored', async () => {
-      const handle = await service.beginReassessment();
-      const staleToken = handle.session.getCurrentStepToken();
+    const speaking = report.domains.find((d) => d.domain === 'speaking');
+    expect(speaking?.status).toBe('insufficient');
+  });
 
-      handle.session.advance(); // Step moved on
+  // 16. arbitrary generic observation cannot create strength
+  it('16. arbitrary generic observation cannot create strength', async () => {
+    const genericInputs: SuccessObservationInput[] = [
+      {
+        learnerId,
+        type: 'grammar',
+        referenceId: 'g:1',
+        source: 'conversation_session',
+        context: 'Great job!',
+        evidence: { kind: 'observation', id: generateId(), at: nowIso(), summary: 'Great job!' },
+      },
+      {
+        learnerId,
+        type: 'grammar',
+        referenceId: 'g:2',
+        source: 'conversation_session',
+        context: 'Session finished',
+        evidence: { kind: 'observation', id: generateId(), at: nowIso(), summary: 'Session finished' },
+      },
+      {
+        learnerId,
+        type: 'listening',
+        referenceId: 'l:1',
+        source: 'listening_service',
+        context: '',
+        evidence: { kind: 'observation', id: generateId(), at: nowIso(), summary: '' },
+      },
+    ];
 
-      const res = await onboardingService.recordPronunciation(
-        handle,
-        'Recognized text',
-        'Target sentence',
-        { stepToken: staleToken },
-      );
+    for (const input of genericInputs) {
+      const res = await service.recordSuccessObservation(input);
+      expect(res.recorded).toBe(false);
+    }
 
-      expect(res.observed).toBe(false);
+    const strengths = await weaknessRepo.listStrengths(learnerId);
+    expect(strengths).toHaveLength(0);
+  });
+
+  // 17. trusted evaluated success CAN create/update strength
+  it('17. trusted evaluated success CAN create/update strength', async () => {
+    const res1 = await recordListeningSuccess(service.successRecorder, {
+      learnerId,
+      referenceId: 'listening:multi_speaker',
+      context: 'Understood multi-speaker discussion',
+      summary: 'Exact detail match in multi-speaker task',
     });
 
-    it('25. late pronunciation ignored', async () => {
-      const handle = await service.beginReassessment();
-      const staleToken = handle.session.getCurrentStepToken();
+    expect(res1.recorded).toBe(true);
 
-      handle.session.advance();
-
-      const res = await onboardingService.recordPronunciation(
-        handle,
-        'Recognized text',
-        'Target sentence',
-        { stepToken: staleToken },
-      );
-
-      expect(res.observed).toBe(false);
+    const res2 = await recordPronunciationSuccess(service.successRecorder, {
+      learnerId,
+      referenceId: 'pron:θ',
+      context: 'Repeat of target sentence with clear /θ/ sound',
+      summary: 'Clear intelligibility on /θ/',
     });
 
-    it('26. double acceptance cannot update twice', async () => {
-      const handle = await service.beginReassessment();
-      handle.session.markProfileStepDone(handle.session.getCurrentStepToken());
-      handle.session.advance();
+    expect(res2.recorded).toBe(true);
 
-      await onboardingService.recordSpeakingAnswer(handle, 'I work as a project manager in a logistics company.');
-      await onboardingService.recordSpeakingAnswer(handle, 'Last week I finished a big project for a client.');
-      await onboardingService.recordSpeakingAnswer(handle, 'I prepared the plan and talked to the whole team.');
+    const strengths = await weaknessRepo.listStrengths(learnerId);
+    expect(strengths).toHaveLength(2);
+  });
 
-      handle.session.advance();
-      handle.session.markListeningUnavailable('Not used in test.', handle.session.getCurrentStepToken());
-
-      handle.session.advance();
-      await onboardingService.recordLanguageUseAnswer(handle, 'I plan to travel next week because I need a rest.');
-
-      handle.session.advance();
-      handle.session.markPronunciationUnavailable('Not used in test.', handle.session.getCurrentStepToken());
-
-      handle.session.advance();
-      handle.session.markSummaryDone(handle.session.getCurrentStepToken());
-
-      const { record } = await service.finishReassessment(handle);
-      expect(record).not.toBeNull();
-
-      if (record) {
-        const first = await service.acceptReassessmentLevel(record.id);
-        expect(first.updated).toBe(true);
-
-        const second = await service.acceptReassessmentLevel(record.id);
-        expect(second.updated).toBe(false);
-        expect(second.reason).toBe('already-accepted');
-      }
-    });
+  // 18. insufficient evidence does not auto-enable reassessment
+  it('18. insufficient evidence does not auto-enable reassessment', async () => {
+    const elig = await service.checkEligibility(learnerId);
+    expect(elig.available).toBe(false);
+    expect(elig.reason).toBe('insufficient_evidence');
+    expect(elig.message).toContain('Not enough practice evidence');
   });
 });

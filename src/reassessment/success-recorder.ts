@@ -18,8 +18,9 @@
 import type { LearnerStrength } from '../domain/models/learner';
 import type { EvidenceRef } from '../domain/shared/types';
 import type { WeaknessRepository } from '../repositories';
+import { generateId } from '../shared/id';
 import { nowIso } from '../shared/time';
-import type { SuccessObservationInput, SuccessObservationResult } from './types';
+import type { SuccessEvidenceSource, SuccessObservationInput, SuccessObservationResult } from './types';
 
 /** Valid evidence kinds recognized for strength observations. */
 const VALID_STRENGTH_EVIDENCE_KINDS: readonly string[] = [
@@ -34,6 +35,34 @@ const VALID_STRENGTH_EVIDENCE_KINDS: readonly string[] = [
   'vocabulary',
   'conversation',
   'shadowing',
+];
+
+/** Valid sources that have real evaluation authority. */
+const VALID_SUCCESS_SOURCES: readonly SuccessEvidenceSource[] = [
+  'pronunciation_engine',
+  'listening_service',
+  'shadowing_session',
+  'fluency_service',
+  'vocabulary_workspace',
+  'conversation_session',
+  'onboarding_diagnostic',
+  'curriculum_progression',
+];
+
+/** Phrases indicating unsupported / non-evaluated events. */
+const BANNED_UNSUPPORTED_PHRASES: readonly string[] = [
+  'great job',
+  'session finished',
+  'lesson completed',
+  'button pressed',
+  'button tapped',
+  'provider unavailable',
+  'unsupported',
+  'not evaluated',
+  'no errors',
+  'absence of failure',
+  'transcript existed',
+  'generic practice',
 ];
 
 export interface SuccessObservationRecorder {
@@ -54,21 +83,33 @@ export function createSuccessObservationRecorder(
         return { recorded: false, strength: null, reason: 'invalid_input' };
       }
 
-      // 2. Provenance discipline check: must have valid evidence.kind
+      // 2. Source validation
+      if (!VALID_SUCCESS_SOURCES.includes(input.source)) {
+        return { recorded: false, strength: null, reason: 'unsupported_event' };
+      }
+
+      // 3. Provenance discipline check: must have valid evidence.kind
       const kind = input.evidence.kind;
       if (!kind || !VALID_STRENGTH_EVIDENCE_KINDS.includes(kind)) {
         return { recorded: false, strength: null, reason: 'unsupported_event' };
       }
 
+      // Must have actual context or summary evidence (not empty caller text)
+      const contextText = (input.context ?? '').trim();
+      const summaryText = (input.evidence.summary ?? '').trim();
+      if (!contextText && !summaryText) {
+        return { recorded: false, strength: null, reason: 'unsupported_event' };
+      }
+
       // Reject unsupported events: e.g. empty or generic notes indicating non-evaluation
-      const notes = (input.notes ?? '').toLowerCase();
-      if (
-        notes.includes('provider unavailable') ||
-        notes.includes('unsupported') ||
-        notes.includes('not evaluated') ||
-        notes.includes('failed')
-      ) {
-        return { recorded: false, strength: null, reason: 'provider_failed' };
+      const fullText = `${input.notes ?? ''} ${contextText} ${summaryText}`.toLowerCase();
+      for (const phrase of BANNED_UNSUPPORTED_PHRASES) {
+        if (fullText.includes(phrase)) {
+          if (phrase === 'provider unavailable') {
+            return { recorded: false, strength: null, reason: 'provider_failed' };
+          }
+          return { recorded: false, strength: null, reason: 'unsupported_event' };
+        }
       }
 
       try {
@@ -84,8 +125,8 @@ export function createSuccessObservationRecorder(
         if (existing && existing.contexts) {
           newContexts = [...existing.contexts];
         }
-        if (input.context && !newContexts.includes(input.context)) {
-          newContexts.push(input.context);
+        if (contextText && !newContexts.includes(contextText)) {
+          newContexts.push(contextText);
         }
         // Bound contexts to max 5 recent items
         newContexts = newContexts.slice(-5);
@@ -94,9 +135,9 @@ export function createSuccessObservationRecorder(
         if (existing && existing.evidence) {
           newEvidence = [...existing.evidence];
         }
-        // Deduplicate evidence refs by targetRef or summary
+        // Deduplicate evidence refs by id or summary
         const existsEvidence = newEvidence.some(
-          (e) => e.id === input.evidence.id && e.summary === input.evidence.summary,
+          (e) => (e.id && e.id === input.evidence.id) || (e.summary && e.summary === summaryText),
         );
         if (!existsEvidence) {
           newEvidence.push(input.evidence);
@@ -130,4 +171,126 @@ export function createSuccessObservationRecorder(
       }
     },
   };
+}
+
+// ────────────────────────────────────────────── Narrow domain-specific helpers
+
+export async function recordListeningSuccess(
+  recorder: SuccessObservationRecorder,
+  params: {
+    learnerId: string;
+    referenceId: string;
+    context: string;
+    summary: string;
+  },
+): Promise<SuccessObservationResult> {
+  return recorder.recordSuccessObservation({
+    learnerId: params.learnerId,
+    type: 'listening',
+    referenceId: params.referenceId,
+    source: 'listening_service',
+    context: params.context,
+    evidence: {
+      kind: 'observation',
+      id: generateId(),
+      at: nowIso(),
+      summary: params.summary,
+    },
+  });
+}
+
+export async function recordPronunciationSuccess(
+  recorder: SuccessObservationRecorder,
+  params: {
+    learnerId: string;
+    referenceId: string;
+    context: string;
+    summary: string;
+  },
+): Promise<SuccessObservationResult> {
+  return recorder.recordSuccessObservation({
+    learnerId: params.learnerId,
+    type: 'pronunciation',
+    referenceId: params.referenceId,
+    source: 'pronunciation_engine',
+    context: params.context,
+    evidence: {
+      kind: 'observation',
+      id: generateId(),
+      at: nowIso(),
+      summary: params.summary,
+    },
+  });
+}
+
+export async function recordShadowingSuccess(
+  recorder: SuccessObservationRecorder,
+  params: {
+    learnerId: string;
+    referenceId: string;
+    context: string;
+    summary: string;
+  },
+): Promise<SuccessObservationResult> {
+  return recorder.recordSuccessObservation({
+    learnerId: params.learnerId,
+    type: 'listening',
+    referenceId: params.referenceId,
+    source: 'shadowing_session',
+    context: params.context,
+    evidence: {
+      kind: 'observation',
+      id: generateId(),
+      at: nowIso(),
+      summary: params.summary,
+    },
+  });
+}
+
+export async function recordFluencySuccess(
+  recorder: SuccessObservationRecorder,
+  params: {
+    learnerId: string;
+    referenceId: string;
+    context: string;
+    summary: string;
+  },
+): Promise<SuccessObservationResult> {
+  return recorder.recordSuccessObservation({
+    learnerId: params.learnerId,
+    type: 'fluency',
+    referenceId: params.referenceId,
+    source: 'fluency_service',
+    context: params.context,
+    evidence: {
+      kind: 'observation',
+      id: generateId(),
+      at: nowIso(),
+      summary: params.summary,
+    },
+  });
+}
+
+export async function recordVocabularySuccess(
+  recorder: SuccessObservationRecorder,
+  params: {
+    learnerId: string;
+    referenceId: string;
+    context: string;
+    summary: string;
+  },
+): Promise<SuccessObservationResult> {
+  return recorder.recordSuccessObservation({
+    learnerId: params.learnerId,
+    type: 'vocabulary',
+    referenceId: params.referenceId,
+    source: 'vocabulary_workspace',
+    context: params.context,
+    evidence: {
+      kind: 'observation',
+      id: generateId(),
+      at: nowIso(),
+      summary: params.summary,
+    },
+  });
 }
