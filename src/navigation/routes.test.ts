@@ -27,6 +27,7 @@ describe('route tables (single source of truth)', () => {
       'FluencyPractice',
       'ProfessionalEnglish',
       'Onboarding',
+      'Reassessment',
     ]);
   });
 
