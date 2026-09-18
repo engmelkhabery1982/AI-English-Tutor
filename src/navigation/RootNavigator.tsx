@@ -4,9 +4,10 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createStackNavigator } from '@react-navigation/stack';
 import { Text } from 'react-native';
 
-import type { SpeakingPracticeSeed } from '../deep-speaking';
+import type { SpeakingPracticeSeed, SpeakingPracticeType, SpeakingProfessionalScenario } from '../deep-speaking';
 import HomeScreen from '../screens/HomeScreen';
 import DeepSpeakingScreen from '../screens/DeepSpeakingScreen';
+import ProfessionalEnglishScreen from '../screens/ProfessionalEnglishScreen';
 import TalkScreen from '../screens/TalkScreen';
 import VocabularyScreen from '../screens/VocabularyScreen';
 import ReviewScreen from '../screens/ReviewScreen';
@@ -49,7 +50,15 @@ export type RootStackParamList = {
    * lesson step start a full practice on the SAME material — the inline lesson
    * path stays available when Deep Speaking is not.
    */
-  DeepSpeaking: { readonly seed?: SpeakingPracticeSeed } | undefined;
+  DeepSpeaking:
+    | {
+        readonly seed?: SpeakingPracticeSeed;
+        readonly practiceType?: SpeakingPracticeType;
+        readonly professionalScenario?: SpeakingProfessionalScenario;
+      }
+    | undefined;
+  /** Professional English scenario picker (content layer; starts Deep Speaking). */
+  ProfessionalEnglish: undefined;
   /** Personalized onboarding + diagnostic assessment (pushed from Home/Settings). */
   Onboarding: undefined;
 };
@@ -96,6 +105,11 @@ export default function RootNavigator() {
           name="DeepSpeaking"
           component={DeepSpeakingScreen}
           options={{ title: 'Speaking practice', headerBackTitle: 'Home' }}
+        />
+        <Stack.Screen
+          name="ProfessionalEnglish"
+          component={ProfessionalEnglishScreen}
+          options={{ title: 'Professional English', headerBackTitle: 'Home' }}
         />
         <Stack.Screen
           name="Onboarding"

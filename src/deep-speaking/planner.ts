@@ -23,6 +23,7 @@ import type {
   SpeakingPracticePlanResult,
   SpeakingPracticeSource,
   SpeakingPracticeType,
+  SpeakingProfessionalScenario,
   SpeakingTargetExpression,
   SpeakingTurnGoal,
   SpeakingTurnGoalKind,
@@ -30,6 +31,7 @@ import type {
 } from './types';
 import {
   TURN_GOAL_INSTRUCTIONS,
+  buildProfessionalScenarioPrompt,
   defaultCoachingModeForType,
   practiceTypeForGoal,
   selectScenario,
@@ -200,6 +202,45 @@ function selectTargetExpressions(
   }
 
   return candidates;
+}
+
+/**
+ * Additive (Professional English): merge the learner's REAL saved lexical
+ * targets with professional scenario language under the SAME existing bound.
+ *
+ * Honesty rules:
+ * - Real evidence ALWAYS keeps priority: professional expressions only fill
+ *   the slots not already taken by saved vocabulary/expressions. They never
+ *   replace or reorder real targets.
+ * - The total stays bounded by MAX_TARGET_EXPRESSIONS (3).
+ * - Professional items are labelled as scenario context, not saved vocabulary.
+ * - Deterministic: identical input yields the identical merged list.
+ */
+function mergeProfessionalTargetExpressions(
+  realTargets: readonly SpeakingTargetExpression[],
+  professional: SpeakingProfessionalScenario | undefined,
+): readonly SpeakingTargetExpression[] {
+  if (!professional || professional.targetExpressions.length === 0) {
+    return realTargets;
+  }
+  const remaining = MAX_TARGET_EXPRESSIONS - realTargets.length;
+  if (remaining <= 0) return realTargets;
+
+  const seen = new Set(realTargets.map((target) => target.headword.trim().toLowerCase()));
+  const added: SpeakingTargetExpression[] = [];
+  for (const expression of professional.targetExpressions) {
+    if (added.length >= remaining) break;
+    const key = expression.trim().toLowerCase();
+    if (key.length === 0 || seen.has(key)) continue;
+    seen.add(key);
+    added.push({
+      itemId: `professional-${professional.scenarioId}-${added.length}`,
+      headword: expression,
+      meaning: 'Professional scenario language to use naturally.',
+      reason: 'Professional scenario practice target (scenario context, not saved vocabulary).',
+    });
+  }
+  return [...realTargets, ...added];
 }
 
 /* ------------------------------------------------------------------ *
@@ -489,6 +530,10 @@ export function planSpeakingPractice(
   }
 
   const learnerId = coaching.profile.learnerId;
+  // Additive (Professional English): bounded scenario content from the content
+  // layer. The adapter always pairs it with the mapped EXISTING practice type,
+  // so `resolvePracticeType` already resolves it through options.practiceType.
+  const professional = options?.professionalScenario;
   const practiceType = resolvePracticeType(options, coaching, evidenceIsReal);
   const scenario = selectScenario(practiceType, learnerId, now);
 
@@ -497,8 +542,9 @@ export function planSpeakingPractice(
     ? selectWeaknessTargets(coaching.activeWeaknesses, MAX_WEAKNESS_TARGETS)
     : [];
 
-  // Target expressions (real evidence only)
-  const targetExpressions = evidenceIsReal
+  // Target expressions (real saved evidence only — professional scenario
+  // language is merged in later and never counted as learner evidence).
+  const realTargetExpressions = evidenceIsReal
     ? selectTargetExpressions(
         coaching.vocabularyFocus,
         coaching.expressionFocus,
@@ -516,7 +562,7 @@ export function planSpeakingPractice(
     : 0;
   const focusAreas = buildFocusAreas(
     weaknessTargets,
-    targetExpressions,
+    realTargetExpressions,
     dueVocabCount,
     dueExprCount,
   );
@@ -527,13 +573,22 @@ export function planSpeakingPractice(
     : [];
   const recentMemoryNote = buildRecentMemoryNote(boundedRecent);
 
-  // Source
+  // The full lexical targets the session will carry: real saved evidence
+  // first, professional scenario language only in the remaining slots.
+  const targetExpressions = mergeProfessionalTargetExpressions(
+    realTargetExpressions,
+    professional,
+  );
+
+  // Source — determined from REAL learner evidence only. Professional scenario
+  // content is practice material, never personalization evidence: a session
+  // with only scenario language stays honestly 'general'.
   const hasGoals =
     evidenceIsReal && coaching.profile.learningGoals.some((g) => g.trim().length > 0);
   const source = evidenceIsReal
     ? determineSource(
         weaknessTargets,
-        targetExpressions,
+        realTargetExpressions,
         hasGoals,
         Boolean(recentMemoryNote),
         practiceType,
@@ -567,13 +622,17 @@ export function planSpeakingPractice(
     ? { stepId: options.seed.stepId, targetText: options.seed.targetText }
     : undefined;
 
-  // Topic override from seed
+  // Topic / opening prompt: professional scenario content wins over the
+  // generic bank (seed is never set together with a professional scenario in
+  // practice; seed still takes precedence if both were somehow present).
   const topic = options?.seed
     ? options.seed.targetText
-    : scenario.topic;
+    : professional
+      ? professional.title
+      : scenario.topic;
 
-  // Scenario prompt override from seed
-  const scenarioPrompt = options?.seed?.prompt ?? scenario.scenarioPrompt;
+  const scenarioPrompt = options?.seed?.prompt
+    ?? (professional ? buildProfessionalScenarioPrompt(professional) : scenario.scenarioPrompt);
 
   const plan: SpeakingPracticePlan = {
     id: planId(learnerId, now, practiceType),
@@ -593,6 +652,7 @@ export function planSpeakingPractice(
     turnGoals,
     ...(recentMemoryNote ? { recentMemoryNote } : {}),
     ...(seedFromAdaptiveLesson ? { seedFromAdaptiveLesson } : {}),
+    ...(professional ? { professionalScenario: professional } : {}),
   };
 
   return { status: 'planned', plan };
