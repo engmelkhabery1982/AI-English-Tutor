@@ -107,12 +107,14 @@ function schemaFor(taskType: ContentTaskType, requestKey: string, topic?: string
     ...taskFields,
     '  "expectedAnswer": "the exact expected answer",',
     '  "keyItems": ["1 to 4 short items that really occur in the passage"],',
-    // Topic honesty: the field is only offered when the request REALLY
-    // established one. Without a topic the model is told to omit it, so it is
-    // never simultaneously required to invent a topic and forbidden to.
+    // Topic honesty: the property is included ONLY when the request REALLY
+    // established a topic. Without one it is omitted from this example
+    // entirely (never null, empty, or pseudo-JSON), so the example stays
+    // valid JSON and the model is never asked to invent a topic it is
+    // forbidden to invent — the prose rules below say to omit it.
     ...(topic !== undefined
       ? ['  "contextTopic": "the exact topic label given in the request",']
-      : ['  "contextTopic": omit this field entirely — no topic was established',]),
+      : []),
     '  "explanation": "one short neutral listening tip",',
     '  "targetExpressionsUsed": ["any requested expressions the passage really uses"],',
     '  "newLanguageItems": 0',

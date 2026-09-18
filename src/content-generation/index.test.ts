@@ -646,14 +646,55 @@ describe('generated material validation', () => {
     const topicPrompt = buildMaterialPrompt(withTopic)
       .messages.map((message) => message.content)
       .join('\n');
-    // Topicless: the model is told to omit the field, never to invent one.
+    // Topicless: the model is told (in prose) to omit the field, never to
+    // invent one — while the JSON example itself carries NO contextTopic.
     expect(topiclessPrompt).toContain('No topic was established for this material');
-    expect(topiclessPrompt).toContain('omit this field entirely');
     expect(topiclessPrompt).toContain('omit "contextTopic" unless a topic label was given');
     // With a topic: the label travels and must be echoed exactly.
     expect(topicPrompt).toContain('Topic: daily routine');
     expect(topicPrompt).toContain('the exact topic label given in the request');
-    expect(topicPrompt).not.toContain('omit this field entirely');
+  });
+
+  /**
+   * The prompt's final block is the JSON example the model must echo.
+   * Its schema-ish descriptions are not valid JSON, so substitute normal
+   * example values for every value placeholder before parsing — exactly what
+   * a well-behaved model does when it fills the template in.
+   */
+  function jsonExampleFromPrompt(promptText: string): Record<string, unknown> {
+    const start = promptText.indexOf('{');
+    const end = promptText.lastIndexOf('}');
+    if (start < 0 || end <= start) throw new Error('no JSON example found in prompt');
+    const template = promptText.slice(start, end + 1);
+    const filled = template
+      // String placeholders inside quotes become a normal example string.
+      .replace(/"(?:[^"]*)"(?=,?\s*\n)/g, '"example"')
+      // Array placeholders become a one-element example array.
+      .replace(/\[[^\]]*\]/g, '["example"]')
+      // Numbers stay as-is (already valid JSON literals).
+      ;
+    return JSON.parse(filled) as Record<string, unknown>;
+  }
+
+  it('35c. the topicless JSON example is VALID JSON and carries NO contextTopic', () => {
+    const topicless = request();
+    const promptText = buildMaterialPrompt(topicless)
+      .messages.map((message) => message.content)
+      .join('\n');
+    // The template must not contain pseudo-JSON prose (the old defect).
+    expect(promptText).not.toContain('"contextTopic": omit');
+    // After substituting normal example values the template parses as JSON.
+    const parsed = jsonExampleFromPrompt(promptText);
+    expect(Object.prototype.hasOwnProperty.call(parsed, 'contextTopic')).toBe(false);
+  });
+
+  it('35d. the topic-present JSON example is valid JSON and includes contextTopic', () => {
+    const withTopic = request({ context: { topic: 'daily routine' } });
+    const promptText = buildMaterialPrompt(withTopic)
+      .messages.map((message) => message.content)
+      .join('\n');
+    const parsed = jsonExampleFromPrompt(promptText);
+    expect(Object.prototype.hasOwnProperty.call(parsed, 'contextTopic')).toBe(true);
   });
 
   it('36. level, score and percentage claims are rejected', () => {
