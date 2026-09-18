@@ -264,6 +264,57 @@ describe('lifecycle prioritization', () => {
     expect(confirmedIdx).toBeLessThan(stableIdx);
   });
 
+  it('14a. stable evidence never emits new_skill', () => {
+    const plan = planCurriculum({ evidence: [snapshot('phrasal_verbs', 'stable')], maxItems: 50 });
+    const item = plan.recommendations.find((r) => r.skillId === 'phrasal_verbs');
+    expect(item).toBeDefined();
+    expect(item?.reasons.some((r) => r.code === 'new_skill')).toBe(false);
+    expect(item?.reasons.some((r) => r.code === 'stable_maintenance')).toBe(true);
+  });
+
+  it('14b. stable evidence keeps lifecycleState === stable and status === evidenced', () => {
+    const plan = planCurriculum({ evidence: [snapshot('phrasal_verbs', 'stable')], maxItems: 50 });
+    const item = plan.recommendations.find((r) => r.skillId === 'phrasal_verbs');
+    expect(item?.lifecycleState).toBe('stable');
+    expect(item?.status).toBe('evidenced');
+  });
+
+  it('14c. stable reason message is honest and never claims new', () => {
+    const plan = planCurriculum({ evidence: [snapshot('phrasal_verbs', 'stable')], maxItems: 50 });
+    const reason = plan.recommendations
+      .find((r) => r.skillId === 'phrasal_verbs')
+      ?.reasons.find((r) => r.code === 'stable_maintenance');
+    expect(reason?.message.toLowerCase()).toContain('stable');
+    expect(reason?.message.toLowerCase()).not.toContain('no learner evidence');
+  });
+
+  it('14d. stable remains below unresolved weakness states', () => {
+    const plan = planCurriculum({
+      evidence: [
+        snapshot('phrasal_verbs', 'stable'),
+        snapshot('articles', 'confirmed'),
+        snapshot('fluency', 'active_training'),
+        snapshot('core_vocabulary', 'repeated'),
+        snapshot('detail_listening', 'observed'),
+      ],
+      maxItems: 50,
+    });
+    const order = plan.recommendations.map((r) => r.skillId);
+    const stableIdx = order.indexOf('phrasal_verbs');
+    for (const above of ['articles', 'fluency', 'core_vocabulary', 'detail_listening']) {
+      expect(order.indexOf(above), `${above} should rank above stable`).toBeLessThan(stableIdx);
+    }
+  });
+
+  it('14e. unobserved/new skill still correctly emits new_skill', () => {
+    const plan = planCurriculum({ maxItems: 50 });
+    const item = plan.recommendations.find((r) => r.skillId === 'sentence_structure');
+    expect(item?.lifecycleState).toBeNull();
+    expect(item?.status).toBe('unobserved');
+    expect(item?.reasons.some((r) => r.code === 'new_skill')).toBe(true);
+    expect(item?.reasons.some((r) => r.code === 'stable_maintenance')).toBe(false);
+  });
+
   it('15. mastered is normally excluded', () => {
     const plan = planCurriculum({ evidence: [snapshot('sentence_structure', 'mastered')], maxItems: 50 });
     expect(plan.recommendations.find((r) => r.skillId === 'sentence_structure')).toBeUndefined();
