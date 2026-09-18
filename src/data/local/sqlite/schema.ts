@@ -15,7 +15,7 @@
  */
 
 /** Current schema version. Bump this when adding a migration. */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /** A single SQL step inside a migration. */
 export interface SchemaStep {
@@ -321,8 +321,6 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
     version: 4,
     description: 'Additive Daily Tutor storage: daily_tutor_sessions + daily_tutor_activities',
     steps: [
-      // daily_tutor_sessions — ONE row per (learner, local date). The UNIQUE
-      // constraint is the durable "never duplicate a daily session" invariant.
       { sql: `CREATE TABLE IF NOT EXISTS daily_tutor_sessions (
         id TEXT PRIMARY KEY,
         learner_id TEXT NOT NULL,
@@ -338,7 +336,6 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
         FOREIGN KEY (learner_id) REFERENCES learner_profile(id) ON DELETE CASCADE,
         UNIQUE(learner_id, date_key)
       )` },
-      // daily_tutor_activities — ordered activities of one daily session.
       { sql: `CREATE TABLE IF NOT EXISTS daily_tutor_activities (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
@@ -385,41 +382,140 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       { sql: `CREATE INDEX IF NOT EXISTS idx_reassessment_history_learner ON reassessment_history(learner_id, created_at)` },
     ],
   },
+  {
+    version: 6,
+    description: 'Additive logical uniqueness: dedupe + unique indexes for trusted identities',
+    steps: [
+      { sql: `UPDATE lexical_meanings SET lexical_item_id = (
+          SELECT keep.id FROM lexical_items keep
+          WHERE keep.learner_id = (SELECT li.learner_id FROM lexical_items li WHERE li.id = lexical_meanings.lexical_item_id)
+            AND keep.headword  = (SELECT li.headword  FROM lexical_items li WHERE li.id = lexical_meanings.lexical_item_id)
+            AND keep.type      = (SELECT li.type      FROM lexical_items li WHERE li.id = lexical_meanings.lexical_item_id)
+          ORDER BY keep.created_at ASC, keep.id ASC
+          LIMIT 1
+        )
+        WHERE EXISTS (
+          SELECT 1 FROM lexical_items li
+          WHERE li.id = lexical_meanings.lexical_item_id
+            AND EXISTS (
+              SELECT 1 FROM lexical_items k
+              WHERE k.learner_id = li.learner_id
+                AND k.headword = li.headword
+                AND k.type = li.type
+                AND (k.created_at < li.created_at
+                     OR (k.created_at = li.created_at AND k.id < li.id))
+            )
+        )` },
+      { sql: `UPDATE lexical_examples SET lexical_item_id = (
+          SELECT keep.id FROM lexical_items keep
+          WHERE keep.learner_id = (SELECT li.learner_id FROM lexical_items li WHERE li.id = lexical_examples.lexical_item_id)
+            AND keep.headword  = (SELECT li.headword  FROM lexical_items li WHERE li.id = lexical_examples.lexical_item_id)
+            AND keep.type      = (SELECT li.type      FROM lexical_items li WHERE li.id = lexical_examples.lexical_item_id)
+          ORDER BY keep.created_at ASC, keep.id ASC
+          LIMIT 1
+        )
+        WHERE EXISTS (
+          SELECT 1 FROM lexical_items li
+          WHERE li.id = lexical_examples.lexical_item_id
+            AND EXISTS (
+              SELECT 1 FROM lexical_items k
+              WHERE k.learner_id = li.learner_id
+                AND k.headword = li.headword
+                AND k.type = li.type
+                AND (k.created_at < li.created_at
+                     OR (k.created_at = li.created_at AND k.id < li.id))
+            )
+        )` },
+      { sql: `DELETE FROM lexical_items WHERE id IN (
+          SELECT li.id FROM lexical_items li
+          WHERE EXISTS (
+            SELECT 1 FROM lexical_items k
+            WHERE k.learner_id = li.learner_id
+              AND k.headword = li.headword
+              AND k.type = li.type
+              AND (k.created_at < li.created_at
+                   OR (k.created_at = li.created_at AND k.id < li.id))
+          )
+        )` },
+      { sql: `CREATE UNIQUE INDEX IF NOT EXISTS uq_lexical_items_identity
+          ON lexical_items(learner_id, headword, type)` },
+      { sql: `CREATE INDEX IF NOT EXISTS idx_review_items_kind_ref
+          ON review_items(kind, reference_id)` },
+    ],
+  },
 ];
+
+/** True when an error is the classic "column already exists" SQLite error. */
+function isDuplicateColumnError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /duplicate column name/i.test(message);
+}
 
 /**
  * Run all pending migrations against the given adapter.
- * Idempotent: only applies migrations with version > current DB version.
- * Each migration runs in its own transaction. Version is recorded only on success.
+ *
+ * CRASH SAFETY CONTRACT
+ * - Each migration's SQL body and its schema_migrations version row are written
+ *   through the adapter's atomic transaction contract, so a migration is
+ *   recorded only once its body has committed.
+ * - The runner is also RECOVERY-SAFE on re-run: an interrupted migration that
+ *   partially applied is detected as not-yet-recorded and re-applied, and the
+ *   non-idempotent `ALTER TABLE ... ADD COLUMN` step is tolerated when its
+ *   column already exists. A half-applied migration therefore cannot
+ *   permanently brick startup.
+ * - Only migrations with version > current DB version are applied.
  */
 export async function runMigrations(adapter: {
   query(sql: string, params?: readonly unknown[]): Promise<readonly Record<string, unknown>[]>;
   transaction(steps: readonly { sql: string; params?: readonly unknown[] }[]): Promise<readonly { rowsAffected: number; insertId?: number }[]>;
   execute(sql: string, params?: readonly unknown[]): Promise<{ rowsAffected: number; insertId?: number }>;
 }): Promise<void> {
-  // Ensure schema_migrations table exists
+  // Ensure the bookkeeping table exists (idempotent).
   await adapter.execute(SCHEMA_MIGRATIONS_TABLE_SQL);
   await adapter.execute(`PRAGMA foreign_keys = ON`);
 
-  // Get applied versions
+  // Get applied versions.
   const rows = await adapter.query(`SELECT version FROM schema_migrations ORDER BY version`);
   const appliedVersions = new Set(rows.map((r) => Number(r.version)));
 
-  // Apply pending migrations in order
   for (const migration of SCHEMA_MIGRATIONS) {
     if (appliedVersions.has(migration.version)) {
       continue;
     }
 
     const steps = migration.steps.map((s) => ({ sql: s.sql }));
-    await adapter.transaction(steps);
 
-    // Record successful migration
+    // Apply the body. If the transaction fails because a previous, interrupted
+    // attempt already added a column, re-apply step-by-step (each ADD COLUMN
+    // whose column exists is treated as already satisfied). Any other error is
+    // real and aborts the migration.
+    try {
+      await adapter.transaction(steps);
+    } catch (err) {
+      if (!isDuplicateColumnError(err)) {
+        throw err;
+      }
+      for (const step of steps) {
+        try {
+          await adapter.execute(step.sql);
+        } catch (stepErr) {
+          if (!isDuplicateColumnError(stepErr)) {
+            throw stepErr;
+          }
+        }
+      }
+    }
+
+    // Record success. Written only after the body succeeded, so the schema
+    // version can never claim success before the migration did. INSERT OR
+    // REPLACE keeps re-runs safe.
     const now = new Date().toISOString();
-    await adapter.execute(
-      `INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)`,
-      [migration.version, migration.description, now]
-    );
+    await adapter.transaction([
+      {
+        sql: `INSERT OR REPLACE INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)`,
+        params: [migration.version, migration.description, now],
+      },
+    ]);
   }
 }
 
