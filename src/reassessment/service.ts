@@ -306,7 +306,7 @@ export function createReassessmentService(
         return {
           updated: false,
           currentLevel: existingRecord.previousLevel,
-          reason: 'terminal_decision',
+          reason: 'kept',
         };
       }
 
@@ -324,7 +324,7 @@ export function createReassessmentService(
         return {
           updated: false,
           currentLevel: updateResult.record?.acceptedLevel ?? updateResult.record?.previousLevel ?? 'unknown',
-          reason: 'terminal_decision',
+          reason: updateResult.record?.decision === 'kept' ? 'kept' : 'already-accepted',
         };
       }
 
@@ -364,7 +364,7 @@ export function createReassessmentService(
         return {
           updated: false,
           currentLevel: existingRecord.acceptedLevel ?? existingRecord.proposedLevel,
-          reason: 'terminal_decision',
+          reason: 'already-accepted',
         };
       }
 
@@ -378,7 +378,7 @@ export function createReassessmentService(
         return {
           updated: false,
           currentLevel: updateResult.record?.previousLevel ?? 'unknown',
-          reason: 'terminal_decision',
+          reason: updateResult.record?.decision === 'accepted' ? 'already-accepted' : 'kept',
         };
       }
 

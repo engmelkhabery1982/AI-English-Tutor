@@ -89,7 +89,7 @@ export default function ReassessmentScreen({
     };
   }, [service, learnerId]);
 
-  const startReassessment = async (force = false) => {
+  const startReassessment = async (_force = false) => {
     // Increment generation so any late async response from prior run is ignored
     generationRef.current += 1;
     const currentGen = generationRef.current;

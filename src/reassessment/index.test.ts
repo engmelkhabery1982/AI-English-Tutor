@@ -282,7 +282,7 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
       // Attempt to flip to keep
       const second = await service.keepCurrentLevel(record.id);
       expect(second.updated).toBe(false);
-      expect(second.reason).toBe('terminal_decision');
+      expect(second.reason).toBe('already-accepted');
 
       const profileAfterKeep = await profileRepo.get();
       expect(profileAfterKeep.currentLevel).toBe(record.proposedLevel); // Stays at accepted level!
@@ -319,7 +319,7 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
       // Attempt to flip to accept
       const second = await service.acceptReassessmentLevel(record.id);
       expect(second.updated).toBe(false);
-      expect(second.reason).toBe('terminal_decision');
+      expect(second.reason).toBe('kept');
 
       const profile = await profileRepo.get();
       expect(profile.currentLevel).toBe('A2'); // Stays at kept level!

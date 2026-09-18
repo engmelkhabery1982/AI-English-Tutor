@@ -11,7 +11,6 @@
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { CefrLevelInput } from '../domain/shared/types';
-import { generateId } from '../shared/id';
 import { nowIso } from '../shared/time';
 import type {
   QualitativeChangeReport,
