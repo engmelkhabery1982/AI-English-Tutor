@@ -571,4 +571,83 @@ describe('Translation Core (Phase 1)', () => {
       expect(result.overallSuccess).toBe(true);
     });
   });
+
+  describe('Short-text exact source fidelity', () => {
+    const successProvider = createMockAIProvider(() => ({
+      ok: true,
+      response: {
+        content: JSON.stringify({
+          translatedText: 'مرحبا بالعالم',
+          direction: 'en-to-ar',
+          style: 'natural',
+          arabicVariety: 'msa',
+          alternatives: [],
+          learningNotes: [],
+          learningCandidates: {
+            vocabulary: [],
+            expressions: [],
+            collocations: [],
+            phrasalVerbs: [],
+          },
+        }),
+      },
+    }));
+
+    it('preserves exact raw source on success while translating semantic content', async () => {
+      const rawInput = '  \tHello world.\r\n';
+      const service = createTranslationService(successProvider);
+      const outcome = await service.translateText(rawInput);
+
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) {
+        expect(outcome.data.originalText).toBe(rawInput);
+      }
+    });
+
+    it('preserves exact raw source on provider failure', async () => {
+      const rawInput = '\n\t Critical memo.  \r\n';
+      const service = createTranslationService(
+        createMockAIProvider(() => ({
+          ok: false,
+          error: { code: 'unavailable', message: 'offline', retryable: true },
+        }))
+      );
+      const outcome = await service.translateText(rawInput);
+
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) expect(outcome.originalText).toBe(rawInput);
+    });
+
+    it('preserves exact raw source on malformed response and thrown exception', async () => {
+      const rawInput = '  Hello\t\r\n';
+      const malformed = createTranslationService(
+        createMockAIProvider(() => ({ ok: true, response: { content: 'not-json' } }))
+      );
+      const malformedOutcome = await malformed.translateText(rawInput);
+      expect(malformedOutcome.ok).toBe(false);
+      if (!malformedOutcome.ok) expect(malformedOutcome.originalText).toBe(rawInput);
+
+      const throwing = createTranslationService(
+        createMockAIProvider(() => {
+          throw new Error('boom');
+        })
+      );
+      const thrownOutcome = await throwing.translateText(rawInput);
+      expect(thrownOutcome.ok).toBe(false);
+      if (!thrownOutcome.ok) expect(thrownOutcome.originalText).toBe(rawInput);
+    });
+
+    it('treats whitespace-only input as empty without altering originalText', async () => {
+      const rawInput = '  \t\r\n\n ';
+      const service = createTranslationService(successProvider);
+      const outcome = await service.translateText(rawInput);
+
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) {
+        expect(outcome.error.code).toBe('empty_input');
+        expect(outcome.originalText).toBe(rawInput);
+      }
+    });
+  });
+
 });
