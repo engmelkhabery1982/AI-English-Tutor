@@ -15,7 +15,7 @@
  * 9. foreign-key enforcement still works
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SqlJsAdapter } from './SqlJsAdapter';
 import { SQLiteUserProfileRepository, SQLiteConversationRepository, SQLiteMistakeRepository, SQLitePronunciationRepository, SQLiteWeaknessRepository, SQLiteVocabularyRepository } from './repositories';
 import type { CefrLevelInput, ConversationMode, ExampleSource } from '../../../domain/shared/types';
@@ -26,6 +26,29 @@ describe('SQLite repositories (sql.js)', () => {
   let adapter: SqlJsAdapter;
   let profileRepo: SQLiteUserProfileRepository;
   let conversationRepo: SQLiteConversationRepository;
+
+  /*
+   * DETERMINISTIC CLOCK
+   *
+   * Repository updates stamp `updated_at` from the wall clock (`nowIso()`), so
+   * an update performed inside the same millisecond as the insert yields an
+   * IDENTICAL timestamp. Asserting "updatedAt changed" against the real clock
+   * is therefore a timing race: it passed or failed depending on machine
+   * speed. Freezing `Date` (and only `Date` — timers stay real) lets each test
+   * advance time explicitly and assert the EXACT expected ISO timestamp, which
+   * is a stronger guarantee than the previous `not.toBe(...)` comparison.
+   */
+  const CLOCK_T0 = '2026-01-01T00:00:00.000Z';
+  const CLOCK_T1 = '2026-01-01T00:00:01.000Z';
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(CLOCK_T0));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
   beforeEach(async () => {
     adapter = new SqlJsAdapter(':memory:');
@@ -88,6 +111,9 @@ describe('SQLite repositories (sql.js)', () => {
       const originalId = profile.id;
       const originalCreatedAt = profile.createdAt;
 
+      // Advance the frozen clock so the update is provably later than creation.
+      vi.setSystemTime(new Date(CLOCK_T1));
+
       await profileRepo.update({
         displayName: 'Alice Updated',
         currentLevel: 'B1',
@@ -101,8 +127,10 @@ describe('SQLite repositories (sql.js)', () => {
       // Preserved fields
       expect(profile.id).toBe(originalId);
       expect(profile.createdAt).toBe(originalCreatedAt);
-      // updatedAt should have changed
-      expect(profile.updatedAt).not.toBe(originalCreatedAt);
+      // updatedAt is stamped exactly at the advanced clock time (strictly later
+      // than the preserved createdAt — no same-millisecond ambiguity).
+      expect(originalCreatedAt).toBe(CLOCK_T0);
+      expect(profile.updatedAt).toBe(CLOCK_T1);
     });
 
     it('2. profile survives repository re-instantiation on the same DB adapter', async () => {
@@ -224,7 +252,10 @@ describe('SQLite repositories (sql.js)', () => {
       const originalSummary = session.summary;
       const originalTags = session.tags;
 
-      // Update only title and status
+      // Update only title and status. Advance the frozen clock first so the
+      // update cannot land in the creation millisecond.
+      vi.setSystemTime(new Date(CLOCK_T1));
+
       const updated = await conversationRepo.updateSession(session.id, {
         title: 'Updated Title',
         status: 'completed',
@@ -247,8 +278,10 @@ describe('SQLite repositories (sql.js)', () => {
       expect(updated.status).toBe('completed');
       expect(updated.endedAt).toBeDefined();
       expect(updated.durationSeconds).toBe(300);
-      // updatedAt should have changed
-      expect(updated.updatedAt).not.toBe(originalCreatedAt);
+      // updatedAt is stamped exactly at the advanced clock time (strictly later
+      // than the preserved createdAt — no same-millisecond ambiguity).
+      expect(originalCreatedAt).toBe(CLOCK_T0);
+      expect(updated.updatedAt).toBe(CLOCK_T1);
     });
 
     it('5. multiple sessions can be listed for learner', async () => {
@@ -657,11 +690,15 @@ describe('SQLite repositories (sql.js)', () => {
       });
 
       expect(mistake.resolved).toBe(false);
+      expect(mistake.updatedAt).toBe(CLOCK_T0);
+
+      // Advance the frozen clock so the resolution is provably later.
+      vi.setSystemTime(new Date(CLOCK_T1));
 
       const updated = await mistakeRepo.markResolved(mistake.id, true);
       expect(updated.id).toBe(mistake.id);
       expect(updated.resolved).toBe(true);
-      expect(updated.updatedAt).not.toBe(mistake.updatedAt);
+      expect(updated.updatedAt).toBe(CLOCK_T1);
 
       // Verify persistence
       const mistakes = await mistakeRepo.listMistakes(learnerId, { resolved: true });
