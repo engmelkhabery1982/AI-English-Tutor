@@ -839,4 +839,45 @@ describe('Blocker 3 — Stale voice work & controller lifecycle', () => {
     await controller2.dispose();
   });
 
+
+  it('prevents state mutation when controller is disposed while ListeningService.submitShadowingAttempt pronunciation analysis is in-flight', async () => {
+    let resolvePortPromise!: (val: PronunciationTurnOutcome) => void;
+    const pendingPortPromise = new Promise<PronunciationTurnOutcome>((resolve) => {
+      resolvePortPromise = resolve;
+    });
+
+    const port: ShadowingPronunciationPort = {
+      analyzeSpokenTurn: async () => pendingPortPromise,
+    };
+
+    const ctx = await createContext();
+    const service = createService(ctx, { pronunciation: port });
+
+    const session = sessionWith({ baseSupport: 'full_transcript' });
+    const recorder = fakeRecorder();
+    const stt = fakeStt(async () => ({ ok: true, transcript: CHUNK }));
+
+    const controller = new ShadowingVoiceController(session, {
+      recorder,
+      stt,
+      submit: (transcript: string, checkStale?: () => boolean) =>
+        service.submitShadowingAttempt(session, transcript, { checkStale }),
+    });
+
+    await controller.startRecording();
+    const stopPromise = controller.stopAndJudge();
+
+    expect(session.attemptCount).toBe(0);
+
+    await controller.dispose();
+
+    resolvePortPromise(outcome());
+
+    const result = await stopPromise;
+
+    expect('ok' in result && result.ok).toBe(false);
+    expect(session.attemptCount).toBe(0);
+    expect(session.support).toBe('full_transcript');
+    expect(session.transcript).toBeNull();
+  });
 });

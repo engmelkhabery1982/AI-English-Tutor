@@ -333,12 +333,13 @@ export class ListeningService {
   async submitShadowingAttempt(
     session: ShadowingSession,
     transcript: string | null,
-    opts?: { now?: IsoDate },
+    opts?: { now?: IsoDate; checkStale?: () => boolean },
   ): Promise<ShadowingAttempt> {
     return session.submit(
       transcript,
       this.deps.pronunciation,
       opts?.now,
+      opts?.checkStale,
     );
   }
 

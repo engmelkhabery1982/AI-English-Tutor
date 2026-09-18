@@ -432,7 +432,7 @@ export interface ShadowingVoiceDeps {
    * service (which owns the pronunciation port). When absent, the session
    * judges locally through `port`.
    */
-  readonly submit?: (transcript: string) => Promise<ShadowingAttempt>;
+  readonly submit?: (transcript: string, checkStale?: () => boolean) => Promise<ShadowingAttempt>;
 }
 
 /**
@@ -445,7 +445,7 @@ export class ShadowingVoiceController {
   private readonly stt: SpeechToTextProvider | null;
   private readonly port: ShadowingPronunciationPort | undefined;
   private readonly now: string | undefined;
-  private readonly submitOverride: ((transcript: string) => Promise<ShadowingAttempt>) | undefined;
+  private readonly submitOverride: ((transcript: string, checkStale?: () => boolean) => Promise<ShadowingAttempt>) | undefined;
   private state: 'idle' | 'recording' | 'transcribing' = 'idle';
   private disposed = false;
   private generation = 0;
@@ -554,7 +554,7 @@ export class ShadowingVoiceController {
     const checkStale = () => this.disposed || this.generation !== token;
     let result: ShadowingAttempt;
     if (this.submitOverride) {
-      result = await this.submitOverride(transcript);
+      result = await this.submitOverride(transcript, checkStale);
     } else {
       result = await this.session.submit(transcript, this.port, this.now, checkStale);
     }

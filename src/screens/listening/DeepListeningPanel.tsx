@@ -275,7 +275,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
       const controller = new ShadowingVoiceController(session, {
         ...(recorder ? { recorder } : {}),
         ...(stt ? { stt } : {}),
-        submit: (transcript: string) => service.submitShadowingAttempt(session, transcript),
+        submit: (transcript: string, checkStale?: () => boolean) => service.submitShadowingAttempt(session, transcript, { checkStale }),
       });
 
       controllerRef.current = controller;
