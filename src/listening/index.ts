@@ -22,6 +22,7 @@ import {
   SQLiteVocabularyRepository,
   SQLiteWeaknessRepository,
 } from '../data/local/sqlite/repositories';
+import { createPronunciationEngine } from '../pronunciation';
 import { ListeningService } from './service';
 
 export * from './types';
@@ -29,6 +30,10 @@ export * from './evaluator';
 export * from './ai-material';
 export * from './generator';
 export * from './service';
+// WP-2 additive surface: deep listening (long discourse, multi-speaker,
+// speech rate, connected speech, shadowing). It reuses this engine's
+// evaluation and persistence — it is not a second engine.
+export * from './deep';
 
 /**
  * Compose a ListeningService on the given adapter using the EXISTING
@@ -53,7 +58,14 @@ export function createListeningService(
 ): ListeningService {
   const weaknesses = new SQLiteWeaknessRepository(adapter);
   const review = new SQLiteReviewRepository(adapter);
+  // WP-2: the EXISTING pronunciation engine is composed ONLY as the shadowing
+  // port, so pronunciation evidence keeps its existing owner. It adds no voice
+  // stack and no second pronunciation engine.
+  const pronunciation = createPronunciationEngine(adapter);
   return new ListeningService({
+    pronunciation: {
+      analyzeSpokenTurn: (input) => pronunciation.analyzeSpokenTurn(input),
+    },
     weaknesses: {
       listWeaknesses: (learnerId, limit) => weaknesses.listWeaknesses(learnerId, limit),
       upsertWeakness: (weakness) => weaknesses.upsertWeakness(weakness),

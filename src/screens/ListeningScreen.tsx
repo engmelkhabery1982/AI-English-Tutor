@@ -37,6 +37,9 @@ import type {
   ListeningEvaluation,
   ListeningExercise,
 } from '../listening';
+import type { SpeechToTextProvider } from '../providers/stt';
+import type { AudioRecorderService } from '../voice/types';
+import DeepListeningPanel from './listening/DeepListeningPanel';
 import type { DailyTutorActivityRef, DailyTutorLaunchState } from '../daily-tutor';
 import {
   DAILY_TUTOR_LAUNCH_IDLE,
@@ -53,6 +56,9 @@ export interface ListeningScreenProps {
   readonly service?: ListeningService;
   /** Injectable TTS (existing provider abstraction). */
   readonly ttsProvider?: TextToSpeechProvider;
+  /** WP-2: injectable EXISTING recorder/STT, used only by deep shadowing. */
+  readonly recorder?: AudioRecorderService;
+  readonly stt?: SpeechToTextProvider;
 }
 
 const TYPE_LABELS: Record<ListeningExercise['type'], string> = {
@@ -127,6 +133,12 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
   const [savedItems, setSavedItems] = useState<readonly string[]>([]);
   const [sessionDone, setSessionDone] = useState<boolean>(false);
   const [problemCount, setProblemCount] = useState<number>(0);
+  /**
+   * WP-2: short (Phase 1) or deep listening. Deep mode is additive — it cannot
+   * be entered while a Daily Tutor workflow is active, so that flow keeps its
+   * existing Phase-1 behaviour exactly.
+   */
+  const [mode, setMode] = useState<'short' | 'deep'>('short');
 
   const serviceRef = useRef<ListeningService | null>(props?.service ?? null);
   const ttsRef = useRef<TextToSpeechProvider | null>(props?.ttsProvider ?? null);
@@ -383,9 +395,72 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
 
   // ---------- Empty / start state ----------
   if (!session || !currentExercise) {
+    // WP-2 deep mode: its own scroll container, so the Phase-1 layout below is
+    // untouched (and no scroll view is nested inside another one).
+    if (mode === 'deep' && !dailyTutorRef) {
+      return (
+        <ScrollView style={styles.container} contentContainerStyle={styles.deepContent}>
+          <Text style={styles.title}>🎧 Deep listening</Text>
+          <TouchableOpacity
+            style={styles.secondaryButtonRow}
+            onPress={() => setMode('short')}
+            accessibilityRole="button"
+            accessibilityLabel="Back to short exercises"
+          >
+            <Text style={styles.difficultyPillText}>← Short exercises</Text>
+          </TouchableOpacity>
+          {serviceReady && serviceRef.current ? (
+            <DeepListeningPanel
+              service={serviceRef.current}
+              {...(props?.ttsProvider ? { ttsProvider: props.ttsProvider } : {})}
+              {...(props?.recorder ? { recorder: props.recorder } : {})}
+              {...(props?.stt ? { stt: props.stt } : {})}
+            />
+          ) : (
+            <Text style={styles.subtitle}>Loading deep listening…</Text>
+          )}
+        </ScrollView>
+      );
+    }
     return (
       <ScrollView style={styles.container} contentContainerStyle={styles.centerContent}>
         <Text style={styles.title}>🎧 Listening</Text>
+        {!dailyTutorRef ? (
+          <View style={styles.modeRow}>
+            <TouchableOpacity
+              style={[styles.difficultyPill, mode === 'short' && styles.difficultyPillActive]}
+              onPress={() => setMode('short')}
+              accessibilityRole="button"
+              accessibilityLabel="Short listening exercises"
+            >
+              <Text
+                style={[
+                  styles.difficultyPillText,
+                  mode === 'short' && styles.difficultyPillTextActive,
+                ]}
+              >
+                Short exercises
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.difficultyPill, mode === 'deep' && styles.difficultyPillActive]}
+              onPress={() => setMode('deep')}
+              testID="deep_listening_tab"
+              accessibilityRole="button"
+              accessibilityLabel="Deep listening practice"
+            >
+              <Text
+                style={[
+                  styles.difficultyPillText,
+                  mode === 'deep' && styles.difficultyPillTextActive,
+                ]}
+              >
+                Deep listening
+              </Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
+
         <Text style={styles.subtitle}>
           Short listening exercises. Play the audio, answer what you understood, and get
           qualitative feedback — no scores, just real comprehension practice.
@@ -634,6 +709,16 @@ const styles = StyleSheet.create({
   title: { fontSize: 28, fontWeight: '700', color: '#1F2937', marginBottom: 8 },
   subtitle: { fontSize: 14, color: '#4B5563', textAlign: 'center', lineHeight: 20, marginBottom: 20 },
   difficultyRow: { flexDirection: 'row', gap: 8, marginBottom: 20 },
+  modeRow: { flexDirection: 'row', gap: 8, marginBottom: 16 },
+  deepContent: { padding: 16, paddingBottom: 40 },
+  secondaryButtonRow: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 14,
+    backgroundColor: '#E5EDFB',
+    marginBottom: 8,
+  },
   difficultyPill: {
     paddingHorizontal: 14,
     paddingVertical: 8,

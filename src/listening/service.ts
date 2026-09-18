@@ -39,6 +39,24 @@ import type {
 import { evaluateListeningAnswer } from './evaluator';
 import { planListeningSession, stableReferenceId } from './generator';
 import type { ListeningGeneratedContentOptions } from './generator';
+import {
+  deepEvaluationView,
+  planDeepListeningSession,
+  resolveDeepListeningPlan,
+  syntheticExerciseForStep,
+} from './deep';
+import type {
+  DeepListeningActivity,
+  DeepListeningTaskType,
+  DiscourseKind,
+  DeepSpeechRateLevel,
+  DeepSessionOptions,
+  PlannedDeepSession,
+  ShadowingAttempt,
+  ShadowingPronunciationPort,
+  ShadowingSession,
+  SpeechRateCapability,
+} from './deep';
 
 /** Max missed key items persisted per exercise (bounded evidence). */
 const MAX_MISSED_PER_EXERCISE = 2;
@@ -77,6 +95,12 @@ export interface ListeningServiceDeps {
   readonly aiProvider?: AIProvider;
   /** EXISTING profile repository — the ONLY source of the learner id (never fabricated). */
   readonly profile?: Pick<UserProfileRepository, 'get'>;
+  /**
+   * WP-2: the EXISTING pronunciation engine, used ONLY by shadowing, through
+   * this narrow port. Absent → shadowing stays qualitative and local, and no
+   * pronunciation evidence is ever fabricated.
+   */
+  readonly pronunciation?: ShadowingPronunciationPort;
 }
 
 /** True when the result indicates a comprehension problem worth persisting. */
@@ -185,6 +209,137 @@ export class ListeningService {
       // No honest learner level available → no generated content.
       return undefined;
     }
+  }
+
+  /**
+   * WP-2: plan ONE bounded DEEP listening session.
+   *
+   * Additive and opt-in: the Phase-1 `startSession` path (and therefore the
+   * Adaptive Lessons integration) is completely unaffected. Deep activities
+   * are planned by the same engine, over the same repositories, with the same
+   * bounded reads, and every activity is served through `evaluateDeepAnswer`.
+   */
+  async startDeepSession(
+    learnerId: string,
+    options?: {
+      targetCount?: number;
+      taskTypes?: readonly DeepListeningTaskType[];
+      discourseKinds?: readonly DiscourseKind[];
+      speechRateLevel?: DeepSpeechRateLevel;
+      /** The playback capability of the REAL provider the screen will use. */
+      speechRateCapability?: SpeechRateCapability;
+      /** Opt-in: allow ONE generated deep activity (default off). */
+      allowGeneratedContent?: boolean;
+      now?: IsoDate;
+    },
+  ): Promise<PlannedDeepSession> {
+    const capability: SpeechRateCapability = options?.speechRateCapability ?? {
+      supported: false,
+      providerId: null,
+      reason: 'no_provider',
+    };
+    if (!learnerId) {
+      return {
+        activities: [],
+        plan: resolveDeepListeningPlan({
+          level: 'unknown',
+          evidence: null,
+          speechRateCapability: capability,
+        }),
+        sourceNote: 'No learner profile found yet. Set up your profile to start deep listening practice.',
+      };
+    }
+    try {
+      const profile = this.deps.profile ? await this.deps.profile.get() : null;
+      const generated =
+        options?.allowGeneratedContent && this.deps.aiProvider
+          ? { provider: this.deps.aiProvider }
+          : undefined;
+      const deepOptions: DeepSessionOptions = {
+        // The stored working level is used AS-IS: a level is a claim, never
+        // inferred and never promoted here.
+        level: profile?.currentLevel ?? 'unknown',
+        learningGoals: profile?.learningGoals ?? [],
+        speechRateCapability: capability,
+        ...(options?.targetCount !== undefined ? { targetCount: options.targetCount } : {}),
+        ...(options?.taskTypes !== undefined ? { taskTypes: options.taskTypes } : {}),
+        ...(options?.discourseKinds !== undefined ? { discourseKinds: options.discourseKinds } : {}),
+        ...(options?.speechRateLevel !== undefined
+          ? { requestedSpeechRate: options.speechRateLevel }
+          : {}),
+        ...(options?.now !== undefined ? { now: options.now } : {}),
+        ...(generated !== undefined ? { generatedContent: generated } : {}),
+      };
+      return await planDeepListeningSession(
+        {
+          weaknesses: { listWeaknesses: this.deps.weaknesses.listWeaknesses },
+          vocabulary: this.deps.vocabulary,
+          expressions: this.deps.expressions,
+        },
+        learnerId,
+        deepOptions,
+      );
+    } catch {
+      // Planning must never crash the screen — an honest empty session.
+      return {
+        activities: [],
+        plan: resolveDeepListeningPlan({
+          level: 'unknown',
+          evidence: null,
+          speechRateCapability: capability,
+        }),
+        sourceNote: 'Deep listening practice is unavailable right now. Please try again.',
+      };
+    }
+  }
+
+  /**
+   * WP-2: answer ONE step of a deep activity.
+   *
+   * The step is expressed as an EXISTING listening exercise and evaluated by
+   * the EXISTING path (deterministic-first; a deep answer is never judged by a
+   * model), so weakness lifecycle and one-time review scheduling stay with
+   * their existing owner. Returns `evaluation: null` for a step that does not
+   * exist — never a fabricated result.
+   */
+  async evaluateDeepAnswer(
+    learnerId: string,
+    activity: DeepListeningActivity,
+    stepId: string,
+    answer: string,
+    opts?: { replayCount?: number; now?: IsoDate },
+  ): Promise<{ evaluation: ListeningEvaluation | null; persistenceError: boolean }> {
+    const exercise = syntheticExerciseForStep(activity, stepId);
+    if (!exercise) return { evaluation: null, persistenceError: false };
+    const result = await this.evaluateAnswer(learnerId, exercise, answer, {
+      ...(opts?.replayCount !== undefined ? { replayCount: opts.replayCount } : {}),
+      ...(opts?.now !== undefined ? { now: opts.now } : {}),
+    });
+    return {
+      evaluation: deepEvaluationView(result.evaluation, activity, stepId),
+      persistenceError: result.persistenceError,
+    };
+  }
+
+  /**
+   * WP-2: judge ONE shadowing repeat.
+   *
+   * Repetition and replays are LOCAL practice state: this records nothing by
+   * itself. A real transcript is routed to the EXISTING pronunciation path (the
+   * only owner of pronunciation evidence); without that path — or without a
+   * transcript — the judgement stays local and qualitative, and nothing at all
+   * is persisted.
+   */
+  async submitShadowingAttempt(
+    session: ShadowingSession,
+    transcript: string | null,
+    opts?: { now?: IsoDate },
+  ): Promise<ShadowingAttempt> {
+    return session.submit(
+      transcript,
+      this.deps.pronunciation,
+      opts?.now,
+    );
   }
 
   /**
