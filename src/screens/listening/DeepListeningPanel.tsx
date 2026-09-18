@@ -129,6 +129,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
 
   const ttsRef = useRef<TextToSpeechProvider | null>(props.ttsProvider ?? null);
   const capabilityRef = useRef<SpeechRateCapability>(resolveSpeechRateCapability(props.ttsProvider));
+  const shadowingTokenRef = useRef<number>(0);
   /** The current shadowing practice session (state so the UI really re-renders). */
   const [shadowing, setShadowing] = useState<{
     readonly session: ShadowingSession;
@@ -225,12 +226,19 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
 
   /** Reset the per-activity local practice state (shadowing included). */
   useEffect(() => {
+    let active = true;
+    const token = (shadowingTokenRef.current += 1);
+
     if (!activity || activity.taskType !== 'shadowing') {
-      setShadowing(null);
+      setShadowing((prev) => {
+        if (prev) void prev.controller.dispose();
+        return null;
+      });
       setIsRecording(false);
       setShadowingResult(null);
       return;
     }
+
     const session = new ShadowingSession({
       id: activity.id,
       chunk: activity.chunk,
@@ -238,15 +246,37 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
       baseSupport: activity.support,
       maxRepeats: activity.maxRepeats,
     });
-    const controller = new ShadowingVoiceController(session, {
-      ...(props.recorder ? { recorder: props.recorder } : {}),
-      ...(props.stt ? { stt: props.stt } : {}),
-      // The attempt is judged through the EXISTING service (pronunciation path).
-      submit: (transcript: string) => service.submitShadowingAttempt(session, transcript),
-    });
-    setShadowing({ session, controller });
-    setIsRecording(false);
-    setShadowingResult(null);
+
+    void (async () => {
+      let recorder = props.recorder;
+      let stt = props.stt;
+      if (!recorder || !stt) {
+        const resolved = await resolveVoiceInput(props.recorder, props.stt);
+        if (resolved) {
+          recorder = resolved.recorder;
+          stt = resolved.stt;
+        }
+      }
+      if (!active || shadowingTokenRef.current !== token) return;
+
+      const controller = new ShadowingVoiceController(session, {
+        ...(recorder ? { recorder } : {}),
+        ...(stt ? { stt } : {}),
+        submit: (transcript: string) => service.submitShadowingAttempt(session, transcript),
+      });
+
+      setShadowing((prev) => {
+        if (prev) void prev.controller.dispose();
+        return { session, controller };
+      });
+      setIsRecording(false);
+      setShadowingResult(null);
+    })();
+
+    return () => {
+      active = false;
+      shadowingTokenRef.current += 1;
+    };
   }, [activity, props.recorder, props.stt, service]);
 
   const handlePlay = async (): Promise<void> => {
@@ -336,19 +366,20 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
   const handleShadowingToggle = async (): Promise<void> => {
     const current = shadowing;
     if (!current) return;
+    const token = shadowingTokenRef.current;
     setErrorMessage(null);
+
     if (!current.controller.voiceAvailable) {
-      const voice = await resolveVoiceInput(props.recorder, props.stt);
       setErrorMessage(
-        voice
-          ? 'Voice capture is starting up. Tap again to record.'
-          : 'Voice capture needs a configured speech provider. You can still read the chunk and repeat it aloud.',
+        'Voice capture needs a configured speech provider. You can still read the chunk and repeat it aloud.',
       );
       return;
     }
+
     try {
       if (!isRecording) {
         const started = await current.controller.startRecording();
+        if (shadowingTokenRef.current !== token) return;
         if (!('ok' in started) || !started.ok) {
           if ('message' in started) setErrorMessage(started.message);
           return;
@@ -358,12 +389,14 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
       }
       setIsRecording(false);
       const judged = await current.controller.stopAndJudge();
+      if (shadowingTokenRef.current !== token) return;
       if ('ok' in judged && judged.ok === false) {
         setErrorMessage(judged.message);
         return;
       }
       setShadowingResult(judged as ShadowingAttempt);
     } catch {
+      if (shadowingTokenRef.current !== token) return;
       setIsRecording(false);
       setErrorMessage('That repeat could not be checked. Nothing was saved.');
     }
@@ -371,6 +404,12 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
 
   const handleNext = (): void => {
     setErrorMessage(null);
+    shadowingTokenRef.current += 1;
+    if (shadowing) {
+      void shadowing.controller.dispose();
+    }
+    void ttsRef.current?.stop();
+
     if (stepIndex + 1 < steps.length) {
       setStepIndex((index) => index + 1);
       setAnswer('');

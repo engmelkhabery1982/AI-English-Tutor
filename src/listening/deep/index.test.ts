@@ -1395,4 +1395,18 @@ describe('existing behaviour stays intact', () => {
     expect(shadowingSource).toContain('analyzeSpokenTurn');
     expect(shadowingSource).not.toMatch(/\b(score|percentage|rating)\s*[:=]/i);
   });
+
+describe('DeepListeningPanel lifecycle & voice composition hardening', () => {
+  it('28. DeepListeningPanel disposes shadowing voice controller and cancels active work on activity change/exit', async () => {
+    const screenSource = readFileSync(
+      join(__dirname, '..', '..', 'screens', 'listening', 'DeepListeningPanel.tsx'),
+      'utf8',
+    );
+    expect(screenSource).toContain('shadowingTokenRef');
+    expect(screenSource).toContain('resolveVoiceInput');
+    expect(screenSource).toContain('shadowing.controller.dispose()');
+    expect(screenSource).toContain('ttsRef.current?.stop()');
+  });
+});
+
 });

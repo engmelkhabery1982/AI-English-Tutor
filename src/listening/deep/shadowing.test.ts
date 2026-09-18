@@ -36,6 +36,7 @@ import {
   playShadowingChunk,
   runShadowingAttempt,
   supportForAttempt,
+  resolveShadowingSupport,
 } from './shadowing';
 import type { ShadowingPronunciationPort } from './shadowing';
 import { resolveSpeechRateCapability } from './speech-rate';
@@ -326,7 +327,7 @@ describe('shadowing pronunciation integration', () => {
     const attempt = await service.submitShadowingAttempt(session, CHUNK, { now: NOW });
     expect(port.calls).toBe(1);
     expect(attempt.evaluatedBy).toBe('pronunciation');
-    expect(attempt.qualitative).toBe('close');
+    expect(attempt.qualitative).toBe('matched');
     // Repetition itself never creates a listening weakness.
     expect(await ctx.weaknesses.listWeaknesses(ctx.learnerId, 20)).toHaveLength(0);
   });
@@ -456,7 +457,7 @@ describe('shadowing failure honesty', () => {
         }),
       ),
     });
-    expect(insufficient.qualitative).toBe('insufficient_evidence');
+    expect(insufficient.qualitative).toBe('different');
     expect(insufficient.evaluatedBy).toBe('local');
 
     // No feedback line ever carries a number-as-score claim.
@@ -479,8 +480,8 @@ describe('shadowing failure honesty', () => {
     await session.submit('something else entirely');
     expect(session.attemptCount).toBe(2);
     expect(session.exhausted).toBe(true);
-    expect(session.support).toBe('audio_only');
-    expect(session.visibleChunk).toBeNull();
+    // 'different' does not reduce support further (Blocker 4 policy)
+    expect(session.support).toBe('partial_transcript');
   });
 
   it('18c. the shadowing controller never records anything on its own', async () => {
@@ -495,5 +496,267 @@ describe('shadowing failure honesty', () => {
     expect(session.replayCount).toBe(0);
     expect(await ctx.weaknesses.listWeaknesses(ctx.learnerId, 20)).toHaveLength(0);
     expect(evaluateShadowingLocally(CHUNK, '').judged).toBe(false);
+  });
+});
+
+/* ================================================================== *
+ * BLOCKER 2 — Content match vs. Pronunciation separation
+ * ================================================================== */
+
+describe('Blocker 2 — Content match vs. Pronunciation observations', () => {
+  it('wrong words + clear pronunciation => different (pronunciation cannot override lexical mismatch)', async () => {
+    const port = fakePort(outcome({
+      analysis: {
+        provider: 'fake-pronunciation',
+        evidenceLevel: 'transcript_comparison',
+        observations: [],
+        overallIntelligibility: 'clear',
+      },
+      feedbackLines: ['Pronunciation is clear.'],
+    }));
+
+    const attempt = await runShadowingAttempt({
+      chunk: 'Could you take a look at this when you have a minute?',
+      transcript: 'I like eating apples and oranges for breakfast.',
+      port,
+      now: NOW,
+    });
+
+    expect(attempt.qualitative).toBe('different');
+    expect(attempt.judged).toBe(true);
+    expect(attempt.feedbackLines).toContain('Pronunciation is clear.');
+  });
+
+  it('close transcript + clear pronunciation => close', async () => {
+    const port = fakePort(outcome({
+      analysis: {
+        provider: 'fake-pronunciation',
+        evidenceLevel: 'transcript_comparison',
+        observations: [],
+        overallIntelligibility: 'clear',
+      },
+      feedbackLines: ['Rhythm and vowels sounded natural.'],
+    }));
+
+    const attempt = await runShadowingAttempt({
+      chunk: 'Could you take a look at this when you have a minute?',
+      transcript: 'Could you take a look at this when you have a second?',
+      port,
+      now: NOW,
+    });
+
+    expect(attempt.qualitative).toBe('close');
+    expect(attempt.judged).toBe(true);
+    expect(attempt.feedbackLines).toContain('Rhythm and vowels sounded natural.');
+  });
+
+  it('exact transcript + unclear pronunciation => matched content, with pronunciation warning', async () => {
+    const port = fakePort(outcome({
+      analysis: {
+        provider: 'fake-pronunciation',
+        evidenceLevel: 'transcript_comparison',
+        observations: [],
+        overallIntelligibility: 'unclear',
+      },
+      feedbackLines: ['Some ending consonants were slurred or unclear.'],
+    }));
+
+    const attempt = await runShadowingAttempt({
+      chunk: 'Could you take a look at this when you have a minute?',
+      transcript: 'Could you take a look at this when you have a minute?',
+      port,
+      now: NOW,
+    });
+
+    expect(attempt.qualitative).toBe('matched');
+    expect(attempt.judged).toBe(true);
+    expect(attempt.feedbackLines).toContain('Some ending consonants were slurred or unclear.');
+  });
+
+  it('pronunciation unavailable => local content match remains valid', async () => {
+    const failingPort: ShadowingPronunciationPort = {
+      analyzeSpokenTurn: async () => {
+        throw new Error('Engine offline');
+      },
+    };
+
+    const attempt = await runShadowingAttempt({
+      chunk: 'Could you take a look at this when you have a minute?',
+      transcript: 'Could you take a look at this when you have a minute?',
+      port: failingPort,
+      now: NOW,
+    });
+
+    expect(attempt.qualitative).toBe('matched');
+    expect(attempt.evaluatedBy).toBe('local');
+    expect(attempt.judged).toBe(true);
+    expect(attempt.feedbackLines).toContain(SHADOWING_PRONUNCIATION_UNAVAILABLE_NOTE);
+  });
+
+  it('no transcript => insufficient_evidence', async () => {
+    const port = fakePort(outcome());
+    const attempt = await runShadowingAttempt({
+      chunk: 'Could you take a look at this when you have a minute?',
+      transcript: '',
+      port,
+      now: NOW,
+    });
+
+    expect(attempt.qualitative).toBe('insufficient_evidence');
+    expect(attempt.judged).toBe(false);
+    expect(port.calls).toBe(0);
+  });
+});
+
+/* ================================================================== *
+ * BLOCKER 4 — Deterministic Support Progression Policy
+ * ================================================================== */
+
+describe('Blocker 4 — Deterministic Support Progression Policy', () => {
+  it('different keeps current support', async () => {
+    const session = sessionWith({ baseSupport: 'full_transcript' });
+    expect(session.support).toBe('full_transcript');
+
+    await session.submit('completely wrong sentence');
+    expect(session.attemptCount).toBe(1);
+    expect(session.transcript?.qualitative).toBe('different');
+    expect(session.support).toBe('full_transcript');
+
+    await session.submit('another completely wrong sentence');
+    expect(session.attemptCount).toBe(2);
+    expect(session.support).toBe('full_transcript');
+  });
+
+  it('failed/empty keeps current support', async () => {
+    const session = sessionWith({ baseSupport: 'full_transcript' });
+    expect(session.support).toBe('full_transcript');
+
+    await session.submit(null);
+    expect(session.attemptCount).toBe(0);
+    expect(session.support).toBe('full_transcript');
+  });
+
+  it('matched reduces max one step', async () => {
+    const session = sessionWith({ baseSupport: 'full_transcript' });
+    expect(session.support).toBe('full_transcript');
+
+    await session.submit(CHUNK);
+    expect(session.attemptCount).toBe(1);
+    expect(session.transcript?.qualitative).toBe('matched');
+    expect(session.support).toBe('partial_transcript');
+  });
+
+  it('repeated good attempts may eventually reach audio_only', async () => {
+    const session = sessionWith({ baseSupport: 'full_transcript', maxRepeats: 5 });
+    expect(session.support).toBe('full_transcript');
+
+    await session.submit(CHUNK);
+    expect(session.support).toBe('partial_transcript');
+
+    await session.submit(CHUNK);
+    expect(session.support).toBe('audio_only');
+
+    await session.submit(CHUNK);
+    expect(session.support).toBe('audio_only');
+  });
+
+  it('close behaves conservatively (requires 2 consecutive close attempts to step down)', async () => {
+    const session = sessionWith({ baseSupport: 'full_transcript', maxRepeats: 5 });
+    expect(session.support).toBe('full_transcript');
+
+    // Attempt 1: close -> support stays full_transcript
+    await session.submit('Could you take a look at this when you have time?');
+    expect(session.transcript?.qualitative).toBe('close');
+    expect(session.support).toBe('full_transcript');
+
+    // Attempt 2: close -> 2nd consecutive close steps down to partial_transcript
+    await session.submit('Could you take a look at this when you have a sec?');
+    expect(session.transcript?.qualitative).toBe('close');
+    expect(session.support).toBe('partial_transcript');
+  });
+
+  it('replay changes nothing regarding support', async () => {
+    const session = sessionWith({ baseSupport: 'full_transcript' });
+    expect(session.support).toBe('full_transcript');
+
+    session.recordReplay();
+    session.recordReplay();
+    expect(session.replayCount).toBe(2);
+    expect(session.attemptCount).toBe(0);
+    expect(session.support).toBe('full_transcript');
+  });
+
+  it('same evidence history => same support result (pure policy)', () => {
+    const base = 'full_transcript';
+    const history1 = ['different' as const, 'matched' as const];
+    const history2 = ['different' as const, 'matched' as const];
+
+    const res1 = resolveShadowingSupport(base, history1);
+    const res2 = resolveShadowingSupport(base, history2);
+
+    expect(res1).toBe('partial_transcript');
+    expect(res1).toBe(res2);
+  });
+});
+
+/* ================================================================== *
+ * BLOCKER 3 — Stale voice work & controller lifecycle
+ * ================================================================== */
+
+describe('Blocker 3 — Stale voice work & controller lifecycle', () => {
+  it('disposed controller rejects startRecording and stopAndJudge', async () => {
+    const recorder = fakeRecorder();
+    const stt = fakeStt(async () => ({ ok: true, transcript: CHUNK }));
+    const session = sessionWith();
+    const controller = new ShadowingVoiceController(session, { recorder, stt, now: NOW });
+
+    await controller.dispose();
+    const startRes = await controller.startRecording();
+    expect(startRes.ok).toBe(false);
+
+    const judgeRes = await controller.stopAndJudge();
+    expect('ok' in judgeRes && judgeRes.ok === false).toBe(true);
+  });
+
+  it('cancelling/disposing recording discards audio without judging or incrementing attempt', async () => {
+    const recorder = fakeRecorder();
+    const stt = fakeStt(async () => ({ ok: true, transcript: CHUNK }));
+    const session = sessionWith();
+    const controller = new ShadowingVoiceController(session, { recorder, stt, now: NOW });
+
+    await controller.startRecording();
+    expect(recorder.isRecording()).toBe(true);
+
+    await controller.dispose();
+    expect(recorder.isRecording()).toBe(false);
+    expect(session.attemptCount).toBe(0);
+  });
+
+  it('late STT result on disposed controller is ignored and does not mutate session', async () => {
+    const recorder = fakeRecorder();
+    let resolveSttFunc: ((res: STTResult) => void) | null = null;
+    const stt: SpeechToTextProvider = {
+      id: 'slow-stt',
+      transcribe: async () => new Promise<STTResult>((resolve) => {
+        resolveSttFunc = resolve;
+      }),
+    };
+    const session = sessionWith();
+    const controller = new ShadowingVoiceController(session, { recorder, stt, now: NOW });
+
+    await controller.startRecording();
+    const stopPromise = controller.stopAndJudge();
+
+    // Dispose controller while STT is pending
+    await controller.dispose();
+
+    // Resolve STT late
+    if (resolveSttFunc) {
+      (resolveSttFunc as (res: STTResult) => void)({ ok: true, transcript: CHUNK });
+    }
+    const res = await stopPromise;
+
+    expect('ok' in res && res.ok === false).toBe(true);
+    expect(session.attemptCount).toBe(0);
   });
 });

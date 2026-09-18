@@ -46,6 +46,50 @@ export interface ShadowingPronunciationPort {
  * Support after `attempt` attempts. Help is removed ONE step at a time, never
  * instantly: the first attempt is the most supported, later attempts less so.
  */
+export function stepDownSupportLevel(
+  level: ShadowingSupportLevel,
+): ShadowingSupportLevel {
+  if (level === 'full_transcript') return 'partial_transcript';
+  if (level === 'partial_transcript') return 'audio_only';
+  return 'audio_only';
+}
+
+/**
+ * Resolve support level for the NEXT attempt based on qualitative history.
+ * Pure and deterministic.
+ *
+ * Rules:
+ * - 'different' or 'insufficient_evidence': support stays unchanged.
+ * - 'matched': steps down support by ONE level.
+ * - 'close': conservative progression (requires 2 consecutive 'close' attempts to step down ONE level).
+ * - Replay or failed STT: support unchanged.
+ */
+export function resolveShadowingSupport(
+  baseSupport: ShadowingSupportLevel,
+  history: readonly ShadowingQualitativeResult[],
+): ShadowingSupportLevel {
+  let current = baseSupport;
+  let consecutiveClose = 0;
+
+  for (const result of history) {
+    if (result === 'matched') {
+      current = stepDownSupportLevel(current);
+      consecutiveClose = 0;
+    } else if (result === 'close') {
+      consecutiveClose += 1;
+      if (consecutiveClose >= 2) {
+        current = stepDownSupportLevel(current);
+        consecutiveClose = 0;
+      }
+    } else {
+      // 'different' or 'insufficient_evidence': support stays unchanged
+      consecutiveClose = 0;
+    }
+  }
+
+  return current;
+}
+
 export function supportForAttempt(
   base: ShadowingSupportLevel,
   attempt: number,
@@ -147,15 +191,7 @@ export function evaluateShadowingLocally(
   };
 }
 
-function qualitativeFromOutcome(outcome: PronunciationTurnOutcome): ShadowingQualitativeResult {
-  if (outcome.unavailable) return 'insufficient_evidence';
-  const intelligibility = outcome.analysis.overallIntelligibility;
-  if (intelligibility === 'clear') return 'matched';
-  if (intelligibility === 'partially_clear') return 'close';
-  if (intelligibility === 'unclear') return 'different';
-  // No intelligibility judgement was produced: never invent one.
-  return outcome.analysis.insufficientEvidence ? 'insufficient_evidence' : 'close';
-}
+
 
 export interface ShadowingAttemptInput {
   readonly chunk: string;
@@ -188,15 +224,16 @@ export async function runShadowingAttempt(
       ...(input.now !== undefined ? { now: input.now } : {}),
     });
     if (!outcome) return local;
-    const qualitative = qualitativeFromOutcome(outcome);
+    // Content match category comes ONLY from local text matching. Pronunciation
+    // analysis adds qualitative feedback lines only and NEVER overrides content match.
+    const qualitative = local.qualitative;
     const lines = outcome.feedbackLines.filter((line) => line.trim().length > 0);
     return {
       transcript,
       qualitative,
-      feedbackLines:
-        lines.length > 0 ? lines : local.feedbackLines,
+      feedbackLines: lines.length > 0 ? lines : local.feedbackLines,
       evaluatedBy: outcome.unavailable ? 'local' : 'pronunciation',
-      judged: !outcome.unavailable,
+      judged: local.judged,
     };
   } catch {
     // The pronunciation layer failed: keep the honest local judgement and the
@@ -234,6 +271,7 @@ export class ShadowingSession {
   private attempts = 0;
   private replays = 0;
   private lastAttempt: ShadowingAttempt | null = null;
+  private qualitativeHistory: ShadowingQualitativeResult[] = [];
 
   constructor(input: ShadowingSessionInput) {
     this.id = input.id;
@@ -266,7 +304,7 @@ export class ShadowingSession {
 
   /** The support in effect for the NEXT attempt. */
   get support(): ShadowingSupportLevel {
-    return supportForAttempt(this.baseSupport, this.attempts + 1);
+    return resolveShadowingSupport(this.baseSupport, this.qualitativeHistory);
   }
 
   /** What the learner may currently read (null when support is removed). */
@@ -296,6 +334,7 @@ export class ShadowingSession {
     if (outcome.judged) {
       this.attempts += 1;
       this.lastAttempt = outcome;
+      this.qualitativeHistory.push(outcome.qualitative);
     }
     return outcome;
   }
@@ -405,6 +444,7 @@ export class ShadowingVoiceController {
   private readonly submitOverride: ((transcript: string) => Promise<ShadowingAttempt>) | undefined;
   private state: 'idle' | 'recording' | 'transcribing' = 'idle';
   private disposed = false;
+  private generation = 0;
 
   constructor(
     private readonly session: ShadowingSession,
@@ -459,6 +499,7 @@ export class ShadowingVoiceController {
    * pronunciation port. A transcription failure records nothing.
    */
   async stopAndJudge(): Promise<ShadowingAttempt | ShadowingVoiceFailure> {
+    const token = ++this.generation;
     if (this.disposed) return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
     if (this.state !== 'recording') return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
     const recorder = this.recorder;
@@ -470,6 +511,10 @@ export class ShadowingVoiceController {
     let audio: AudioRecordingResult;
     try {
       audio = await recorder.stopRecording();
+      if (this.disposed || this.generation !== token) {
+        this.state = 'idle';
+        return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+      }
     } catch {
       this.state = 'idle';
       return this.failure('recording-failed', SHADOWING_RECORDING_FAILED_MESSAGE);
@@ -484,6 +529,10 @@ export class ShadowingVoiceController {
         mimeType: audio.mimeType,
         durationMs: audio.durationMs,
       });
+      if (this.disposed || this.generation !== token) {
+        this.state = 'idle';
+        return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+      }
       if (result.ok) transcript = (result.transcript ?? '').trim();
     } catch {
       this.state = 'idle';
@@ -495,6 +544,9 @@ export class ShadowingVoiceController {
     }
 
     this.state = 'idle';
+    if (this.disposed || this.generation !== token) {
+      return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+    }
     if (this.submitOverride) return this.submitOverride(transcript);
     return this.session.submit(transcript, this.port, this.now);
   }
@@ -507,6 +559,7 @@ export class ShadowingVoiceController {
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.generation += 1;
     await this.cancel();
   }
 
