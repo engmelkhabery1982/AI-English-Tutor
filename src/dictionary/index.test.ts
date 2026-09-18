@@ -622,4 +622,308 @@ describe('Dictionary Core (Phase 1)', () => {
       expect(item.comprehensionQuestion).toContain('Review the usage of');
     }
   });
+
+  describe('Contextual Meaning Parser Honesty Regression Tests (Blocker 2)', () => {
+    const validPayload = {
+      word: 'run',
+      sentence: 'He runs a company.',
+      selectedSenseId: 'run-manage',
+      distinction: 'manage or operate',
+      arabicMeaning: 'يدير',
+      englishExplanation: 'In charge of managing an organization.',
+      whyFits: 'The direct object is a business organization.',
+      certainty: 'clear',
+      alternativeSense: null,
+    };
+
+    it('valid complete result still parses successfully', () => {
+      const parsed = parseContextualMeaning(
+        JSON.stringify(validPayload),
+        'run',
+        'He runs a company.'
+      );
+      expect(parsed).not.toBeNull();
+      expect(parsed?.arabicMeaning).toBe('يدير');
+      expect(parsed?.englishExplanation).toBe('In charge of managing an organization.');
+      expect(parsed?.whyFits).toBe('The direct object is a business organization.');
+      expect(parsed?.certainty).toBe('clear');
+    });
+
+    it('missing whyFits => parser rejects (returns null)', () => {
+      const payload = { ...validPayload };
+      delete (payload as Record<string, unknown>).whyFits;
+
+      const parsed = parseContextualMeaning(
+        JSON.stringify(payload),
+        'run',
+        'He runs a company.'
+      );
+      expect(parsed).toBeNull();
+    });
+
+    it('whitespace-only whyFits => parser rejects (returns null)', () => {
+      const payload = { ...validPayload, whyFits: '   \n  ' };
+      const parsed = parseContextualMeaning(
+        JSON.stringify(payload),
+        'run',
+        'He runs a company.'
+      );
+      expect(parsed).toBeNull();
+    });
+
+    it('invalid certainty => parser rejects (returns null) and does not default to likely', () => {
+      const payload = { ...validPayload, certainty: 'absolutely_certain_99%' };
+      const parsed = parseContextualMeaning(
+        JSON.stringify(payload),
+        'run',
+        'He runs a company.'
+      );
+      expect(parsed).toBeNull();
+    });
+
+    it('missing certainty => parser rejects (returns null)', () => {
+      const payload = { ...validPayload };
+      delete (payload as Record<string, unknown>).certainty;
+
+      const parsed = parseContextualMeaning(
+        JSON.stringify(payload),
+        'run',
+        'He runs a company.'
+      );
+      expect(parsed).toBeNull();
+    });
+
+    it('missing Arabic meaning => parser rejects (returns null)', () => {
+      const payload = { ...validPayload, arabicMeaning: '' };
+      const parsed = parseContextualMeaning(
+        JSON.stringify(payload),
+        'run',
+        'He runs a company.'
+      );
+      expect(parsed).toBeNull();
+    });
+
+    it('missing English explanation => parser rejects (returns null)', () => {
+      const payload = { ...validPayload, englishExplanation: '   ' };
+      const parsed = parseContextualMeaning(
+        JSON.stringify(payload),
+        'run',
+        'He runs a company.'
+      );
+      expect(parsed).toBeNull();
+    });
+
+    it('alternativeSense is omitted when missing required fields', () => {
+      const payloadWithIncompleteAlt = {
+        ...validPayload,
+        alternativeSense: {
+          senseId: 'run-physical',
+          // arabicMeaning missing
+          englishExplanation: 'Physical running',
+          reason: 'Could be running physically',
+        },
+      };
+
+      const parsed = parseContextualMeaning(
+        JSON.stringify(payloadWithIncompleteAlt),
+        'run',
+        'He runs a company.'
+      );
+      expect(parsed).not.toBeNull();
+      expect(parsed?.alternativeSense).toBeNull();
+    });
+  });
+
+  describe('Known Sense ID Validation Tests (Blocker 3)', () => {
+    const knownSenses = [
+      {
+        senseId: 'run-physical',
+        partOfSpeech: 'verb' as const,
+        distinction: 'move fast on foot',
+        englishDefinition: 'to move swiftly on foot',
+        arabicMeaning: 'يركض',
+        examples: [],
+        contexts: ['sports'],
+      },
+      {
+        senseId: 'run-manage',
+        partOfSpeech: 'verb' as const,
+        distinction: 'manage or operate',
+        englishDefinition: 'to manage an organization',
+        arabicMeaning: 'يدير',
+        examples: [],
+        contexts: ['business'],
+      },
+    ];
+
+    it('valid known selectedSenseId accepted when knownSenses are supplied', async () => {
+      const aiResponse = JSON.stringify({
+        word: 'run',
+        sentence: 'She runs the clinic.',
+        selectedSenseId: 'run-manage',
+        distinction: 'manage or operate',
+        arabicMeaning: 'يدير',
+        englishExplanation: 'Managing a facility.',
+        whyFits: 'Clinic is an organization.',
+        certainty: 'clear',
+        alternativeSense: null,
+      });
+
+      const service = createDictionaryService(
+        createMockAIProvider(() => ({
+          ok: true,
+          response: { content: aiResponse },
+        }))
+      );
+
+      const result = await service.resolveMeaningInContext({
+        word: 'run',
+        sentence: 'She runs the clinic.',
+        knownSenses,
+      });
+
+      expect(result.certainty).toBe('clear');
+      expect(result.selectedSenseId).toBe('run-manage');
+      expect(result.arabicMeaning).toBe('يدير');
+    });
+
+    it('unknown selectedSenseId rejected safely with honest insufficient_context', async () => {
+      const aiResponse = JSON.stringify({
+        word: 'run',
+        sentence: 'She runs the clinic.',
+        selectedSenseId: 'run-hallucinated-id-999',
+        distinction: 'hallucinated distinction',
+        arabicMeaning: 'يدير',
+        englishExplanation: 'Managing a facility.',
+        whyFits: 'Clinic is an organization.',
+        certainty: 'clear',
+        alternativeSense: null,
+      });
+
+      const service = createDictionaryService(
+        createMockAIProvider(() => ({
+          ok: true,
+          response: { content: aiResponse },
+        }))
+      );
+
+      const result = await service.resolveMeaningInContext({
+        word: 'run',
+        sentence: 'She runs the clinic.',
+        knownSenses,
+      });
+
+      expect(result.certainty).toBe('insufficient_context');
+      expect(result.selectedSenseId).toBeUndefined();
+      expect(result.englishExplanation).toContain('did not match the supplied known senses');
+      expect(result.whyFits).toContain('Sense ID mismatch with known senses');
+    });
+
+    it('unknown alternativeSense ID is omitted rather than exposed as valid', async () => {
+      const aiResponse = JSON.stringify({
+        word: 'run',
+        sentence: 'She had to run.',
+        selectedSenseId: 'run-physical',
+        distinction: 'move fast on foot',
+        arabicMeaning: 'يركض',
+        englishExplanation: 'Moving swiftly.',
+        whyFits: 'Speed context.',
+        certainty: 'likely',
+        alternativeSense: {
+          senseId: 'run-hallucinated-alt-id',
+          distinction: 'hallucinated alt',
+          arabicMeaning: 'معنى بديل غير موجود',
+          englishExplanation: 'Alternative meaning not in known list',
+          reason: 'Context is ambiguous',
+        },
+      });
+
+      const service = createDictionaryService(
+        createMockAIProvider(() => ({
+          ok: true,
+          response: { content: aiResponse },
+        }))
+      );
+
+      const result = await service.resolveMeaningInContext({
+        word: 'run',
+        sentence: 'She had to run.',
+        knownSenses,
+      });
+
+      // selectedSenseId was valid ('run-physical')
+      expect(result.selectedSenseId).toBe('run-physical');
+      expect(result.certainty).toBe('likely');
+      // But hallucinated alternative sense ID must be omitted (set to null)
+      expect(result.alternativeSense).toBeNull();
+    });
+
+    it('valid alternativeSense ID is preserved when in knownSenses', async () => {
+      const aiResponse = JSON.stringify({
+        word: 'run',
+        sentence: 'She had to run.',
+        selectedSenseId: 'run-physical',
+        distinction: 'move fast on foot',
+        arabicMeaning: 'يركض',
+        englishExplanation: 'Moving swiftly.',
+        whyFits: 'Speed context.',
+        certainty: 'likely',
+        alternativeSense: {
+          senseId: 'run-manage',
+          distinction: 'manage or operate',
+          arabicMeaning: 'يدير',
+          englishExplanation: 'Could manage something',
+          reason: 'Ambiguous phrasing',
+        },
+      });
+
+      const service = createDictionaryService(
+        createMockAIProvider(() => ({
+          ok: true,
+          response: { content: aiResponse },
+        }))
+      );
+
+      const result = await service.resolveMeaningInContext({
+        word: 'run',
+        sentence: 'She had to run.',
+        knownSenses,
+      });
+
+      expect(result.selectedSenseId).toBe('run-physical');
+      expect(result.alternativeSense).not.toBeNull();
+      expect(result.alternativeSense?.senseId).toBe('run-manage');
+    });
+
+    it('behavior without knownSenses remains unchanged', async () => {
+      const aiResponse = JSON.stringify({
+        word: 'run',
+        sentence: 'She runs the clinic.',
+        selectedSenseId: 'any-arbitrary-sense-id',
+        distinction: 'manage',
+        arabicMeaning: 'يدير',
+        englishExplanation: 'Managing.',
+        whyFits: 'Valid context reason.',
+        certainty: 'clear',
+        alternativeSense: null,
+      });
+
+      const service = createDictionaryService(
+        createMockAIProvider(() => ({
+          ok: true,
+          response: { content: aiResponse },
+        }))
+      );
+
+      const result = await service.resolveMeaningInContext({
+        word: 'run',
+        sentence: 'She runs the clinic.',
+        // no knownSenses
+      });
+
+      expect(result.certainty).toBe('clear');
+      expect(result.selectedSenseId).toBe('any-arbitrary-sense-id');
+      expect(result.arabicMeaning).toBe('يدير');
+    });
+  });
 });
