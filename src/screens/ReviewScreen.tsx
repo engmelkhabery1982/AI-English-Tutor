@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useState, useRef } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
@@ -9,11 +9,23 @@ import {
   View,
 } from 'react-native';
 import type { ViewStyle } from 'react-native';
+import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
+import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 import type { ReviewService } from '../review/service';
 import { createReviewService } from '../review/factory';
 import type { ReviewItemCandidate, EvaluationResult, ReviewDashboardSummary } from '../review/types';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { LearnerWeakness } from '../domain/models/learner';
+import type { DailyTutorReviewLaunch, DailyTutorLaunchState } from '../daily-tutor';
+import {
+  DAILY_TUTOR_LAUNCH_IDLE,
+  beginStandaloneSession,
+  captureDailyTutorLaunch,
+  clearDailyTutorReturn,
+  endDailyTutorVisit,
+  finishDailyTutorWorkflow,
+  reportDailyTutorCompletion,
+} from '../daily-tutor';
 import {
   SQLiteUserProfileRepository,
 } from '../data/local/sqlite/repositories';
@@ -119,7 +131,50 @@ export interface ReviewScreenProps {
   readonly ttsProvider?: TextToSpeechProvider;
 }
 
+/**
+ * Daily Tutor handshake params (present ONLY when the Daily Tutor launched
+ * this tab through the nested MainTabs route; standalone use of the Review
+ * tab never sets them): the activity ref to echo back on REAL completion,
+ * plus the optional bounded review subset (kind emphasis + item limit) the
+ * existing Review planner is conditioned on.
+ */
 export default function ReviewScreen(props?: ReviewScreenProps) {
+  const navigation = useNavigation<NavigationProp<ParamListBase>>();
+  const route = useRoute() as { readonly params?: { readonly dailyTutor?: DailyTutorReviewLaunch } };
+
+  /**
+   * ONE-SHOT Daily Tutor launch context. React Navigation keeps params
+   * attached to a TAB route, so the `dailyTutor` param is captured ONCE
+   * into local state and immediately CONSUMED (cleared from the route).
+   * The captured context lives only for that child workflow; a later
+   * standalone open of this tab has NO Daily Tutor behavior.
+   */
+  const [dailyLaunch, setDailyLaunch] = useState<DailyTutorLaunchState<DailyTutorReviewLaunch>>(
+    DAILY_TUTOR_LAUNCH_IDLE,
+  );
+  /** Auto-start guard: at most one auto-start per Daily Tutor activity. */
+  const dailyAutoStartedRef = useRef<string | null>(null);
+  const routeLaunch = route.params?.dailyTutor;
+  useEffect(() => {
+    if (!routeLaunch) return;
+    setDailyLaunch((current) => captureDailyTutorLaunch(current, { dailyTutor: routeLaunch }).state);
+    // A fresh Daily Tutor launch may auto-start its bounded workflow, even
+    // when the very same activity is relaunched after an abandoned attempt.
+    dailyAutoStartedRef.current = null;
+    // ONE-SHOT: consume the launch param from the tab route.
+    navigation.setParams({ dailyTutor: undefined });
+  }, [routeLaunch, navigation]);
+  /** The captured context of the ACTIVE Daily Tutor workflow, if any. */
+  const dailyTutorRef = dailyLaunch.active;
+  // Leaving the tab ends the Daily Tutor VISIT affordance, but an active
+  // workflow keeps its captured ref until its real completion.
+  useFocusEffect(
+    useCallback(() => {
+      return () => {
+        setDailyLaunch((current) => clearDailyTutorReturn(current));
+      };
+    }, []),
+  );
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [isDemoMode, setIsDemoMode] = useState<boolean>(props?.initialDemoMode ?? false);
@@ -290,7 +345,9 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     }
   };
 
-  const handleStartSession = async () => {
+  const handleStartSession = async (
+    dailyOptions?: { reviewKind?: 'vocabulary' | 'expression' | 'grammar'; reviewLimit?: number },
+  ) => {
     if (isDemoMode) {
       setSessionCandidates(MOCK_ITEMS);
       setCurrentIndex(0);
@@ -314,9 +371,21 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       }
       const learnerId = profile.id;
 
-      const candidates = await reviewServiceRef.current.planSession(learnerId);
+      // Daily Tutor launch: a BOUNDED subset of the existing review queue
+      // (the Daily Tutor plans WHAT; this screen still owns HOW the review
+      // session runs). Standalone launches keep the existing defaults.
+      const limit = dailyOptions?.reviewLimit;
+      const candidates = await reviewServiceRef.current.planSession(
+        learnerId,
+        dailyOptions
+          ? { minItems: 1, maxItems: limit ?? 10, targetItems: limit ?? 10 }
+          : undefined,
+      );
+      const bounded = dailyOptions?.reviewKind
+        ? candidates.filter((candidate) => candidate.kind === dailyOptions.reviewKind)
+        : candidates;
       // A real empty queue stays genuinely empty — pre-built cards are only for explicit Demo Mode.
-      setSessionCandidates(candidates);
+      setSessionCandidates(bounded);
 
       setCurrentIndex(0);
       setSessionState('reviewing');
@@ -333,6 +402,26 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       setLoading(false);
     }
   };
+
+  /**
+   * Daily Tutor launch: when this screen was opened by the Daily Tutor, start
+   * its bounded review session automatically (once per activity). The Review
+   * flow itself is completely unchanged — this only triggers the existing
+   * start handler with the bounded options.
+   */
+  useEffect(() => {
+    if (!dailyTutorRef || isDemoMode) return;
+    if (sessionState !== 'dashboard' || loading || hasNoProfile) return;
+    if (!reviewServiceRef.current || !dbAdapterRef.current) return;
+    if (dailyAutoStartedRef.current === dailyTutorRef.activityId) return;
+    dailyAutoStartedRef.current = dailyTutorRef.activityId;
+    void handleStartSession({
+      reviewKind: dailyTutorRef.reviewKind,
+      reviewLimit: dailyTutorRef.reviewLimit,
+    });
+    // handleStartSession is intentionally not a dependency: the ref guards
+    // above make this effect run at most once per Daily Tutor activity.
+  }, [dailyTutorRef, sessionState, loading, hasNoProfile, isDemoMode]);
 
   /**
    * Play a listening review item through the EXISTING TTS provider.
@@ -450,12 +539,32 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       } catch (err) {
         console.error('Error completing session in SQLite:', err);
       }
+      // Daily Tutor handshake: report the REAL review completion (real mode
+      // only — demo items are never real practice). Exiting early never
+      // reaches this point, so an unfinished review never completes. The
+      // captured launch is ONE-SHOT: once its workflow really completed and
+      // reported, it is consumed — a later session in this tab is standalone.
+      if (dailyTutorRef && !isDemoMode) {
+        reportDailyTutorCompletion({
+          ref: {
+            sessionId: dailyTutorRef.sessionId,
+            activityId: dailyTutorRef.activityId,
+            kind: dailyTutorRef.kind,
+          },
+          completedAt: new Date().toISOString(),
+          itemsPracticed: sessionCandidates.length,
+        });
+        setDailyLaunch((current) => finishDailyTutorWorkflow(current));
+      }
       setSessionState('completed');
     }
   };
 
   const handleExitSession = () => {
     setSessionState('dashboard');
+    // Leaving the session ends any Daily Tutor visit context — later use of
+    // this tab is standalone.
+    setDailyLaunch((current) => endDailyTutorVisit(current));
     loadDashboardMetrics();
   };
 
@@ -525,7 +634,12 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
               styles.startSessionButton,
               (hasNoProfile && !isDemoMode) && styles.startSessionButtonDisabled
             ]}
-            onPress={handleStartSession}
+            onPress={() => {
+              // A user-started session is NEVER the Daily Tutor workflow:
+              // clear any lingering launch context, then start normally.
+              setDailyLaunch((current) => beginStandaloneSession(current));
+              void handleStartSession();
+            }}
             disabled={hasNoProfile && !isDemoMode}
             accessibilityRole="button"
             id="start_review_button"
@@ -805,6 +919,17 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
         >
           <Text style={styles.doneButtonText}>Return to Dashboard</Text>
         </TouchableOpacity>
+        {dailyLaunch.showReturn ? (
+          <TouchableOpacity
+            style={styles.doneButton}
+            onPress={() => {
+              setDailyLaunch((current) => endDailyTutorVisit(current));
+              navigation.navigate('DailyTutor');
+            }}
+          >
+            <Text style={styles.doneButtonText}>Back to today&apos;s practice</Text>
+          </TouchableOpacity>
+        ) : null}
       </View>
     </View>
   );

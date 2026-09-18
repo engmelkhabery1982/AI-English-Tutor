@@ -1,4 +1,4 @@
-﻿/**
+/**
  * src/data/local/sqlite/schema.ts
  *
  * SQLite schema definition and migration runner.
@@ -15,7 +15,7 @@
  */
 
 /** Current schema version. Bump this when adding a migration. */
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 /** A single SQL step inside a migration. */
 export interface SchemaStep {
@@ -315,6 +315,50 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
     description: 'Add evidence_log to pronunciation_weaknesses (evidence source + confidence)',
     steps: [
       { sql: `ALTER TABLE pronunciation_weaknesses ADD COLUMN evidence_log TEXT NOT NULL DEFAULT '[]'` },
+    ],
+  },
+  {
+    version: 4,
+    description: 'Additive Daily Tutor storage: daily_tutor_sessions + daily_tutor_activities',
+    steps: [
+      // daily_tutor_sessions — ONE row per (learner, local date). The UNIQUE
+      // constraint is the durable "never duplicate a daily session" invariant.
+      { sql: `CREATE TABLE IF NOT EXISTS daily_tutor_sessions (
+        id TEXT PRIMARY KEY,
+        learner_id TEXT NOT NULL,
+        date_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        headline TEXT NOT NULL,
+        source_mode TEXT NOT NULL,
+        estimated_minutes INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (learner_id) REFERENCES learner_profile(id) ON DELETE CASCADE,
+        UNIQUE(learner_id, date_key)
+      )` },
+      // daily_tutor_activities — ordered activities of one daily session.
+      { sql: `CREATE TABLE IF NOT EXISTS daily_tutor_activities (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        order_index INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        estimated_minutes INTEGER NOT NULL DEFAULT 0,
+        target TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        practiced_items INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES daily_tutor_sessions(id) ON DELETE CASCADE,
+        UNIQUE(session_id, order_index)
+      )` },
+      { sql: `CREATE INDEX IF NOT EXISTS idx_daily_tutor_sessions_learner_date ON daily_tutor_sessions(learner_id, date_key)` },
+      { sql: `CREATE INDEX IF NOT EXISTS idx_daily_tutor_activities_session ON daily_tutor_activities(session_id, order_index)` },
     ],
   },
 ];

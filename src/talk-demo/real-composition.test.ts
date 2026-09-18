@@ -232,8 +232,10 @@ describe('Talk — real persisted-learner composition', () => {
     const adaptiveSource = readFileSync(join(__dirname, '..', 'adaptive-lessons', 'index.ts'), 'utf8');
 
     // The real route mounts Talk with no props, so the DEFAULT composition path
-    // is the one that runs in the app.
-    expect(navigatorSource).toContain('<Tab.Screen name="Talk" component={TalkScreen} />');
+    // is the one that runs in the app. Since the Daily Tutor navigation
+    // repair the tabs are rendered from the single-source route registry in
+    // RootNavigator — still with no props.
+    expect(navigatorSource).toContain('Talk: TalkScreen');
     expect(navigatorSource).not.toContain('databaseAdapter');
 
     // TalkScreen resolves the real coaching context instead of defaulting to demo.

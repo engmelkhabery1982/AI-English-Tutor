@@ -59,6 +59,8 @@ import type {
   AdaptiveTodayPractice,
 } from '../adaptive-lessons';
 import { createDefaultAdaptiveLessonService } from '../adaptive-lessons';
+import type { DailyTutorActivityRef } from '../daily-tutor';
+import { reportDailyTutorCompletion } from '../daily-tutor';
 import { buildSpeakingSeed } from '../deep-speaking';
 import { useNavigation } from '@react-navigation/native';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
@@ -92,6 +94,17 @@ export interface AdaptiveLessonScreenProps {
   /** Injectable recorder + STT for speaking/pronunciation voice input. */
   readonly recorder?: AudioRecorderService;
   readonly sttProvider?: SpeechToTextProvider;
+  /** Route params (when pushed through the navigator by the Daily Tutor). */
+  readonly route?: {
+    readonly params?: {
+      /**
+       * Daily Tutor completion handshake ref. Present ONLY when the Daily
+       * Tutor launched this lesson; standalone use never sets it and is
+       * completely unchanged.
+       */
+      readonly dailyTutor?: DailyTutorActivityRef;
+    };
+  };
 }
 
 type Phase = 'loading' | 'overview' | 'running' | 'complete';
@@ -121,6 +134,10 @@ const VOICE_NOT_READY_NOTICE =
 
 export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) {
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
+  // Daily Tutor handshake: present only when the Daily Tutor launched this
+  // lesson. The real completion report happens in finishLesson — opening this
+  // screen never completes anything.
+  const dailyTutorRef = props?.route?.params?.dailyTutor;
   const [phase, setPhase] = useState<Phase>('loading');
   const [practice, setPractice] = useState<AdaptiveTodayPractice | null>(null);
   const [session, setSession] = useState<AdaptiveLessonSession | null>(null);
@@ -209,13 +226,24 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
         setSession(finished.session);
         syncProgress();
         setPhase('complete');
+        // Daily Tutor handshake: report the REAL completion (the lesson's own
+        // summary), only when the Daily Tutor launched this lesson. The real
+        // practiced-item count travels with it; a zero-practice finish is
+        // reported honestly as such and completes nothing.
+        if (dailyTutorRef) {
+          reportDailyTutorCompletion({
+            ref: dailyTutorRef,
+            completedAt: finished.summary.completedAt,
+            itemsPracticed: finished.summary.itemsPracticed,
+          });
+        }
       }
     } catch {
       setErrorMessage('The lesson summary could not be saved. Your practice itself was kept.');
     } finally {
       setIsBusy(false);
     }
-  }, [syncProgress]);
+  }, [dailyTutorRef, syncProgress]);
 
   /** Load Today's Practice (or resume an unfinished in-memory lesson). */
   const loadPractice = useCallback(async () => {

@@ -34,12 +34,16 @@ import type { AdaptiveLessonService, AdaptiveTodayPractice } from '../adaptive-l
 import { createDefaultAdaptiveLessonService } from '../adaptive-lessons';
 import type { OnboardingPrefill, OnboardingService } from '../onboarding';
 import { createDefaultOnboardingService } from '../onboarding';
+import type { DailyTutorHomeCard, DailyTutorService } from '../daily-tutor';
+import { buildDailyTutorHomeCard, createDefaultDailyTutorService } from '../daily-tutor';
 
 export interface HomeScreenProps {
   /** Injectable service (tests/composition); defaults to the real factory. */
   readonly service?: AdaptiveLessonService;
   /** Injectable onboarding service (tests/composition); defaults to the real factory. */
   readonly onboardingService?: OnboardingService;
+  /** Injectable Daily Tutor service (tests/composition); defaults to the real factory. */
+  readonly dailyTutorService?: DailyTutorService;
 }
 
 const SOURCE_LABELS: Record<AdaptiveTodayPractice['status'], string> = {
@@ -91,11 +95,47 @@ export default function HomeScreen(props?: HomeScreenProps) {
     }
   }, []);
 
+  /**
+   * DAILY TUTOR — the primary recommended action on Home. Loading is a
+   * local, deterministic repository read (plus a bounded learner-model
+   * refresh only when today's plan does not exist yet): no AI calls happen
+   * merely to render this card.
+   */
+  const dailyTutorRef = useRef<DailyTutorService | null>(props?.dailyTutorService ?? null);
+  const [dailyCard, setDailyCard] = useState<DailyTutorHomeCard | null>(null);
+  const [dailyUnavailable, setDailyUnavailable] = useState<string | null>(null);
+  const loadDailyTutor = useCallback(async () => {
+    try {
+      if (!dailyTutorRef.current) {
+        dailyTutorRef.current = await createDefaultDailyTutorService();
+      }
+      const today = await dailyTutorRef.current.getToday();
+      if (today.status === 'ready') {
+        setDailyCard(buildDailyTutorHomeCard(today.session));
+        setDailyUnavailable(null);
+        return;
+      }
+      // Honest states only: no fabricated card, no invented session.
+      setDailyCard(null);
+      setDailyUnavailable(today.message);
+    } catch {
+      // Keep any previously loaded card; never fabricate a replacement.
+      setDailyUnavailable(
+        'Your daily practice could not be loaded right now. Nothing was changed.',
+      );
+    }
+  }, []);
+
+  const openDailyTutor = () => {
+    navigation.navigate('DailyTutor');
+  };
+
   useFocusEffect(
     useCallback(() => {
+      void loadDailyTutor();
       void loadPractice();
       void loadProfileState();
-    }, [loadPractice, loadProfileState]),
+    }, [loadDailyTutor, loadPractice, loadProfileState]),
   );
 
   const openOnboarding = () => {
@@ -131,7 +171,7 @@ export default function HomeScreen(props?: HomeScreenProps) {
     return (
       <View style={styles.card}>
         <View style={styles.cardHeader}>
-          <Text style={styles.cardTitle}>Today&apos;s Practice</Text>
+          <Text style={styles.cardTitle}>Adaptive lesson</Text>
           <View style={[styles.pill, plan.sourceMode === 'general' ? styles.pillGeneral : styles.pillPersonal]}>
             <Text style={styles.pillText}>{modeLabel}</Text>
           </View>
@@ -182,7 +222,7 @@ export default function HomeScreen(props?: HomeScreenProps) {
   const renderNotReady = (today: Exclude<AdaptiveTodayPractice, { status: 'ready' }>) => (
     <View style={styles.card}>
       <View style={styles.cardHeader}>
-        <Text style={styles.cardTitle}>Today&apos;s Practice</Text>
+        <Text style={styles.cardTitle}>Adaptive lesson</Text>
         <View style={styles.pill}>
           <Text style={styles.pillText}>{SOURCE_LABELS[today.status]}</Text>
         </View>
@@ -203,6 +243,45 @@ export default function HomeScreen(props?: HomeScreenProps) {
       <Text style={styles.subtitle}>
         One lesson at a time, chosen from your own practice history.
       </Text>
+
+      {dailyCard ? (
+        <View style={[styles.card, styles.dailyCard]}>
+          <View style={styles.cardHeader}>
+            <Text style={styles.cardTitle}>{dailyCard.title}</Text>
+            <View style={[styles.pill, dailyCard.state === 'completed' ? styles.pillPersonal : null]}>
+              <Text style={styles.pillText}>
+                {dailyCard.state === 'new'
+                  ? 'Ready'
+                  : dailyCard.state === 'in_progress'
+                    ? 'In progress'
+                    : 'Done'}
+              </Text>
+            </View>
+          </View>
+          <Text style={styles.headline}>{dailyCard.headline}</Text>
+          <Text style={styles.sourceNote}>
+            {dailyCard.progressLabel} · built from your own practice history, planned locally.
+          </Text>
+          <TouchableOpacity style={styles.primaryButton} onPress={openDailyTutor}>
+            <Text style={styles.primaryButtonText}>{dailyCard.buttonLabel}</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+
+      {!dailyCard && dailyUnavailable ? (
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Text style={styles.cardTitle}>Today&apos;s Practice</Text>
+            <View style={styles.pill}>
+              <Text style={styles.pillText}>Not ready</Text>
+            </View>
+          </View>
+          <Text style={styles.body}>{dailyUnavailable}</Text>
+          <TouchableOpacity style={styles.secondaryButton} onPress={() => void loadDailyTutor()}>
+            <Text style={styles.secondaryButtonText}>Check again</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
 
       {prefill && !prefill.isComplete ? (
         <View style={styles.card}>
@@ -290,7 +369,7 @@ export default function HomeScreen(props?: HomeScreenProps) {
 
       {!isLoading && !practice && !loadError ? (
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>Today&apos;s Practice</Text>
+          <Text style={styles.cardTitle}>Adaptive lesson</Text>
           <Text style={styles.body}>
             Your lesson could not be prepared yet. Nothing was changed.
           </Text>
@@ -316,6 +395,11 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     borderWidth: 1,
     borderColor: '#e6e9ef',
+  },
+  /** The primary recommended action gets a slightly stronger presence. */
+  dailyCard: {
+    borderColor: '#cfe3d6',
+    borderWidth: 2,
   },
   cardHeader: {
     flexDirection: 'row',

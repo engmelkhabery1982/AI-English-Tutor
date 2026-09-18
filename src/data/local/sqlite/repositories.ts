@@ -33,6 +33,12 @@ import type {
   ExpressionRepository,
   ReviewRepository,
   ProgressRepository,
+  DailyTutorRepository,
+  DailyTutorSessionRecord,
+  DailyTutorActivityRecord,
+  CreateDailyTutorSessionInput,
+  DailyTutorSessionPatch,
+  DailyTutorActivityPatch,
 } from '../../../repositories';
 import type {
   UserProfile,
@@ -63,6 +69,13 @@ import type {
   ExampleSource,
 } from '../../../domain/shared/types';
 import { generateId, isValidUuid } from '../../../shared/id';
+import { DAILY_ACTIVITY_KINDS } from '../../../daily-tutor/types';
+import type {
+  DailyActivityKind,
+  DailyActivityStatus,
+  DailySessionStatus,
+} from '../../../daily-tutor/types';
+import { isValidDateKey } from '../../../daily-tutor/date';
 
 /** Current ISO timestamp helper. */
 function nowIso(): string {
@@ -3271,3 +3284,372 @@ export class SQLiteProgressRepository implements ProgressRepository {
 }
 
 export { deleteLexicalItemWithReviews };
+
+/* ------------------------------------------------------------------ *
+ * Daily Tutor (additive storage for the Daily Tutor Loop)
+ * ------------------------------------------------------------------ */
+
+/** Valid session statuses for writes. */
+const DAILY_SESSION_STATUSES: ReadonlySet<string> = new Set([
+  'planned',
+  'in_progress',
+  'completed',
+  'abandoned',
+]);
+
+/** Valid activity statuses for writes. */
+const DAILY_ACTIVITY_STATUSES: ReadonlySet<string> = new Set([
+  'pending',
+  'in_progress',
+  'completed',
+  'skipped',
+]);
+
+/** Map a daily_tutor_sessions row (+ activities) to the record shape. */
+function rowToDailySessionRecord(
+  row: SqlRow,
+  activities: readonly DailyTutorActivityRecord[],
+): DailyTutorSessionRecord {
+  return {
+    id: row.id as string,
+    learnerId: row.learner_id as string,
+    dateKey: row.date_key as string,
+    status: row.status as DailySessionStatus,
+    headline: row.headline as string,
+    sourceMode: row.source_mode as DailyTutorSessionRecord['sourceMode'],
+    estimatedMinutes: Number(row.estimated_minutes ?? 0),
+    activities,
+    createdAt: row.created_at as string,
+    startedAt: (row.started_at as string | null) ?? null,
+    completedAt: (row.completed_at as string | null) ?? null,
+  };
+}
+
+/** Map a daily_tutor_activities row to the record shape. */
+function rowToDailyActivityRecord(row: SqlRow): DailyTutorActivityRecord {
+  return {
+    id: row.id as string,
+    orderIndex: Number(row.order_index ?? 0),
+    kind: row.kind as DailyActivityKind,
+    title: row.title as string,
+    reason: row.reason as string,
+    estimatedMinutes: Number(row.estimated_minutes ?? 0),
+    // Corrupt JSON degrades to {} — the activity routes generically instead
+    // of crashing the session (fails safe; the service still validates the
+    // structural fields it depends on).
+    target: safeJsonParse<Record<string, unknown>>(row.target, {}),
+    status: row.status as DailyActivityStatus,
+    startedAt: (row.started_at as string | null) ?? null,
+    completedAt: (row.completed_at as string | null) ?? null,
+    practicedItems:
+      row.practiced_items === null || row.practiced_items === undefined
+        ? null
+        : Number(row.practiced_items),
+  };
+}
+
+/** Validate the session-side fields of an insert. */
+function assertValidDailySessionInput(
+  session: Omit<DailyTutorSessionRecord, 'activities'>,
+): void {
+  if (!session.learnerId || !isValidUuid(session.learnerId)) {
+    throw new Error('Invalid learnerId');
+  }
+  if (!isValidDateKey(session.dateKey)) {
+    throw new Error('Invalid dateKey (expected YYYY-MM-DD)');
+  }
+  if (!session.id) {
+    throw new Error('id is required');
+  }
+  if (!DAILY_SESSION_STATUSES.has(session.status)) {
+    throw new Error(`Invalid daily tutor session status: ${String(session.status)}`);
+  }
+  if (session.sourceMode !== 'personalized' && session.sourceMode !== 'mixed' && session.sourceMode !== 'general') {
+    throw new Error(`Invalid daily tutor source mode: ${String(session.sourceMode)}`);
+  }
+  if (typeof session.headline !== 'string') {
+    throw new Error('headline is required');
+  }
+}
+
+/** Validate the activity list of an insert. */
+function assertValidDailyActivitiesInput(
+  activities: readonly Omit<DailyTutorActivityRecord, 'orderIndex'>[],
+): void {
+  if (!Array.isArray(activities) || activities.length === 0) {
+    throw new Error('A daily tutor session requires at least one activity');
+  }
+  const ids = new Set<string>();
+  const kinds: string[] = [];
+  for (const activity of activities) {
+    if (!activity.id || ids.has(activity.id)) {
+      throw new Error('Activity ids must be non-empty and unique');
+    }
+    ids.add(activity.id);
+    if (!DAILY_ACTIVITY_KINDS.includes(activity.kind)) {
+      throw new Error(`Invalid daily tutor activity kind: ${String(activity.kind)}`);
+    }
+    kinds.push(activity.kind);
+    if (!DAILY_ACTIVITY_STATUSES.has(activity.status)) {
+      throw new Error(`Invalid daily tutor activity status: ${String(activity.status)}`);
+    }
+    if (typeof activity.title !== 'string' || typeof activity.reason !== 'string') {
+      throw new Error('Activity title and reason are required');
+    }
+  }
+}
+
+/**
+ * SQLiteDailyTutorRepository
+ *
+ * Implements DailyTutorRepository over daily_tutor_sessions +
+ * daily_tutor_activities. Writes validate statuses/kinds/date keys; reads
+ * return persisted rows as-is (structural validation on load belongs to the
+ * Daily Tutor service, which can recover safely). The UNIQUE(learner_id,
+ * date_key) constraint backs the insert contract: a second insert for the
+ * same learner/date returns null instead of duplicating the session.
+ */
+export class SQLiteDailyTutorRepository implements DailyTutorRepository {
+  constructor(private readonly adapter: DatabaseAdapter) {}
+
+  async getSessionForDate(
+    learnerId: string,
+    dateKey: string,
+  ): Promise<DailyTutorSessionRecord | null> {
+    if (!isValidUuid(learnerId) || !isValidDateKey(dateKey)) return null;
+    const rows = await this.adapter.query(
+      `SELECT * FROM daily_tutor_sessions WHERE learner_id = ? AND date_key = ?`,
+      [learnerId, dateKey],
+    );
+    if (rows.length === 0) return null;
+    return this.loadRecord(rows[0].id as string);
+  }
+
+  async getSession(id: string): Promise<DailyTutorSessionRecord | null> {
+    if (!id) return null;
+    return this.loadRecord(id);
+  }
+
+  async listRecentSessions(
+    learnerId: string,
+    limit?: number,
+  ): Promise<readonly DailyTutorSessionRecord[]> {
+    if (!isValidUuid(learnerId)) return [];
+    let sql = `SELECT id, date_key FROM daily_tutor_sessions WHERE learner_id = ? ORDER BY date_key DESC`;
+    const params: SqlParam[] = [learnerId];
+    if (limit !== undefined && limit > 0) {
+      sql += ` LIMIT ?`;
+      params.push(limit);
+    }
+    const rows = await this.adapter.query(sql, params);
+    const records: DailyTutorSessionRecord[] = [];
+    for (const row of rows) {
+      const record = await this.loadRecord(row.id as string);
+      if (record) records.push(record);
+    }
+    return records;
+  }
+
+  async insertSession(input: CreateDailyTutorSessionInput): Promise<DailyTutorSessionRecord | null> {
+    assertValidDailySessionInput(input.session);
+    assertValidDailyActivitiesInput(input.activities);
+
+    // Fast path: an existing session for this learner/date wins immediately.
+    const existing = await this.adapter.query(
+      `SELECT id FROM daily_tutor_sessions WHERE learner_id = ? AND date_key = ?`,
+      [input.session.learnerId, input.session.dateKey],
+    );
+    if (existing.length > 0) return null;
+
+    const now = nowIso();
+    const steps: { sql: string; params: SqlParam[] }[] = [
+      {
+        sql: `INSERT INTO daily_tutor_sessions (
+          id, learner_id, date_key, status, headline, source_mode,
+          estimated_minutes, created_at, started_at, completed_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        params: [
+          input.session.id,
+          input.session.learnerId,
+          input.session.dateKey,
+          input.session.status,
+          input.session.headline,
+          input.session.sourceMode,
+          input.session.estimatedMinutes ?? 0,
+          now,
+          input.session.startedAt ?? null,
+          input.session.completedAt ?? null,
+          now,
+        ],
+      },
+    ];
+    input.activities.forEach((activity, index) => {
+      steps.push({
+        sql: `INSERT INTO daily_tutor_activities (
+          id, session_id, order_index, kind, title, reason,
+          estimated_minutes, target, status, started_at, completed_at,
+          practiced_items, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        params: [
+          activity.id,
+          input.session.id,
+          index,
+          activity.kind,
+          activity.title,
+          activity.reason,
+          activity.estimatedMinutes ?? 0,
+          JSON.stringify(activity.target ?? {}),
+          activity.status,
+          activity.startedAt ?? null,
+          activity.completedAt ?? null,
+          activity.practicedItems ?? null,
+          now,
+          now,
+        ],
+      });
+    });
+
+    try {
+      await this.adapter.transaction(steps);
+    } catch (error) {
+      // A concurrent writer may have won the UNIQUE(learner_id, date_key)
+      // race between the check above and this transaction: never duplicate.
+      const raced = await this.adapter.query(
+        `SELECT id FROM daily_tutor_sessions WHERE learner_id = ? AND date_key = ?`,
+        [input.session.learnerId, input.session.dateKey],
+      );
+      if (raced.length > 0) return null;
+      throw error;
+    }
+
+    const stored = await this.getSession(input.session.id);
+    if (!stored) {
+      throw new Error('Failed to persist daily tutor session');
+    }
+    return stored;
+  }
+
+  async updateSession(id: string, patch: DailyTutorSessionPatch): Promise<DailyTutorSessionRecord> {
+    if (!id) throw new Error('Invalid session id');
+    if (patch.status !== undefined && !DAILY_SESSION_STATUSES.has(patch.status)) {
+      throw new Error(`Invalid daily tutor session status: ${String(patch.status)}`);
+    }
+    const existing = await this.getSession(id);
+    if (!existing) {
+      throw new Error(`Daily tutor session not found: ${id}`);
+    }
+
+    const fields: string[] = [];
+    const params: SqlParam[] = [];
+    if (patch.status !== undefined) {
+      fields.push('status = ?');
+      params.push(patch.status);
+    }
+    if (patch.startedAt !== undefined) {
+      fields.push('started_at = ?');
+      params.push(patch.startedAt);
+    }
+    if (patch.completedAt !== undefined) {
+      fields.push('completed_at = ?');
+      params.push(patch.completedAt);
+    }
+    if (fields.length > 0) {
+      fields.push('updated_at = ?');
+      params.push(nowIso());
+      params.push(id);
+      await this.adapter.execute(
+        `UPDATE daily_tutor_sessions SET ${fields.join(', ')} WHERE id = ?`,
+        params,
+      );
+    }
+
+    const updated = await this.getSession(id);
+    if (!updated) {
+      throw new Error('Daily tutor session disappeared after update');
+    }
+    return updated;
+  }
+
+  async updateActivity(
+    sessionId: string,
+    activityId: string,
+    patch: DailyTutorActivityPatch,
+  ): Promise<DailyTutorSessionRecord> {
+    if (!sessionId || !activityId) throw new Error('Invalid session or activity id');
+    if (patch.status !== undefined && !DAILY_ACTIVITY_STATUSES.has(patch.status)) {
+      throw new Error(`Invalid daily tutor activity status: ${String(patch.status)}`);
+    }
+    const existing = await this.getSession(sessionId);
+    if (!existing) {
+      throw new Error(`Daily tutor session not found: ${sessionId}`);
+    }
+    if (!existing.activities.some((activity) => activity.id === activityId)) {
+      throw new Error(`Daily tutor activity not found: ${activityId}`);
+    }
+
+    const fields: string[] = [];
+    const params: SqlParam[] = [];
+    if (patch.status !== undefined) {
+      fields.push('status = ?');
+      params.push(patch.status);
+    }
+    if (patch.startedAt !== undefined) {
+      fields.push('started_at = ?');
+      params.push(patch.startedAt);
+    }
+    if (patch.completedAt !== undefined) {
+      fields.push('completed_at = ?');
+      params.push(patch.completedAt);
+    }
+    if (patch.practicedItems !== undefined) {
+      fields.push('practiced_items = ?');
+      params.push(patch.practicedItems);
+    }
+    if (fields.length > 0) {
+      fields.push('updated_at = ?');
+      params.push(nowIso());
+      params.push(activityId);
+      await this.adapter.execute(
+        `UPDATE daily_tutor_activities SET ${fields.join(', ')} WHERE id = ?`,
+        params,
+      );
+    }
+
+    const updated = await this.getSession(sessionId);
+    if (!updated) {
+      throw new Error('Daily tutor session disappeared after activity update');
+    }
+    return updated;
+  }
+
+  async deleteSession(id: string): Promise<boolean> {
+    if (!id) return false;
+    const existing = await this.adapter.query(
+      `SELECT id FROM daily_tutor_sessions WHERE id = ?`,
+      [id],
+    );
+    if (existing.length === 0) return false;
+    // Children are deleted explicitly so recovery does not depend on
+    // PRAGMA foreign_keys being enabled (same pattern as lexical deletion).
+    await this.adapter.execute(`DELETE FROM daily_tutor_activities WHERE session_id = ?`, [id]);
+    await this.adapter.execute(`DELETE FROM daily_tutor_sessions WHERE id = ?`, [id]);
+    return true;
+  }
+
+  /** Load a session record with its ordered activities. */
+  private async loadRecord(id: string): Promise<DailyTutorSessionRecord | null> {
+    const rows = await this.adapter.query(
+      `SELECT * FROM daily_tutor_sessions WHERE id = ?`,
+      [id],
+    );
+    if (rows.length === 0) return null;
+    const activityRows = await this.adapter.query(
+      `SELECT * FROM daily_tutor_activities WHERE session_id = ? ORDER BY order_index ASC`,
+      [id],
+    );
+    return rowToDailySessionRecord(
+      rows[0],
+      activityRows.map(rowToDailyActivityRecord),
+    );
+  }
+}

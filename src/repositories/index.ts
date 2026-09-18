@@ -31,6 +31,14 @@ import type {
   ReviewItem,
 } from '../domain/models/learning';
 import type { PronunciationEvidenceSource, QualitativeConfidence } from '../pronunciation/types';
+import type {
+  DailyActivityKind,
+  DailyActivityStatus,
+  DailySessionStatus,
+  DailyTutorActivityTarget,
+  DailyTutorDateKey,
+  DailyTutorSourceMode,
+} from '../daily-tutor/types';
 
 /** Exact activity aggregates over a learner's persisted conversation sessions. */
 export interface ConversationActivityStats {
@@ -321,6 +329,95 @@ export interface ProgressRepository {
     learnerId: string,
     opts?: { recordedAfter?: string; recordedUntil?: string },
   ): Promise<number>;
+}
+
+/* ------------------------------------------------------------------ *
+ * Daily Tutor (additive persistence for the Daily Tutor Loop)
+ *
+ * Deliberately a STANDALONE repository interface (not part of the
+ * AppRepositories facade): existing composition factories stay unchanged,
+ * and the Daily Tutor owns the only write path to these tables.
+ * ------------------------------------------------------------------ */
+
+/** ONE persisted daily-tutor activity row (order via `orderIndex`). */
+export interface DailyTutorActivityRecord {
+  readonly id: string;
+  readonly orderIndex: number;
+  readonly kind: DailyActivityKind;
+  readonly title: string;
+  readonly reason: string;
+  readonly estimatedMinutes: number;
+  /** Serializable routing context (see daily-tutor/types). */
+  readonly target: DailyTutorActivityTarget;
+  readonly status: DailyActivityStatus;
+  readonly startedAt: string | null;
+  readonly completedAt: string | null;
+  /** Real item count reported by the child workflow at completion, if any. */
+  readonly practicedItems: number | null;
+}
+
+/** ONE persisted daily-tutor session with its ordered activities. */
+export interface DailyTutorSessionRecord {
+  readonly id: string;
+  readonly learnerId: string;
+  readonly dateKey: DailyTutorDateKey;
+  readonly status: DailySessionStatus;
+  readonly headline: string;
+  readonly sourceMode: DailyTutorSourceMode;
+  readonly estimatedMinutes: number;
+  readonly activities: readonly DailyTutorActivityRecord[];
+  readonly createdAt: string;
+  readonly startedAt: string | null;
+  readonly completedAt: string | null;
+}
+
+/** A session to persist: the session row plus activities in plan order. */
+export interface CreateDailyTutorSessionInput {
+  readonly session: Omit<DailyTutorSessionRecord, 'activities'>;
+  readonly activities: readonly Omit<DailyTutorActivityRecord, 'orderIndex'>[];
+}
+
+/** Patchable session execution fields. */
+export interface DailyTutorSessionPatch {
+  readonly status?: DailySessionStatus;
+  readonly startedAt?: string | null;
+  readonly completedAt?: string | null;
+}
+
+/** Patchable activity execution fields. */
+export interface DailyTutorActivityPatch {
+  readonly status?: DailyActivityStatus;
+  readonly startedAt?: string | null;
+  readonly completedAt?: string | null;
+  readonly practicedItems?: number | null;
+}
+
+export interface DailyTutorRepository {
+  /** Today's (or any date's) session for a learner, or null. */
+  getSessionForDate(
+    learnerId: string,
+    dateKey: DailyTutorDateKey,
+  ): Promise<DailyTutorSessionRecord | null>;
+  getSession(id: string): Promise<DailyTutorSessionRecord | null>;
+  /** Recent sessions, newest dateKey first (bounded). */
+  listRecentSessions(learnerId: string, limit?: number): Promise<readonly DailyTutorSessionRecord[]>;
+  /**
+   * Insert a new session for (learnerId, dateKey). Returns null when a
+   * session already exists for that learner/date — the caller then loads the
+   * existing one. This is the unique-learner/date invariant that makes
+   * concurrent "create today" calls safe.
+   */
+  insertSession(input: CreateDailyTutorSessionInput): Promise<DailyTutorSessionRecord | null>;
+  /** Update execution fields; returns the updated session. */
+  updateSession(id: string, patch: DailyTutorSessionPatch): Promise<DailyTutorSessionRecord>;
+  /** Update ONE activity's execution fields; returns the updated session. */
+  updateActivity(
+    sessionId: string,
+    activityId: string,
+    patch: DailyTutorActivityPatch,
+  ): Promise<DailyTutorSessionRecord>;
+  /** Delete a session and its activities (corrupt-state recovery). */
+  deleteSession(id: string): Promise<boolean>;
 }
 
 /** Aggregated repository facade used by engines/UI. */
