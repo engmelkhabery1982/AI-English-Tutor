@@ -28,6 +28,13 @@ export type {
 } from './types';
 
 export {
+  CONTRACTION_DENSITIES,
+  LEXICAL_STYLES,
+  SENTENCE_SHAPES,
+  TEXT_REGISTERS,
+} from './types';
+
+export {
   isUrgentNegativeStatus,
   toProgressionEvidence,
   urgentNegativeEvidenceCount,

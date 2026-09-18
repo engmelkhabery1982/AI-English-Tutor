@@ -66,6 +66,37 @@ export type ContractionDensity = 'high' | 'moderate' | 'low';
 /** Lexical style guidance (TEXT behaviour only). */
 export type LexicalStyle = 'high_frequency' | 'common_general' | 'varied' | 'precise';
 
+/** Every text register, in stable order (runtime validation + rendering). */
+export const TEXT_REGISTERS: readonly TextRegister[] = [
+  'everyday',
+  'neutral',
+  'professional',
+  'formal',
+] as const;
+
+/** Every sentence shape, in stable order. */
+export const SENTENCE_SHAPES: readonly SentenceShape[] = [
+  'short_simple',
+  'simple_with_coordination',
+  'mixed_clauses',
+  'complex_clauses',
+] as const;
+
+/** Every contraction density, in stable order. */
+export const CONTRACTION_DENSITIES: readonly ContractionDensity[] = [
+  'high',
+  'moderate',
+  'low',
+] as const;
+
+/** Every lexical style, in stable order. */
+export const LEXICAL_STYLES: readonly LexicalStyle[] = [
+  'high_frequency',
+  'common_general',
+  'varied',
+  'precise',
+] as const;
+
 /**
  * TEXT behaviour of the material. This is deliberately NOT an audio/TTS
  * concern: no speak rate, no prosody, no accent, no connected-speech model.

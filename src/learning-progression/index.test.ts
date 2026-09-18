@@ -717,12 +717,12 @@ describe('curriculum projection — DEAD and UNMAPPABLE mappings emit nothing', 
     expect(strengthMapping?.skillId).toBeUndefined();
     // Passing strength-shaped data cannot create evidence: the projection
     // input has no strength channel at all.
-    const snapshots = projectCurriculumEvidence({
+    const withStrengths = {
       weaknesses: [],
       pronunciationWeaknesses: [],
-      ...({ strengths: [{ type: 'grammar', confidence: 1 }] } as never),
-    });
-    expect(snapshots).toEqual([]);
+      strengths: [{ type: 'grammar', confidence: 1 }],
+    };
+    expect(projectCurriculumEvidence(withStrengths)).toEqual([]);
   });
 
   it('39. the explicit classification table covers every source family', () => {
