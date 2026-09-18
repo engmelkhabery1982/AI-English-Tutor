@@ -28,6 +28,8 @@
  *   - `recentlyPractised` is traceable via a `recently_practised` reason.
  *   - A learning goal appears in `appliedLearningGoals` ONLY when it
  *     materially changes the plan (inclusion, ordering, or selection).
+ *   - Every evidenced lifecycle state maps to its own honest reason; a real
+ *     `stable` skill is never described as `new_skill`.
  */
 
 import {
@@ -102,6 +104,11 @@ function stateReason(state: SkillLifecycleState): CurriculumReason {
       return {
         code: 'improving_in_rotation',
         message: 'Improving skill should remain in rotation.',
+      };
+    case 'stable':
+      return {
+        code: 'stable_maintenance',
+        message: 'Stable skill is deprioritized but may remain available for occasional maintenance.',
       };
     default:
       return { code: 'new_skill', message: 'No learner evidence yet; a reasonable default.' };
