@@ -21,6 +21,7 @@ import type {
   CreateDailyTutorSessionInput,
 } from '../repositories';
 import type { LearnerModel, CoachingContext } from '../learner-model';
+import type { CurriculumRecommendation } from '../curriculum/types';
 import { DailyTutorService } from './service';
 import type { DailyTutorChildCompletion, DailyTutorSession } from './types';
 
@@ -38,6 +39,8 @@ class FakeRepository {
   sessions = new Map<string, DailyTutorSessionRecord>();
   failReads = false;
   failInserts = false;
+  /** When true, activity/session updates fail (mid-settle failures). */
+  failUpdates = false;
   insertCalls = 0;
   deleteCalls: string[] = [];
 
@@ -84,6 +87,7 @@ class FakeRepository {
   }
 
   updateSession(id: string, patch: DailyTutorSessionPatch): Promise<DailyTutorSessionRecord> {
+    if (this.failUpdates) return Promise.reject(new Error('sqlite locked'));
     const session = this.sessions.get(id);
     if (!session) return Promise.reject(new Error('missing session'));
     const updated: DailyTutorSessionRecord = {
@@ -101,6 +105,7 @@ class FakeRepository {
     activityId: string,
     patch: DailyTutorActivityPatch,
   ): Promise<DailyTutorSessionRecord> {
+    if (this.failUpdates) return Promise.reject(new Error('sqlite locked'));
     const session = this.sessions.get(sessionId);
     if (!session) return Promise.reject(new Error('missing session'));
     const updated: DailyTutorSessionRecord = {
@@ -312,6 +317,8 @@ function makeService(options?: {
   hasProfile?: boolean;
   now?: () => string;
   offset?: () => number;
+  /** Curriculum recommendations the injected planner returns (tests). */
+  curriculum?: readonly Omit<CurriculumRecommendation, 'status' | 'reasons' | 'blockedByPrerequisites'>[];
 }): { service: DailyTutorService; repository: FakeRepository; model: FakeModel | RichFakeModel } {
   const repository = options?.repository ?? new FakeRepository();
   const model = options?.model ?? new FakeModel();
@@ -324,11 +331,15 @@ function makeService(options?: {
     now: options?.now ?? (() => NOW),
     timeZoneOffsetMinutes: options?.offset ?? (() => 0),
     curriculumPlanner: () => ({
-      recommendations: [],
-      sourceMode: 'balanced_rotation' as const,
+      recommendations:
+        options?.curriculum?.map((rec) => ({
+          ...rec,
+          status: rec.lifecycleState === null ? ('unobserved' as const) : ('evidenced' as const),
+          reasons: [],
+          blockedByPrerequisites: [],
+        })) ?? [],
       appliedLearningGoals: [],
       notes: [],
-      generatedAt: NOW,
     }),
   });
   return { service, repository, model };
@@ -813,8 +824,11 @@ describe('applyChildCompletion (the handshake)', () => {
       { ref: { sessionId: 'bogus', activityId: 'x', kind: 'review' }, completedAt: NOW, itemsPracticed: 1 },
       { ref: { sessionId: today.session.id, activityId: second.id, kind: second.kind }, completedAt: NOW, itemsPracticed: 2 },
     ]);
-    expect(result?.activities[0].status).toBe('completed');
-    expect(result?.activities[1].status).toBe('completed');
+    expect(result.session?.activities[0].status).toBe('completed');
+    expect(result.session?.activities[1].status).toBe('completed');
+    expect(result.appliedActivityIds).toEqual([first.id, second.id]);
+    expect(result.rejectedActivityIds).toEqual(['x']); // foreign session: permanent
+    expect(result.retryable).toEqual([]);
   });
 });
 
@@ -828,14 +842,18 @@ describe('getChildRoute', () => {
     const vocabulary = today.session.activities.find((a) => a.kind === 'vocabulary');
     expect(vocabulary).toBeDefined();
     const route = await service.getChildRoute(vocabulary!.id);
-    expect(route?.routeName).toBe('Review');
-    expect(route?.params.dailyTutor).toMatchObject({
+    // Review is a MAIN TAB: the route is the nested Root → MainTabs → Review
+    // envelope, with the bounded review subset inside the tab params.
+    expect(route?.routeName).toBe('MainTabs');
+    expect(route?.params.screen).toBe('Review');
+    expect((route?.params.params as { dailyTutor: Record<string, unknown> }).dailyTutor).toMatchObject({
       sessionId: today.session.id,
       activityId: vocabulary!.id,
       kind: 'vocabulary',
       reviewKind: 'vocabulary',
     });
-    expect((route?.params.dailyTutor as { reviewLimit: number }).reviewLimit).toBeGreaterThan(0);
+    const nested = route?.params.params as { dailyTutor: { reviewLimit: number } };
+    expect(nested.dailyTutor.reviewLimit).toBeGreaterThan(0);
   });
 
   it('routes listening, adaptive lessons and speaking to their existing screens', async () => {
@@ -846,7 +864,11 @@ describe('getChildRoute', () => {
     for (const activity of today.session.activities) {
       const route = await service.getChildRoute(activity.id);
       expect(route).not.toBeNull();
-      routeNames.add(route!.routeName);
+      // Tab-resident children resolve to the nested MainTabs envelope; root
+      // screens resolve directly.
+      routeNames.add(
+        activity.kind === 'listening' ? (route!.params.screen as string) : route!.routeName,
+      );
     }
     expect(routeNames).toEqual(new Set(['AdaptiveLesson', 'Listening', 'DeepSpeaking']));
   });
@@ -857,7 +879,11 @@ describe('getChildRoute', () => {
     if (today.status !== 'ready') throw new Error('not ready');
     await service.completeActivity(today.session.activities[0].id, { itemsPracticed: 1 });
     const route = await service.getChildRoute();
-    expect(route?.params.dailyTutor).toMatchObject({
+    const dailyTutor =
+      route?.routeName === 'MainTabs'
+        ? (route?.params.params as { dailyTutor?: { activityId: string } }).dailyTutor
+        : (route?.params.dailyTutor as { activityId: string } | undefined);
+    expect(dailyTutor).toMatchObject({
       activityId: today.session.activities[1].id,
     });
   });
@@ -948,5 +974,264 @@ describe('race guards and serialization', () => {
       (a) => a.status === 'pending' || a.status === 'in_progress',
     ).length;
     expect(openCount).toBe(final.session.activities.length - 1); // exactly one settled
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * REGRESSION (HIGH 4): no completion without real evidence
+ * ------------------------------------------------------------------ */
+
+describe('completion evidence guard (no evidence, no completion)', () => {
+  it('missing evidence never completes (even from an untyped caller)', async () => {
+    const { service } = makeService();
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const activity = today.session.activities[0];
+
+    // Simulate a caller that bypasses the required-evidence signature
+    // (the compile-time guard makes this impossible to write normally).
+    const untyped = service as unknown as {
+      completeActivity(activityId: string): Promise<DailyTutorSession | null>;
+    };
+    const updated = await untyped.completeActivity(activity.id);
+    expect(updated?.activities[0].status).not.toBe('completed');
+    expect(updated?.activities[0].practicedItems).toBeUndefined();
+  });
+
+  it('zero, negative and non-finite counts never complete', async () => {
+    const { service } = makeService();
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    for (const bad of [0, -3, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const updated = await service.completeActivity(today.session.activities[0].id, {
+        itemsPracticed: bad,
+      });
+      expect(updated?.activities[0].status).not.toBe(`completed for ${bad}`);
+      expect(updated?.activities[0].status).toBe('pending');
+    }
+  });
+
+  it('a child completion WITHOUT a count never completes (missing evidence)', async () => {
+    const { service } = makeService();
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const activity = today.session.activities[0];
+    const result = await service.applyChildCompletions([
+      {
+        ref: { sessionId: today.session.id, activityId: activity.id, kind: activity.kind },
+        completedAt: NOW,
+        // itemsPracticed deliberately absent — not completion evidence.
+      },
+    ]);
+    expect(result.appliedActivityIds).toEqual([]);
+    expect(result.rejectedActivityIds).toEqual([activity.id]); // permanent
+    expect(result.session?.activities[0].status).toBe('pending'); // stays open
+  });
+
+  it('opening/navigation state (planned, not started) never completes anything', async () => {
+    const { service } = makeService();
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    // Merely starting the activity (the "opening" equivalent) never completes.
+    const started = await service.startActivity(today.session.activities[0].id);
+    expect(started?.activities[0].status).toBe('in_progress');
+    expect(started?.activities[0].completedAt).toBeUndefined();
+  });
+
+  it('a valid real completion completes; a duplicate stays idempotent', async () => {
+    const { service } = makeService();
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const activity = today.session.activities[0];
+    const first = await service.completeActivity(activity.id, { itemsPracticed: 3 });
+    expect(first?.activities[0].status).toBe('completed');
+    const duplicate = await service.completeActivity(activity.id, { itemsPracticed: 8 });
+    expect(duplicate?.activities[0].practicedItems).toBe(3); // first wins
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * REGRESSION (HIGH 3): retry-safe completion application
+ * ------------------------------------------------------------------ */
+
+describe('retry-safe completion application (storage failures)', () => {
+  it('a repository failure is RETRYABLE — the completion is never lost', async () => {
+    const repository = new FakeRepository();
+    const { service } = makeService({ repository });
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const activity = today.session.activities[0];
+
+    repository.failReads = true; // storage fails during application
+    const failed = await service.applyChildCompletions([
+      completionFor(today.session, activity.id, 4),
+    ]);
+    expect(failed.appliedActivityIds).toEqual([]);
+    expect(failed.rejectedActivityIds).toEqual([]);
+    expect(failed.retryable).toHaveLength(1); // preserved for retry
+    expect(failed.retryable[0].ref.activityId).toBe(activity.id);
+
+    // Storage heals: the SAME completion now applies (same-day recovery).
+    repository.failReads = false;
+    const retried = await service.applyChildCompletions(failed.retryable);
+    expect(retried.appliedActivityIds).toEqual([activity.id]);
+    expect(retried.session?.activities[0].status).toBe('completed');
+    expect(retried.session?.activities[0].practicedItems).toBe(4);
+  });
+
+  it('an update failure mid-settle is retryable and then idempotent', async () => {
+    const repository = new FakeRepository();
+    const { service } = makeService({ repository });
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const activity = today.session.activities[0];
+
+    // Break writes (but keep reads) to simulate a mid-settle failure.
+    repository.failUpdates = true;
+
+    const failed = await service.applyChildCompletions([
+      completionFor(today.session, activity.id, 2),
+    ]);
+    expect(failed.retryable).toHaveLength(1);
+    expect(failed.session?.activities[0].status ?? 'pending').not.toBe('completed');
+
+    repository.failUpdates = false; // heal
+    const retried = await service.applyChildCompletions(failed.retryable);
+    expect(retried.appliedActivityIds).toEqual([activity.id]);
+    expect(retried.session?.activities[0].practicedItems).toBe(2);
+  });
+
+  it('stale, foreign and mismatched completions are PERMANENTLY rejected (no retry loop)', async () => {
+    const { service } = makeService();
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const activity = today.session.activities[0];
+    const result = await service.applyChildCompletions([
+      { ref: { sessionId: 'dt:other:2026-09-18', activityId: activity.id, kind: activity.kind }, completedAt: NOW, itemsPracticed: 1 },
+      { ref: { sessionId: today.session.id, activityId: activity.id, kind: 'listening' }, completedAt: NOW, itemsPracticed: 1 },
+      { ref: { sessionId: today.session.id, activityId: 'ghost', kind: 'review' }, completedAt: NOW, itemsPracticed: 1 },
+    ]);
+    expect(result.appliedActivityIds).toEqual([]);
+    expect(result.rejectedActivityIds).toHaveLength(3);
+    expect(result.retryable).toEqual([]);
+  });
+
+  it('same-day corrupt-state recovery keeps completions applicable (deterministic ids)', async () => {
+    const repository = new FakeRepository();
+    const snapshot: ModelSnapshot = { ...EMPTY_SNAPSHOT, dueReview: [{ kind: 'vocabulary' }, { kind: 'vocabulary' }] };
+    const { service } = makeService({ repository, model: new RichFakeModel(snapshot) });
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const vocabulary = today.session.activities.find((a) => a.kind === 'vocabulary')!;
+    const pendingCompletion = completionFor(today.session, vocabulary.id, 5);
+
+    // The stored record corrupts after the child completed but before the
+    // completion was applied: recovery deletes + replans TODAY (same
+    // deterministic activity ids), and the completion still applies.
+    repository.corrupt(today.session.id, (record) => ({ ...record, status: 'banana' as never }));
+    const recovered = await service.getToday();
+    if (recovered.status !== 'ready') throw new Error('not ready');
+    expect(recovered.session.id).toBe(today.session.id); // deterministic id
+
+    const result = await service.applyChildCompletions([pendingCompletion]);
+    expect(result.appliedActivityIds).toEqual([vocabulary.id]);
+    expect(result.session?.activities.find((a) => a.id === vocabulary.id)?.status).toBe('completed');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * REGRESSION (BLOCKER 2): target fidelity from plan to child entry point
+ * ------------------------------------------------------------------ */
+
+describe('target fidelity: plan → persisted activity → child route', () => {
+  it('adaptive lesson activities persist NO skill claim and route bare', async () => {
+    const { service } = makeService({
+      curriculum: [
+        { skillId: 'past_simple_questions', domain: 'grammar', title: 'Past simple questions', lifecycleState: 'repeated' },
+      ],
+    });
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const lesson = today.session.activities.find((a) => a.kind === 'adaptive_lesson');
+    expect(lesson).toBeDefined();
+    expect(lesson!.target).toEqual({}); // persisted without the skill claim
+
+    const route = await service.getChildRoute(lesson!.id);
+    expect(route?.routeName).toBe('AdaptiveLesson');
+    expect(route?.params.dailyTutor).toMatchObject({ kind: 'adaptive_lesson' });
+    expect(Object.keys(route?.params as object)).toEqual(['dailyTutor']); // nothing else claimed
+  });
+
+  it('deep speaking activities persist the practice type and route it (conditioned child)', async () => {
+    const { service } = makeService({
+      curriculum: [
+        { skillId: 'elaboration', domain: 'speaking', title: 'Elaboration', lifecycleState: 'observed' },
+      ],
+    });
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const speaking = today.session.activities.find((a) => a.kind === 'deep_speaking');
+    expect(speaking).toBeDefined();
+    expect(speaking!.target.practiceType).toBe('explain_and_expand');
+
+    const route = await service.getChildRoute(speaking!.id);
+    expect(route?.routeName).toBe('DeepSpeaking');
+    expect(route?.params.practiceType).toBe('explain_and_expand'); // the conditioned focus travels
+  });
+
+  it('listening activities persist no skill claim and route to the Listening tab', async () => {
+    const { service } = makeService({
+      curriculum: [
+        { skillId: 'gist_listening', domain: 'listening', title: 'Listening for gist', lifecycleState: 'observed' },
+      ],
+    });
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const listening = today.session.activities.find((a) => a.kind === 'listening');
+    expect(listening).toBeDefined();
+    expect(listening!.target).toEqual({});
+
+    const route = await service.getChildRoute(listening!.id);
+    expect(route?.routeName).toBe('MainTabs');
+    expect(route?.params.screen).toBe('Listening');
+    const nested = route?.params.params as { dailyTutor: Record<string, unknown> };
+    expect(Object.keys(nested.dailyTutor).sort()).toEqual(['activityId', 'kind', 'sessionId']);
+  });
+
+  it('weakness retraining persists only the practice type (the coach selects the weakness)', async () => {
+    const { service } = makeService({
+      model: new RichFakeModel({
+        ...EMPTY_SNAPSHOT,
+        weaknesses: [
+          { id: 'w-1', type: 'grammar', referenceId: 'ref-1', status: 'relapsed', severity: 0.9, occurrenceCount: 5 },
+        ],
+      }),
+    });
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const retraining = today.session.activities.find((a) => a.kind === 'weakness_retraining');
+    expect(retraining).toBeDefined();
+    expect(retraining!.target).toEqual({ practiceType: 'weakness_retraining' });
+
+    const route = await service.getChildRoute(retraining!.id);
+    expect(route?.routeName).toBe('DeepSpeaking');
+    expect(route?.params.practiceType).toBe('weakness_retraining');
+  });
+
+  it('review activities persist the bounded subset and route it into the Review tab', async () => {
+    const { service } = makeService({
+      model: new RichFakeModel({ ...EMPTY_SNAPSHOT, dueReview: [{ kind: 'vocabulary' }, { kind: 'vocabulary' }, { kind: 'vocabulary' }] }),
+    });
+    const today = await service.getToday();
+    if (today.status !== 'ready') throw new Error('not ready');
+    const vocabulary = today.session.activities.find((a) => a.kind === 'vocabulary');
+    expect(vocabulary).toBeDefined();
+    expect(vocabulary!.target).toEqual({ reviewKind: 'vocabulary', reviewLimit: 3 });
+
+    const route = await service.getChildRoute(vocabulary!.id);
+    expect(route?.routeName).toBe('MainTabs');
+    expect(route?.params.screen).toBe('Review');
+    const nested = route?.params.params as { dailyTutor: Record<string, unknown> };
+    expect(nested.dailyTutor).toMatchObject({ reviewKind: 'vocabulary', reviewLimit: 3 });
   });
 });

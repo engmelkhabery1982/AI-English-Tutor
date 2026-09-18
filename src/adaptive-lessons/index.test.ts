@@ -2196,12 +2196,18 @@ describe('Adaptive lessons — architecture, composition and UI wiring', () => {
     expect(navigatorSrc).toContain('createStackNavigator');
     expect(navigatorSrc).toContain('createBottomTabNavigator');
     expect(navigatorSrc).toContain('AdaptiveLessonScreen');
-    expect(navigatorSrc).toContain('name="AdaptiveLesson"');
-    expect(navigatorSrc).toContain('name="MainTabs"');
-    // All seven existing tabs are preserved unchanged.
+    expect(navigatorSrc).toContain("name: 'AdaptiveLesson'");
+    expect(navigatorSrc).toContain("name: 'MainTabs'");
+    // All seven existing tabs are preserved unchanged. Since the Daily
+    // Tutor navigation repair, the tab names/order come from the
+    // single-source route tables (./routes) and each tab still mounts its
+    // existing screen component with no props.
+    const routesSrc = readFileSync(join(__dirname, '../navigation/routes.ts'), 'utf8');
     for (const tab of ['Home', 'Talk', 'Listening', 'Vocabulary', 'Review', 'Progress', 'Settings']) {
-      expect(navigatorSrc).toContain(`name="${tab}"`);
+      expect(routesSrc).toContain(`'${tab}'`);
+      expect(navigatorSrc).toContain(`${tab}: ${tab}Screen`);
     }
+    expect(navigatorSrc).toContain('MAIN_TAB_ROUTES');
     expect(navigatorSrc).toContain('NavigationContainer');
   });
 

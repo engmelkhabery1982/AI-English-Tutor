@@ -248,9 +248,10 @@ describe('selection policy: weakness lifecycle', () => {
     const retraining = plan.activities.find((a) => a.kind === 'weakness_retraining');
     expect(retraining).toBeDefined();
     expect(plan.activities.indexOf(retraining!)).toBeLessThanOrEqual(1); // with the due review at top
+    // The practice type IS passed to the child (the coach is conditioned on
+    // it); the specific weakness identity is deliberately NOT claimed.
     expect(retraining!.target.practiceType).toBe('weakness_retraining');
-    expect(retraining!.target.weaknessId).toBe('w-1');
-    expect(retraining!.target.weaknessStatus).toBe('relapsed');
+    expect(retraining!.reason).toContain('relapsed');
   });
 
   it('a mastered weakness never drives retraining', () => {
@@ -286,7 +287,7 @@ describe('selection policy: curriculum progression', () => {
     expect(kinds).toContain('listening');
   });
 
-  it('curriculum evidence is consumed, never duplicated: the reason quotes the lifecycle', () => {
+  it('curriculum evidence is consumed honestly: the reason quotes the lifecycle, never a skill the child cannot train', () => {
     const plan = planDailyTutorSession(
       emptyInput({
         curriculum: [
@@ -296,12 +297,16 @@ describe('selection policy: curriculum progression', () => {
     );
     const lesson = plan.activities.find((a) => a.kind === 'adaptive_lesson');
     expect(lesson).toBeDefined();
-    expect(lesson!.target.skillId).toBe('past_simple_questions');
-    expect(lesson!.reason).toContain('Curriculum priority');
+    // The Adaptive Lesson engine picks its own steps — the target must NOT
+    // claim a skill id the child is not conditioned on.
+    expect(lesson!.target.skillId).toBeUndefined();
+    expect(lesson!.target.domain).toBeUndefined();
+    expect(lesson!.reason).toContain('Curriculum progression');
     expect(lesson!.reason).toContain('repeated');
+    expect(lesson!.reason).toContain('adaptive lesson picks the exact steps');
   });
 
-  it('a curriculum speaking skill maps to a Deep Speaking practice type', () => {
+  it('a curriculum speaking skill maps to a Deep Speaking practice type (conditioned child)', () => {
     const plan = planDailyTutorSession(
       emptyInput({
         curriculum: [
@@ -311,7 +316,28 @@ describe('selection policy: curriculum progression', () => {
     );
     const speaking = plan.activities.find((a) => a.kind === 'deep_speaking');
     expect(speaking).toBeDefined();
+    // The speaking coach IS conditioned on the mapped practice type, so the
+    // skill may be claimed and its provenance kept.
     expect(speaking!.target.practiceType).toBe('explain_and_expand');
+    expect(speaking!.target.skillId).toBe('elaboration');
+    expect(speaking!.target.domain).toBe('speaking');
+    expect(speaking!.title).toBe('Speaking \u2014 Elaboration');
+    expect(speaking!.reason).toContain('practiced as explain and expand speaking');
+  });
+
+  it('an UNKNOWN curriculum speaking skill claims only the modality (no skill, no practice type)', () => {
+    const plan = planDailyTutorSession(
+      emptyInput({
+        curriculum: [
+          { skillId: 'brand_new_skill', domain: 'speaking', title: 'Brand New Skill', lifecycleState: 'observed' },
+        ],
+      }),
+    );
+    const speaking = plan.activities.find((a) => a.kind === 'deep_speaking');
+    expect(speaking).toBeDefined();
+    expect(speaking!.title).toBe('Speaking practice'); // no skill claim
+    expect(speaking!.target.skillId).toBeUndefined();
+    expect(speaking!.target.practiceType).toBeUndefined();
   });
 
   it('an unobserved curriculum pronunciation skill is skipped (honesty)', () => {
@@ -531,6 +557,123 @@ describe('goal → curriculum hint mapping', () => {
   it('each goal maps to at most one hint (deterministic order)', () => {
     const hints = mapLearningGoalsToCurriculumHints(['work', 'business', 'office']);
     expect(hints).toEqual(['workplace_communication']);
+  });
+});
+
+
+/**
+ * TARGET FIDELITY (BLOCKER-2 repair): for every activity kind, the planned
+ * target may only carry what the launched child workflow actually consumes.
+ * Plan -> persisted target -> child route is asserted per kind here and in
+ * navigation/service tests.
+ */
+describe('target fidelity: the plan never claims a target the child cannot train', () => {
+  it('review family: the bounded subset IS the target (the Review flow is conditioned on it)', () => {
+    const plan = planDailyTutorSession(emptyInput({ dueVocabularyCount: 5, dueExpressionCount: 3 }));
+    const vocabulary = plan.activities.find((a) => a.kind === 'vocabulary');
+    const expressions = plan.activities.find((a) => a.kind === 'expressions');
+    expect(vocabulary!.target).toEqual({ reviewKind: 'vocabulary', reviewLimit: 5 });
+    expect(expressions!.target).toEqual({ reviewKind: 'expression', reviewLimit: 3 });
+    // The titles claim exactly the bounded subset the child will run.
+    expect(vocabulary!.title).toBe('Review 5 due words');
+    expect(expressions!.title).toBe('Review 3 due expressions');
+  });
+
+  it('pronunciation: no specific target or curriculum skill is claimed (engine self-plans)', () => {
+    const evidence = { unresolvedPronunciationCount: 3, pronunciationTargets: ['th sound', 'r/l'] };
+    const plan = planDailyTutorSession(emptyInput(evidence));
+    const pronunciation = plan.activities.find((a) => a.kind === 'pronunciation');
+    expect(pronunciation).toBeDefined();
+    expect(pronunciation!.target).toEqual({});
+    expect(pronunciation!.title).not.toContain('th');
+    expect(pronunciation!.title).not.toContain('Word stress');
+    expect(pronunciation!.reason).toContain('3 pronunciation targets');
+    expect(pronunciation!.reason).toContain('adaptive lesson builds its steps');
+
+    // Curriculum pronunciation recommendation: same honesty.
+    const withCurriculum = planDailyTutorSession(
+      emptyInput({
+        ...evidence,
+        curriculum: [
+          { skillId: 'word_stress', domain: 'pronunciation', title: 'Word stress', lifecycleState: 'observed' },
+        ],
+      }),
+    );
+    const curriculumPron = withCurriculum.activities.find(
+      (a) => a.kind === 'pronunciation' && a.target.skillId === undefined,
+    );
+    const anyPron = withCurriculum.activities.find((a) => a.kind === 'pronunciation');
+    expect(anyPron).toBeDefined();
+    expect(anyPron!.target).toEqual({});
+    expect(anyPron!.title).not.toContain('Word stress');
+    expect(curriculumPron).toBeDefined();
+  });
+
+  it('weakness retraining: no specific weakness identity is claimed (the coach selects)', () => {
+    const plan = planDailyTutorSession(
+      emptyInput({
+        activeWeaknesses: [weakness({ type: 'grammar', status: 'relapsed', label: 'past simple questions' })],
+      }),
+    );
+    const retraining = plan.activities.find((a) => a.kind === 'weakness_retraining');
+    expect(retraining).toBeDefined();
+    expect(retraining!.target).toEqual({ practiceType: 'weakness_retraining' });
+    expect(retraining!.title).toBe('Weakness retraining'); // no specific weakness label
+    expect(retraining!.reason).toContain('relapsed');
+    expect(retraining!.reason).toContain('speaking coach retrains your most urgent weaknesses');
+  });
+
+  it('curriculum listening: modality only — the engine picks the material', () => {
+    const plan = planDailyTutorSession(
+      emptyInput({
+        curriculum: [
+          { skillId: 'gist_listening', domain: 'listening', title: 'Listening for gist', lifecycleState: 'observed' },
+        ],
+      }),
+    );
+    const listening = plan.activities.find((a) => a.kind === 'listening');
+    expect(listening).toBeDefined();
+    expect(listening!.target).toEqual({});
+    expect(listening!.title).toBe('Listening practice');
+    expect(listening!.title).not.toContain('gist');
+    expect(listening!.reason).toContain('listening engine picks the material');
+  });
+
+  it('curriculum lessons: modality only — the engine picks the steps', () => {
+    const plan = planDailyTutorSession(
+      emptyInput({
+        curriculum: [
+          { skillId: 'past_simple_questions', domain: 'grammar', title: 'Past simple questions', lifecycleState: 'repeated' },
+          { skillId: 'word_formation', domain: 'vocabulary', title: 'Word formation', lifecycleState: null },
+        ],
+      }),
+    );
+    const lesson = plan.activities.find((a) => a.kind === 'adaptive_lesson');
+    expect(lesson).toBeDefined();
+    expect(lesson!.target).toEqual({});
+    expect(lesson!.title).toBe('Adaptive lesson');
+    expect(lesson!.title).not.toContain('Past simple');
+  });
+
+  it('professional english: the category IS the target and is planned from real goals', () => {
+    const plan = planDailyTutorSession(
+      emptyInput({ dateKey: '2026-09-16', learningGoals: ['job_interviews'] }),
+    );
+    const professional = plan.activities.find((a) => a.kind === 'professional_english');
+    if (professional) {
+      expect(professional.target.professionalCategory).toBeDefined();
+      expect(professional.target.practiceType).toBeUndefined();
+    }
+  });
+
+  it('the honest listening-weakness activity stays class-level (engine retrains first)', () => {
+    const plan = planDailyTutorSession(
+      emptyInput({ activeWeaknesses: [weakness({ type: 'listening', status: 'confirmed' })] }),
+    );
+    const listening = plan.activities.find((a) => a.kind === 'listening');
+    expect(listening).toBeDefined();
+    expect(listening!.target).toEqual({});
+    expect(listening!.reason).toContain('listening weakness');
   });
 });
 

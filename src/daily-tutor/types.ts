@@ -63,29 +63,47 @@ export type DailySessionStatus = 'planned' | 'in_progress' | 'completed' | 'aban
 export type DailyTutorSourceMode = 'personalized' | 'mixed' | 'general';
 
 /**
- * Serializable routing context for one activity — the smallest required
- * context handed to the child workflow. Values come from real planning
- * evidence and are persisted with the session so resume needs no re-planning.
+ * Serializable routing context for one activity — the smallest context the
+ * CHILD WORKFLOW ACTUALLY CONSUMES, handed over at launch and persisted with
+ * the session so resume needs no re-planning.
+ *
+ * TARGET-FIDELITY CONTRACT: a target field may only claim what the launched
+ * child is genuinely conditioned on. The Daily Tutor decides WHAT (the kind
+ * +, where supported, a bounded focus); the child engine always owns HOW it
+ * selects material. If an engine cannot be conditioned on a planned focus,
+ * the planner must NOT put that focus here (nor in the title/reason) — the
+ * activity is then worded generically instead.
  */
 export interface DailyTutorActivityTarget {
-  /** Review-family emphasis for the existing Review flow, when the activity has one. */
+  /**
+   * Review-family emphasis for the existing Review flow. The Review screen
+   * filters its planned candidates by this kind and bounds the count — the
+   * child is genuinely conditioned on it.
+   */
   readonly reviewKind?: 'vocabulary' | 'expression' | 'grammar';
-  /** Bounded review subset size (guidance for the existing Review planner). */
+  /** Bounded review subset size (consumed by the existing Review planner). */
   readonly reviewLimit?: number;
-  /** Curriculum skill this activity progresses/retrains, when known. */
+  /**
+   * Curriculum skill provenance. Only set when the launched child is
+   * actually conditioned on this skill — i.e. deep_speaking activities whose
+   * practice type is mapped from this exact skill. Never set for
+   * adaptive_lesson/listening/pronunciation activities (those engines pick
+   * their own material and cannot be conditioned on a skill id).
+   */
   readonly skillId?: string;
-  /** Curriculum domain of the skill, when known. */
+  /** Curriculum domain of the skill, when the skillId is set. */
   readonly domain?: string;
-  /** Speaking practice type for the Deep Speaking family, when routed there. */
+  /**
+   * Speaking practice type for the Deep Speaking family — the child engine
+   * plans its scenario from this type, so the child IS conditioned on it.
+   */
   readonly practiceType?: string;
-  /** Persisted weakness row a retraining activity was planned from. */
-  readonly weaknessId?: string;
-  /** Honest lifecycle provenance (e.g. 'relapsed') — display only. */
-  readonly weaknessStatus?: string;
-  /** Professional English scenario category, when planned from real goals. */
+  /**
+   * Professional English scenario category (from real goals). The launch
+   * builds the scenario for exactly this category through the existing PE
+   * planner, so the child IS conditioned on it.
+   */
   readonly professionalCategory?: string;
-  /** Honest pronunciation practice label from real evidence, when present. */
-  readonly pronunciationTarget?: string;
 }
 
 /** ONE planned activity inside a daily session (pure plan data). */
@@ -235,10 +253,23 @@ export interface DailyTutorChildCompletion {
   readonly ref: DailyTutorActivityRef;
   readonly completedAt: string;
   /**
-   * Real count of practiced items from the child's own summary, when it has
-   * one. An explicit 0 means the child finished without practicing anything,
-   * which must NOT complete the daily activity.
+   * Real count of practiced items from the child's own summary. An explicit
+   * 0 means the child finished without practicing anything, which must NOT
+   * complete the daily activity. This field is REQUIRED for a completion to
+   * settle an activity: a completion without a real positive count is not
+   * completion evidence.
    */
   readonly itemsPracticed?: number;
   readonly note?: string;
+}
+
+/**
+ * Params the Daily Tutor passes into the Review tab (existing Review flow):
+ * the completion handshake ref plus an optional bounded review subset
+ * (kind emphasis + item limit) the Review planner is genuinely conditioned
+ * on. Present ONLY on Daily Tutor launches; standalone tab use is unchanged.
+ */
+export interface DailyTutorReviewLaunch extends DailyTutorActivityRef {
+  readonly reviewKind?: 'vocabulary' | 'expression' | 'grammar';
+  readonly reviewLimit?: number;
 }

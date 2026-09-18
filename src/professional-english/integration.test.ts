@@ -567,9 +567,14 @@ describe('Professional English integration', () => {
 
   it('39. ProfessionalEnglish route exists and Deep Speaking accepts professionalScenario', () => {
     const nav = readSrc('../navigation/RootNavigator.tsx');
+    // Since the Daily Tutor navigation repair the typed route params live in
+    // the single-source route tables (src/navigation/routes.ts); the screens
+    // are still rendered from them in RootNavigator.
+    const routes = readSrc('../navigation/routes.ts');
     expect(nav).toMatch(/ProfessionalEnglish/);
-    expect(nav).toMatch(/professionalScenario\?/);
     expect(nav).toMatch(/ProfessionalEnglishScreen/);
+    expect(routes).toMatch(/ProfessionalEnglish/);
+    expect(routes).toMatch(/professionalScenario\?/);
     const ds = readSrc('../screens/DeepSpeakingScreen.tsx');
     expect(ds).toMatch(/professionalScenario/);
     expect(ds).toMatch(/Target expressions/);

@@ -2,10 +2,19 @@ import React from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createStackNavigator } from '@react-navigation/stack';
+import type { StackNavigationOptions } from '@react-navigation/stack';
 import { Text } from 'react-native';
 
-import type { SpeakingPracticeSeed, SpeakingPracticeType, SpeakingProfessionalScenario } from '../deep-speaking';
-import type { DailyTutorActivityRef } from '../daily-tutor';
+import {
+  MAIN_TAB_ROUTES,
+  ROOT_STACK_ROUTES,
+} from './routes';
+import type {
+  MainTabParamList,
+  MainTabRouteName,
+  RootStackParamList,
+  RootStackRouteName,
+} from './routes';
 import HomeScreen from '../screens/HomeScreen';
 import DailyTutorScreen from '../screens/DailyTutorScreen';
 import DeepSpeakingScreen from '../screens/DeepSpeakingScreen';
@@ -19,13 +28,17 @@ import SettingsScreen from '../screens/SettingsScreen';
 import AdaptiveLessonScreen from '../screens/AdaptiveLessonScreen';
 import OnboardingScreen from '../screens/OnboardingScreen';
 
+// Re-exported for callers that import the param list types from the
+// navigator module (the definitions live in ./routes, the single source).
+export type { RootStackParamList, MainTabParamList } from './routes';
+
 /**
  * RootNavigator
  *
  * Structure:
  *   NavigationContainer
- *   └── Root stack
- *       ├── MainTabs (the EXISTING bottom-tab layout, unchanged)
+ *   └── Root stack (routes from ./routes — the single source of truth)
+ *       ├── MainTabs (the EXISTING bottom-tab layout, tab routes from ./routes)
  *       │     Home | Talk | Listening | Vocabulary | Review | Progress | Settings
  *       ├── DailyTutor      ← pushed from Home → "Today's Practice" (the Daily
  *       │                      Tutor hub; launches existing activities and
@@ -38,6 +51,13 @@ import OnboardingScreen from '../screens/OnboardingScreen';
  *       ├── ProfessionalEnglish
  *       └── Onboarding      ← pushed from Home/Settings → diagnostic assessment
  *
+ * NAVIGATION CONTRACT (see ./routes): Review and Listening are TAB routes
+ * inside MainTabs, NOT root-stack routes. A root-stack screen (such as the
+ * Daily Tutor hub) reaches them ONLY through the nested MainTabs envelope
+ * ({ routeName: 'MainTabs', params: { screen: 'Review', params: … } }) —
+ * navigating to 'Review'/'Listening' directly from the root stack would be
+ * invalid and is exactly what ./routes + the Daily Tutor routing prevent.
+ *
  * The stack exists so these are pushed destinations (with a real back
  * action) rather than extra tabs. It uses @react-navigation/stack, which is
  * ALREADY a declared dependency of this project — no new package is
@@ -47,49 +67,21 @@ import OnboardingScreen from '../screens/OnboardingScreen';
  * the adaptive lesson screen orchestrate the existing systems and never
  * duplicate them.
  */
-const Tab = createBottomTabNavigator();
-const Stack = createStackNavigator();
+const Tab = createBottomTabNavigator<MainTabParamList>();
+const Stack = createStackNavigator<RootStackParamList>();
 
-/** Routes of the root stack (typed for navigation.navigate calls). */
-export type RootStackParamList = {
-  MainTabs: undefined;
-  /**
-   * Daily Tutor session hub. Additive: it orchestrates existing activities
-   * (Review / Listening / Adaptive Lesson / Deep Speaking) and owns only the
-   * daily session state — never the learning engines themselves.
-   */
-  DailyTutor: undefined;
-  /**
-   * Adaptive Lesson. The optional dailyTutor ref is the completion
-   * handshake from the Daily Tutor; standalone use passes nothing and is
-   * unchanged.
-   */
-  AdaptiveLesson:
-    | {
-        readonly dailyTutor?: DailyTutorActivityRef;
-      }
-    | undefined;
-  /**
-   * Deep Speaking Practice / Speaking Coach. The optional seed lets a speaking
-   * lesson step start a full practice on the SAME material — the inline lesson
-   * path stays available when Deep Speaking is not. The optional dailyTutor
-   * ref is the completion handshake from the Daily Tutor.
-   */
-  DeepSpeaking:
-    | {
-        readonly seed?: SpeakingPracticeSeed;
-        readonly practiceType?: SpeakingPracticeType;
-        readonly professionalScenario?: SpeakingProfessionalScenario;
-        readonly dailyTutor?: DailyTutorActivityRef;
-      }
-    | undefined;
-  /** Professional English scenario picker (content layer; starts Deep Speaking). */
-  ProfessionalEnglish: undefined;
-  /** Personalized onboarding + diagnostic assessment (pushed from Home/Settings). */
-  Onboarding: undefined;
+/** Screen components for the REAL bottom tabs (exhaustive by type). */
+const TAB_COMPONENTS: Record<MainTabRouteName, React.ComponentType<{}>> = {
+  Home: HomeScreen,
+  Talk: TalkScreen,
+  Listening: ListeningScreen,
+  Vocabulary: VocabularyScreen,
+  Review: ReviewScreen,
+  Progress: ProgressScreen,
+  Settings: SettingsScreen,
 };
 
-/** The existing bottom-tab layout, now hosted inside the root stack. */
+/** The existing bottom-tab layout: tab names AND order come from ./routes. */
 function MainTabs() {
   return (
     <Tab.Navigator
@@ -99,15 +91,54 @@ function MainTabs() {
         tabBarInactiveTintColor: '#8e8e93',
       })}
     >
-      <Tab.Screen name="Home" component={HomeScreen} />
-      <Tab.Screen name="Talk" component={TalkScreen} />
-      <Tab.Screen name="Listening" component={ListeningScreen} />
-      <Tab.Screen name="Vocabulary" component={VocabularyScreen} />
-      <Tab.Screen name="Review" component={ReviewScreen} />
-      <Tab.Screen name="Progress" component={ProgressScreen} />
-      <Tab.Screen name="Settings" component={SettingsScreen} />
+      {MAIN_TAB_ROUTES.map((name) => (
+        <Tab.Screen key={name} name={name} component={TAB_COMPONENTS[name]} />
+      ))}
     </Tab.Navigator>
   );
+}
+
+/** One root-stack screen: name, component and (unchanged) options. */
+interface RootScreenDef {
+  readonly name: RootStackRouteName;
+  readonly component: React.ComponentType<{}>;
+  readonly options?: StackNavigationOptions;
+}
+
+const ROOT_SCREENS: readonly RootScreenDef[] = [
+  { name: 'MainTabs', component: MainTabs, options: { headerShown: false } },
+  {
+    name: 'DailyTutor',
+    component: DailyTutorScreen,
+    options: { title: "Today's Practice", headerBackTitle: 'Home' },
+  },
+  {
+    name: 'AdaptiveLesson',
+    component: AdaptiveLessonScreen,
+    options: { title: 'Adaptive lesson', headerBackTitle: 'Home' },
+  },
+  {
+    name: 'DeepSpeaking',
+    component: DeepSpeakingScreen,
+    options: { title: 'Speaking practice', headerBackTitle: 'Home' },
+  },
+  {
+    name: 'ProfessionalEnglish',
+    component: ProfessionalEnglishScreen,
+    options: { title: 'Professional English', headerBackTitle: 'Home' },
+  },
+  {
+    name: 'Onboarding',
+    component: OnboardingScreen,
+    options: { title: 'Assess my English', headerBackTitle: 'Back' },
+  },
+];
+
+// Single-source-of-truth check: the rendered root screens must be EXACTLY
+// ROOT_STACK_ROUTES from ./routes, in order. A mismatch is a programmer
+// error — fail fast instead of navigating to a route that does not exist.
+if (ROOT_SCREENS.map((screen) => screen.name).join(',') !== ROOT_STACK_ROUTES.join(',')) {
+  throw new Error('RootNavigator screens are out of sync with src/navigation/routes.ts');
 }
 
 export default function RootNavigator() {
@@ -121,32 +152,14 @@ export default function RootNavigator() {
           cardStyle: { backgroundColor: '#f5f7fa' },
         }}
       >
-        <Stack.Screen name="MainTabs" component={MainTabs} options={{ headerShown: false }} />
-        <Stack.Screen
-          name="DailyTutor"
-          component={DailyTutorScreen}
-          options={{ title: "Today's Practice", headerBackTitle: 'Home' }}
-        />
-        <Stack.Screen
-          name="AdaptiveLesson"
-          component={AdaptiveLessonScreen}
-          options={{ title: 'Adaptive lesson', headerBackTitle: 'Home' }}
-        />
-        <Stack.Screen
-          name="DeepSpeaking"
-          component={DeepSpeakingScreen}
-          options={{ title: 'Speaking practice', headerBackTitle: 'Home' }}
-        />
-        <Stack.Screen
-          name="ProfessionalEnglish"
-          component={ProfessionalEnglishScreen}
-          options={{ title: 'Professional English', headerBackTitle: 'Home' }}
-        />
-        <Stack.Screen
-          name="Onboarding"
-          component={OnboardingScreen}
-          options={{ title: 'Assess my English', headerBackTitle: 'Back' }}
-        />
+        {ROOT_SCREENS.map((screen) => (
+          <Stack.Screen
+            key={screen.name}
+            name={screen.name}
+            component={screen.component}
+            options={screen.options}
+          />
+        ))}
       </Stack.Navigator>
     </NavigationContainer>
   );

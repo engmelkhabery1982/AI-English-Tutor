@@ -134,6 +134,26 @@ export type DailyTutorTodayResult =
   | { readonly status: 'no-profile'; readonly message: string; readonly session: null }
   | { readonly status: 'unavailable'; readonly message: string; readonly session: null };
 
+/**
+ * Result of applying a drained batch of child completions. The
+ * applied/rejected/retryable split is what makes the completion inbox
+ * retry-safe: applied and rejected ids are acknowledged (final), while
+ * retryable completions MUST be re-queued and retried later.
+ */
+export interface DailyTutorCompletionBatchResult {
+  /** Today's session after the batch, when known. */
+  readonly session: DailyTutorSession | null;
+  /** Activity ids settled (now, or idempotently already complete). */
+  readonly appliedActivityIds: readonly string[];
+  /**
+   * Activity ids permanently ignored: stale/foreign/mismatched/skipped, or
+   * reported without real practice evidence. Retrying can never succeed.
+   */
+  readonly rejectedActivityIds: readonly string[];
+  /** Completions that MUST be retried later (transient storage failures). */
+  readonly retryable: readonly DailyTutorChildCompletion[];
+}
+
 /* ------------------------------------------------------------------ *
  * Helpers
  * ------------------------------------------------------------------ */
@@ -173,9 +193,24 @@ export function isValidDailyTutorSessionRecord(record: DailyTutorSessionRecord):
   return true;
 }
 
+/**
+ * Real completion evidence: a positive, finite count of practiced items
+ * from the child workflow's own summary. Missing, zero, negative or
+ * non-finite counts are NOT completion evidence — the activity stays open.
+ */
+function isValidCompletionEvidence(
+  evidence: { readonly itemsPracticed?: number } | undefined,
+): evidence is { readonly itemsPracticed: number } {
+  return (
+    evidence !== undefined &&
+    typeof evidence.itemsPracticed === 'number' &&
+    Number.isFinite(evidence.itemsPracticed) &&
+    evidence.itemsPracticed > 0
+  );
+}
+
 /** Honest display label for a persisted weakness row (no fabrication). */
-function weaknessLabel(notes: string | undefined): string | undefined {
-  const identity = parseWeaknessIdentity(notes);
+function weaknessLabel(notes: string | undefined): string | undefined {  const identity = parseWeaknessIdentity(notes);
   if (identity?.target) {
     return identity.target;
   }
@@ -617,13 +652,16 @@ export class DailyTutorService {
   }
 
   /**
-   * Mark an activity completed. Called only with REAL completion evidence
-   * (the child workflow's own result). Idempotent; a completion with zero
-   * practiced items is refused (nothing was practised).
+   * Mark an activity completed. REQUIRES real completion evidence from the
+   * child workflow's own result: a positive, finite count of practiced
+   * items. There is deliberately no evidence-free variant — opening or
+   * navigating to an activity never completes it, missing evidence never
+   * completes it, and zero/negative/invalid counts never complete it.
+   * Idempotent: a duplicate valid completion leaves the first result as-is.
    */
   async completeActivity(
     activityId: string,
-    evidence?: { readonly itemsPracticed?: number },
+    evidence: { readonly itemsPracticed: number },
   ): Promise<DailyTutorSession | null> {
     return this.enqueue(async () => {
       const context = await this.todayContext();
@@ -640,13 +678,11 @@ export class DailyTutorService {
       if (activity.status === 'skipped') {
         return recordToSession(record); // Already settled differently.
       }
-      if (evidence?.itemsPracticed === 0) {
-        return recordToSession(record); // No real practice → not complete.
+      if (!isValidCompletionEvidence(evidence)) {
+        return recordToSession(record); // Missing/zero/invalid evidence → stays open.
       }
       return this.settleActivity(record, activity, 'completed', {
-        ...(evidence?.itemsPracticed !== undefined
-          ? { practicedItems: evidence.itemsPracticed }
-          : {}),
+        practicedItems: evidence.itemsPracticed,
       });
     });
   }
@@ -716,63 +752,119 @@ export class DailyTutorService {
    * activities and zero-practice completions are all ignored safely.
    * Returns the updated today session (or null when nothing applied).
    */
+  /**
+   * Apply ONE child completion (single-completion convenience wrapper).
+   * Returns today's session when it is known; null when the completion was
+   * not applicable (stale/foreign/malformed) or could not be applied yet
+   * (storage failure — retryable). Use applyChildCompletions for the full
+   * applied/rejected/retryable classification.
+   */
   async applyChildCompletion(completion: DailyTutorChildCompletion): Promise<DailyTutorSession | null> {
-    if (!completion?.ref?.sessionId || !completion.ref.activityId) return null;
-    return this.enqueue(async () => {
-      const learnerId = await this.resolveLearnerId();
-      if (!learnerId) return null;
-      const dateKey = toDateKey(this.now(), this.offsetMinutes());
-      if (!dateKey) return null;
-
-      let record: DailyTutorSessionRecord | null;
-      try {
-        record = await this.deps.repository.getSession(completion.ref.sessionId);
-      } catch {
-        return null;
-      }
-      if (!record || record.learnerId !== learnerId || record.dateKey !== dateKey) {
-        return null; // Unknown or stale (not today's session).
-      }
-      if (record.status !== 'planned' && record.status !== 'in_progress') {
-        return null; // Completed/abandoned day: nothing left to apply.
-      }
-      const activity = record.activities.find((entry) => entry.id === completion.ref.activityId);
-      if (!activity) return null;
-      if (completion.ref.kind !== activity.kind) return null; // Mismatched echo.
-      if (activity.status === 'completed') {
-        return recordToSession(record); // Idempotent.
-      }
-      if (activity.status === 'skipped') {
-        return null; // Already settled differently.
-      }
-      if (completion.itemsPracticed === 0) {
-        return recordToSession(record); // Real finish, zero practice → stays open.
-      }
-      return this.settleActivity(record, activity, 'completed', {
-        ...(completion.itemsPracticed !== undefined
-          ? { practicedItems: completion.itemsPracticed }
-          : {}),
-      });
-    });
+    const outcome = await this.applyClassifiedChildCompletion(completion);
+    if (outcome.status === 'retryable') return null; // Retry later, complete nothing.
+    return outcome.session;
   }
 
   /**
-   * Apply a batch of drained child completions in order. Returns the latest
-   * today session (or null). Never throws for individual bad entries.
+   * Apply a drained batch of child completions in order. Every completion is
+   * classified so the caller (the completion inbox) can acknowledge what was
+   * finally dispositioned and re-queue what must be retried — a real child
+   * completion is never lost to a transient storage failure.
    */
   async applyChildCompletions(
     completions: readonly DailyTutorChildCompletion[],
-  ): Promise<DailyTutorSession | null> {
-    let latest: DailyTutorSession | null = null;
-    for (const completion of completions) {
-      try {
-        const updated = await this.applyChildCompletion(completion);
-        if (updated) latest = updated;
-      } catch {
-        // One bad completion never blocks the rest.
+  ): Promise<DailyTutorCompletionBatchResult> {
+    const appliedActivityIds: string[] = [];
+    const rejectedActivityIds: string[] = [];
+    const retryable: DailyTutorChildCompletion[] = [];
+    let session: DailyTutorSession | null = null;
+    for (const completion of completions ?? []) {
+      const outcome = await this.applyClassifiedChildCompletion(completion);
+      const activityId = completion?.ref?.activityId;
+      if (!activityId) continue; // Malformed entry: dropped, never retried.
+      if (outcome.status === 'applied') {
+        appliedActivityIds.push(activityId);
+        session = outcome.session ?? session;
+      } else if (outcome.status === 'rejected') {
+        rejectedActivityIds.push(activityId);
+        session = outcome.session ?? session;
+      } else {
+        retryable.push(completion);
       }
     }
-    return latest;
+    return {
+      session,
+      appliedActivityIds,
+      rejectedActivityIds,
+      retryable,
+    };
+  }
+
+  /**
+   * Classify and apply one child completion (serialized with all other
+   * mutations). Outcomes:
+   * - applied: settled now, or already completed (idempotent success).
+   * - rejected: permanently inapplicable (stale/foreign/mismatched/skipped,
+   *   or without real practice evidence) — the activity stays open where
+   *   applicable; retrying can never succeed.
+   * - retryable: a transient failure (repository/storage) — the completion
+   *   must stay retryable until it is applied or permanently rejected.
+   */
+  private async applyClassifiedChildCompletion(
+    completion: DailyTutorChildCompletion,
+  ): Promise<
+    | { readonly status: 'applied'; readonly session: DailyTutorSession | null }
+    | { readonly status: 'rejected'; readonly session: DailyTutorSession | null }
+    | { readonly status: 'retryable'; readonly completion: DailyTutorChildCompletion }
+  > {
+    if (!completion?.ref?.sessionId || !completion.ref.activityId) {
+      return { status: 'rejected', session: null };
+    }
+    return this.enqueue(async () => {
+      const learnerId = await this.resolveLearnerId();
+      if (!learnerId) {
+        // Profile not readable right now (a real child completion implies a
+        // profile exists) — keep the completion retryable, complete nothing.
+        return { status: 'retryable', completion } as const;
+      }
+      const dateKey = toDateKey(this.now(), this.offsetMinutes());
+      if (!dateKey) {
+        return { status: 'retryable', completion } as const;
+      }
+
+      // Repository failures are RETRYABLE: they propagate out of this read
+      // (no swallowing) so the batch can re-queue the completion.
+      const record = await this.deps.repository.getSession(completion.ref.sessionId);
+
+      if (!record || record.learnerId !== learnerId || record.dateKey !== dateKey) {
+        return { status: 'rejected', session: null } as const; // Unknown or stale (not today's session).
+      }
+      if (record.status !== 'planned' && record.status !== 'in_progress') {
+        return { status: 'rejected', session: null } as const; // Completed/abandoned day: nothing left to apply.
+      }
+      const activity = record.activities.find((entry) => entry.id === completion.ref.activityId);
+      if (!activity) {
+        return { status: 'rejected', session: null } as const;
+      }
+      if (completion.ref.kind !== activity.kind) {
+        return { status: 'rejected', session: null } as const; // Mismatched echo.
+      }
+      if (activity.status === 'completed') {
+        return { status: 'applied', session: recordToSession(record) } as const; // Idempotent.
+      }
+      if (activity.status === 'skipped') {
+        return { status: 'rejected', session: null } as const; // Already settled differently.
+      }
+      if (!isValidCompletionEvidence(completion)) {
+        // Child finished without real practice evidence → stays open. This
+        // is final for THIS report (a later relaunch may report real counts).
+        return { status: 'rejected', session: recordToSession(record) } as const;
+      }
+      const settled = await this.settleActivity(record, activity, 'completed', {
+        practicedItems: completion.itemsPracticed,
+      });
+      return { status: 'applied', session: settled } as const;
+    }).catch(() => ({ status: 'retryable', completion }) as const);
   }
 
   /* ---------------- child route launching ---------------- */

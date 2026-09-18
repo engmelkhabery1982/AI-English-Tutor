@@ -359,17 +359,17 @@ function buildCandidates(input: DailyTutorPlanningInput): ActivityCandidate[] {
   const topWeakness = pickTopWeakness(input.activeWeaknesses);
   if (topWeakness) {
     const statusPriority = WEAKNESS_STATUS_PRIORITY[topWeakness.status] ?? 0;
-    const label = topWeakness.label?.trim();
     push({
       kind: 'weakness_retraining',
-      title: label
-        ? `Retrain: ${label}`
-        : `Weakness retraining (${topWeakness.type.replace(/_/g, ' ')})`,
-      reason: `A ${topWeakness.status.replace(/_/g, ' ')} weakness from your own practice history.`,
+      // TARGET FIDELITY: Deep Speaking owns WHICH weaknesses it retrains (its
+      // own priority ordering, read live at launch). The daily plan must not
+      // name a specific weakness it cannot guarantee — the wording claims
+      // retraining of the learner's most urgent weaknesses, which is exactly
+      // what the existing practice type does.
+      title: 'Weakness retraining',
+      reason: `A ${topWeakness.status.replace(/_/g, ' ')} weakness from your own practice history — the speaking coach retrains your most urgent weaknesses.`,
       target: {
         practiceType: 'weakness_retraining',
-        weaknessId: topWeakness.id,
-        weaknessStatus: topWeakness.status,
       },
       priority: statusPriority + Math.min(topWeakness.occurrenceCount, 10),
       family: 'speaking',
@@ -396,14 +396,16 @@ function buildCandidates(input: DailyTutorPlanningInput): ActivityCandidate[] {
 
   /* --- 3. Pronunciation evidence (existing Pronunciation Engine targets) --- */
   if (input.unresolvedPronunciationCount > 0) {
-    const firstTarget = input.pronunciationTargets[0];
     push({
       kind: 'pronunciation',
-      title: 'Pronunciation practice',
+      // TARGET FIDELITY: the Adaptive Lesson engine builds its own steps
+      // from the same evidence and cannot be conditioned on a specific
+      // pronunciation target — so the activity never names one.
+      title: 'Adaptive lesson (pronunciation evidence)',
       reason: `${input.unresolvedPronunciationCount} pronunciation ${
         input.unresolvedPronunciationCount === 1 ? 'target is' : 'targets are'
-      } recorded in your history.`,
-      target: firstTarget ? { pronunciationTarget: firstTarget } : {},
+      } recorded in your history — the adaptive lesson builds its steps from your own evidence.`,
+      target: {},
       priority: 65 + Math.min(input.unresolvedPronunciationCount, 5),
       family: 'adaptive',
       urgent: false,
@@ -414,16 +416,19 @@ function buildCandidates(input: DailyTutorPlanningInput): ActivityCandidate[] {
   /* --- 4. Curriculum progression (recommendations of the EXISTING planner) --- */
   input.curriculum.forEach((rec, recIndex) => {
     const evidenceDriven = rec.lifecycleState !== null;
-    const reason = evidenceDriven
-      ? `Curriculum priority: ${rec.title} (${rec.lifecycleState?.replace(/_/g, ' ')}).`
-      : `Curriculum next step: ${rec.title} (no evidence yet).`;
+    const lifecycle = evidenceDriven
+      ? (rec.lifecycleState ?? '').replace(/_/g, ' ')
+      : 'no evidence yet';
     switch (rec.domain) {
       case 'listening':
+        // TARGET FIDELITY: the Listening Engine owns material selection and
+        // cannot be conditioned on a specific curriculum skill — the
+        // activity claims the MODALITY, never the skill.
         push({
           kind: 'listening',
-          title: `Listening — ${rec.title}`,
-          reason,
-          target: { skillId: rec.skillId, domain: rec.domain },
+          title: 'Listening practice',
+          reason: `Curriculum progression (${lifecycle}) — the listening engine picks the material from your own history.`,
+          target: {},
           priority: 55 - recIndex * 5,
           family: 'listening',
           urgent: false,
@@ -432,20 +437,17 @@ function buildCandidates(input: DailyTutorPlanningInput): ActivityCandidate[] {
         break;
       case 'pronunciation':
         // Pronunciation practice needs REAL targets (Phase 1 is
-        // evidence-based): without stored evidence there is nothing honest
-        // to practise, so an unobserved pronunciation skill is skipped.
+        // evidence-based). The Adaptive Lesson engine builds its own steps
+        // from that same evidence — it cannot be conditioned on this
+        // skill, so the activity never names it.
         if (input.unresolvedPronunciationCount > 0) {
           push({
             kind: 'pronunciation',
-            title: `Pronunciation — ${rec.title}`,
-            reason,
-            target: {
-              skillId: rec.skillId,
-              domain: rec.domain,
-              ...(input.pronunciationTargets[0]
-                ? { pronunciationTarget: input.pronunciationTargets[0] }
-                : {}),
-            },
+            title: 'Adaptive lesson (pronunciation evidence)',
+            reason: `Curriculum progression (${lifecycle}) with ${input.unresolvedPronunciationCount} pronunciation ${
+              input.unresolvedPronunciationCount === 1 ? 'target' : 'targets'
+            } recorded — the adaptive lesson builds its steps from your own evidence.`,
+            target: {},
             priority: 55 - recIndex * 5,
             family: 'adaptive',
             urgent: false,
@@ -454,29 +456,48 @@ function buildCandidates(input: DailyTutorPlanningInput): ActivityCandidate[] {
         }
         break;
       case 'speaking': {
-        const practiceType =
-          SPEAKING_SKILL_PRACTICE_TYPE[rec.skillId] ?? 'guided_topic';
-        push({
-          kind: 'deep_speaking',
-          title: `Speaking — ${rec.title}`,
-          reason,
-          target: { skillId: rec.skillId, domain: rec.domain, practiceType },
-          priority: 55 - recIndex * 5,
-          family: 'speaking',
-          urgent: false,
-          evidenceDriven,
-        });
+        const practiceType = SPEAKING_SKILL_PRACTICE_TYPE[rec.skillId];
+        if (practiceType) {
+          // The speaking coach IS conditioned on this mapped practice type
+          // — the skill may be claimed, and its provenance kept.
+          push({
+            kind: 'deep_speaking',
+            title: `Speaking — ${rec.title}`,
+            reason: `Curriculum priority: ${rec.title} (${lifecycle}) — practiced as ${practiceType.replace(/_/g, ' ')} speaking.`,
+            target: { skillId: rec.skillId, domain: rec.domain, practiceType },
+            priority: 55 - recIndex * 5,
+            family: 'speaking',
+            urgent: false,
+            evidenceDriven,
+          });
+        } else {
+          // Unknown speaking skill: no honest practice-type mapping exists,
+          // so the activity claims only the modality, never the skill.
+          push({
+            kind: 'deep_speaking',
+            title: 'Speaking practice',
+            reason: `Curriculum progression (${lifecycle}) — the speaking coach plans the scenario.`,
+            target: {},
+            priority: 55 - recIndex * 5,
+            family: 'speaking',
+            urgent: false,
+            evidenceDriven,
+          });
+        }
         break;
       }
       case 'grammar':
       case 'vocabulary':
       case 'expressions':
       default:
+        // TARGET FIDELITY: the Adaptive Lesson engine self-plans from the
+        // learner's own evidence and cannot be conditioned on this skill
+        // — the activity claims the modality only, never the skill.
         push({
           kind: 'adaptive_lesson',
-          title: `Adaptive lesson — ${rec.title}`,
-          reason,
-          target: { skillId: rec.skillId, domain: rec.domain },
+          title: 'Adaptive lesson',
+          reason: `Curriculum progression (${lifecycle}) — the adaptive lesson picks the exact steps from your own history.`,
+          target: {},
           priority: 55 - recIndex * 5,
           family: 'adaptive',
           urgent: false,

@@ -23,7 +23,7 @@
  *   service, so double drains are harmless.
  */
 
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
@@ -37,8 +37,8 @@ import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 
 import {
   activityKindLabel,
+  applyDrainedDailyTutorCompletions,
   buildDailyTutorSessionView,
-  drainDailyTutorCompletions,
 } from '../daily-tutor';
 import type { DailyTutorService } from '../daily-tutor';
 import type { DailyTutorSession } from '../daily-tutor';
@@ -107,11 +107,9 @@ export default function DailyTutorScreen(props?: DailyTutorScreenProps) {
     }
     try {
       // Apply real child completions FIRST (they may finish the session),
-      // then read today's session state.
-      const completions = drainDailyTutorCompletions();
-      if (completions.length > 0) {
-        await service.applyChildCompletions(completions);
-      }
+      // then read today's session state. The helper is retry-safe: anything
+      // that could not be applied stays queued for the next focus.
+      await applyDrainedDailyTutorCompletions(service);
       const today = await service.getToday();
       if (unmountedRef.current || loadTokenRef.current !== token) return;
       if (today.status === 'ready') {
@@ -131,9 +129,23 @@ export default function DailyTutorScreen(props?: DailyTutorScreenProps) {
     }
   }, [ensureService]);
 
+  /**
+   * Lifecycle guard: mark the screen unmounted on real unmount (pop from
+   * the stack) so no stale async result can ever write state afterwards.
+   * Pushing a child route on top of this screen does NOT unmount it — the
+   * guard never cancels work merely because a child was opened; draining
+   * and applying completions is safe either way because the completion
+   * inbox is module-scoped, not component state.
+   */
+  useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+    };
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
-      unmountedRef.current = false;
       void loadSession();
     }, [loadSession]),
   );

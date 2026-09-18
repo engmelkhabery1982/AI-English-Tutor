@@ -16,7 +16,7 @@ import { createReviewService } from '../review/factory';
 import type { ReviewItemCandidate, EvaluationResult, ReviewDashboardSummary } from '../review/types';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { LearnerWeakness } from '../domain/models/learner';
-import type { DailyTutorActivityRef } from '../daily-tutor';
+import type { DailyTutorReviewLaunch } from '../daily-tutor';
 import { reportDailyTutorCompletion } from '../daily-tutor';
 import {
   SQLiteUserProfileRepository,
@@ -125,18 +125,14 @@ export interface ReviewScreenProps {
 
 /**
  * Daily Tutor handshake params (present ONLY when the Daily Tutor launched
- * this screen; standalone use of the Review tab never sets them):
- * - the activity ref to echo back on REAL completion,
- * - an optional bounded review subset (kind emphasis + item limit).
+ * this tab through the nested MainTabs route; standalone use of the Review
+ * tab never sets them): the activity ref to echo back on REAL completion,
+ * plus the optional bounded review subset (kind emphasis + item limit) the
+ * existing Review planner is conditioned on.
  */
-interface DailyTutorReviewParams extends DailyTutorActivityRef {
-  readonly reviewKind?: 'vocabulary' | 'expression' | 'grammar';
-  readonly reviewLimit?: number;
-}
-
 export default function ReviewScreen(props?: ReviewScreenProps) {
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
-  const route = useRoute() as { readonly params?: { readonly dailyTutor?: DailyTutorReviewParams } };
+  const route = useRoute() as { readonly params?: { readonly dailyTutor?: DailyTutorReviewLaunch } };
   const dailyTutorRef = route.params?.dailyTutor;
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
