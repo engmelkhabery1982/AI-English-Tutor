@@ -15,11 +15,20 @@
  */
 
 import { generateId } from '../shared/id';
+import type { ProgressionLevel } from '../learning-progression/types';
+import type { ContentTaskType } from '../content-generation';
+import type { AIProvider } from '../providers/ai/types';
 import type {
   ExpressionRepository,
   WeaknessRepository,
   VocabularyRepository,
 } from '../repositories';
+import {
+  deterministicProvenanceForSource,
+  generateListeningExercise,
+  listeningEvidenceFromWeaknesses,
+} from './ai-material';
+import type { ListeningGeneratedOutcome } from './ai-material';
 import type {
   ListeningDifficulty,
   ListeningExercise,
@@ -219,6 +228,8 @@ function buildFromTemplate(
     source: 'general',
     contextTopic: template.contextTopic,
     explanation: template.explanation,
+    contentProvenance: deterministicProvenanceForSource('general'),
+    materialOrigin: 'deterministic',
   };
 }
 
@@ -265,6 +276,8 @@ export function buildWeaknessExercise(
       contextTopic: 'listening retraining',
       weaknessReferenceId: referenceId,
       explanation: `Tip: you missed '${identity.target}' before — listen for it carefully this time.`,
+      contentProvenance: deterministicProvenanceForSource('listening_weakness'),
+      materialOrigin: 'deterministic',
     };
   }
 
@@ -282,6 +295,8 @@ export function buildWeaknessExercise(
     contextTopic: 'listening retraining',
     weaknessReferenceId: referenceId,
     explanation: `Tip: listen again for '${identity.target}' and type exactly what you hear.`,
+    contentProvenance: deterministicProvenanceForSource('listening_weakness'),
+    materialOrigin: 'deterministic',
   };
 }
 
@@ -308,6 +323,8 @@ export function buildVocabularyExercise(
     lexicalItemKind: 'vocabulary',
     contextTopic: 'vocabulary listening',
     explanation: `Tip: '${item.headword}' — ${meaning}`,
+    contentProvenance: deterministicProvenanceForSource('due_vocabulary'),
+    materialOrigin: 'deterministic',
   };
 }
 
@@ -335,6 +352,8 @@ export function buildExpressionExercise(
     lexicalItemKind: 'expression',
     contextTopic: 'expression listening',
     explanation: `Tip: '${item.expression}' — ${meaning}`,
+    contentProvenance: deterministicProvenanceForSource('due_expression'),
+    materialOrigin: 'deterministic',
   };
 }
 
@@ -345,13 +364,115 @@ export interface PlannedSession {
 }
 
 /**
+ * WP-1 opt-in generated content.
+ *
+ * Generation is OFF unless the SERVING path explicitly allows it, so a path
+ * that must never trigger an AI call (the Adaptive Lesson, which invokes this
+ * planner internally) simply omits this option and keeps its behaviour
+ * byte-identical.
+ *
+ * Everything needed here was ALREADY read by this planner (level and goals
+ * come from the owning service's existing profile read), so opting in adds no
+ * repository read.
+ */
+export interface ListeningGeneratedContentOptions {
+  readonly provider: AIProvider;
+  /** The stored working level (a working claim, never inferred here). */
+  readonly level: ProgressionLevel;
+  /** REAL stored learner goals, bounded — used only for context honesty. */
+  readonly learningGoals: readonly string[];
+}
+
+/**
+ * The task type for the ONE generated slot: the first allowed WP-1 task the
+ * deterministic plan does not already cover (then listen_and_type).
+ * Deterministic — never random.
+ */
+function preferredGeneratedTaskType(
+  exercises: readonly ListeningExercise[],
+): ContentTaskType {
+  const present = new Set(exercises.map((entry) => entry.type));
+  const order: readonly ContentTaskType[] = [
+    'listen_and_type',
+    'missing_word',
+    'listen_and_answer',
+  ];
+  return order.find((taskType) => !present.has(taskType)) ?? 'listen_and_type';
+}
+
+/** Index of the material that generation may replace (never a personal one). */
+function lastReplacableGeneralIndex(
+  exercises: readonly ListeningExercise[],
+): number {
+  for (let index = exercises.length - 1; index >= 0; index -= 1) {
+    if (exercises[index].source === 'general') return index;
+  }
+  return -1;
+}
+
+/**
+ * Attempt ONE bounded generated exercise for the session's general slot.
+ *
+ * Everything the request needs is derived from what this planner already
+ * loaded: bounded saved vocabulary, due lexical targets, the listening
+ * objective of a real retraining item, and the learner's own weaknesses.
+ *
+ * TARGET HONESTY: `targetExpressions` carries REAL expression targets only.
+ * Due vocabulary is never reinterpreted as expressions — it stays in the
+ * bounded `knownVocabulary` context, where it honestly belongs. Provenance
+ * is therefore computed from evidence that was really requested as a target.
+ */
+async function tryGeneratedExercise(
+  learnerId: string,
+  exercises: readonly ListeningExercise[],
+  savedVocabulary: readonly { readonly headword: string }[],
+  dueExpressions: readonly { readonly expression: string }[],
+  weaknessRows: readonly {
+    readonly type: string;
+    readonly status: string;
+    readonly resolved: boolean;
+  }[],
+  options: ListeningGeneratedContentOptions,
+): Promise<ListeningGeneratedOutcome | null> {
+  if (lastReplacableGeneralIndex(exercises) < 0) return null;
+
+  const objectiveItem = exercises.find(
+    (entry) => entry.source === 'listening_weakness' && entry.keyItems.length > 0,
+  );
+  const targetExpressions = dueExpressions.map((entry) => entry.expression);
+
+  return generateListeningExercise(options.provider, {
+    learnerId,
+    level: options.level,
+    // The rows this planner ALREADY read — no extra repository read.
+    evidence: listeningEvidenceFromWeaknesses(weaknessRows),
+    domain: 'listening',
+    knownVocabulary: savedVocabulary.map((entry) => entry.headword),
+    targetExpressions,
+    ...(objectiveItem ? { listeningObjective: objectiveItem.keyItems[0] } : {}),
+    learningGoals: options.learningGoals,
+    // No listening curriculum skill is reachable from stored evidence (see the
+    // shared projection), and a profession is never available here — both are
+    // deliberately absent rather than invented.
+    targetSkill: { domain: 'listening' },
+    taskType: preferredGeneratedTaskType(exercises),
+  });
+}
+
+/**
  * Plan ONE bounded listening session (deterministic; no N+1 queries —
  * all reads happen in one bounded parallel batch).
  */
 export async function planListeningSession(
   deps: WeaknessRepoForListening & LexicalRepos,
   learnerId: string,
-  options?: { difficulty?: ListeningDifficulty; now?: string; targetCount?: number },
+  options?: {
+    difficulty?: ListeningDifficulty;
+    now?: string;
+    targetCount?: number;
+    /** WP-1: opt-in generated content (see ListeningGeneratedContentOptions). */
+    generatedContent?: ListeningGeneratedContentOptions;
+  },
 ): Promise<PlannedSession> {
   const now = options?.now ?? new Date().toISOString();
   const targetCount = Math.min(
@@ -416,10 +537,56 @@ export async function planListeningSession(
     exercises.push(buildFromTemplate(template, learnerId));
   }
 
-  const hasPersonalContent = exercises.some((e) => e.source !== 'general');
-  const sourceNote = hasPersonalContent
+  // 5. WP-1: ONE bounded generated exercise, replacing the general-fallback
+  //    slot only. On ANY failure the deterministic material above stays as-is,
+  //    so generation can never block, empty or break the session.
+  if (options?.generatedContent) {
+    let generated: ListeningGeneratedOutcome | null = null;
+    try {
+      generated = await tryGeneratedExercise(
+        learnerId,
+        exercises,
+        savedVocab,
+        dueExpr,
+        weaknessRows,
+        options.generatedContent,
+      );
+    } catch {
+      // A generated slot is strictly optional: never let it fail the session.
+      generated = null;
+    }
+    if (generated?.exercise) {
+      const replaceIndex = lastReplacableGeneralIndex(exercises);
+      if (replaceIndex >= 0) exercises[replaceIndex] = generated.exercise;
+    }
+  }
+
+  return { exercises: exercises.slice(0, MAX_SESSION_EXERCISES), sourceNote: buildSourceNote(exercises) };
+}
+
+/**
+ * Honest session note. It accounts for BOTH where the material came from and
+ * how personalized it really is, and it never claims personalization for
+ * material that had none.
+ */
+function buildSourceNote(exercises: readonly ListeningExercise[]): string {
+  const hasPersonalContent = exercises.some(
+    (entry) =>
+      entry.source !== 'general' ||
+      (entry.contentProvenance !== undefined && entry.contentProvenance !== 'general'),
+  );
+  const note = hasPersonalContent
     ? 'Includes practice from your own words, expressions and listening history.'
     : 'General practice — not personalized. Save words in Talk or Vocabulary to get personalized listening practice.';
 
-  return { exercises: exercises.slice(0, MAX_SESSION_EXERCISES), sourceNote };
+  const generated = exercises.filter((entry) => entry.materialOrigin === 'ai');
+  if (generated.length === 0) return note;
+
+  const generatedPersonalized = generated.some(
+    (entry) => entry.contentProvenance !== undefined && entry.contentProvenance !== 'general',
+  );
+  const generatedNote = `${generated.length === 1 ? 'One exercise was' : `${generated.length} exercises were`} freshly generated for this session from ${
+    generatedPersonalized ? 'your own saved words and expressions' : 'general practice context'
+  }.`;
+  return `${note} ${generatedNote}`;
 }

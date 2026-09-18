@@ -47,8 +47,13 @@ import type {
   ConversationSessionConfig,
   ConversationSessionResult,
 } from '../conversation-session';
-import type { CoachingRecentConversation } from '../learner-model';
+import type { CoachingContext, CoachingRecentConversation } from '../learner-model';
 import type { LearnerModel } from '../learner-model';
+import { getSkill } from '../curriculum/catalog';
+import {
+  resolveDifficultyProfile,
+  toProgressionEvidence,
+} from '../learning-progression';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { IsoDate } from '../domain/shared/types';
 import type { ProgressRecord } from '../domain/models/learning';
@@ -80,7 +85,7 @@ import {
 import { generateId } from '../shared/id';
 import { nowIso } from '../shared/time';
 
-import { planSpeakingPractice } from './planner';
+import { boundedKnownVocabulary, planSpeakingPractice } from './planner';
 import {
   TURN_GOAL_INSTRUCTIONS,
   buildSpeakingCoachingPrompt,
@@ -89,8 +94,10 @@ import {
   shouldReformulate,
 } from './prompts';
 import type {
+  SpeakingCurriculumTarget,
   SpeakingPracticePlan,
   SpeakingPracticePlanResult,
+  SpeakingProgressionGuidance,
   SpeakingPracticeProgress,
   SpeakingPracticeSession,
   SpeakingPracticeSummary,
@@ -105,6 +112,67 @@ import type {
 
 const MAX_REFORMULATIONS = 2;
 const MAX_SECTION_ITEMS = 4;
+
+/* ------------------------------------------------------------------ *
+ * WP-1 progression guidance assembly (pure, over ALREADY-LOADED state)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Keep only a curriculum target the EXISTING catalog really has.
+ *
+ * A skillId that does not exist is dropped (the honest domain-level target is
+ * kept); a made-up skillId must never reach the coach prompt. This is pure and
+ * performs no I/O — `getSkill` reads the static catalog only.
+ */
+function normalizeCurriculumTarget(
+  target: SpeakingCurriculumTarget | undefined,
+): SpeakingCurriculumTarget | undefined {
+  if (!target || !target.domain) return undefined;
+  if (!target.skillId) return { domain: target.domain };
+  if (!getSkill(target.skillId)) return { domain: target.domain };
+  return { domain: target.domain, skillId: target.skillId };
+}
+
+/**
+ * Assemble the ALREADY-RESOLVED progression guidance from the coaching
+ * context the service already holds.
+ *
+ * PURE over the loaded snapshot: no repository read, no AI call, no clock
+ * read, no write-back and no level promotion. The stored working level is used
+ * as-is and real negative evidence may only make the guidance MORE supported.
+ */
+function assembleProgressionGuidance(
+  coaching: CoachingContext,
+  curriculumTarget: SpeakingCurriculumTarget | undefined,
+): SpeakingProgressionGuidance {
+  const workingLevel = coaching.profile.currentLevel;
+  // The coaching context already exposes only ACTIVE weakness rows, so every
+  // row it hands over is unresolved by construction — nothing is assumed away.
+  const difficultyProfile = resolveDifficultyProfile(
+    workingLevel,
+    toProgressionEvidence(
+      coaching.activeWeaknesses.map((weakness) => ({
+        type: weakness.type,
+        status: weakness.status,
+        resolved: false,
+      })),
+    ),
+    'speaking',
+  );
+  // Bounded saved-lexicon context from lists the coaching context ALREADY
+  // loaded (bounded reads owned by the learner model).
+  const knownVocabulary = boundedKnownVocabulary([
+    ...coaching.vocabularyFocus.map((entry) => entry.headword),
+    ...coaching.expressionFocus.map((entry) => entry.expression),
+  ]);
+  const targetSkill = normalizeCurriculumTarget(curriculumTarget);
+  return {
+    workingLevel,
+    difficultyProfile,
+    knownVocabulary,
+    ...(targetSkill ? { targetSkill } : {}),
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * Thin ConversationEngine decorator (augments systemPrompt only)
@@ -201,6 +269,12 @@ export interface SpeakingPracticeServiceDeps {
    * persisted learner state. Such a plan is never labeled personalized.
    */
   readonly evidenceIsReal?: boolean;
+  /**
+   * WP-1: a GENUINELY mapped existing curriculum skill, supplied by composition
+   * (never inferred here). Only a skill the existing catalog really has is used;
+   * anything else is dropped rather than guessed.
+   */
+  readonly curriculumTarget?: SpeakingCurriculumTarget;
   readonly now?: () => IsoDate;
 }
 
@@ -252,13 +326,21 @@ export class SpeakingPracticeService {
       recentConversations = [];
     }
 
+    const evidenceIsReal = this.deps.evidenceIsReal !== false;
+
     return planSpeakingPractice(
       {
         coaching,
         hasProfile: true,
         recentConversations,
         now: this.now(),
-        ...(this.deps.evidenceIsReal === false ? { evidenceIsReal: false } : {}),
+        ...(evidenceIsReal ? { evidenceIsReal: true } : { evidenceIsReal: false }),
+        // WP-1: working-level guidance is assembled ONLY from REAL stored
+        // learner state. A demo/unknown snapshot is never presented to the
+        // coach as the learner's level.
+        ...(evidenceIsReal
+          ? { progression: assembleProgressionGuidance(coaching, this.deps.curriculumTarget) }
+          : {}),
       },
       options,
     );

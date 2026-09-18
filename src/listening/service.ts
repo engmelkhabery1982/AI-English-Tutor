@@ -38,6 +38,7 @@ import type {
 } from './types';
 import { evaluateListeningAnswer } from './evaluator';
 import { planListeningSession, stableReferenceId } from './generator';
+import type { ListeningGeneratedContentOptions } from './generator';
 
 /** Max missed key items persisted per exercise (bounded evidence). */
 const MAX_MISSED_PER_EXERCISE = 2;
@@ -116,7 +117,17 @@ export class ListeningService {
    */
   async startSession(
     learnerId: string,
-    options?: { difficulty?: 'easy' | 'medium' | 'hard'; now?: IsoDate; targetCount?: number },
+    options?: {
+      difficulty?: 'easy' | 'medium' | 'hard';
+      now?: IsoDate;
+      targetCount?: number;
+      /**
+       * WP-1: explicitly allow ONE bounded generated exercise to fill the
+       * session's general slot. Off by default, so a caller that must never
+       * trigger generation (Adaptive Lessons) keeps its existing behaviour.
+       */
+      allowGeneratedContent?: boolean;
+    },
   ): Promise<{ exercises: readonly ListeningExercise[]; sourceNote: string }> {
     if (!learnerId) {
       return {
@@ -125,6 +136,7 @@ export class ListeningService {
       };
     }
     try {
+      const generatedContent = await this.resolveGeneratedContent(options);
       return await planListeningSession(
         {
           weaknesses: { listWeaknesses: this.deps.weaknesses.listWeaknesses },
@@ -132,7 +144,10 @@ export class ListeningService {
           expressions: this.deps.expressions,
         },
         learnerId,
-        options,
+        {
+          ...options,
+          ...(generatedContent ? { generatedContent } : {}),
+        },
       );
     } catch {
       // Planning must never crash the screen — an honest empty session.
@@ -140,6 +155,35 @@ export class ListeningService {
         exercises: [],
         sourceNote: 'Listening practice is unavailable right now. Please try again.',
       };
+    }
+  }
+
+  /**
+   * The opt-in generated-content context, assembled from the EXISTING profile
+   * read (level + real stored goals). Returns undefined unless the caller
+   * explicitly allowed generation AND a real provider is configured, so the
+   * default path never calls AI.
+   */
+  private async resolveGeneratedContent(options?: {
+    allowGeneratedContent?: boolean;
+  }): Promise<ListeningGeneratedContentOptions | undefined> {
+    if (!options?.allowGeneratedContent) return undefined;
+    const provider = this.deps.aiProvider;
+    if (!provider) return undefined;
+    if (!this.deps.profile) return undefined;
+    try {
+      const profile = await this.deps.profile.get();
+      if (!profile) return undefined;
+      return {
+        provider,
+        // The stored working level is used AS-IS: WP-1 never infers or
+        // promotes a level, and 'unknown' resolves conservatively.
+        level: profile.currentLevel,
+        learningGoals: profile.learningGoals ?? [],
+      };
+    } catch {
+      // No honest learner level available → no generated content.
+      return undefined;
     }
   }
 
