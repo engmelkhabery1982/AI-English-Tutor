@@ -756,15 +756,17 @@ describe('listening WP-1 boundaries', () => {
     const names = tables.map((row) => String(row.name).toLowerCase());
     expect(names.filter((name) => /content|generat|difficulty|progression/.test(name))).toEqual([]);
 
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const aiMaterial = await import('./ai-material');
     expect(typeof aiMaterial.generateListeningExercise).toBe('function');
     expect(Object.keys(aiMaterial)).not.toContain('createGeminiAIProvider');
   });
 
   it('38. the module reuses the shared contract, the shared normalizer and writes nothing', async () => {
+    // @ts-ignore -- node built-ins are available in the vitest runtime; the app tsconfig targets Expo.
     const { readFileSync } = await import('node:fs');
+    // @ts-ignore -- see above.
     const { join, dirname } = await import('node:path');
+    // @ts-ignore -- see above.
     const { fileURLToPath } = await import('node:url');
     const raw = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'ai-material.ts'), 'utf8');
     // Inspect real code, not prose.
