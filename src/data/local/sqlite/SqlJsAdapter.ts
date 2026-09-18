@@ -82,11 +82,9 @@ export class SqlJsAdapter implements DatabaseAdapter {
 
   async execute(sql: string, params?: readonly SqlParam[]): Promise<SqlExecuteResult> {
     this.ensureOpen();
-    const before = this.db!.getRowsModified();
     this.db!.run(sql, toUnknownArray(params));
-    const after = this.db!.getRowsModified();
     return {
-      rowsAffected: Math.max(0, after - before),
+      rowsAffected: this.db!.getRowsModified(),
       insertId: this.db!.lastInsertRowid,
     };
   }
@@ -114,11 +112,9 @@ export class SqlJsAdapter implements DatabaseAdapter {
     this.db!.exec('BEGIN');
     try {
       for (const step of steps) {
-        const before = this.db!.getRowsModified();
         this.db!.run(step.sql, toUnknownArray(step.params));
-        const after = this.db!.getRowsModified();
         results.push({
-          rowsAffected: Math.max(0, after - before),
+          rowsAffected: this.db!.getRowsModified(),
           insertId: this.db!.lastInsertRowid,
         });
       }

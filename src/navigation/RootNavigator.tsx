@@ -27,6 +27,7 @@ import ListeningScreen from '../screens/ListeningScreen';
 import SettingsScreen from '../screens/SettingsScreen';
 import AdaptiveLessonScreen from '../screens/AdaptiveLessonScreen';
 import OnboardingScreen from '../screens/OnboardingScreen';
+import ReassessmentScreen from '../screens/ReassessmentScreen';
 import FluencyPracticeScreen from '../screens/FluencyPracticeScreen';
 
 // Re-exported for callers that import the param list types from the
@@ -137,6 +138,11 @@ const ROOT_SCREENS: readonly RootScreenDef[] = [
     name: 'Onboarding',
     component: OnboardingScreen,
     options: { title: 'Assess my English', headerBackTitle: 'Back' },
+  },
+  {
+    name: 'Reassessment',
+    component: ReassessmentScreen,
+    options: { title: 'Periodic Reassessment', headerBackTitle: 'Back' },
   },
 ];
 

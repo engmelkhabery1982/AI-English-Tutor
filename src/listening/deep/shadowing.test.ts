@@ -11,6 +11,14 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+// @ts-ignore -- node built-ins are available in the vitest runtime; the app tsconfig targets Expo.
+import { readFileSync } from 'node:fs';
+// @ts-ignore -- see above.
+import { dirname, join } from 'node:path';
+// @ts-ignore -- see above.
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 import { SqlJsAdapter } from '../../data/local/sqlite/SqlJsAdapter';
 import type { DatabaseAdapter } from '../../data/local/sqlite/DatabaseAdapter';
@@ -26,6 +34,10 @@ import type { TextToSpeechProvider } from '../../providers/tts/types';
 import type { PronunciationTurnOutcome } from '../../pronunciation/types';
 import type { AudioRecorderService, AudioRecordingResult } from '../../voice/types';
 import { ListeningService } from '../service';
+import {
+  createSuccessObservationRecorder,
+  type SuccessObservationRecorder,
+} from '../../reassessment';
 import {
   SHADOWING_PRONUNCIATION_UNAVAILABLE_NOTE,
   SHADOWING_VOICE_UNAVAILABLE_MESSAGE,
@@ -80,7 +92,14 @@ async function createContext(): Promise<TestContext> {
 
 function createService(
   ctx: TestContext,
-  options?: { pronunciation?: ShadowingPronunciationPort; onWeakness?: () => void },
+  options?: {
+    pronunciation?: ShadowingPronunciationPort;
+    onWeakness?: () => void;
+    /** WP-4: the EXISTING success-observation recorder (strength evidence). */
+    successRecorder?: SuccessObservationRecorder;
+    /** Compose WITHOUT a profile repository (identity unavailable). */
+    withoutProfile?: boolean;
+  },
 ): ListeningService {
   return new ListeningService({
     weaknesses: {
@@ -99,8 +118,9 @@ function createService(
     },
     vocabulary: ctx.vocabulary,
     expressions: ctx.expressions,
-    profile: ctx.profileRepo,
+    ...(options?.withoutProfile ? {} : { profile: ctx.profileRepo }),
     ...(options?.pronunciation ? { pronunciation: options.pronunciation } : {}),
+    ...(options?.successRecorder ? { successRecorder: options.successRecorder } : {}),
   });
 }
 
@@ -879,5 +899,209 @@ describe('Blocker 3 — Stale voice work & controller lifecycle', () => {
     expect(session.attemptCount).toBe(0);
     expect(session.support).toBe('full_transcript');
     expect(session.transcript).toBeNull();
+  });
+});
+
+/* ================================================================== *
+ * WP-4 evidence integrity — Blocker 2
+ *
+ * The REAL production path is exercised end to end:
+ *   ListeningService.submitShadowingAttempt()
+ *     -> ShadowingSession.submit()
+ *       -> runShadowingAttempt()
+ * No helper is tested in isolation, and the strengths are read back from the
+ * EXISTING learner-strength store.
+ * ================================================================== */
+
+const WP4_CHUNK = 'Could you send it today?';
+
+function wp4Session(): ShadowingSession {
+  return new ShadowingSession({
+    id: 'wp4-shadow-1',
+    chunk: WP4_CHUNK,
+    canonicalWrittenForm: 'Could you send it today?',
+    baseSupport: 'full_transcript',
+  });
+}
+
+describe('WP-4 shadowing success wiring (Blocker 2, production path)', () => {
+  it('a matched judged attempt persists strength for the REAL learner id', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, {
+      successRecorder: createSuccessObservationRecorder(ctx.weaknesses),
+    });
+    const session = wp4Session();
+
+    const attempt = await service.submitShadowingAttempt(session, WP4_CHUNK, { now: NOW });
+
+    expect(attempt.judged).toBe(true);
+    expect(attempt.qualitative).toBe('matched');
+    expect(session.attemptCount).toBe(1);
+
+    const strengths = await ctx.weaknesses.listStrengths(ctx.learnerId);
+    expect(strengths).toHaveLength(1);
+    expect(strengths[0].learnerId).toBe(ctx.learnerId);
+    expect(strengths[0].type).toBe('listening');
+    expect(strengths[0].referenceId).toBe('shadowing:could you send it today?');
+    expect(strengths[0].contexts).toContain('shadowing_chunk');
+    // Shadowing repetition never fabricates a listening weakness.
+    expect(await ctx.weaknesses.listWeaknesses(ctx.learnerId, 20)).toHaveLength(0);
+  });
+
+  it('close / different / insufficient attempts never persist strength', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, {
+      successRecorder: createSuccessObservationRecorder(ctx.weaknesses),
+    });
+
+    // 'close': nearly the whole chunk (>= 0.7 word overlap, not exact).
+    const close = await service.submitShadowingAttempt(
+      wp4Session(),
+      'Could you send it now today',
+      { now: NOW },
+    );
+    expect(close.qualitative).toBe('close');
+    expect(close.judged).toBe(true);
+
+    const different = await service.submitShadowingAttempt(
+      wp4Session(),
+      'Something completely unrelated was said here',
+      { now: NOW },
+    );
+    expect(different.qualitative).toBe('different');
+
+    const emptySession = wp4Session();
+    const insufficient = await service.submitShadowingAttempt(emptySession, null, { now: NOW });
+    expect(insufficient.qualitative).toBe('insufficient_evidence');
+    expect(insufficient.judged).toBe(false);
+    // An empty repeat is not even an attempt.
+    expect(emptySession.attemptCount).toBe(0);
+
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+  });
+
+  it('a partial-but-not-matched repeat writes no strength while support stays conservative', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, {
+      successRecorder: createSuccessObservationRecorder(ctx.weaknesses),
+    });
+    const session = wp4Session();
+
+    const attempt = await service.submitShadowingAttempt(
+      session,
+      'Could you send it later maybe?',
+      { now: NOW },
+    );
+    expect(attempt.judged).toBe(true);
+    expect(['close', 'different']).toContain(attempt.qualitative);
+    expect(attempt.qualitative).not.toBe('matched');
+
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+    // Practice state is unaffected: the repeat still counted.
+    expect(session.attemptCount).toBe(1);
+  });
+
+  it('a stale/disposed attempt writes NO strength even when it matched', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, {
+      successRecorder: createSuccessObservationRecorder(ctx.weaknesses),
+    });
+    const session = wp4Session();
+
+    const attempt = await service.submitShadowingAttempt(session, WP4_CHUNK, {
+      now: NOW,
+      checkStale: () => true,
+    });
+
+    expect(attempt.qualitative).toBe('matched');
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+    // The stale attempt never mutated the practice state either.
+    expect(session.attemptCount).toBe(0);
+  });
+
+  it('repeated matched attempts deduplicate into ONE bounded strength row', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, {
+      successRecorder: createSuccessObservationRecorder(ctx.weaknesses),
+    });
+
+    for (let i = 0; i < 12; i += 1) {
+      const attempt = await service.submitShadowingAttempt(wp4Session(), WP4_CHUNK, {
+        now: NOW,
+      });
+      expect(attempt.qualitative).toBe('matched');
+    }
+
+    const strengths = await ctx.weaknesses.listStrengths(ctx.learnerId);
+    expect(strengths).toHaveLength(1);
+    expect(strengths[0].referenceId).toBe('shadowing:could you send it today?');
+    expect(strengths[0].contexts.length).toBeLessThanOrEqual(5);
+    expect(strengths[0].evidence.length).toBeLessThanOrEqual(10);
+    expect(strengths[0].firstSeenAt).toBe(strengths[0].lastSeenAt);
+  });
+
+  it('without a resolvable learner identity nothing is persisted (never fabricated)', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, {
+      successRecorder: createSuccessObservationRecorder(ctx.weaknesses),
+      withoutProfile: true,
+    });
+
+    const attempt = await service.submitShadowingAttempt(wp4Session(), WP4_CHUNK, {
+      now: NOW,
+    });
+    expect(attempt.qualitative).toBe('matched');
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+  });
+
+  it('without the owner recorder nothing is persisted (session stays repository-free)', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, {});
+
+    const attempt = await service.submitShadowingAttempt(wp4Session(), WP4_CHUNK, {
+      now: NOW,
+    });
+    expect(attempt.qualitative).toBe('matched');
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+  });
+
+  it('the true screen path (controller -> service.submitShadowingAttempt) persists the match', async () => {
+    const ctx = await createContext();
+    const service = createService(ctx, {
+      successRecorder: createSuccessObservationRecorder(ctx.weaknesses),
+    });
+    const session = wp4Session();
+    const recorder = fakeRecorder();
+    const stt = fakeStt(async () => ({ ok: true, transcript: WP4_CHUNK }));
+    const controller = new ShadowingVoiceController(session, {
+      recorder,
+      stt,
+      now: NOW,
+      submit: (transcript: string, checkStale?: () => boolean) =>
+        service.submitShadowingAttempt(session, transcript, { now: NOW, ...(checkStale ? { checkStale } : {}) }),
+    });
+
+    expect(await controller.startRecording()).toEqual({ ok: true });
+    const judged = await controller.stopAndJudge();
+    expect('judged' in judged && judged.judged).toBe(true);
+
+    const strengths = await ctx.weaknesses.listStrengths(ctx.learnerId);
+    expect(strengths).toHaveLength(1);
+    expect(strengths[0].learnerId).toBe(ctx.learnerId);
+    await controller.dispose();
+  });
+
+  it('the shadowing session itself stays repository-free (no store, no lookup)', () => {
+    const source = readFileSync(join(__dirname, 'shadowing.ts'), 'utf8');
+    // No repository/store import may enter the shadowing module: identity and
+    // evidence plumbing arrive injected from the owning service.
+    expect(source).not.toMatch(/from '\.\.\/\.\.\/repositories'/);
+    expect(source).not.toMatch(/from '\.\.\/\.\.\/data\//);
+    expect(source).not.toMatch(/SQLite\w*Repository/);
+    expect(source).not.toMatch(/listStrengths|upsertStrength/);
+    // The session never composes a recorder for itself either.
+    expect(source).not.toMatch(/createSuccessObservationRecorder/);
+    // The only evidence write goes through the injected recorder.
+    expect(source).toContain('input.successRecorder');
   });
 });

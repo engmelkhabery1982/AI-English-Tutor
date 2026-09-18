@@ -15,7 +15,7 @@
  */
 
 /** Current schema version. Bump this when adding a migration. */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 /** A single SQL step inside a migration. */
 export interface SchemaStep {
@@ -359,6 +359,30 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       )` },
       { sql: `CREATE INDEX IF NOT EXISTS idx_daily_tutor_sessions_learner_date ON daily_tutor_sessions(learner_id, date_key)` },
       { sql: `CREATE INDEX IF NOT EXISTS idx_daily_tutor_activities_session ON daily_tutor_activities(session_id, order_index)` },
+    ],
+  },
+  {
+    version: 5,
+    description: 'Additive WP-4 storage: reassessment_history',
+    steps: [
+      { sql: `CREATE TABLE IF NOT EXISTS reassessment_history (
+        id TEXT PRIMARY KEY,
+        learner_id TEXT NOT NULL,
+        assessment_kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        proposed_level TEXT NOT NULL,
+        previous_level TEXT NOT NULL,
+        confidence TEXT NOT NULL,
+        decision TEXT NOT NULL DEFAULT 'pending',
+        accepted_level TEXT,
+        basis TEXT NOT NULL DEFAULT '[]',
+        qualitative_summary TEXT NOT NULL DEFAULT '{}',
+        generated_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (learner_id) REFERENCES learner_profile(id) ON DELETE CASCADE
+      )` },
+      { sql: `CREATE INDEX IF NOT EXISTS idx_reassessment_history_learner ON reassessment_history(learner_id, created_at)` },
     ],
   },
 ];

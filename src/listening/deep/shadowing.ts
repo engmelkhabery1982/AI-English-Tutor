@@ -23,6 +23,7 @@ import type { TextToSpeechProvider } from '../../providers/tts/types';
 import type { PronunciationTurnOutcome } from '../../pronunciation/types';
 import type { AudioRecorderService, AudioRecordingResult } from '../../voice/types';
 import { internalWordOverlap, normalizeAnswerText } from '../evaluator';
+import { recordShadowingSuccess, type SuccessObservationRecorder } from '../../reassessment';
 import type { ShadowingQualitativeResult, ShadowingSupportLevel } from './types';
 
 /** How many times a chunk may be repeated (bounded practice). */
@@ -193,12 +194,67 @@ export function evaluateShadowingLocally(
 
 
 
-export interface ShadowingAttemptInput {
+/**
+ * Narrow, owner-provided identity + recorder inputs.
+ *
+ * The shadowing session stays REPOSITORY-FREE: it never looks a learner up,
+ * never opens a store and never owns a clock. The owning service (the
+ * ListeningService) resolves the REAL learner id through the EXISTING profile
+ * repository and hands these two narrow inputs down; without them nothing is
+ * persisted, and identity is never fabricated.
+ */
+export interface ShadowingEvidenceInput {
+  /** The REAL learner id resolved by the owning service (never a fallback). */
+  readonly learnerId?: string | null;
+  /** The owner's strength recorder — the only writer of shadowing success. */
+  readonly successRecorder?: SuccessObservationRecorder;
+}
+
+export interface ShadowingAttemptInput extends ShadowingEvidenceInput {
   readonly chunk: string;
   readonly transcript: string | null;
   /** The EXISTING pronunciation engine, when the app really has one. */
   readonly port?: ShadowingPronunciationPort;
   readonly now?: string;
+  /**
+   * Owner-side staleness probe (dispose / navigation / new task). Evaluated
+   * AFTER the asynchronous judgement, so a stale or disposed attempt writes
+   * NO strength evidence.
+   */
+  readonly checkStale?: () => boolean;
+}
+
+/**
+ * Persist matched-chunk strength through the OWNER's recorder.
+ *
+ * Evidence discipline:
+ * - the ONLY evidence accepted is a real, judged transcript that MATCHED the
+ *   chunk (close / different / insufficient_evidence write nothing);
+ * - a stale/disposed attempt writes NOTHING, even when it matched;
+ * - without a real learner id, or without the owner's recorder, nothing is
+ *   written — the learner identity is never fabricated, and the session never
+ *   reaches a repository itself;
+ * - repeats deduplicate into ONE strength row and stay bounded (the recorder
+ *   owns the context/evidence bounds).
+ */
+async function persistMatchedShadowingSuccess(
+  input: ShadowingAttemptInput,
+  attempt: ShadowingAttempt,
+): Promise<void> {
+  if (input.checkStale?.() === true) return;
+  if (!attempt.judged || attempt.qualitative !== 'matched') return;
+  if (!input.successRecorder || !input.learnerId) return;
+  try {
+    await recordShadowingSuccess(input.successRecorder, {
+      learnerId: input.learnerId,
+      referenceId: `shadowing:${input.chunk.toLowerCase().trim().slice(0, 30)}`,
+      context: 'shadowing_chunk',
+      summary: `Matched shadowing chunk: "${input.chunk}"`,
+    });
+  } catch {
+    // Evidence persistence is corrective, never destructive: a recorder
+    // failure must not break the learner's practice or hide the judgement.
+  }
 }
 
 /**
@@ -207,6 +263,10 @@ export interface ShadowingAttemptInput {
  * A real pronunciation analysis wins when it is available; otherwise the local
  * comparison is used. Neither path can produce a score, and a missing/failed
  * pronunciation layer never becomes a fabricated judgement.
+ *
+ * The judgement is returned to the caller either way; matched success evidence
+ * is persisted AFTER it, and only through the owner-provided recorder + real
+ * learner id, and only when the attempt is not stale.
  */
 export async function runShadowingAttempt(
   input: ShadowingAttemptInput,
@@ -214,8 +274,13 @@ export async function runShadowingAttempt(
   const local = evaluateShadowingLocally(input.chunk, input.transcript);
   const transcript = local.transcript;
   const port = input.port;
-  if (!port || transcript === null) return local;
 
+  if (!port || transcript === null) {
+    await persistMatchedShadowingSuccess(input, local);
+    return local;
+  }
+
+  let attempt: ShadowingAttempt;
   try {
     const outcome = await port.analyzeSpokenTurn({
       transcript,
@@ -223,26 +288,32 @@ export async function runShadowingAttempt(
       context: 'shadowing',
       ...(input.now !== undefined ? { now: input.now } : {}),
     });
-    if (!outcome) return local;
-    // Content match category comes ONLY from local text matching. Pronunciation
-    // analysis adds qualitative feedback lines only and NEVER overrides content match.
-    const qualitative = local.qualitative;
-    const lines = outcome.feedbackLines.filter((line) => line.trim().length > 0);
-    return {
-      transcript,
-      qualitative,
-      feedbackLines: lines.length > 0 ? lines : local.feedbackLines,
-      evaluatedBy: outcome.unavailable ? 'local' : 'pronunciation',
-      judged: local.judged,
-    };
+    if (!outcome) {
+      attempt = local;
+    } else {
+      // Content match category comes ONLY from local text matching. Pronunciation
+      // analysis adds qualitative feedback lines only and NEVER overrides content match.
+      const qualitative = local.qualitative;
+      const lines = outcome.feedbackLines.filter((line) => line.trim().length > 0);
+      attempt = {
+        transcript,
+        qualitative,
+        feedbackLines: lines.length > 0 ? lines : local.feedbackLines,
+        evaluatedBy: outcome.unavailable ? 'local' : 'pronunciation',
+        judged: local.judged,
+      };
+    }
   } catch {
     // The pronunciation layer failed: keep the honest local judgement and the
     // fact that detailed pronunciation feedback was unavailable.
-    return {
+    attempt = {
       ...local,
       feedbackLines: [...local.feedbackLines, SHADOWING_PRONUNCIATION_UNAVAILABLE_NOTE],
     };
   }
+
+  await persistMatchedShadowingSuccess(input, local);
+  return attempt;
 }
 
 /* ------------------------------------------------------------------ *
@@ -319,18 +390,28 @@ export class ShadowingSession {
   /**
    * Register one repeat. An empty transcript is NOT an attempt: nothing was
    * captured, so nothing is judged and no support is removed.
+   *
+   * `evidence` carries the OWNER's narrow identity + recorder inputs (real
+   * learner id, strength recorder) and the owner's staleness probe. The
+   * session itself stays repository-free: it only forwards them to the
+   * judgement, which never fabricates identity and never writes a stale
+   * result.
    */
   async submit(
     transcript: string | null,
     port?: ShadowingPronunciationPort,
     now?: string,
     checkStale?: () => boolean,
+    evidence?: ShadowingEvidenceInput,
   ): Promise<ShadowingAttempt> {
     const outcome = await runShadowingAttempt({
       chunk: this.chunk,
       transcript,
       ...(port !== undefined ? { port } : {}),
       ...(now !== undefined ? { now } : {}),
+      ...(checkStale !== undefined ? { checkStale } : {}),
+      ...(evidence?.learnerId ? { learnerId: evidence.learnerId } : {}),
+      ...(evidence?.successRecorder ? { successRecorder: evidence.successRecorder } : {}),
     });
     if (checkStale?.()) {
       return outcome;

@@ -42,11 +42,15 @@ import {
   type OnboardingService,
 } from '../onboarding';
 import { createTalkVoiceCoordinator, type TalkProviderKind } from '../talk-demo';
+import type { ReassessmentService, ReassessmentRecord, QualitativeChangeReport } from '../reassessment';
 import type { VoiceSessionCoordinator, VoiceStatus } from '../voice';
 
 export interface OnboardingScreenProps {
   /** Injectable service (tests/composition); defaults to the real factory. */
   readonly service?: OnboardingService;
+  readonly reassessmentService?: ReassessmentService;
+  readonly isReassessment?: boolean;
+  readonly onFinish?: () => void;
   /** Injectable coordinator factory (tests); defaults to the existing factory. */
   readonly createCoordinator?: (input: {
     readonly session: DiagnosticHandle['conversation'];
@@ -131,6 +135,8 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
   // Result.
   const [result, setResult] = useState<DiagnosticResult | null>(null);
   const [decisionLine, setDecisionLine] = useState<string | null>(null);
+  const [reassessmentRecord, setReassessmentRecord] = useState<ReassessmentRecord | null>(null);
+  const [reassessmentReport, setReassessmentReport] = useState<QualitativeChangeReport | null>(null);
 
   const getService = useCallback(async (): Promise<OnboardingService> => {
     if (serviceRef.current) return serviceRef.current;
@@ -230,7 +236,9 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     // (the saved preferences are never rolled back), and it never claims the
     // profile was untouched.
     try {
-      const handle = await service.beginDiagnostic();
+      const handle = props?.isReassessment && props?.reassessmentService
+        ? await props.reassessmentService.beginReassessment()
+        : await service.beginDiagnostic();
       handleRef.current = handle;
       const token = handle.session.getCurrentStepToken();
       handle.session.markProfileStepDone(token);
@@ -462,14 +470,27 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         handle.session.markSummaryDone(handle.session.getCurrentStepToken());
         setBusy(true);
         try {
-          const finished = await service.finishDiagnostic(handle);
-          if (!finished) {
-            setTurnError('The assessment is not complete yet, so no result was produced.');
-            return;
+          if (props?.isReassessment && props?.reassessmentService) {
+            const outcome = await props.reassessmentService.finishReassessment(handle);
+            if (!outcome.result) {
+              setTurnError('The assessment is not complete yet, so no result was produced.');
+              return;
+            }
+            if (!mountedRef.current) return;
+            setResult(outcome.result);
+            setReassessmentRecord(outcome.record);
+            setReassessmentReport(outcome.report);
+            setPhase('result');
+          } else {
+            const finished = await service.finishDiagnostic(handle);
+            if (!finished) {
+              setTurnError('The assessment is not complete yet, so no result was produced.');
+              return;
+            }
+            if (!mountedRef.current) return;
+            setResult(finished);
+            setPhase('result');
           }
-          if (!mountedRef.current) return;
-          setResult(finished);
-          setPhase('result');
         } finally {
           setBusy(false);
         }
@@ -566,6 +587,17 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
 
   const acceptLevel = useCallback(async () => {
     if (!result) return;
+    if (props?.isReassessment && props?.reassessmentService && reassessmentRecord) {
+      const decision = await props.reassessmentService.acceptReassessmentLevel(reassessmentRecord.id);
+      setDecisionLine(
+        decision.updated
+          ? `Saved. Your working level is now ${decision.currentLevel}.`
+          : decision.reason === 'already-accepted'
+            ? `Your level is already ${decision.currentLevel}.`
+            : `Working level kept at ${decision.currentLevel}.`,
+      );
+      return;
+    }
     const service = serviceRef.current;
     if (!service) return;
     const decision = await service.acceptEstimatedLevel(result.estimate);
@@ -576,14 +608,19 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           ? `Your level is already ${decision.currentLevel}.`
           : 'That level could not be saved. Nothing was changed.',
     );
-  }, [result]);
+  }, [result, props, reassessmentRecord]);
 
   const keepLevel = useCallback(async () => {
+    if (props?.isReassessment && props?.reassessmentService && reassessmentRecord) {
+      const decision = await props.reassessmentService.keepCurrentLevel(reassessmentRecord.id);
+      setDecisionLine(`Kept your current level (${decision.currentLevel}). Nothing was changed.`);
+      return;
+    }
     const service = serviceRef.current;
     if (!service) return;
     const decision = await service.keepCurrentLevel();
     setDecisionLine(`Kept your current level (${decision.currentLevel}). Nothing was changed.`);
-  }, []);
+  }, [props, reassessmentRecord]);
 
   const stepTitle = useMemo(() => STEP_TITLES[stepId], [stepId]);
 
@@ -601,6 +638,17 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           {resultValue.estimate.basis.map((line) => (
             <Text key={line} style={styles.listLine}>
               • {line}
+            </Text>
+          ))}
+        </View>
+      ) : null}
+      {reassessmentReport ? (
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Qualitative Ability Change Summary</Text>
+          <Text style={styles.listLine}>{reassessmentReport.overallSummary}</Text>
+          {reassessmentReport.domains.map((d) => (
+            <Text key={d.domain} style={styles.listLine}>
+              • {d.domain.toUpperCase()} [{d.status}]: {d.summary}
             </Text>
           ))}
         </View>

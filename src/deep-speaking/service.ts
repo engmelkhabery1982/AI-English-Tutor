@@ -295,6 +295,29 @@ export class SpeakingPracticeService {
     return this.deps.now?.() ?? nowIso();
   }
 
+  /* ---------------------------- identity ------------------------------ */
+
+  /**
+   * The REAL active learner id of the loaded learner model, or null when no
+   * profile is available.
+   *
+   * Narrow owner accessor: composition layers that need the learner identity
+   * (e.g. the fluency service recording success evidence) ask the OWNER —
+   * which owns the learner model — instead of reaching into it. There is no
+   * fallback and no placeholder: an unavailable identity returns null, and
+   * callers must then persist nothing rather than fabricate a learner.
+   */
+  getLearnerId(): string | null {
+    try {
+      const learnerId = this.deps.learnerModel.getCoachingContext().profile.learnerId;
+      return learnerId ? learnerId : null;
+    } catch {
+      // An unreadable learner model is an unavailable identity, never a
+      // guessed one.
+      return null;
+    }
+  }
+
   /* ----------------------------- planning ----------------------------- */
 
   async planPractice(

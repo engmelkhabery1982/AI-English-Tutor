@@ -35,6 +35,10 @@ import { createTranscriptComparisonPronunciationProvider } from './baseline-prov
 import { buildPronunciationFeedback } from './feedback';
 import { createPronunciationEngine } from './index';
 import type { PronunciationAnalysis, PronunciationProvider } from './types';
+import {
+  createSuccessObservationRecorder,
+  type SuccessObservationRecorder,
+} from '../reassessment';
 import { ReviewService } from '../review/service';
 import { VocabularyWorkspaceService } from '../vocabulary-workspace/service';
 import { SQLiteExpressionRepository } from '../data/local/sqlite/repositories';
@@ -84,7 +88,14 @@ async function createContext(): Promise<TestContext> {
 }
 
 /** Compose the real engine on a context with an arbitrary provider. */
-function createEngine(ctx: TestContext, provider: PronunciationProvider): PronunciationEngine {
+function createEngine(
+  ctx: TestContext,
+  provider: PronunciationProvider,
+  options?: {
+    /** WP-4: the EXISTING success-observation recorder (strength evidence). */
+    successRecorder?: SuccessObservationRecorder;
+  },
+): PronunciationEngine {
   return new PronunciationEngine({
     provider,
     pronunciation: {
@@ -95,6 +106,7 @@ function createEngine(ctx: TestContext, provider: PronunciationProvider): Pronun
     review: ctx.review,
     profile: ctx.profileRepo,
     vocabulary: ctx.vocabulary,
+    ...(options?.successRecorder ? { successRecorder: options.successRecorder } : {}),
   });
 }
 
@@ -1059,5 +1071,215 @@ describe('Retired review history preservation (integrity)', () => {
     );
     expect(weaknessAfter!.status).toBe('repeated');
     expect(weaknessAfter!.occurrenceCount).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WP-4 evidence integrity — Blocker 4: pronunciation success can NEVER be
+// inferred from the absence of negative observations. The engine only writes
+// strength when the EXISTING provider contract reports an explicit positive
+// signal (`overallIntelligibility: 'clear'`) from a supported evidence source.
+// ---------------------------------------------------------------------------
+describe('WP-4 pronunciation success evidence integrity (Blocker 4)', () => {
+  function engineWithRecorder(ctx: TestContext, provider: PronunciationProvider): PronunciationEngine {
+    return createEngine(ctx, provider, {
+      successRecorder: createSuccessObservationRecorder(ctx.weaknesses),
+    });
+  }
+
+  it('zero negative observations alone => NO strength (absence of a weakness is not evidence)', async () => {
+    const ctx = await createContext();
+    // A provider that reports no problems but asserts NO positive signal.
+    const engine = engineWithRecorder(ctx, fakeProvider({ observations: [] }));
+
+    const outcome = await engine.analyzeSpokenTurn({
+      transcript: 'I feel comfortable here',
+      expectedText: 'I feel comfortable here',
+      now: NOW,
+    });
+
+    expect(outcome).not.toBeNull();
+    expect(outcome!.analysis.observations).toHaveLength(0);
+    expect(outcome!.analysis.insufficientEvidence).toBeFalsy();
+    // No explicit positive signal exists in this result.
+    expect(outcome!.analysis.overallIntelligibility).toBeUndefined();
+
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+    // …and no weakness is fabricated either.
+    expect(await ctx.weaknesses.listWeaknesses(ctx.learnerId, 20)).toHaveLength(0);
+
+    // 'partially_clear' / 'unclear' are equally not positive success evidence.
+    for (const intelligibility of ['partially_clear', 'unclear'] as const) {
+      const other = await createContext();
+      const otherEngine = engineWithRecorder(
+        other,
+        fakeProvider({ observations: [], overallIntelligibility: intelligibility }),
+      );
+      await otherEngine.analyzeSpokenTurn({
+        transcript: 'I feel comfortable here',
+        expectedText: 'I feel comfortable here',
+        now: NOW,
+      });
+      expect(await other.weaknesses.listStrengths(other.learnerId)).toHaveLength(0);
+    }
+  });
+
+  it('insufficient evidence => NO strength', async () => {
+    const ctx = await createContext();
+    // The REAL baseline provider with no expected target: it honestly reports
+    // insufficient evidence instead of inventing a judgement.
+    const engine = engineWithRecorder(ctx, createTranscriptComparisonPronunciationProvider());
+
+    const outcome = await engine.analyzeSpokenTurn({
+      transcript: 'hello how are you',
+      now: NOW,
+    });
+    expect(outcome!.analysis.insufficientEvidence).toBe(true);
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+
+    // An explicit provider claim of insufficient evidence is refused as well.
+    const explicit = await createContext();
+    const explicitEngine = engineWithRecorder(
+      explicit,
+      fakeProvider({
+        observations: [],
+        overallIntelligibility: 'clear',
+        insufficientEvidence: true,
+      }),
+    );
+    await explicitEngine.analyzeSpokenTurn({
+      transcript: 'I feel comfortable here',
+      expectedText: 'I feel comfortable here',
+      now: NOW,
+    });
+    expect(await explicit.weaknesses.listStrengths(explicit.learnerId)).toHaveLength(0);
+  });
+
+  it('provider failure => NO strength', async () => {
+    const ctx = await createContext();
+    const engine = engineWithRecorder(
+      ctx,
+      fakeProvider(() => {
+        throw new Error('provider exploded');
+      }),
+    );
+
+    const outcome = await engine.analyzeSpokenTurn({
+      transcript: 'I feel comfortable here',
+      expectedText: 'I feel comfortable here',
+      now: NOW,
+    });
+    expect(outcome!.unavailable).toBe(true);
+    expect(outcome!.analysis.insufficientEvidence).toBe(true);
+
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+    expect(await ctx.weaknesses.listWeaknesses(ctx.learnerId, 20)).toHaveLength(0);
+  });
+
+  it('an EXPLICIT supported positive signal => strength (the only accepted path)', async () => {
+    const ctx = await createContext();
+    const engine = engineWithRecorder(
+      ctx,
+      fakeProvider({
+        observations: [],
+        overallIntelligibility: 'clear',
+        evidenceLevel: 'transcript_comparison',
+      }),
+    );
+
+    await engine.analyzeSpokenTurn({
+      transcript: 'I feel comfortable here',
+      expectedText: 'I feel comfortable here',
+      context: 'shadowing',
+      now: NOW,
+    });
+
+    const strengths = await ctx.weaknesses.listStrengths(ctx.learnerId);
+    expect(strengths).toHaveLength(1);
+    expect(strengths[0].learnerId).toBe(ctx.learnerId);
+    expect(strengths[0].type).toBe('pronunciation');
+    expect(strengths[0].referenceId).toBe('pron:i feel comfortable here');
+    await expect(
+      ctx.weaknesses.listWeaknesses(ctx.learnerId, 20),
+    ).resolves.toHaveLength(0);
+  });
+
+  it('the REAL baseline provider produces that signal only on an exact match (production path)', async () => {
+    const ctx = await createContext();
+    const engine = engineWithRecorder(ctx, createTranscriptComparisonPronunciationProvider());
+
+    const outcome = await engine.analyzeSpokenTurn({
+      transcript: 'I feel comfortable here',
+      expectedText: 'I feel comfortable here',
+      now: NOW,
+    });
+    expect(outcome!.analysis.overallIntelligibility).toBe('clear');
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(1);
+
+    // A mismatching repeat is judged as a problem and NEVER as strength.
+    const other = await createContext();
+    const otherEngine = engineWithRecorder(
+      other,
+      createTranscriptComparisonPronunciationProvider(),
+    );
+    await otherEngine.analyzeSpokenTurn({
+      transcript: 'I walk to school yesterday',
+      expectedText: 'I walked to school yesterday',
+      now: NOW,
+    });
+    expect(await other.weaknesses.listStrengths(other.learnerId)).toHaveLength(0);
+    expect(
+      (await other.weaknesses.listWeaknesses(other.learnerId, 20)).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('inference-only evidence can never ground a success claim', async () => {
+    const ctx = await createContext();
+    const engine = engineWithRecorder(
+      ctx,
+      fakeProvider({
+        evidenceLevel: 'ai_explanation_only',
+        overallIntelligibility: 'clear',
+        observations: [
+          {
+            type: 'vowel',
+            description: 'The tutor explained that vowels should be longer here.',
+            evidence: 'ai_explanation_only',
+            inferenceOnly: true,
+          },
+        ],
+      }),
+    );
+
+    await engine.analyzeSpokenTurn({
+      transcript: 'I feel comfortable here',
+      expectedText: 'I feel comfortable here',
+      now: NOW,
+    });
+
+    // No strength from an explanation-only result.
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+    // Inference-only observations are still never persisted as weaknesses.
+    expect(await ctx.weaknesses.listWeaknesses(ctx.learnerId, 20)).toHaveLength(0);
+  });
+
+  it('an issued observation is never replaced by a strength claim', async () => {
+    const ctx = await createContext();
+    const engine = engineWithRecorder(
+      ctx,
+      fakeProvider({
+        observations: [wordObservation('comfortable')],
+        overallIntelligibility: 'clear',
+      }),
+    );
+
+    await engine.analyzeSpokenTurn({
+      transcript: 'comf-ta-ble',
+      expectedText: 'comfortable',
+      now: NOW,
+    });
+
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toHaveLength(0);
+    expect(await ctx.pronunciation.listWeaknesses(ctx.learnerId, { limit: 20 })).toHaveLength(1);
   });
 });

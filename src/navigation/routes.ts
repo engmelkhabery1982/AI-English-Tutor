@@ -37,6 +37,7 @@ export const ROOT_STACK_ROUTES = [
   'FluencyPractice',
   'ProfessionalEnglish',
   'Onboarding',
+  'Reassessment',
 ] as const;
 
 export type RootStackRouteName = (typeof ROOT_STACK_ROUTES)[number];
@@ -95,6 +96,7 @@ export type RootStackParamList = {
   FluencyPractice: { readonly taskId?: string } | undefined;
   ProfessionalEnglish: undefined;
   Onboarding: undefined;
+  Reassessment: undefined;
 };
 
 /** The nested-navigation envelope returned by toMainTabRoute. */

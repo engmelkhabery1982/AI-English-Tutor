@@ -58,7 +58,7 @@ describe('SQLite schema migrations (sql.js)', () => {
 
   it('records schema version in schema_migrations', async () => {
     const rows = await adapter.query(`SELECT version, description FROM schema_migrations ORDER BY version`);
-    expect(rows).toHaveLength(4);
+    expect(rows).toHaveLength(CURRENT_SCHEMA_VERSION);
     expect(rows[0].version).toBe(1);
     expect(rows[0].description).toBe(SCHEMA_MIGRATIONS[0].description);
     expect(rows[1].version).toBe(2);
@@ -80,11 +80,11 @@ describe('SQLite schema migrations (sql.js)', () => {
 
     // Version should still be 4
     const version = await getSchemaVersion(adapter);
-    expect(version).toBe(4);
+    expect(version).toBe(CURRENT_SCHEMA_VERSION);
 
     // schema_migrations should still have only four rows
     const rows = await adapter.query(`SELECT COUNT(*) as count FROM schema_migrations`);
-    expect(rows[0].count).toBe(4);
+    expect(rows[0].count).toBe(CURRENT_SCHEMA_VERSION);
   });
 
   it('enforces foreign keys (PRAGMA foreign_keys = ON)', async () => {
@@ -320,8 +320,8 @@ describe('SQLite schema migrations (sql.js)', () => {
   });
 
   describe('Migration version 2: expression metadata', () => {
-    it('CURRENT_SCHEMA_VERSION is 4', async () => {
-      expect(CURRENT_SCHEMA_VERSION).toBe(4);
+    it('CURRENT_SCHEMA_VERSION is 5', async () => {
+      expect(CURRENT_SCHEMA_VERSION).toBe(5);
     });
 
     it('migration v2 exists with correct description', async () => {
@@ -399,16 +399,16 @@ describe('SQLite schema migrations (sql.js)', () => {
       await runMigrations(adapter);
 
       const versionBefore = await getSchemaVersion(adapter);
-      expect(versionBefore).toBe(4);
+      expect(versionBefore).toBe(CURRENT_SCHEMA_VERSION);
 
       // Run migrations again
       await runMigrations(adapter);
 
       const versionAfter = await getSchemaVersion(adapter);
-      expect(versionAfter).toBe(4);
+      expect(versionAfter).toBe(CURRENT_SCHEMA_VERSION);
 
       const rows = await adapter.query(`SELECT COUNT(*) as count FROM schema_migrations`);
-      expect(rows[0].count).toBe(4);
+      expect(rows[0].count).toBe(CURRENT_SCHEMA_VERSION);
     });
 
     it('fresh database applies v1 then v2 successfully', async () => {
@@ -416,10 +416,10 @@ describe('SQLite schema migrations (sql.js)', () => {
       await freshAdapter.init();
 
       const version = await getSchemaVersion(freshAdapter);
-      expect(version).toBe(4);
+      expect(version).toBe(CURRENT_SCHEMA_VERSION);
 
       const rows = await freshAdapter.query(`SELECT version FROM schema_migrations ORDER BY version`);
-      expect(rows).toHaveLength(4);
+      expect(rows).toHaveLength(CURRENT_SCHEMA_VERSION);
       expect(rows[0].version).toBe(1);
       expect(rows[1].version).toBe(2);
 
@@ -610,6 +610,27 @@ describe('SQLite schema migrations (sql.js)', () => {
           ['dta-x', 'no-such-session', 0, 'review', 'Review', 'Due', 5, '{}', 'pending', null, null, null, now, now],
         ),
       ).rejects.toThrow();
+    });
+  });
+
+  describe('Migration version 5: reassessment_history', () => {
+    it('migration v5 exists with correct description', () => {
+      const v5 = SCHEMA_MIGRATIONS.find((m) => m.version === 5);
+      expect(v5).toBeDefined();
+      expect(v5?.description).toContain('reassessment_history');
+    });
+
+    it('fresh database creates reassessment_history table', async () => {
+      const freshAdapter = new SqlJsAdapter(':memory:');
+      await freshAdapter.init();
+
+      const version = await getSchemaVersion(freshAdapter);
+      expect(version).toBe(CURRENT_SCHEMA_VERSION);
+
+      const tables = await freshAdapter.query(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='reassessment_history'",
+      );
+      expect(tables).toHaveLength(1);
     });
   });
 });

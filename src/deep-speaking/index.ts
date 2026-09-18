@@ -19,8 +19,15 @@
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
-import { SQLiteProgressRepository } from '../data/local/sqlite/repositories';
+import {
+  SQLiteProgressRepository,
+  SQLiteWeaknessRepository,
+} from '../data/local/sqlite/repositories';
 import type { LearnerModel } from '../learner-model';
+import {
+  createSuccessObservationRecorder,
+  type SuccessObservationRecorder,
+} from '../reassessment/success-recorder';
 import { resolveTalkCoaching } from '../talk-demo';
 import {
   createSpeakingPracticeService,
@@ -65,12 +72,25 @@ export function createSpeakingService(
 
 // Default composition bootstrap — adapter lifecycle lives behind composition,
 // never inside UI screens (SAME pattern as Talk / Adaptive Lessons / etc.).
-let defaultServicePromise: Promise<SpeakingPracticeService> | null = null;
+let defaultCompositionPromise: Promise<DefaultSpeakingComposition> | null = null;
 
-/** Compose the service on the default app database (reused across calls). */
-export function createDefaultSpeakingService(): Promise<SpeakingPracticeService> {
-  if (!defaultServicePromise) {
-    defaultServicePromise = (async () => {
+/**
+ * The canonical app composition behind the default speaking service: the
+ * service itself PLUS the one database adapter it runs on (the same
+ * `ai_english_tutor.db` composition used by Talk / Listening / Adaptive
+ * Lessons / Review). Exposing the adapter here lets OTHER production
+ * compositions (e.g. fluency) attach evidence writers to the SAME database
+ * instead of opening a second one.
+ */
+export interface DefaultSpeakingComposition {
+  readonly service: SpeakingPracticeService;
+  readonly adapter: DatabaseAdapter;
+}
+
+/** Compose (once, reused) on the default app database. */
+export function createDefaultSpeakingComposition(): Promise<DefaultSpeakingComposition> {
+  if (!defaultCompositionPromise) {
+    defaultCompositionPromise = (async () => {
       const resolution = await resolveTalkCoaching();
       if (!resolution.learnerModel || !resolution.databaseAdapter) {
         // No persisted learner state: Deep Speaking stays unavailable rather
@@ -79,14 +99,49 @@ export function createDefaultSpeakingService(): Promise<SpeakingPracticeService>
           'Persisted learner data could not be composed from the local database.',
         );
       }
-      return createSpeakingService(
-        resolution.learnerModel,
-        resolution.databaseAdapter,
-      );
+      return {
+        service: createSpeakingService(
+          resolution.learnerModel,
+          resolution.databaseAdapter,
+        ),
+        adapter: resolution.databaseAdapter,
+      };
     })().catch((error: unknown) => {
-      defaultServicePromise = null;
+      defaultCompositionPromise = null;
       throw error;
     });
   }
-  return defaultServicePromise;
+  return defaultCompositionPromise;
+}
+
+/** Compose the service on the default app database (reused across calls). */
+export async function createDefaultSpeakingService(): Promise<SpeakingPracticeService> {
+  return (await createDefaultSpeakingComposition()).service;
+}
+
+/**
+ * The canonical composition, or null when no persisted learner state can be
+ * composed (the honest "unavailable" answer — never demo data presented as
+ * real state).
+ */
+export async function resolveDefaultSpeakingComposition(): Promise<DefaultSpeakingComposition | null> {
+  try {
+    return await createDefaultSpeakingComposition();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The EXISTING success-observation recorder over a canonical composition's
+ * own adapter.
+ *
+ * WP-4 production wiring: fluency success evidence must land in the SAME
+ * learner-strength store the rest of the app uses — same adapter, same
+ * EXISTING weakness repository, no second database and no second stack.
+ */
+export function createSpeakingSuccessRecorder(
+  adapter: DatabaseAdapter,
+): SuccessObservationRecorder {
+  return createSuccessObservationRecorder(new SQLiteWeaknessRepository(adapter));
 }
