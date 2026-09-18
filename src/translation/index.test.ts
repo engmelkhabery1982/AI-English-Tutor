@@ -376,7 +376,7 @@ describe('Translation Core (Phase 1)', () => {
           if (handled === null) {
             return {
               ok: false,
-              error: { code: 'failed', message: 'Translation failed', retryable: false },
+              error: { code: 'unavailable', message: 'Translation failed', retryable: false },
             };
           }
           return {
@@ -524,7 +524,7 @@ describe('Translation Core (Phase 1)', () => {
         })
       );
 
-      const result = await service.translateLongText(rawInput, { maxChunkSize: 35 });
+      const result = await service.translateLongText(rawInput, { maxChunkSize: 50 });
 
       expect(result.overallSuccess).toBe(false);
       expect(result.failedChunkIndexes.length).toBeGreaterThanOrEqual(1);
