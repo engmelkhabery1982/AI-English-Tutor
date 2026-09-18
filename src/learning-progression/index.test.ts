@@ -21,6 +21,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 import type { LearnerWeakness, PronunciationWeakness } from '../domain/models/learner';
 import type { ExpressionItem, VocabularyItem } from '../domain/models/vocabulary';
 import type { SkillDomain } from '../curriculum/types';
+import { planCurriculum } from '../curriculum';
 import {
   CONSERVATIVE_DIFFICULTY_PROFILE,
   CURRICULUM_EVIDENCE_MAPPINGS,
@@ -594,17 +595,19 @@ describe('curriculum projection — supported mappings', () => {
     ]);
   });
 
-  it('31. every stored mastery state maps to an honest lifecycle state', () => {
+  it('31. every stored mastery state maps to an honest difficulty-side lifecycle state', () => {
     expect(lifecycleFromMasteryState('struggling', 3)).toBe('confirmed');
     expect(lifecycleFromMasteryState('familiar', 3)).toBe('repeated');
     expect(lifecycleFromMasteryState('learning', 1)).toBe('observed');
-    expect(lifecycleFromMasteryState('mastered', 5)).toBe('mastered');
     expect(lifecycleFromMasteryState('new', 0)).toBeNull();
     expect(lifecycleFromMasteryState('new', 2)).toBe('observed');
+    // Positive/terminal review states are NOT difficulty-side evidence:
+    // they must never claim curriculum mastery.
+    expect(lifecycleFromMasteryState('mastered', 5)).toBeNull();
     expect(lifecycleFromMasteryState('retired', 5)).toBeNull();
   });
 
-  it('32. saved-but-never-reviewed lexical items contribute NOTHING', () => {
+  it('32. saved-but-never-reviewed or non-evidencing lexical items contribute NOTHING', () => {
     expect(
       projectCurriculumEvidence({
         weaknesses: [],
@@ -894,15 +897,34 @@ describe('curriculum projection — aggregation, ordering and purity', () => {
     expect(reversed.map((s) => s.skillId)).toEqual(['common_expressions', 'core_vocabulary']);
   });
 
-  it('46. a mastered skill is projected but is NOT active difficulty', () => {
-    const snapshots = projectCurriculumEvidence({
-      weaknesses: [
-        weaknessRow({ id: 'w1', type: 'pronunciation', status: 'mastered', referenceId: 'p1' }),
-      ],
-      pronunciationWeaknesses: [pronunciationRow({ id: 'p1', targetSound: 'ending:worked' })],
-    });
-    expect(snapshots[0].lifecycleState).toBe('mastered');
-    expect(activeDifficultySkillIds(snapshots)).toEqual([]);
+  it('46. a resolved or mastered weakness emits NOTHING (positive evidence is later work)', () => {
+    // A mastered weakness row is no longer difficulty-side evidence: it must
+    // not project, and must never exclude or claim a curriculum skill.
+    expect(
+      projectCurriculumEvidence({
+        weaknesses: [
+          weaknessRow({ id: 'w1', type: 'pronunciation', status: 'mastered', referenceId: 'p1' }),
+        ],
+        pronunciationWeaknesses: [pronunciationRow({ id: 'p1', targetSound: 'ending:worked' })],
+      }),
+    ).toEqual([]);
+    // The same for a resolved weakness row.
+    expect(
+      projectCurriculumEvidence({
+        weaknesses: [
+          weaknessRow({
+            id: 'w1',
+            type: 'pronunciation',
+            status: 'stable',
+            referenceId: 'p1',
+            resolved: true,
+          }),
+        ],
+        pronunciationWeaknesses: [pronunciationRow({ id: 'p1', targetSound: 'ending:worked' })],
+      }),
+    ).toEqual([]);
+    // The active-difficulty helper still reports nothing for mastered/observed
+    // snapshots that a DIFFERENT (still-supported) mapping may produce.
     expect(PROJECTION_ACTIVE_STATES).toEqual([
       'relapsed',
       'confirmed',
@@ -915,6 +937,92 @@ describe('curriculum projection — aggregation, ordering and purity', () => {
         { skillId: 'core_vocabulary', lifecycleState: 'observed' },
       ]),
     ).toEqual(['sound_clarity']);
+  });
+
+  it('46a. mastered lexical review states never mark a broad curriculum skill mastered', () => {
+    // A FINITE set of fully-mastered saved words and expressions cannot make
+    // the broad curriculum skills 'mastered' — that would let the planner
+    // exclude the whole skill on the strength of a handful of meanings.
+    const manyMastered = Array.from({ length: 25 }, (_v, index) => index);
+    const snapshots = projectCurriculumEvidence({
+      weaknesses: [],
+      pronunciationWeaknesses: [],
+      vocabulary: manyMastered.map((index) =>
+        vocabItem(`v${index}`, [{ state: 'mastered', reviewCount: 8 }]),
+      ),
+      expressions: manyMastered.map((index) =>
+        exprItem(`e${index}`, [{ state: 'mastered', reviewCount: 8 }]),
+      ),
+    });
+    expect(snapshots).toEqual([]);
+
+    // Mixed items: only the difficulty-side meanings survive. An otherwise
+    // mastered word with one struggling meaning still evidences difficulty.
+    const mixed = projectCurriculumEvidence({
+      weaknesses: [],
+      pronunciationWeaknesses: [],
+      vocabulary: [
+        vocabItem('v-mix', [
+          { state: 'mastered', reviewCount: 8 },
+          { state: 'struggling', reviewCount: 3 },
+        ]),
+      ],
+    });
+    expect(mixed).toEqual([
+      {
+        skillId: 'core_vocabulary',
+        lifecycleState: 'confirmed',
+        evidenceCount: 1,
+      },
+    ]);
+  });
+
+  it('46b. mastered lexical items never exclude a broad skill from curriculum planning', () => {
+    // End-to-end honesty check through the EXISTING planner: even with many
+    // mastered words/expressions, core_vocabulary and common_expressions stay
+    // recommendable (no `mastered` snapshot is ever produced to exclude them).
+    const manyMastered = Array.from({ length: 25 }, (_v, index) => index);
+    const snapshots = projectCurriculumEvidence({
+      weaknesses: [],
+      pronunciationWeaknesses: [],
+      vocabulary: manyMastered.map((index) =>
+        vocabItem(`v${index}`, [{ state: 'mastered', reviewCount: 8 }]),
+      ),
+      expressions: manyMastered.map((index) =>
+        exprItem(`e${index}`, [{ state: 'mastered', reviewCount: 8 }]),
+      ),
+    });
+    const plan = planCurriculum({ evidence: snapshots, maxItems: 50 });
+    const vocabularySkill = plan.recommendations.find((rec) => rec.skillId === 'core_vocabulary');
+    const expressionsSkill = plan.recommendations.find(
+      (rec) => rec.skillId === 'common_expressions',
+    );
+    expect(vocabularySkill).toBeDefined();
+    expect(expressionsSkill).toBeDefined();
+    expect(vocabularySkill?.lifecycleState).toBeNull(); // unobserved, not mastered
+    expect(expressionsSkill?.lifecycleState).toBeNull();
+    expect(vocabularySkill?.status).toBe('unobserved');
+    expect(expressionsSkill?.status).toBe('unobserved');
+  });
+
+  it('46c. a resolved specific weakness never claims global curriculum mastery', () => {
+    // A resolved pronunciation weakness (stable + resolved) paired with a
+    // real row must not project sound_clarity — the same one-sided rule that
+    // protects the broad lexical skills protects every projected skill.
+    expect(
+      projectCurriculumEvidence({
+        weaknesses: [
+          weaknessRow({
+            id: 'w1',
+            type: 'pronunciation',
+            status: 'mastered',
+            referenceId: 'p1',
+            resolved: true,
+          }),
+        ],
+        pronunciationWeaknesses: [pronunciationRow({ id: 'p1', targetSound: 'ending:worked' })],
+      }),
+    ).toEqual([]);
   });
 
   it('47. the projection never mutates its inputs', () => {

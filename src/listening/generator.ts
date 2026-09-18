@@ -416,12 +416,16 @@ function lastReplacableGeneralIndex(
  * Everything the request needs is derived from what this planner already
  * loaded: bounded saved vocabulary, due lexical targets, the listening
  * objective of a real retraining item, and the learner's own weaknesses.
+ *
+ * TARGET HONESTY: `targetExpressions` carries REAL expression targets only.
+ * Due vocabulary is never reinterpreted as expressions — it stays in the
+ * bounded `knownVocabulary` context, where it honestly belongs. Provenance
+ * is therefore computed from evidence that was really requested as a target.
  */
 async function tryGeneratedExercise(
   learnerId: string,
   exercises: readonly ListeningExercise[],
   savedVocabulary: readonly { readonly headword: string }[],
-  dueVocabulary: readonly { readonly headword: string }[],
   dueExpressions: readonly { readonly expression: string }[],
   weaknessRows: readonly {
     readonly type: string;
@@ -435,10 +439,7 @@ async function tryGeneratedExercise(
   const objectiveItem = exercises.find(
     (entry) => entry.source === 'listening_weakness' && entry.keyItems.length > 0,
   );
-  const targetExpressions =
-    dueExpressions.length > 0
-      ? dueExpressions.map((entry) => entry.expression)
-      : dueVocabulary.map((entry) => entry.headword);
+  const targetExpressions = dueExpressions.map((entry) => entry.expression);
 
   return generateListeningExercise(options.provider, {
     learnerId,
@@ -546,7 +547,6 @@ export async function planListeningSession(
         learnerId,
         exercises,
         savedVocab,
-        dueVocab,
         dueExpr,
         weaknessRows,
         options.generatedContent,

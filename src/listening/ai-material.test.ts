@@ -111,13 +111,16 @@ function echoProvider(options?: {
       const text = request.messages.map((message) => message.content).join('\n');
       const requestKey = /"requestKey":\s*"([^"]+)"/.exec(text)?.[1] ?? '';
       const taskType = /"taskType":\s*"([^"]+)"/.exec(text)?.[1] ?? 'listen_and_type';
+      // Topic honesty: echo the topic label ONLY when the prompt really
+      // established one (a well-behaved model omits it otherwise).
+      const topicMatch = /^Topic: (.+)$/m.exec(text);
       const base: Record<string, unknown> = {
         requestKey,
         taskType,
         speakText: 'I usually drink coffee in the morning.',
         expectedAnswer: 'I usually drink coffee in the morning',
         keyItems: ['coffee', 'morning'],
-        contextTopic: 'daily routine',
+        ...(topicMatch ? { contextTopic: topicMatch[1].trim() } : {}),
         explanation: 'Tip: listen for the stressed content words.',
       };
       if (taskType === 'missing_word') {
@@ -434,6 +437,37 @@ describe('generateListeningExercise outcomes', () => {
     expect(outcome.exercise?.contentProvenance).toBe('personalized');
   });
 
+  it('21a. a due vocabulary word alone never becomes a targetExpression', async () => {
+    // TARGET HONESTY: vocabulary words are CONTEXT, not expression targets.
+    // A due word may not sneak into `targetExpressions` (and so may not claim
+    // personalization through a target that was never requested as one).
+    const promptCapture: { text: string } = { text: '' };
+    const capturing = echoProvider({
+      transform: (material) => material,
+    });
+    const generate = capturing.generate;
+    capturing.generate = async (request) => {
+      promptCapture.text = request.messages.map((message) => message.content).join('\n');
+      return generate(request);
+    };
+
+    const outcome = await generateListeningExercise(capturing, {
+      ...generatedInput(),
+      knownVocabulary: ['deadline'], // due/saved vocabulary in the bounded context
+      targetExpressions: [], // NO due expressions this time
+    });
+    expect(outcome.exercise).not.toBeNull();
+
+    // The word stays in the bounded known-vocabulary context...
+    expect(promptCapture.text).toContain('The learner has saved evidence for these items');
+    expect(promptCapture.text).toContain('deadline');
+    // ...and never appears as a requested target expression.
+    expect(promptCapture.text).not.toContain('Weave these requested target expressions');
+    // Provenance stays honest: context-only shaping is 'mixed', never
+    // 'personalized' via a reinterpreted target.
+    expect(outcome.provenance).toBe('mixed');
+  });
+
   it('22. an unhonored requested target degrades provenance honestly', async () => {
     const outcome = await generateListeningExercise(
       echoProvider(),
@@ -643,6 +677,55 @@ describe('planner integration (opt-in only)', () => {
     expect(vocabListDue).toHaveBeenCalledTimes(1);
     expect(exprListDue).toHaveBeenCalledTimes(1);
     expect(vocabList.mock.calls[0][1]?.limit).toBeLessThanOrEqual(20);
+  });
+
+  it('31a. a due vocabulary word alone does not become a targetExpression end-to-end', async () => {
+    // Only DUE vocabulary exists (no due expressions): the generated request
+    // must carry the word as bounded CONTEXT only — never as a target — and
+    // the served provenance must stay honest about that.
+    const ctx = await createContext();
+    await saveVocab(ctx, 'deadline', 'the latest time');
+    await ctx.review.upsert({
+      learnerId: ctx.learnerId,
+      kind: 'vocabulary',
+      referenceId: 'deadline',
+      prompt: 'What word matches this definition? (word)',
+      expectedResponse: 'deadline',
+      state: 'learning',
+      dueAt: NOW,
+      consecutiveCorrect: 0,
+      reviewCount: 1,
+      outcomeHistory: [],
+    } as never);
+
+    const promptCapture: { text: string } = { text: '' };
+    const capturing = echoProvider();
+    const generate = capturing.generate;
+    capturing.generate = async (request) => {
+      promptCapture.text = request.messages.map((message) => message.content).join('\n');
+      return generate(request);
+    };
+
+    const planned = await planListeningSession(
+      {
+        weaknesses: { listWeaknesses: (id, limit) => ctx.weaknesses.listWeaknesses(id, limit) },
+        vocabulary: ctx.vocabulary,
+        expressions: ctx.expressions,
+      },
+      ctx.learnerId,
+      {
+        targetCount: 8,
+        now: NOW,
+        generatedContent: { provider: capturing, level: 'B1', learningGoals: [] },
+      },
+    );
+
+    const generated = planned.exercises.find((entry) => entry.materialOrigin === 'ai');
+    expect(generated).toBeDefined();
+    expect(promptCapture.text).toContain('The learner has saved evidence for these items');
+    expect(promptCapture.text).toContain('deadline');
+    expect(promptCapture.text).not.toContain('Weave these requested target expressions');
+    expect(generated?.contentProvenance).toBe('mixed');
   });
 });
 

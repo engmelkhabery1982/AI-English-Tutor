@@ -235,7 +235,7 @@ const LEXICAL_MAPPINGS: readonly CurriculumEvidenceMapping[] = [
     skillId: 'core_vocabulary',
     domain: 'vocabulary',
     reason:
-      'A saved word carries a REAL stored per-meaning review state; that is stored review evidence about core vocabulary, and no finer curriculum node is supported by it.',
+      'A saved word carries a REAL stored per-meaning review state; that is stored review evidence about core vocabulary, and no finer curriculum node is supported by it. Mastered/retired meanings are never projected: positive ability evidence belongs to later work.',
   },
   {
     id: 'expression_review:common_expressions',
@@ -244,7 +244,7 @@ const LEXICAL_MAPPINGS: readonly CurriculumEvidenceMapping[] = [
     skillId: 'common_expressions',
     domain: 'expressions',
     reason:
-      'A saved expression carries a REAL stored per-meaning review state; that is stored review evidence about common expressions, and no finer curriculum node is supported by it.',
+      'A saved expression carries a REAL stored per-meaning review state; that is stored review evidence about common expressions, and no finer curriculum node is supported by it. Mastered/retired meanings are never projected: positive ability evidence belongs to later work.',
   },
 ];
 
@@ -340,8 +340,15 @@ function mostUrgent(
 /**
  * Real stored per-meaning review state → curriculum lifecycle state.
  *
- * `null` means the stored state carries NO usable evidence and is skipped
- * (a brand-new meaning that was never actually reviewed, or a retired one).
+ * `null` means the stored state carries NO usable DIFFICULTY-side evidence
+ * and is skipped. This projection is deliberately one-sided:
+ * - a brand-new meaning that was never actually reviewed emits nothing;
+ * - a retired meaning emits nothing;
+ * - a MASTERED meaning also emits nothing. A broad curriculum skill must
+ *   never be marked `mastered` (and so excluded from planning) because a
+ *   finite set of lexical meanings reached their stored review state.
+ *   Positive observed-success / ability evidence is later work and needs its
+ *   own honest writer first.
  * Nothing is upgraded: a struggling meaning never becomes 'improving'.
  */
 export function lifecycleFromMasteryState(
@@ -357,8 +364,8 @@ export function lifecycleFromMasteryState(
       return 'observed';
     case 'new':
       return reviewCount > 0 ? 'observed' : null;
+    // Positive/terminal review states are NOT difficulty-side evidence.
     case 'mastered':
-      return 'mastered';
     case 'retired':
       return null;
     default:
@@ -418,6 +425,12 @@ function pronunciationCandidates(
   const candidates: SkillEvidenceCandidate[] = [];
   for (const weakness of input.weaknesses ?? []) {
     if (weakness.type !== 'pronunciation') continue;
+    // DIFFICULTY-side evidence only: a resolved weakness, or one whose
+    // lifecycle reached `mastered`, no longer represents difficulty. It must
+    // never claim (and never exclude) a curriculum skill — positive ability
+    // evidence belongs to later work.
+    if (weakness.resolved) continue;
+    if (weakness.status === 'mastered') continue;
     const row = rows.get(weakness.referenceId);
     if (!row) continue;
     // The stored identity is `<observation kind>:<target>` — read through the

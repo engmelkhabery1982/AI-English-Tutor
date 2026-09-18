@@ -76,7 +76,11 @@ function materialFor(
     speakText: 'I usually drink coffee in the morning.',
     expectedAnswer: 'I usually drink coffee in the morning',
     keyItems: ['coffee', 'morning'],
-    contextTopic: target.context.topic ?? 'daily routine',
+    // Honest default: a topic is only claimed when the request established
+    // one (see the topic-honesty tests below).
+    ...(target.context.topic !== undefined
+      ? { contextTopic: target.context.topic }
+      : { contextTopic: undefined }),
     explanation: 'Tip: listen for the stressed content words.',
     ...overrides,
   });
@@ -168,6 +172,25 @@ describe('ContentRequest — normalization and requestKey', () => {
     expect(normalizeTermList(['', '   '], 5)).toEqual([]);
   });
 
+  it('5a. learning goals are lowercased like every other list', () => {
+    // Semantically identical goals written in different casing must normalize
+    // to the same request and the same requestKey.
+    const lower = request({ context: { learningGoals: ['prepare for meetings'] } });
+    const mixed = request({ context: { learningGoals: ['  Prepare   For MEETINGS '] } });
+    expect(mixed.context.learningGoals).toEqual(['prepare for meetings']);
+    expect(mixed.requestKey).toBe(lower.requestKey);
+
+    // Goal-array ORDER still never changes the key.
+    const reordered = request({
+      context: { learningGoals: ['travel', 'Work With Clients'] },
+    });
+    const canonical = request({
+      context: { learningGoals: ['work with clients', 'TRAVEL'] },
+    });
+    expect(reordered.requestKey).toBe(canonical.requestKey);
+    expect(canonical.context.learningGoals).toEqual(['travel', 'work with clients']);
+  });
+
   it('6. the canonical identity is stable and version-prefixed', () => {
     const target = request({ context: { topic: 'daily routine' } });
     const identity = canonicalContentRequestIdentity({
@@ -182,6 +205,7 @@ describe('ContentRequest — normalization and requestKey', () => {
       supportLevel: target.supportLevel,
       speechStyle: target.speechStyle,
       context: target.context,
+      evidenceAdjusted: target.difficultyProfile.evidenceAdjusted,
       ...(target.listeningObjective ? { listeningObjective: target.listeningObjective } : {}),
     });
     expect(identity.startsWith(`${CONTENT_REQUEST_KEY_VERSION}|`)).toBe(true);
@@ -246,6 +270,38 @@ describe('ContentRequest — bounds and honesty', () => {
     expect(built.status).toBe('rejected');
     if (built.status !== 'rejected') return;
     expect(built.reason).toBe('invalid_skill');
+  });
+
+  it('13a. only evidenceAdjusted false→true produces a DIFFERENT requestKey', () => {
+    // The prompt changes materially with evidenceAdjusted, so the identity
+    // must distinguish it — while an identical normalized request stays
+    // identical.
+    const plain = request();
+    const adjusted = request({
+      difficultyProfile: { ...profileFor('B1'), evidenceAdjusted: true },
+    });
+    expect(adjusted.difficultyProfile.evidenceAdjusted).toBe(true);
+    expect(plain.difficultyProfile.evidenceAdjusted).toBe(false);
+    expect(adjusted.requestKey).not.toBe(plain.requestKey);
+
+    // Same normalized request => same key (evidenceAdjusted false both times).
+    expect(request().requestKey).toBe(plain.requestKey);
+    // And the identity itself carries the distinction explicitly.
+    const identity = canonicalContentRequestIdentity({
+      level: plain.level,
+      taskType: plain.taskType,
+      targetSkill: plain.targetSkill,
+      knownVocabulary: plain.knownVocabulary,
+      targetExpressions: plain.targetExpressions,
+      newLanguageBudget: plain.newLanguageBudget,
+      grammarComplexity: plain.grammarComplexity,
+      discourseLength: plain.discourseLength,
+      supportLevel: plain.supportLevel,
+      speechStyle: plain.speechStyle,
+      context: plain.context,
+      evidenceAdjusted: true,
+    });
+    expect(identity).toContain('evidenceAdjusted=true');
   });
 
   it('14. a skillId from another domain is REJECTED', () => {
@@ -562,6 +618,42 @@ describe('generated material validation', () => {
     expect(
       validateGeneratedMaterial(target, materialFor(target, { contextTopic: 'Daily Routine' })).ok,
     ).toBe(true);
+  });
+
+  it('35a. a topic claimed WITHOUT an established topic is rejected', () => {
+    // The prompt says "never invent a topic the context above did not
+    // establish"; validation enforces it in BOTH directions. However
+    // plausible the label, a topicless request may not carry one.
+    const topicless = request();
+    expect(topicless.context.topic).toBeUndefined();
+    for (const invented of ['daily routine', 'travel', 'the office']) {
+      expect(
+        validateGeneratedMaterial(topicless, materialFor(topicless, { contextTopic: invented })),
+      ).toEqual({ ok: false, issue: 'context_dishonest' });
+    }
+    // Omitting the field is the honest form for general material.
+    const honest = materialFor(topicless);
+    expect(JSON.parse(honest).contextTopic).toBeUndefined();
+    expect(validateGeneratedMaterial(topicless, honest).ok).toBe(true);
+  });
+
+  it('35b. the schema demands a topic only when one was established', () => {
+    const topicless = request();
+    const withTopic = request({ context: { topic: 'daily routine' } });
+    const topiclessPrompt = buildMaterialPrompt(topicless)
+      .messages.map((message) => message.content)
+      .join('\n');
+    const topicPrompt = buildMaterialPrompt(withTopic)
+      .messages.map((message) => message.content)
+      .join('\n');
+    // Topicless: the model is told to omit the field, never to invent one.
+    expect(topiclessPrompt).toContain('No topic was established for this material');
+    expect(topiclessPrompt).toContain('omit this field entirely');
+    expect(topiclessPrompt).toContain('omit "contextTopic" unless a topic label was given');
+    // With a topic: the label travels and must be echoed exactly.
+    expect(topicPrompt).toContain('Topic: daily routine');
+    expect(topicPrompt).toContain('the exact topic label given in the request');
+    expect(topicPrompt).not.toContain('omit this field entirely');
   });
 
   it('36. level, score and percentage claims are rejected', () => {

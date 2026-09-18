@@ -264,6 +264,13 @@ export function validateGeneratedMaterial(
       return fail('context_dishonest');
     }
   }
+  if (contextTopic !== undefined && request.context.topic === undefined) {
+    // Topic honesty, both directions: the prompt says "never invent a topic
+    // the context above did not establish", so a topic claimed for a request
+    // that established NONE is dishonest — however plausible it sounds. A
+    // generated neutral scene is general material, not learner context.
+    return fail('context_dishonest');
+  }
   const explanation = readOptionalString(raw, 'explanation');
   if (explanation === null) return fail('context_dishonest');
   if (

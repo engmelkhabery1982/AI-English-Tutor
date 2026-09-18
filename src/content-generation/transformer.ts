@@ -89,7 +89,7 @@ function taskInstructions(taskType: ContentTaskType): string {
 }
 
 /** JSON schema shown to the model for the requested task type. */
-function schemaFor(taskType: ContentTaskType, requestKey: string): string {
+function schemaFor(taskType: ContentTaskType, requestKey: string, topic?: string): string {
   const common = [
     `  "requestKey": ${JSON.stringify(requestKey)},`,
     `  "taskType": ${JSON.stringify(taskType)},`,
@@ -107,7 +107,12 @@ function schemaFor(taskType: ContentTaskType, requestKey: string): string {
     ...taskFields,
     '  "expectedAnswer": "the exact expected answer",',
     '  "keyItems": ["1 to 4 short items that really occur in the passage"],',
-    '  "contextTopic": "a short topic label",',
+    // Topic honesty: the field is only offered when the request REALLY
+    // established one. Without a topic the model is told to omit it, so it is
+    // never simultaneously required to invent a topic and forbidden to.
+    ...(topic !== undefined
+      ? ['  "contextTopic": "the exact topic label given in the request",']
+      : ['  "contextTopic": omit this field entirely — no topic was established',]),
     '  "explanation": "one short neutral listening tip",',
     '  "targetExpressionsUsed": ["any requested expressions the passage really uses"],',
     '  "newLanguageItems": 0',
@@ -141,6 +146,11 @@ export function buildMaterialPrompt(request: ContentRequest): ConversationReques
   lines.push('=== LEARNER CONTEXT (bounded, honest) ===');
   if (request.context.topic) {
     lines.push(`Topic: ${request.context.topic}`);
+  } else {
+    // No topic was established for this request. Say so explicitly so the
+    // model is never asked to invent one (the prompt below forbids it and
+    // validation rejects any claimed topic).
+    lines.push('No topic was established for this material. Do not invent or label one.');
   }
   if (request.context.learningGoals.length > 0) {
     lines.push(`Stated goals: ${request.context.learningGoals.join('; ')}`);
@@ -189,12 +199,13 @@ export function buildMaterialPrompt(request: ContentRequest): ConversationReques
   lines.push('- Never mention levels, bands, scores, ratings, grades or percentages.');
   lines.push('- Never invent facts about the learner, their job or their life.');
   lines.push('- Never invent a topic the context above did not establish.');
+  lines.push('- General material stays general: a neutral everyday scene is NOT a topic the learner chose, so omit "contextTopic" unless a topic label was given above.');
   lines.push('- Write natural, everyday English that a text-to-speech voice reads clearly.');
   lines.push('- Every "keyItems" entry must really occur in "speakText".');
   lines.push('');
 
   lines.push('Respond with ONLY this JSON object and nothing else:');
-  lines.push(schemaFor(request.taskType, request.requestKey));
+  lines.push(schemaFor(request.taskType, request.requestKey, request.context.topic));
 
   return {
     systemPrompt:

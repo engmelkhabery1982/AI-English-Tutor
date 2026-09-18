@@ -93,7 +93,9 @@ function normalizeGoals(values: readonly string[] | undefined): readonly string[
   const normalized: string[] = [];
   for (const raw of values) {
     if (typeof raw !== 'string') continue;
-    const goal = collapse(raw).slice(0, CONTENT_REQUEST_BOUNDS.topicLength);
+    // Lowercased like every other list: semantically identical goals written
+    // in different casing must normalize to the same request and requestKey.
+    const goal = collapse(raw).toLowerCase().slice(0, CONTENT_REQUEST_BOUNDS.topicLength);
     if (goal.length === 0 || seen.has(goal)) continue;
     seen.add(goal);
     normalized.push(goal);
@@ -218,6 +220,13 @@ export function canonicalContentRequestIdentity(request: {
   readonly speechStyle: SpeechStyle;
   readonly context: ContentContext;
   readonly listeningObjective?: string;
+  /**
+   * Whether REAL recent negative evidence made the material more supported.
+   * Part of the identity because `buildMaterialPrompt` says something
+   * materially different for adjusted requests: two requests that generate
+   * different instructions must never share a requestKey.
+   */
+  readonly evidenceAdjusted: boolean;
 }): string {
   return [
     CONTENT_REQUEST_KEY_VERSION,
@@ -239,6 +248,7 @@ export function canonicalContentRequestIdentity(request: {
     `goals=${request.context.learningGoals.join(',')}`,
     `professional=${request.context.professionalContext ?? '-'}`,
     `objective=${request.listeningObjective ?? '-'}`,
+    `evidenceAdjusted=${request.evidenceAdjusted ? 'true' : 'false'}`,
   ].join('|');
 }
 
@@ -352,6 +362,7 @@ export function buildContentRequest(input: ContentRequestInput): ContentRequestB
       supportLevel: profile.supportLevel,
       speechStyle: profile.speechStyle,
       context,
+      evidenceAdjusted: profile.evidenceAdjusted,
       ...(listeningObjective !== undefined ? { listeningObjective } : {}),
     }),
   );
