@@ -23,6 +23,11 @@ import type {
   WeaknessStatus,
 } from '../domain/shared/types';
 import type { LearnerWeakness } from '../domain/models/learner';
+import type { SkillDomain } from '../curriculum/types';
+import type {
+  DifficultyProfile,
+  ProgressionLevel,
+} from '../learning-progression/types';
 import type { CoachingContext, CoachingRecentConversation } from '../learner-model';
 import type { ConversationFeedback, ConversationFeedbackVocabulary } from '../providers/ai/types';
 import type { ConversationSession, ConversationSessionResult } from '../conversation-session';
@@ -123,6 +128,12 @@ export interface SpeakingPracticePlan {
   readonly hardMaxTurns: number;
   readonly turnGoals: readonly SpeakingTurnGoal[];
   readonly recentMemoryNote?: string;
+  /**
+   * WP-1: bounded working-level guidance the coach is given. Absent for every
+   * caller that does not supply already-resolved progression input, in which
+   * case the plan and the coaching prompt are byte-identical to before.
+   */
+  readonly progression?: SpeakingProgressionGuidance;
   readonly seedFromAdaptiveLesson?: SpeakingPracticeSeed;
   /**
    * Set when the practice conducts a Professional English scenario. Carried so
@@ -153,6 +164,12 @@ export interface SpeakingPlanningInput {
    * no learner-specific focus, targets or memory note.
    */
   readonly evidenceIsReal?: boolean;
+  /**
+   * WP-1: already-resolved progression guidance (working level + difficulty
+   * profile + bounded saved lexicon). The owning service assembles it from the
+   * snapshot it already loaded; it is never resolved or fetched here.
+   */
+  readonly progression?: SpeakingProgressionGuidance;
 }
 
 /**
@@ -210,6 +227,39 @@ export interface SpeakingProfessionalScenario {
   readonly challengeEvents: readonly { readonly id: string; readonly description: string }[];
   /** Real profession/industry context, present only when the learner has one. */
   readonly professionalContext?: string;
+}
+
+/**
+ * WP-1: ALREADY-RESOLVED progression guidance for the speaking coach.
+ *
+ * This is pure data assembled by the existing service/context layer from the
+ * learner snapshot it already loaded (working level, loaded negative evidence,
+ * already-bounded saved lexicon). The planner never resolves it and performs no
+ * read of its own, so `planSpeakingPractice` stays pure.
+ *
+ * HONESTY RULES
+ * - `workingLevel` is a stored WORKING LEVEL, never proof of proficiency: the
+ *   prompt describes HOW the tutor should speak, not what the learner can do.
+ * - `knownVocabulary` is a BOUNDED list of saved items. It is never the
+ *   learner's complete vocabulary and the prompt says so.
+ * - `newLanguageBudget` bounds deliberately introduced target language; it is
+ *   not a claim that every other word is known.
+ * - `targetSkill` is present ONLY when an existing curriculum skill is genuinely
+ *   mapped. It is never guessed to make guidance look richer.
+ * - There is deliberately no score, band, percentage or fluency number here.
+ */
+export interface SpeakingProgressionGuidance {
+  readonly workingLevel: ProgressionLevel;
+  readonly difficultyProfile: DifficultyProfile;
+  /** Bounded, deduplicated saved-lexicon context (see MAX_KNOWN_VOCABULARY). */
+  readonly knownVocabulary: readonly string[];
+  readonly targetSkill?: SpeakingCurriculumTarget;
+}
+
+/** A genuinely mapped existing curriculum skill (never guessed). */
+export interface SpeakingCurriculumTarget {
+  readonly domain: SkillDomain;
+  readonly skillId?: string;
 }
 
 export interface SpeakingPlannerOptions {

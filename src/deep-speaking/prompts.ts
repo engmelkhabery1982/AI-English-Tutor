@@ -14,6 +14,7 @@ import type {
   SpeakingPracticePlan,
   SpeakingPracticeType,
   SpeakingProfessionalScenario,
+  SpeakingProgressionGuidance,
   SpeakingTurnGoal,
   SpeakingTurnGoalKind,
 } from './types';
@@ -248,6 +249,74 @@ export function buildProfessionalScenarioContext(
 }
 
 /* ------------------------------------------------------------------ *
+ * WP-1 working-level guidance (bounded prompt text only)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Bounded, honest working-level guidance appended to the EXISTING coaching
+ * prompt when the plan carries already-resolved progression input.
+ *
+ * HONESTY RULES BAKED INTO THE TEXT
+ * - The level is presented as a WORKING LEVEL / claim, never as proven
+ *   proficiency, and the tutor is told not to announce or upgrade it.
+ * - The new-language budget is described as a budget for deliberately taught
+ *   target language — NOT as a claim that every other word is known.
+ * - The saved lexicon is explicitly labelled a BOUNDED list of saved items,
+ *   never the learner's complete vocabulary.
+ * - No score, band, percentage, fluency number or CEFR claim is ever produced.
+ * - `speechStyle` is TEXT guidance (register / sentence shape / contractions /
+ *   lexis). Nothing here controls audio delivery or speak rate: those belong to
+ *   later work and are deliberately absent.
+ */
+export function buildProgressionGuidance(
+  guidance: SpeakingProgressionGuidance,
+): string {
+  const profile = guidance.difficultyProfile;
+  const lines: string[] = [];
+
+  lines.push('=== WORKING LEVEL GUIDANCE ===');
+  lines.push(
+    `The learner's stored working level is ${guidance.workingLevel}. This is a working level, not proof of proficiency: do not announce it, do not upgrade it and never claim the learner has moved to another level.`,
+  );
+  lines.push('Keep your own language inside this range:');
+  lines.push(`- Discourse: ${profile.discourseLength.replace(/_/g, ' ')}`);
+  lines.push(`- Grammar complexity: ${profile.grammarComplexity}`);
+  lines.push(`- Support: ${profile.supportLevel}`);
+  lines.push(
+    `- Register: ${profile.speechStyle.register}; sentence shape: ${profile.speechStyle.sentenceShape.replace(/_/g, ' ')}; contractions: ${profile.speechStyle.contractionDensity}; vocabulary style: ${profile.speechStyle.lexicalStyle.replace(/_/g, ' ')}`,
+  );
+  lines.push(
+    `Introduce at most ${profile.newLanguageBudget} deliberate new target word${profile.newLanguageBudget === 1 ? '' : 's'}/expression${profile.newLanguageBudget === 1 ? '' : 's'} in this practice. That is a budget for target language you choose to teach; it is NOT a claim that every other word is already known.`,
+  );
+  if (profile.evidenceAdjusted) {
+    lines.push(
+      'This practice is deliberately more supported because the learner has real, repeated difficulty in this area: keep input shorter and support them more. Never make it harder for that reason.',
+    );
+  }
+
+  if (guidance.knownVocabulary.length > 0) {
+    lines.push(
+      `Saved items the learner may already recognise (a BOUNDED list of saved entries only — it is NOT their complete vocabulary): ${guidance.knownVocabulary
+        .map((entry) => `"${entry}"`)
+        .join(', ')}`,
+    );
+  }
+
+  if (guidance.targetSkill) {
+    lines.push(
+      `Curriculum target (a genuinely mapped existing skill): ${guidance.targetSkill.domain}${guidance.targetSkill.skillId ? ` / ${guidance.targetSkill.skillId}` : ''}`,
+    );
+  }
+
+  lines.push(
+    'Do not output levels, bands, scores, percentages or ratings, and do not treat an absence of corrections as proof that the learner has mastered anything.',
+  );
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+/* ------------------------------------------------------------------ *
  * Coaching system-prompt augmentation
  * ------------------------------------------------------------------ */
 
@@ -274,6 +343,13 @@ export function buildSpeakingCoachingPrompt(
   lines.push(`Topic: ${plan.topic}`);
   lines.push(`Coaching mode: ${plan.coachingMode}`);
   lines.push('');
+
+  // Additive (WP-1): bounded working-level guidance. Without already-resolved
+  // progression input this block never appears and the prompt is byte-identical
+  // to the pre-existing behaviour.
+  if (plan.progression) {
+    lines.push(buildProgressionGuidance(plan.progression));
+  }
 
   if (plan.targetExpressions.length > 0) {
     lines.push('Target expressions to weave in naturally (do NOT list them as a dictionary):');

@@ -24,6 +24,7 @@ import type {
   SpeakingPracticeSource,
   SpeakingPracticeType,
   SpeakingProfessionalScenario,
+  SpeakingProgressionGuidance,
   SpeakingTargetExpression,
   SpeakingTurnGoal,
   SpeakingTurnGoalKind,
@@ -47,6 +48,11 @@ export const HARD_MAX_TURNS = 15;
 export const MAX_WEAKNESS_TARGETS = 2;
 export const MAX_TARGET_EXPRESSIONS = 3;
 export const MAX_RECENT_CONVERSATIONS = 3;
+/**
+ * WP-1: the saved-lexicon context handed to the coach is deliberately tiny. It
+ * is a bounded hint about the learner's SAVED items, never their lexicon.
+ */
+export const MAX_KNOWN_VOCABULARY = 12;
 
 const WEAKNESS_PRIORITY: Readonly<Record<WeaknessStatus, number>> = {
   relapsed: 0,
@@ -67,6 +73,49 @@ const SPEAKING_RELEVANT_WEAKNESS_TYPES: ReadonlySet<string> = new Set([
   'confidence',
   'vocabulary',
 ]);
+
+/* ------------------------------------------------------------------ *
+ * WP-1 progression guidance (already-resolved input)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Bound the saved-lexicon context deterministically: trimmed, lowercased,
+ * empty entries dropped, deduplicated, sorted, then capped.
+ *
+ * PURE, and it never implies the list is the learner's complete vocabulary:
+ * an empty input yields an empty list, and no entry is invented.
+ */
+export function boundedKnownVocabulary(
+  values: readonly string[] | undefined,
+  max: number = MAX_KNOWN_VOCABULARY,
+): readonly string[] {
+  if (!Array.isArray(values) || max <= 0) return [];
+  const unique = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    const normalized = value.trim().toLowerCase();
+    if (normalized.length === 0) continue;
+    unique.add(normalized);
+  }
+  return Array.from(unique).sort().slice(0, max);
+}
+
+/**
+ * Normalize the ALREADY-RESOLVED progression guidance. No resolution, no read:
+ * the planner only bounds and orders what it was handed.
+ */
+function normalizeProgression(
+  progression: SpeakingProgressionGuidance | undefined,
+): SpeakingProgressionGuidance | undefined {
+  if (!progression) return undefined;
+  const knownVocabulary = boundedKnownVocabulary(progression.knownVocabulary);
+  return {
+    workingLevel: progression.workingLevel,
+    difficultyProfile: progression.difficultyProfile,
+    knownVocabulary,
+    ...(progression.targetSkill ? { targetSkill: progression.targetSkill } : {}),
+  };
+}
 
 /* ------------------------------------------------------------------ *
  * Weakness selection
@@ -534,6 +583,9 @@ export function planSpeakingPractice(
   // layer. The adapter always pairs it with the mapped EXISTING practice type,
   // so `resolvePracticeType` already resolves it through options.practiceType.
   const professional = options?.professionalScenario;
+  // WP-1: ALREADY-RESOLVED progression guidance. Bounded here, never resolved
+  // here — the planner stays pure and performs no read of its own.
+  const progression = normalizeProgression(input.progression);
   const practiceType = resolvePracticeType(options, coaching, evidenceIsReal);
   const scenario = selectScenario(practiceType, learnerId, now);
 
@@ -651,6 +703,7 @@ export function planSpeakingPractice(
     hardMaxTurns: HARD_MAX_TURNS,
     turnGoals,
     ...(recentMemoryNote ? { recentMemoryNote } : {}),
+    ...(progression ? { progression } : {}),
     ...(seedFromAdaptiveLesson ? { seedFromAdaptiveLesson } : {}),
     ...(professional ? { professionalScenario: professional } : {}),
   };
