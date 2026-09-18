@@ -18,6 +18,11 @@ async function getSpeechModule(): Promise<typeof ExpoSpeechModule> {
 
 export class ExpoTTSProvider implements TextToSpeechProvider {
   readonly id = 'expo-speech';
+  /**
+   * Honest declaration: expo-speech really honors `rate` (0.0–2.0, 1.0 is
+   * normal), so slower/natural/faster playback is a real capability here.
+   */
+  readonly supportsSpeechRate = true;
 
   async speak(text: string, options?: TTSOptions): Promise<void> {
     const cleanText = sanitizeTextForTTS(text);

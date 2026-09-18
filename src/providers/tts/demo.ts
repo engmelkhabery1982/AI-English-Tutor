@@ -9,6 +9,11 @@ import type { TextToSpeechProvider, TTSOptions } from './types';
 
 export class DemoTTSProvider implements TextToSpeechProvider {
   readonly id = 'demo-tts';
+  /**
+   * Honest declaration: this provider records the text it was asked to speak
+   * and ignores `rate` entirely, so speed control is NOT available here.
+   */
+  readonly supportsSpeechRate = false;
   private speaking: boolean = false;
   private readonly spokenList: string[] = [];
 
