@@ -115,6 +115,7 @@ export interface FluencyPracticeServiceDeps {
   readonly successRecorder?: SuccessObservationRecorder;
   /** The EXISTING speaking service (owns conversation + persistence + memory). */
   readonly speaking: SpeakingPracticeService;
+  readonly getLearnerId?: () => string | null;
   readonly now?: () => IsoDate;
 }
 
@@ -488,9 +489,10 @@ export class FluencyPracticeService {
         })
       ) {
         this.consecutiveStrong += 1;
-        if (this.deps.successRecorder) {
+        const activeLearnerId = this.deps.getLearnerId?.() ?? null;
+        if (this.deps.successRecorder && activeLearnerId && this.isRealAI) {
           await recordFluencySuccess(this.deps.successRecorder, {
-            learnerId: (this.deps.speaking as any)?.learnerModel?.getCoachingContext?.()?.profile?.learnerId ?? 'learner',
+            learnerId: activeLearnerId,
             referenceId: `fluency:${task.id}`,
             context: `support:${this.supportLevel}`,
             summary: `Strong fluency attempt on ${task.title}`,

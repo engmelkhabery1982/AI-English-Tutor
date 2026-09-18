@@ -266,6 +266,8 @@ export interface ShadowingSessionInput {
   readonly canonicalWrittenForm: string;
   readonly baseSupport: ShadowingSupportLevel;
   readonly maxRepeats?: number;
+  readonly learnerId?: string;
+  readonly successRecorder?: SuccessObservationRecorder;
 }
 
 /**
@@ -284,12 +286,22 @@ export class ShadowingSession {
   private lastAttempt: ShadowingAttempt | null = null;
   private qualitativeHistory: ShadowingQualitativeResult[] = [];
 
+  private activeLearnerId?: string;
+  private successRecorder?: SuccessObservationRecorder;
+
   constructor(input: ShadowingSessionInput) {
     this.id = input.id;
     this.chunk = input.chunk;
     this.canonicalWrittenForm = input.canonicalWrittenForm;
     this.baseSupport = input.baseSupport;
     this.maxRepeats = input.maxRepeats ?? SHADOWING_MAX_REPEATS;
+    this.activeLearnerId = input.learnerId;
+    this.successRecorder = input.successRecorder;
+  }
+
+  setSuccessTarget(learnerId: string, recorder: SuccessObservationRecorder): void {
+    this.activeLearnerId = learnerId;
+    this.successRecorder = recorder;
   }
 
   get attemptCount(): number {
@@ -337,7 +349,12 @@ export class ShadowingSession {
     now?: string,
     checkStale?: () => boolean,
   ): Promise<ShadowingAttempt> {
+    if (checkStale?.()) {
+      return evaluateShadowingLocally(this.chunk, transcript);
+    }
     const outcome = await runShadowingAttempt({
+      learnerId: this.activeLearnerId,
+      successRecorder: this.successRecorder,
       chunk: this.chunk,
       transcript,
       ...(port !== undefined ? { port } : {}),

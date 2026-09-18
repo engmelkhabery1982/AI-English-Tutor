@@ -114,6 +114,10 @@ function isProblemResult(result: ListeningResultCategory): boolean {
   );
 }
 
+function isSuccessResult(result: ListeningResultCategory): boolean {
+  return result === 'understood' || result === 'mostly_understood';
+}
+
 function persistenceTag(exercise: ListeningExercise): string {
   return `exercise:${exercise.type}`;
 }
@@ -335,8 +339,12 @@ export class ListeningService {
   async submitShadowingAttempt(
     session: ShadowingSession,
     transcript: string | null,
-    opts?: { now?: IsoDate; checkStale?: () => boolean },
+    opts?: { now?: IsoDate; checkStale?: () => boolean; learnerId?: string },
   ): Promise<ShadowingAttempt> {
+    const activeLearnerId = opts?.learnerId ?? (await this.resolveLearnerId()) ?? undefined;
+    if (this.deps.successRecorder && activeLearnerId) {
+      session.setSuccessTarget(activeLearnerId, this.deps.successRecorder);
+    }
     return session.submit(
       transcript,
       this.deps.pronunciation,
@@ -387,7 +395,7 @@ export class ListeningService {
   ): Promise<void> {
     // General exercises still produce evidence when the learner struggles:
     // missed key items become listening weaknesses (deduplicated by identity).
-    if (!isProblemResult(evaluation.result)) {
+    if (isSuccessResult(evaluation.result)) {
       if (this.deps.successRecorder) {
         const referenceId = exercise.weaknessReferenceId ?? stableReferenceId(`listening:${exercise.id}`);
         const context = exercise.lexicalItemId
@@ -402,6 +410,7 @@ export class ListeningService {
       }
       return;
     }
+    if (!isProblemResult(evaluation.result)) return;
 
     const missedItems =
       evaluation.missedItems.length > 0

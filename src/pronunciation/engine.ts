@@ -190,7 +190,7 @@ export class PronunciationEngine {
       }
     }
 
-    if (!analysis.insufficientEvidence && input.expectedText && persistable.length === 0 && this.deps.successRecorder) {
+    if (!analysis.insufficientEvidence && input.expectedText && analysis.overallIntelligibility === 'clear' && this.deps.successRecorder) {
       const refId = `pron:${input.expectedText.toLowerCase().trim().slice(0, 30)}`;
       await recordPronunciationSuccess(this.deps.successRecorder, {
         learnerId,

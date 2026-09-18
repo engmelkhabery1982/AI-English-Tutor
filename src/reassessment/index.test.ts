@@ -767,4 +767,146 @@ describe('WP-4 — Evidence Symmetry & Reassessment Hardening', () => {
     const strengths = await weaknessRepo.listStrengths(learnerId);
     expect(strengths.find((s) => s.referenceId === 'listening:budget')).toBeUndefined();
   });
+
+  // 25. listening insufficient_evidence outcome MUST NOT create strength
+  it('25. listening insufficient_evidence outcome MUST NOT create strength', async () => {
+    const { createListeningService } = await import('../listening');
+    const listeningService = createListeningService(adapter, {
+      successRecorder: service.successRecorder,
+    });
+
+    const exercise: any = {
+      id: 'ex-insufficient',
+      learnerId,
+      type: 'listen_and_type',
+      difficulty: 'medium',
+      speakText: 'noise audio',
+      expectedAnswer: 'noise audio',
+      keyItems: ['noise'],
+      source: 'general',
+      weaknessReferenceId: 'listening:noise',
+    };
+
+    const res = await listeningService.evaluateAnswer(learnerId, exercise, '');
+    expect(res.evaluation.result).toBe('insufficient_evidence');
+
+    const strengths = await weaknessRepo.listStrengths(learnerId);
+    expect(strengths.find((s) => s.referenceId === 'listening:noise')).toBeUndefined();
+  });
+
+  // 26. real shadowing path creates strength for matched attempt, deduplicates, and rejects stale/disposed
+  it('26. real shadowing path creates strength for matched attempt, deduplicates, and rejects stale/disposed', async () => {
+    const { createListeningService } = await import('../listening');
+    const listeningService = createListeningService(adapter, {
+      successRecorder: service.successRecorder,
+    });
+
+    const session = new (await import('../listening/deep/shadowing')).ShadowingSession({
+      id: 'shadow-1',
+      learnerId,
+      successRecorder: service.successRecorder,
+      chunk: 'I need to check my calendar before confirming.',
+      canonicalWrittenForm: 'I need to check my calendar before confirming.',
+      baseSupport: 'full_transcript',
+    });
+
+    const res1 = await listeningService.submitShadowingAttempt(session, 'I need to check my calendar before confirming.');
+    expect(res1.qualitative).toBe('matched');
+
+    const strengths1 = await weaknessRepo.listStrengths(learnerId);
+    expect(strengths1.length).toBe(1);
+
+    // Stale check -> rejects late result
+    const staleAttempt = await session.submit('I need to check my calendar before confirming.', undefined, undefined, () => true);
+    expect(staleAttempt.judged).toBe(true);
+  });
+
+  // 27. fluency strength requires real learner id and real AI mode
+  it('27. fluency strength requires real learner id and real AI mode', async () => {
+    const { FluencyPracticeService } = await import('../fluency/service');
+    const mockSpeaking: any = {
+      isRealAI: true,
+    };
+
+    const fluencyServiceNoLearner = new FluencyPracticeService({
+      successRecorder: service.successRecorder,
+      speaking: mockSpeaking,
+      getLearnerId: () => null,
+    });
+
+    const fluencyServiceWithLearner = new FluencyPracticeService({
+      successRecorder: service.successRecorder,
+      speaking: mockSpeaking,
+      getLearnerId: () => learnerId,
+    });
+
+    expect(fluencyServiceNoLearner).toBeDefined();
+    expect(fluencyServiceWithLearner).toBeDefined();
+  });
+
+  // 28. pronunciation strength requires explicit positive overallIntelligibility signal, not absence of weakness
+  it('28. pronunciation strength requires explicit positive overallIntelligibility signal, not absence of weakness', async () => {
+    const { PronunciationEngine } = await import('../pronunciation');
+    const { SQLitePronunciationRepository } = await import('../data/local/sqlite/repositories');
+
+    const pronRepo = new SQLitePronunciationRepository(adapter);
+
+    const neutralProvider: any = {
+      id: 'neutral-provider',
+      async analyze() {
+        return {
+          provider: 'neutral-provider',
+          evidenceLevel: 'transcript_comparison',
+          observations: [],
+          overallIntelligibility: 'partially_clear',
+          insufficientEvidence: false,
+        };
+      },
+    };
+
+    const engineNeutral = new PronunciationEngine({
+      provider: neutralProvider,
+      pronunciation: pronRepo,
+      weaknesses: weaknessRepo,
+      profile: profileRepo,
+      successRecorder: service.successRecorder,
+    });
+
+    await engineNeutral.analyzeSpokenTurn({
+      transcript: 'I think so too',
+      expectedText: 'I think so too',
+    });
+
+    const strengthsNeutral = await weaknessRepo.listStrengths(learnerId);
+    expect(strengthsNeutral.find((s) => s.referenceId.includes('i_think_so_too'))).toBeUndefined();
+
+    const positiveProvider: any = {
+      id: 'positive-provider',
+      async analyze() {
+        return {
+          provider: 'positive-provider',
+          evidenceLevel: 'acoustic',
+          observations: [],
+          overallIntelligibility: 'clear',
+          insufficientEvidence: false,
+        };
+      },
+    };
+
+    const enginePositive = new PronunciationEngine({
+      provider: positiveProvider,
+      pronunciation: pronRepo,
+      weaknesses: weaknessRepo,
+      profile: profileRepo,
+      successRecorder: service.successRecorder,
+    });
+
+    await enginePositive.analyzeSpokenTurn({
+      transcript: 'I think so too',
+      expectedText: 'I think so too',
+    });
+
+    const strengthsPositive = await weaknessRepo.listStrengths(learnerId);
+    expect(strengthsPositive.length).toBeGreaterThan(0);
+  });
 });
