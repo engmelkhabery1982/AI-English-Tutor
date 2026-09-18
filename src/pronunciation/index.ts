@@ -16,6 +16,7 @@ import {
   SQLitePronunciationRepository,
   SQLiteReviewRepository,
 } from '../data/local/sqlite/repositories';
+import { createSuccessObservationRecorder } from '../reassessment/success-recorder';
 import { createTranscriptComparisonPronunciationProvider } from './baseline-provider';
 import { PronunciationEngine } from './engine';
 
@@ -28,11 +29,19 @@ export * from './feedback';
  * Compose a PronunciationEngine on the given adapter using the EXISTING
  * repositories. The baseline provider is deterministic and offline —
  * zero cost, zero network.
+ *
+ * WP-4 production wiring: the EXISTING success-observation recorder is
+ * composed over the SAME weakness repository this engine already uses, so an
+ * explicit supported positive result (clear intelligibility from a real
+ * evidence source) persists strength evidence on the canonical app database.
+ * No second database, no second repository stack and no fabricated
+ * confidence: without a real learner the engine still persists nothing.
  */
 export function createPronunciationEngine(adapter: DatabaseAdapter): PronunciationEngine {
   const pronunciation = new SQLitePronunciationRepository(adapter);
   const weaknesses = new SQLiteWeaknessRepository(adapter);
   return new PronunciationEngine({
+    successRecorder: createSuccessObservationRecorder(weaknesses),
     provider: createTranscriptComparisonPronunciationProvider(),
     pronunciation: {
       recordObservation: (input) => pronunciation.recordObservation(input),

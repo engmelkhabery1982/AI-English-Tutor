@@ -21,6 +21,8 @@
 import type { IsoDate } from '../domain/shared/types';
 import {
   createDefaultSpeakingService,
+  createSpeakingSuccessRecorder,
+  resolveDefaultSpeakingComposition,
   type SpeakingPracticeService,
 } from '../deep-speaking';
 import type { SuccessObservationRecorder } from '../reassessment';
@@ -45,10 +47,27 @@ export {
  * itself composes the EXISTING learner model + canonical app database).
  * Reused across calls; throws honestly when no persisted learner state can
  * be composed (the caller shows that instead of fake personalization).
+ *
+ * WP-4 production wiring: the EXISTING success-observation recorder is also
+ * composed HERE, over the SAME canonical app database / weakness repository
+ * the rest of the app uses (no second database, no second stack). A real
+ * strong attempt on a real learner id therefore persists fluency strength in
+ * default app usage. When no canonical composition is available the recorder
+ * is left out entirely — nothing is persisted, and no learner is fabricated.
  */
 export async function createDefaultFluencyService(): Promise<FluencyPracticeService> {
   const speaking: SpeakingPracticeService = await createDefaultSpeakingService();
-  return createFluencyPracticeService(speaking);
+  // SAME canonical composition/database the speaking service runs on. When it
+  // is unavailable the recorder is omitted entirely (no strength is written)
+  // rather than pointing evidence at some other store.
+  const composition = await resolveDefaultSpeakingComposition();
+  const successRecorder: SuccessObservationRecorder | null = composition
+    ? createSpeakingSuccessRecorder(composition.adapter)
+    : null;
+  return createFluencyPracticeService(
+    speaking,
+    successRecorder ? { successRecorder } : undefined,
+  );
 }
 
 /** Test/composition seam: build a fluency service over any speaking service. */
