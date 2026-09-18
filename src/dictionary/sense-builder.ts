@@ -323,14 +323,22 @@ export function parseContextualMeaning(
       typeof parsed.englishExplanation === 'string' && parsed.englishExplanation.trim().length > 0
         ? parsed.englishExplanation.trim()
         : '';
-
-    if (!arabicMeaning && !englishExplanation) return null;
+    const whyFits =
+      typeof parsed.whyFits === 'string' && parsed.whyFits.trim().length > 0
+        ? parsed.whyFits.trim()
+        : '';
 
     const rawCertainty =
       typeof parsed.certainty === 'string' ? parsed.certainty.toLowerCase().trim() : '';
-    const certainty: ContextCertainty = ALLOWED_CERTAINTIES.includes(rawCertainty as ContextCertainty)
-      ? (rawCertainty as ContextCertainty)
-      : 'likely';
+    if (
+      !arabicMeaning ||
+      !englishExplanation ||
+      !whyFits ||
+      !ALLOWED_CERTAINTIES.includes(rawCertainty as ContextCertainty)
+    ) {
+      return null;
+    }
+    const certainty = rawCertainty as ContextCertainty;
 
     const selectedSenseId =
       typeof parsed.selectedSenseId === 'string' && parsed.selectedSenseId.trim().length > 0
@@ -342,23 +350,33 @@ export function parseContextualMeaning(
         ? parsed.distinction.trim()
         : undefined;
 
-    const whyFits =
-      typeof parsed.whyFits === 'string' && parsed.whyFits.trim().length > 0
-        ? parsed.whyFits.trim()
-        : 'Fits the grammatical and situational context of the sentence.';
-
     let alternativeSense = null;
     if (typeof parsed.alternativeSense === 'object' && parsed.alternativeSense !== null) {
       const alt = parsed.alternativeSense as Record<string, unknown>;
-      const altArabic = typeof alt.arabicMeaning === 'string' ? alt.arabicMeaning.trim() : '';
-      const altEn = typeof alt.englishExplanation === 'string' ? alt.englishExplanation.trim() : '';
-      if (altArabic || altEn) {
+      const altArabic =
+        typeof alt.arabicMeaning === 'string' && alt.arabicMeaning.trim().length > 0
+          ? alt.arabicMeaning.trim()
+          : '';
+      const altEn =
+        typeof alt.englishExplanation === 'string' && alt.englishExplanation.trim().length > 0
+          ? alt.englishExplanation.trim()
+          : '';
+      const altReason =
+        typeof alt.reason === 'string' && alt.reason.trim().length > 0 ? alt.reason.trim() : '';
+
+      if (altArabic && altEn && altReason) {
         alternativeSense = {
-          senseId: typeof alt.senseId === 'string' ? alt.senseId.trim() : undefined,
-          distinction: typeof alt.distinction === 'string' ? alt.distinction.trim() : undefined,
+          senseId:
+            typeof alt.senseId === 'string' && alt.senseId.trim().length > 0
+              ? alt.senseId.trim()
+              : undefined,
+          distinction:
+            typeof alt.distinction === 'string' && alt.distinction.trim().length > 0
+              ? alt.distinction.trim()
+              : undefined,
           arabicMeaning: altArabic,
           englishExplanation: altEn,
-          reason: typeof alt.reason === 'string' ? alt.reason.trim() : '',
+          reason: altReason,
         };
       }
     }
