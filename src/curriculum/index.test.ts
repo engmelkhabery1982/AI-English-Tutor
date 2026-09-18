@@ -62,7 +62,7 @@ describe('domains', () => {
   it('2. every domain is represented in the catalog', () => {
     for (const domain of SUPPORTED_DOMAINS) {
       const inDomain = SKILL_CATALOG.filter((s) => s.domain === domain);
-      expect(inDomain.length, `domain "${domain}"`).toBeGreaterThan(0);
+      expect(inDomain.length, `domain ${domain}`).toBeGreaterThan(0);
     }
   });
 
@@ -363,51 +363,247 @@ describe('filtering and limits', () => {
 });
 
 // =========================================================================
-// 20-21. LEARNING GOAL BEHAVIOUR
+// BLOCKER 1 — INVALID REQUESTED DOMAIN IS ACTUALLY IGNORED
 // =========================================================================
 
-describe('learning-goal behaviour', () => {
-  it('20. a mapped learning goal materially affects ordering', () => {
+describe('BLOCKER 1: invalid requested domain is safely ignored', () => {
+  const invalid = 'not_a_domain' as unknown as SkillDomain;
+
+  it('does not filter out every skill', () => {
+    const plan = planCurriculum({ requestedDomain: invalid, maxItems: 50 });
+    expect(plan.recommendations.length).toBeGreaterThan(0);
+  });
+
+  it('produces the SAME plan as no domain filter at all', () => {
+    const filtered = planCurriculum({ requestedDomain: invalid, maxItems: 50 });
+    const unfiltered = planCurriculum({ maxItems: 50 });
+    expect(filtered.recommendations).toEqual(unfiltered.recommendations);
+  });
+
+  it('does not expose the invalid value as an applied requestedDomain', () => {
+    const plan = planCurriculum({ requestedDomain: invalid, maxItems: 50 });
+    expect(plan.requestedDomain).toBeUndefined();
+  });
+
+  it('adds an honest note about the ignored domain', () => {
+    const plan = planCurriculum({ requestedDomain: invalid, maxItems: 50 });
+    expect(plan.notes.join(' ').toLowerCase()).toContain('not supported');
+  });
+
+  it('still applies a supported domain filter normally', () => {
+    const plan = planCurriculum({ requestedDomain: 'grammar', maxItems: 50 });
+    expect(plan.requestedDomain).toBe('grammar');
+    expect(plan.recommendations.every((r) => r.domain === 'grammar')).toBe(true);
+  });
+});
+
+// =========================================================================
+// BLOCKER 2 — NO-EVIDENCE SKILLS ARE NOT FABRICATED AS "observed"
+// =========================================================================
+
+describe('BLOCKER 2: no-evidence skills are not exposed as observed', () => {
+  it('a skill with no evidence has lifecycleState null and status unobserved', () => {
+    const plan = planCurriculum({ maxItems: 50 });
+    const noEvidence = plan.recommendations.find((r) => r.skillId === 'sentence_structure');
+    expect(noEvidence).toBeDefined();
+    expect(noEvidence?.lifecycleState).toBeNull();
+    expect(noEvidence?.status).toBe('unobserved');
+  });
+
+  it('no evidence is NOT equal to observed', () => {
+    const plan = planCurriculum({ maxItems: 50 });
+    const noEvidence = plan.recommendations.find((r) => r.skillId === 'sentence_structure');
+    expect(noEvidence?.lifecycleState).not.toBe('observed');
+
+    const observedPlan = planCurriculum({
+      evidence: [snapshot('sentence_structure', 'observed')],
+      maxItems: 50,
+    });
+    const observed = observedPlan.recommendations.find((r) => r.skillId === 'sentence_structure');
+    expect(observed?.lifecycleState).toBe('observed');
+    expect(observed?.status).toBe('evidenced');
+
+    expect(noEvidence?.lifecycleState).not.toBe(observed?.lifecycleState);
+    expect(noEvidence?.status).not.toBe(observed?.status);
+  });
+
+  it('actual observed evidence remains observed', () => {
+    const plan = planCurriculum({ evidence: [snapshot('articles', 'observed')], maxItems: 50 });
+    const item = plan.recommendations.find((r) => r.skillId === 'articles');
+    expect(item?.lifecycleState).toBe('observed');
+    expect(item?.reasons.some((r) => r.code === 'observed')).toBe(true);
+  });
+
+  it('a new skill carries an honest new_skill reason', () => {
+    const plan = planCurriculum({ maxItems: 50 });
+    const item = plan.recommendations.find((r) => r.skillId === 'sentence_structure');
+    expect(item?.reasons.some((r) => r.code === 'new_skill')).toBe(true);
+    expect(item?.reasons.some((r) => r.code === 'observed')).toBe(false);
+  });
+
+  it('evidenced skills always report a lifecycleState; unobserved always null', () => {
+    const plan = planCurriculum({
+      evidence: [snapshot('present_tense', 'repeated')],
+      maxItems: 50,
+    });
+    for (const rec of plan.recommendations) {
+      if (rec.status === 'unobserved') {
+        expect(rec.lifecycleState).toBeNull();
+      } else {
+        expect(rec.lifecycleState).not.toBeNull();
+      }
+    }
+  });
+});
+
+// =========================================================================
+// BLOCKER 3 — ACTIVE WEAKNESS MUST NOT CLAIM "confirmed"
+// =========================================================================
+
+describe('BLOCKER 3: active weakness does not claim confirmed', () => {
+  it('active weakness materially affects priority', () => {
+    const baseline = planCurriculum({ maxItems: 50 });
+    const withWeakness = planCurriculum({ activeWeaknesses: ['sentence_structure'], maxItems: 50 });
+    expect(withWeakness.recommendations).not.toEqual(baseline.recommendations);
+    const baselineIdx = baseline.recommendations.findIndex((r) => r.skillId === 'sentence_structure');
+    const weakIdx = withWeakness.recommendations.findIndex((r) => r.skillId === 'sentence_structure');
+    expect(weakIdx).toBeLessThan(baselineIdx);
+  });
+
+  it('emits an active_weakness reason, never confirmed', () => {
+    const plan = planCurriculum({ activeWeaknesses: ['sentence_structure'], maxItems: 50 });
+    const item = plan.recommendations.find((r) => r.skillId === 'sentence_structure');
+    expect(item?.reasons.some((r) => r.code === 'active_weakness')).toBe(true);
+    expect(item?.reasons.some((r) => r.code === 'confirmed')).toBe(false);
+  });
+
+  it('does NOT mutate lifecycle state because of activeWeaknesses', () => {
+    const plan = planCurriculum({ activeWeaknesses: ['sentence_structure'], maxItems: 50 });
+    const item = plan.recommendations.find((r) => r.skillId === 'sentence_structure');
+    expect(item?.lifecycleState).toBeNull();
+    expect(item?.status).toBe('unobserved');
+  });
+
+  it('confirmed is emitted ONLY for actual confirmed lifecycle evidence', () => {
+    const withConfirmed = planCurriculum({ evidence: [snapshot('articles', 'confirmed')], maxItems: 50 });
+    expect(
+      withConfirmed.recommendations.find((r) => r.skillId === 'articles')?.reasons.some(
+        (r) => r.code === 'confirmed',
+      ),
+    ).toBe(true);
+
+    const onlyWeakness = planCurriculum({ activeWeaknesses: ['articles'], maxItems: 50 });
+    expect(
+      onlyWeakness.recommendations.find((r) => r.skillId === 'articles')?.reasons.some(
+        (r) => r.code === 'confirmed',
+      ),
+    ).toBe(false);
+  });
+});
+
+// =========================================================================
+// BLOCKER 4 — LEARNING GOAL APPLIED ONLY IF IT MATERIALLY CHANGES THE PLAN
+// =========================================================================
+
+describe('BLOCKER 4: learning goals are applied only when material', () => {
+  it('A. goal that materially reorders across domains IS applied', () => {
     const baseline = planCurriculum({ maxItems: 50 });
     const withGoal = planCurriculum({ learningGoals: ['listening_comprehension'], maxItems: 50 });
 
     expect(withGoal.recommendations).not.toEqual(baseline.recommendations);
     expect(withGoal.appliedLearningGoals).toContain('listening_comprehension');
 
-    const baselineFirstListening = baseline.recommendations.findIndex((r) => r.domain === 'listening');
-    const withGoalFirstListening = withGoal.recommendations.findIndex((r) => r.domain === 'listening');
-    expect(withGoalFirstListening).toBeLessThan(baselineFirstListening);
+    const baseListening = baseline.recommendations.findIndex((r) => r.domain === 'listening');
+    const goalListening = withGoal.recommendations.findIndex((r) => r.domain === 'listening');
+    expect(goalListening).toBeLessThan(baseListening);
   });
 
-  it('a goal inside a requested domain is still applied', () => {
-    const plan = planCurriculum({
+  it('B. a goal fully constrained by requestedDomain changes nothing -> NOT applied', () => {
+    const baseline = planCurriculum({ requestedDomain: 'pronunciation', maxItems: 50 });
+    const withGoal = planCurriculum({
       requestedDomain: 'pronunciation',
       learningGoals: ['pronunciation_clarity'],
       maxItems: 50,
     });
-    expect(plan.appliedLearningGoals).toContain('pronunciation_clarity');
-    expect(plan.recommendations.every((r) => r.domain === 'pronunciation')).toBe(true);
+
+    expect(withGoal.recommendations).toEqual(baseline.recommendations);
+    expect(withGoal.appliedLearningGoals).toEqual([]);
+    const notes = withGoal.notes.join(' ').toLowerCase();
+    expect(notes).toContain('did not change the plan');
+    expect(notes).not.toContain('prioritise');
   });
 
-  it('21. an unmapped goal does NOT falsely claim adaptation', () => {
+  it('C. a goal that changes which skills enter the final plan IS applied', () => {
+    const baseline = planCurriculum({ maxItems: 1 });
+    const withGoal = planCurriculum({ learningGoals: ['listening_comprehension'], maxItems: 1 });
+
+    expect(withGoal.recommendations).not.toEqual(baseline.recommendations);
+    expect(withGoal.appliedLearningGoals).toContain('listening_comprehension');
+    expect(withGoal.recommendations[0].domain).toBe('listening');
+  });
+
+  it('D. an unmapped goal is NOT applied and claims no adaptation', () => {
     const plan = planCurriculum({
       requestedDomain: 'grammar',
       learningGoals: ['listening_comprehension'],
       maxItems: 50,
     });
     expect(plan.appliedLearningGoals).toEqual([]);
-    expect(plan.notes.join(' ').toLowerCase()).toContain('did not map');
+    expect(plan.notes.join(' ').toLowerCase()).toContain('did not change the plan');
   });
 
-  it('no goals supplied → no applied goals claimed', () => {
+  it('no goals supplied -> no applied goals claimed', () => {
     const plan = planCurriculum({ maxItems: 50 });
     expect(plan.appliedLearningGoals).toEqual([]);
+  });
+
+  it('applied goals are deterministic across repeated calls', () => {
+    const input: CurriculumPlannerInput = { learningGoals: ['listening_comprehension'], maxItems: 50 };
+    const a = planCurriculum(input).appliedLearningGoals;
+    for (let i = 0; i < 10; i += 1) {
+      expect(planCurriculum(input).appliedLearningGoals).toEqual(a);
+    }
   });
 
   it('every goal hint maps to at least one domain', () => {
     for (const goal of Object.keys(GOAL_DOMAIN_WEIGHTS) as LearningGoalHint[]) {
       expect(GOAL_DOMAIN_WEIGHTS[goal].length, goal).toBeGreaterThan(0);
     }
+  });
+});
+
+// =========================================================================
+// HONESTY HARDENING — RECENT PRACTICE TRACEABILITY
+// =========================================================================
+
+describe('recent practice is traceable', () => {
+  it('recently practised skills are deprioritized with a visible reason', () => {
+    const baseline = planCurriculum({ maxItems: 50 });
+    const withRecent = planCurriculum({ recentlyPractised: ['sentence_structure'], maxItems: 50 });
+
+    expect(withRecent.recommendations).not.toEqual(baseline.recommendations);
+    const item = withRecent.recommendations.find((r) => r.skillId === 'sentence_structure');
+    expect(item?.reasons.some((r) => r.code === 'recently_practised')).toBe(true);
+
+    const baseIdx = baseline.recommendations.findIndex((r) => r.skillId === 'sentence_structure');
+    const recentIdx = withRecent.recommendations.findIndex((r) => r.skillId === 'sentence_structure');
+    expect(recentIdx).toBeGreaterThan(baseIdx);
+  });
+
+  it('the reason message explains the deprioritization without numbers', () => {
+    const plan = planCurriculum({ recentlyPractised: ['sentence_structure'], maxItems: 50 });
+    const reason = plan.recommendations
+      .find((r) => r.skillId === 'sentence_structure')
+      ?.reasons.find((r) => r.code === 'recently_practised');
+    expect(reason?.message).toContain('deprioritized');
+    expect(reason?.message).not.toMatch(/\d/);
+  });
+
+  it('a skill is not marked recently_practised unless it was', () => {
+    const plan = planCurriculum({ maxItems: 50 });
+    expect(
+      plan.recommendations.some((r) => r.reasons.some((x) => x.code === 'recently_practised')),
+    ).toBe(false);
   });
 });
 
@@ -438,7 +634,7 @@ describe('no scoring model', () => {
     expect(JSON.stringify(plan).toUpperCase()).not.toContain('CEFR');
   });
 
-  it('lifecycle states stay qualitative', () => {
+  it('lifecycle states stay qualitative and unchanged', () => {
     expect([...SKILL_LIFECYCLE_STATES]).toEqual([
       'observed',
       'repeated',
@@ -545,15 +741,6 @@ describe('safe handling of invalid input', () => {
       maxItems: 5,
     });
     expect(plan.recommendations.every((r) => getSkill(r.skillId) !== undefined)).toBe(true);
-  });
-
-  it('an unsupported requested domain is ignored with an honest note', () => {
-    const plan = planCurriculum({
-      requestedDomain: 'not_a_domain' as unknown as SkillDomain,
-      maxItems: 5,
-    });
-    expect(plan.notes.join(' ').toLowerCase()).toContain('not supported');
-    expect(plan.recommendations.length).toBeGreaterThan(0);
   });
 
   it('an empty input yields a usable default plan', () => {
