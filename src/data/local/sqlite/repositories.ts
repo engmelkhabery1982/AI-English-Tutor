@@ -162,6 +162,7 @@ function rowToConversationTurn(row: SqlRow): ConversationTurn {
 function buildSessionUpdate(
   id: string,
   patch: Partial<Omit<ConversationSession, 'id' | 'createdAt'>>,
+  opts?: { updatedAt?: string },
 ): { sql: string; params: SqlParam[] } {
   const fields: string[] = [];
   const params: SqlParam[] = [];
@@ -194,9 +195,9 @@ function buildSessionUpdate(
     }
   }
 
-  // Always update updatedAt
+  // Always update updatedAt — monotonic when previous is known
   fields.push('updated_at = ?');
-  params.push(nowIso());
+  params.push(opts?.updatedAt ?? nowIso());
 
   // WHERE clause
   params.push(id);
@@ -508,14 +509,20 @@ export class SQLiteConversationRepository implements ConversationRepository {
     }
 
     // The completed status/endedAt/turnCount are written in the SAME transaction.
-    const completion = buildSessionUpdate(id, {
-      status: session.status,
-      turnCount: session.turnCount ?? input.turns.length,
-      ...(session.endedAt !== undefined && { endedAt: session.endedAt }),
-      ...(session.durationSeconds !== undefined && {
-        durationSeconds: session.durationSeconds,
-      }),
-    });
+    // Use a monotonic timestamp strictly after creation to keep updatedAt meaningful.
+    const completionUpdatedAt = generateMonotonicTimestamp(now);
+    const completion = buildSessionUpdate(
+      id,
+      {
+        status: session.status,
+        turnCount: session.turnCount ?? input.turns.length,
+        ...(session.endedAt !== undefined && { endedAt: session.endedAt }),
+        ...(session.durationSeconds !== undefined && {
+          durationSeconds: session.durationSeconds,
+        }),
+      },
+      { updatedAt: completionUpdatedAt },
+    );
     steps.push({ sql: completion.sql, params: completion.params });
 
     await this.adapter.transaction(steps);
@@ -572,7 +579,8 @@ export class SQLiteConversationRepository implements ConversationRepository {
       throw new Error(`Session not found: ${id}`);
     }
 
-    const { sql, params } = buildSessionUpdate(id, patch);
+    const newUpdatedAt = generateMonotonicTimestamp(existing.updatedAt);
+    const { sql, params } = buildSessionUpdate(id, patch, { updatedAt: newUpdatedAt });
     await this.adapter.execute(sql, params);
 
     const updated = await this.getSession(id);

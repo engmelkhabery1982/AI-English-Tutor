@@ -69,6 +69,8 @@ export class ReviewVoiceController {
    */
   private operationToken = 0;
   private activeOperation: number | null = null;
+  /** Pending recorder teardown that a replacement start must await. */
+  private pendingStop: Promise<void> | null = null;
 
   private readonly unavailable: boolean;
   private readonly unavailableMessage: string | null;
@@ -126,26 +128,45 @@ export class ReviewVoiceController {
     this._userAnswer = '';
   }
 
+  private trackTeardown(promise: Promise<unknown>): void {
+    const safe = promise.then(() => undefined).catch(() => undefined);
+    if (this.pendingStop) {
+      const prev = this.pendingStop;
+      const chained = prev.then(() => safe).catch(() => undefined);
+      this.pendingStop = chained;
+    } else {
+      this.pendingStop = safe;
+    }
+    const cur = this.pendingStop;
+    cur.finally(() => {
+      if (this.pendingStop === cur) {
+        this.pendingStop = null;
+      }
+    });
+  }
+
   /**
    * Item switch: invalidates everything in flight BEFORE anything else runs.
    * An open recording is stopped best-effort — the shared recorder must never
    * keep running for an item the learner already left (invariant: at most one
    * active recording per surface).
+   *
+   * The UI becomes idle synchronously (fast), but any pending recorder
+   * stop/teardown is tracked so a replacement recording waits for it,
+   * preventing “Recording is already in progress”.
    */
   reset(): void {
     if (this._disposed) return;
     const wasRecording = this._isRecording;
+    // Synchronous invalidation FIRST – stale callbacks impossible
     this.generation += 1;
-    // The abandoned operation keeps unwinding in the background, but it no
-    // longer owns the controller — the mic is immediately usable for the new
-    // item while its result is guaranteed to be discarded.
     this.abandonActiveOperation();
     this._userAnswer = '';
     this._error = null;
     this._isRecording = false;
     this._state = 'idle';
     if (wasRecording) {
-      void this.recorder.stopRecording().catch(() => undefined);
+      this.trackTeardown(this.recorder.stopRecording());
     }
   }
 
@@ -171,7 +192,7 @@ export class ReviewVoiceController {
     this._userAnswer = '';
     this._error = null;
     if (wasRecording) {
-      void this.recorder.stopRecording().catch(() => undefined);
+      this.trackTeardown(this.recorder.stopRecording());
     }
   }
 
@@ -205,6 +226,17 @@ export class ReviewVoiceController {
     this._error = null;
     const generation = this.generation;
     try {
+      // A replacement recording must wait for any pending teardown from reset(),
+      // otherwise the native recorder may still report active and fail with
+      // “Recording is already in progress”. We await AFTER generation capture
+      // so stale callbacks remain impossible.
+      if (this.pendingStop) {
+        await this.pendingStop;
+        if (this.isStale(generation)) {
+          return this.getStatus();
+        }
+      }
+
       const hasPermissions = await this.recorder.hasPermissions();
       if (this.isStale(generation)) {
         return this.getStatus();
@@ -224,8 +256,9 @@ export class ReviewVoiceController {
       await this.recorder.startRecording();
       if (this.isStale(generation)) {
         // The learner left the item/surface while the microphone was opening:
-        // never keep an orphaned recording running.
-        void this.recorder.stopRecording().catch(() => undefined);
+        // never keep an orphaned recording running. Track it so the next start
+        // also waits.
+        this.trackTeardown(this.recorder.stopRecording());
         return this.getStatus();
       }
 

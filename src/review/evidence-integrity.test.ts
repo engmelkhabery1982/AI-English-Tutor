@@ -484,3 +484,218 @@ describe('Review evidence integrity — attempt identity', () => {
     );
   });
 });
+
+describe('Review voice lifecycle — teardown serialization', () => {
+  function createRealisticRecorder(stopDelayMs = 40): {
+    recorder: AudioRecorderService;
+    getRecording: () => boolean;
+    getStopCount: () => number;
+  } {
+    let recording = false;
+    let stopCount = 0;
+    const recorder: AudioRecorderService = {
+      requestPermissions: vi.fn(async () => true),
+      hasPermissions: vi.fn(async () => true),
+      startRecording: vi.fn(async () => {
+        if (recording) {
+          throw new Error('Recording is already in progress');
+        }
+        recording = true;
+      }),
+      stopRecording: vi.fn(async () => {
+        stopCount += 1;
+        await new Promise((resolve) => setTimeout(resolve, stopDelayMs));
+        recording = false;
+        return {
+          uri: 'file:///tmp/attempt.m4a',
+          base64: 'YXVkaW8=',
+          mimeType: 'audio/m4a',
+          durationMs: 900,
+        };
+      }),
+      isRecording: vi.fn(() => recording),
+      getElapsedSeconds: vi.fn(() => 0),
+    };
+    return {
+      recorder,
+      getRecording: () => recording,
+      getStopCount: () => stopCount,
+    };
+  }
+
+  it('11. reset while recording → immediate new mic waits for old stop then succeeds', async () => {
+    const { recorder } = createRealisticRecorder(50);
+    const stt: SpeechToTextProvider = {
+      id: 'fast-stt',
+      transcribe: vi.fn(async () => ({ ok: true, transcript: 'new answer' })),
+    };
+    const controller = new ReviewVoiceController(recorder, stt);
+
+    await controller.toggleRecording();
+    expect(controller.isRecording).toBe(true);
+
+    const beforeReset = Date.now();
+    controller.reset();
+
+    // Fast UI: synchronous invalidation
+    expect(controller.isRecording).toBe(false);
+    expect(controller.isBusy).toBe(false);
+    expect(controller.userAnswer).toBe('');
+    expect(recorder.stopRecording).toHaveBeenCalledTimes(1);
+
+    // Immediate replacement mic must wait for pending teardown, then succeed
+    const startPromise = controller.toggleRecording();
+    const elapsedBeforeAwait = Date.now() - beforeReset;
+    expect(elapsedBeforeAwait).toBeLessThan(20);
+
+    const status = await startPromise;
+    expect(status.isRecording).toBe(true);
+    expect(status.state).toBe('recording');
+    expect(status.error).toBeNull();
+    expect(recorder.startRecording).toHaveBeenCalledTimes(2);
+  });
+
+  it('12. reset while recording → no "already recording" error on immediate restart', async () => {
+    const { recorder } = createRealisticRecorder(60);
+    const stt: SpeechToTextProvider = {
+      id: 'fast-stt',
+      transcribe: vi.fn(async () => ({ ok: true, transcript: 'answer' })),
+    };
+    const controller = new ReviewVoiceController(recorder, stt);
+
+    await controller.toggleRecording();
+    controller.reset();
+
+    const status = await controller.toggleRecording();
+    expect(status.isRecording).toBe(true);
+    expect(status.error).toBeNull();
+    expect(status.error?.includes('already')).toBeFalsy();
+    // Even if the underlying recorder would throw when overlapping, controller serialized it
+    expect(recorder.startRecording).toHaveBeenCalledTimes(2);
+    expect((recorder.startRecording as ReturnType<typeof vi.fn>).mock.results.some((r) => r.type === 'throw')).toBe(false);
+  });
+
+  it('13. old transcript cannot land in new item after reset while recording', async () => {
+    const pending: Array<(value: { ok: true; transcript: string }) => void> = [];
+    const transcribe = vi.fn(
+      () =>
+        new Promise<{ ok: true; transcript: string }>((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+    const stt: SpeechToTextProvider = { id: 'deferred-stt', transcribe };
+    const { recorder } = createRealisticRecorder(15);
+    const controller = new ReviewVoiceController(recorder, stt);
+
+    // Attempt A: record + stop → STT pending[0]
+    await controller.toggleRecording();
+    const stoppingA = controller.toggleRecording();
+    // Wait for stopRecording (15ms) to finish so transcribe is invoked
+    await new Promise((r) => setTimeout(r, 25));
+    expect(transcribe).toHaveBeenCalledTimes(1);
+
+    // Abandon A via reset (clears busy, invalidates its transcript)
+    controller.reset();
+    expect(controller.isBusy).toBe(false);
+    expect(controller.userAnswer).toBe('');
+
+    // Attempt B: start and immediately reset WHILE recording
+    await controller.toggleRecording();
+    expect(controller.isRecording).toBe(true);
+    controller.reset(); // abort B mid-recording, bump generation, track teardown
+    expect(controller.isRecording).toBe(false);
+    expect(controller.isBusy).toBe(false);
+
+    // New item C: immediate new mic must wait for B's teardown, then record
+    const startC = controller.toggleRecording(); // should await B's stop
+    const statusC = await startC;
+    expect(statusC.isRecording).toBe(true);
+
+    const stoppingC = controller.toggleRecording(); // stop C → STT pending[1]
+    await new Promise((r) => setTimeout(r, 25));
+    expect(transcribe).toHaveBeenCalledTimes(2);
+
+    // C's transcript arrives first
+    pending[1]({ ok: true, transcript: 'answer for new item C' });
+    await stoppingC;
+    expect(controller.userAnswer).toBe('answer for new item C');
+
+    // A's late transcript must NOT overwrite C
+    pending[0]({ ok: true, transcript: 'answer for abandoned A' });
+    await stoppingA;
+
+    expect(controller.userAnswer).toBe('answer for new item C');
+  });
+
+  it('14. dispose during recording remains terminal', async () => {
+    const { recorder, getStopCount } = createRealisticRecorder(30);
+    const stt: SpeechToTextProvider = {
+      id: 'fast-stt',
+      transcribe: vi.fn(async () => ({ ok: true, transcript: 'should be discarded' })),
+    };
+    const controller = new ReviewVoiceController(recorder, stt);
+
+    await controller.toggleRecording();
+    expect(controller.isRecording).toBe(true);
+
+    controller.dispose();
+    expect(controller.isDisposed).toBe(true);
+    expect(controller.isRecording).toBe(false);
+    expect(controller.isBusy).toBe(false);
+    expect(controller.userAnswer).toBe('');
+    expect(recorder.stopRecording).toHaveBeenCalledTimes(1);
+
+    // Even if stop takes time, controller stays disposed and refuses new work
+    const afterDispose = await controller.toggleRecording();
+    expect(afterDispose.isDisposed).toBe(true);
+    expect(afterDispose.isRecording).toBe(false);
+    expect(afterDispose.transcript).toBe('');
+    // startRecording should not be called after dispose
+    expect(recorder.startRecording).toHaveBeenCalledTimes(1);
+
+    // Wait for teardown to finish, still terminal
+    await new Promise((r) => setTimeout(r, 50));
+    expect(getStopCount()).toBe(1);
+    expect(controller.isDisposed).toBe(true);
+    const again = await controller.toggleRecording();
+    expect(again.isDisposed).toBe(true);
+  });
+
+  it('15. repeated reset/dispose is safe and idempotent', async () => {
+    const { recorder } = createRealisticRecorder(20);
+    const stt: SpeechToTextProvider = {
+      id: 'fast-stt',
+      transcribe: vi.fn(async () => ({ ok: true, transcript: 'answer' })),
+    };
+    const controller = new ReviewVoiceController(recorder, stt);
+
+    await controller.toggleRecording();
+    expect(controller.isRecording).toBe(true);
+
+    // Repeated resets while recording
+    controller.reset();
+    controller.reset();
+    controller.reset();
+    expect(controller.isRecording).toBe(false);
+    expect(controller.isBusy).toBe(false);
+    expect(() => controller.reset()).not.toThrow();
+
+    // New recording after repeated resets must still work
+    const statusAfterResets = await controller.toggleRecording();
+    expect(statusAfterResets.isRecording).toBe(true);
+    expect(statusAfterResets.error).toBeNull();
+
+    // Repeated dispose
+    controller.dispose();
+    expect(controller.isDisposed).toBe(true);
+    expect(() => controller.dispose()).not.toThrow();
+    controller.dispose();
+    controller.reset(); // reset after dispose is no-op
+    expect(controller.isDisposed).toBe(true);
+    expect(controller.isRecording).toBe(false);
+
+    const after = await controller.toggleRecording();
+    expect(after.isDisposed).toBe(true);
+    expect(after.isRecording).toBe(false);
+  });
+});
