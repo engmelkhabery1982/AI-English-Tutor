@@ -9,7 +9,10 @@
  * repository, no second AI provider).
  */
 
-import { getAppDatabase } from '../data/local/sqlite/app-database';
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import { createRecoverableSingleFlight } from '../shared/single-flight';
 import { createTalkComposition } from '../talk-demo';
@@ -52,10 +55,14 @@ export function createOnboardingServiceOn(adapter: DatabaseAdapter): OnboardingS
 // adapter lifecycle (see src/data/local/sqlite/app-database.ts); this factory
 // only composes the service ON that shared adapter. A failed bootstrap is not
 // cached, so a later call retries.
-const defaultService = createRecoverableSingleFlight(async () => {
-  const { adapter } = await getAppDatabase();
-  return createOnboardingServiceOn(adapter);
-});
+const defaultService = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createOnboardingServiceOn(adapter);
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
 /** Compose the service on the canonical app database (reused across calls). */
 export function createDefaultOnboardingService(): Promise<OnboardingService> {

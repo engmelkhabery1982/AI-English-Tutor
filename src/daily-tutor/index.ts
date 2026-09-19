@@ -16,7 +16,10 @@
  * - No AI is used for planning: the daily plan is deterministic and local.
  */
 
-import { getAppDatabase } from '../data/local/sqlite/app-database';
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteConversationRepository,
@@ -93,10 +96,15 @@ export function createDailyTutorService(
 // instance is shared so Home and the Daily Tutor screen see ONE service (and
 // therefore one in-flight plan/session). A failed bootstrap is not cached, so
 // a later call retries.
-const defaultService = createRecoverableSingleFlight(async () => {
-  const { adapter } = await getAppDatabase();
-  return createDailyTutorService(adapter);
-});
+const defaultService = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createDailyTutorService(adapter);
+  },
+  // Cached for ONE database lifecycle only: a new lifecycle means a new
+  // adapter, and the service must be composed on it (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
 /** Compose the service on the canonical app database (reused across calls). */
 export function createDefaultDailyTutorService(): Promise<DailyTutorService> {

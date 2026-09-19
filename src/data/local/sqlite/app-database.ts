@@ -67,6 +67,17 @@ export interface AppDatabaseConnection {
   assertOpen(): void;
 }
 
+/**
+ * Identity of ONE ownership lifecycle of the application database.
+ *
+ * Opaque by design: it is only ever compared by identity (never inspected).
+ * It changes whenever the app-level owner closes, which is exactly when every
+ * value composed on the previous connection becomes invalid — feature default
+ * factories hand this token to `createRecoverableSingleFlight` so a cached
+ * composition can never outlive the lifecycle it was built on.
+ */
+export type AppDatabaseLifecycleToken = object;
+
 /** Adapter factory seam (production default: the Expo SQLite adapter). */
 export type AppDatabaseAdapterFactory = (options: {
   readonly databaseName: string;
@@ -166,6 +177,8 @@ export class AppDatabaseOwner {
   private nextLifecycleId = 1;
   /** Incremented by every terminal close: invalidates in-flight opens. */
   private closeCount = 0;
+  /** Rotated by every terminal close: identifies the CURRENT lifecycle. */
+  private lifecycleTokenValue: AppDatabaseLifecycleToken = {};
 
   constructor(options: AppDatabaseOwnerOptions = {}) {
     this.databaseName = options.databaseName ?? APP_DATABASE_NAME;
@@ -185,6 +198,16 @@ export class AppDatabaseOwner {
   /** Lifecycle id of the open connection, or null when closed. */
   get lifecycleId(): number | null {
     return this.current?.connection.lifecycleId ?? null;
+  }
+
+  /**
+   * Identity of the CURRENT ownership lifecycle. Same value while one lifecycle
+   * stays open (including when it was opened lazily by a feature composition),
+   * and a NEW value after every close — so a cache keyed on it is dropped
+   * exactly when the previous connection is invalidated.
+   */
+  get lifecycleToken(): AppDatabaseLifecycleToken {
+    return this.lifecycleTokenValue;
   }
 
   /**
@@ -300,6 +323,10 @@ export class AppDatabaseOwner {
    * Terminal close of the current lifecycle. Idempotent: closing twice (or
    * closing a never-opened owner) is a safe no-op. Every previously handed-out
    * connection becomes invalid; the next `open()` starts a NEW lifecycle.
+   *
+   * The lifecycle token rotates here, which is what invalidates feature
+   * compositions cached by a default factory: they recompose on the next
+   * request (on the new lifecycle) instead of keeping the closed connection.
    */
   async close(): Promise<void> {
     const current = this.current;
@@ -307,6 +334,7 @@ export class AppDatabaseOwner {
     this.current = null;
     this.pendingOpen = null;
     this.closeCount += 1;
+    this.lifecycleTokenValue = {};
 
     if (current) {
       current.markClosed();
@@ -450,6 +478,16 @@ export function validateAppDatabase(): Promise<DatabaseHealth> {
 /** Terminal close of the canonical database lifecycle (idempotent). */
 export function closeAppDatabase(): Promise<void> {
   return getAppDatabaseOwner().close();
+}
+
+/**
+ * Identity of the CURRENT canonical database lifecycle — the token feature
+ * default factories hand to `createRecoverableSingleFlight({ lifecycleToken })`.
+ * Read it on every call (never capture it): a new value means the previous
+ * connection was closed.
+ */
+export function appDatabaseLifecycleToken(): AppDatabaseLifecycleToken {
+  return getAppDatabaseOwner().lifecycleToken;
 }
 
 /** Explicitly start a NEW canonical lifecycle (close + open). */

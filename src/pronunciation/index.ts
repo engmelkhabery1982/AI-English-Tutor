@@ -8,7 +8,10 @@
  * createDefaultPronunciationEngine().
  */
 
-import { getAppDatabase } from '../data/local/sqlite/app-database';
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteUserProfileRepository,
@@ -60,10 +63,14 @@ export function createPronunciationEngine(adapter: DatabaseAdapter): Pronunciati
 // adapter lifecycle (see src/data/local/sqlite/app-database.ts); this factory
 // only builds the engine ON that shared adapter and caches the instance.
 // A failed bootstrap is not cached, so a later call retries.
-const defaultEngine = createRecoverableSingleFlight(async () => {
-  const { adapter } = await getAppDatabase();
-  return createPronunciationEngine(adapter);
-});
+const defaultEngine = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createPronunciationEngine(adapter);
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
 /** Compose the engine on the canonical app database (reused across calls). */
 export function createDefaultPronunciationEngine(): Promise<PronunciationEngine> {

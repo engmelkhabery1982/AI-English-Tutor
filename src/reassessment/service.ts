@@ -8,7 +8,11 @@
  * DOES NOT silently replace current level: level update requires explicit user acceptance.
  */
 
-import { getAppDatabase } from '../data/local/sqlite/app-database';
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+  type AppDatabaseLifecycleToken,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteWeaknessRepository,
@@ -79,8 +83,30 @@ export function createReassessmentService(
   let historyRepoInstance = deps.historyRepository ?? null;
   let successRecorderInstance = deps.successRecorder ?? null;
   let activeHandle: DiagnosticHandle | null = null;
+  /**
+   * Database lifecycle the DEFAULT composition below was resolved on. Anything
+   * composed from the canonical database is dropped when that database starts a
+   * NEW lifecycle, so this service can never keep reading/writing through a
+   * closed connection. Explicitly injected dependencies are the caller's and
+   * are used exactly as given.
+   */
+  let resolvedLifecycle: AppDatabaseLifecycleToken | null = null;
 
   async function resolveDependencies() {
+    const hasInjectedComposition = Boolean(deps.adapter || deps.onboardingService);
+    if (!hasInjectedComposition) {
+      const lifecycle = appDatabaseLifecycleToken();
+      if (resolvedLifecycle !== lifecycle) {
+        // First resolution, or a close/reopen happened: recompose on the
+        // CURRENT shared adapter instead of the previous connection.
+        resolvedLifecycle = lifecycle;
+        adapterInstance = null;
+        onboardingInstance = null;
+        historyRepoInstance = deps.historyRepository ?? null;
+        successRecorderInstance = deps.successRecorder ?? null;
+      }
+    }
+
     if (!adapterInstance && !onboardingInstance) {
       // Precedence: an explicitly injected adapter/onboarding service first,
       // then the CANONICAL application database owner (one shared adapter for

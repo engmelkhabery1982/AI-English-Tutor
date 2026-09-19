@@ -10,7 +10,10 @@
  * workspace).
  */
 
-import { getAppDatabase } from '../data/local/sqlite/app-database';
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteUserProfileRepository,
@@ -68,10 +71,14 @@ export function createProgressDashboardService(
 // adapter lifecycle (see src/data/local/sqlite/app-database.ts); this factory
 // only builds the dashboard ON that shared adapter and caches the instance.
 // A failed bootstrap is not cached, so a later call retries.
-const defaultService = createRecoverableSingleFlight(async () => {
-  const { adapter } = await getAppDatabase();
-  return createProgressDashboardService(adapter);
-});
+const defaultService = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createProgressDashboardService(adapter);
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
 /**
  * Compose the dashboard on the canonical app database. Safe to call

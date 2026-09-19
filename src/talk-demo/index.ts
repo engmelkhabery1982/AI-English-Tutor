@@ -15,7 +15,10 @@ import {
   type ConversationSessionResult,
   type ConversationTurn,
 } from '../conversation-session';
-import { getAppDatabase } from '../data/local/sqlite/app-database';
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteConversationRepository,
@@ -455,10 +458,16 @@ export function createTalkComposition(adapter: DatabaseAdapter): TalkCoachingCom
 // adapter lifecycle (see src/data/local/sqlite/app-database.ts) — the SAME
 // owner every other feature composition uses. A failed bootstrap is not
 // cached, so a later call retries.
-const defaultComposition = createRecoverableSingleFlight(async () => {
-  const { adapter } = await getAppDatabase();
-  return createTalkComposition(adapter);
-});
+const defaultComposition = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createTalkComposition(adapter);
+  },
+  // The cache belongs to ONE database lifecycle: closing the app database
+  // invalidates it, so the next request recomposes on the new connection
+  // instead of keeping an adapter that was closed.
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
 /** Compose Talk's coaching context on the canonical app database (reused). */
 export function createDefaultTalkComposition(): Promise<TalkCoachingComposition> {

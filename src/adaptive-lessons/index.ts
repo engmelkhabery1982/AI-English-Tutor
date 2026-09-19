@@ -21,7 +21,10 @@
  *   instance is what makes an unfinished lesson recoverable).
  */
 
-import { getAppDatabase } from '../data/local/sqlite/app-database';
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteConversationRepository,
@@ -154,10 +157,14 @@ export function createAdaptiveLessonService(
 // instance is shared so Home and the lesson screen see ONE service instance
 // (and therefore one in-memory lesson). A failed bootstrap is not cached, so a
 // later call retries.
-const defaultService = createRecoverableSingleFlight(async () => {
-  const { adapter } = await getAppDatabase();
-  return createAdaptiveLessonService(adapter);
-});
+const defaultService = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createAdaptiveLessonService(adapter);
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
 /** Compose the engine on the canonical app database (reused across calls). */
 export function createDefaultAdaptiveLessonService(): Promise<AdaptiveLessonService> {

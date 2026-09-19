@@ -12,7 +12,10 @@
  * bootstrap and learner resolution behind the service.
  */
 
-import { getAppDatabase } from '../data/local/sqlite/app-database';
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteUserProfileRepository,
@@ -55,10 +58,14 @@ export function createVocabularyWorkspaceService(
 // adapter lifecycle (see src/data/local/sqlite/app-database.ts); this factory
 // only builds the workspace ON that shared adapter and caches the instance.
 // A failed bootstrap is not cached, so a later call retries.
-const defaultService = createRecoverableSingleFlight(async () => {
-  const { adapter } = await getAppDatabase();
-  return createVocabularyWorkspaceService(adapter);
-});
+const defaultService = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createVocabularyWorkspaceService(adapter);
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
 /**
  * Compose the workspace on the canonical app database. Safe to call

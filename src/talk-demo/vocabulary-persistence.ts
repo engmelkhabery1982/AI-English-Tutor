@@ -6,7 +6,11 @@
  * Hardened to preserve SRS history on re-save.
  */
 
-import { getAppDatabase } from '../data/local/sqlite/app-database';
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+  type AppDatabaseLifecycleToken,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteReviewRepository,
@@ -54,6 +58,12 @@ export function createVocabularyPersistenceService(
     options?.vocabularyRepository ?? null;
   let resolvedUserRepo: UserProfileRepository | null =
     options?.userProfileRepository ?? null;
+  /**
+   * Database lifecycle the memoized repositories were built on. After an
+   * app-level close/reopen they are rebuilt on the NEW adapter; an injected
+   * repository is never dropped (the caller owns it).
+   */
+  let resolvedLifecycle: AppDatabaseLifecycleToken | null = null;
 
   async function ensureDependencies(): Promise<{
     vocabRepo: VocabularyRepository;
@@ -61,6 +71,13 @@ export function createVocabularyPersistenceService(
     adapter?: DatabaseAdapter;
   } | null> {
     try {
+      const lifecycle = appDatabaseLifecycleToken();
+      if (resolvedLifecycle !== null && resolvedLifecycle !== lifecycle) {
+        if (!options?.vocabularyRepository) resolvedVocabRepo = null;
+        if (!options?.userProfileRepository) resolvedUserRepo = null;
+      }
+      resolvedLifecycle = lifecycle;
+
       let adapter = options?.databaseAdapter;
       if (!adapter && (!resolvedVocabRepo || (!resolvedLearnerId && !resolvedUserRepo))) {
         adapter = await getDefaultDatabaseAdapter();

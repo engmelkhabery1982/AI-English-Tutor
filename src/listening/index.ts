@@ -10,7 +10,10 @@
  * new dependency.
  */
 
-import { getAppDatabase } from '../data/local/sqlite/app-database';
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { AIProvider } from '../providers/ai/types';
 import { createGeminiAIProvider } from '../providers/ai/gemini';
@@ -100,10 +103,14 @@ type ListeningServiceDepsHint = ConstructorParameters<typeof ListeningService>[0
 // adapter lifecycle (see src/data/local/sqlite/app-database.ts); this factory
 // only builds the service ON that shared adapter and caches the instance.
 // A failed bootstrap is not cached, so a later call retries.
-const defaultService = createRecoverableSingleFlight(async () => {
-  const { adapter } = await getAppDatabase();
-  return createListeningService(adapter);
-});
+const defaultService = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createListeningService(adapter);
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
 /** Compose the service on the canonical app database (reused across calls). */
 export function createDefaultListeningService(): Promise<ListeningService> {

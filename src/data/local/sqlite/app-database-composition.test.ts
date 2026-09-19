@@ -130,6 +130,57 @@ async function installCanonicalOwner(): Promise<CompositionCtx> {
   };
 }
 
+/**
+ * A canonical owner whose factory creates a REAL, separate in-memory database
+ * per lifecycle — the shape of "close the app database, reopen it later" — so a
+ * test can prove which lifecycle a feature composition was built on.
+ */
+interface MultiLifecycleCtx {
+  readonly owner: AppDatabaseOwner;
+  /** Adapters the owner created, in lifecycle order. */
+  readonly created: readonly CountingAdapter[];
+  /** Seed one real learner profile into a freshly opened lifecycle. */
+  readonly seedProfile: (adapter: DatabaseAdapter, displayName: string) => Promise<string>;
+}
+
+async function installMultiLifecycleOwner(): Promise<MultiLifecycleCtx> {
+  vi.resetModules();
+
+  const { SqlJsAdapter } = await import('./SqlJsAdapter');
+  const repositories = await import('./repositories');
+  const appDb = await import('./app-database');
+
+  const created: CountingAdapter[] = [];
+  const owner = appDb.createAppDatabaseOwner({
+    databaseName: 'ai_english_tutor.db',
+    createAdapter: () => {
+      // A NEW connection per lifecycle: exactly what the real app does after a
+      // close/reopen (a new adapter object, never the invalidated one).
+      const adapter = new CountingAdapter(new SqlJsAdapter(':memory:'));
+      created.push(adapter);
+      return adapter;
+    },
+    now: () => NOW,
+  });
+  appDb.setAppDatabaseOwner(owner);
+
+  async function seedProfile(
+    adapter: DatabaseAdapter,
+    displayName: string,
+  ): Promise<string> {
+    const profile = await new repositories.SQLiteUserProfileRepository(adapter).update({
+      displayName,
+      currentLevel: 'A2',
+      targetLevel: 'B2',
+      learningGoals: [],
+      preferredModes: ['natural'],
+    });
+    return profile.id;
+  }
+
+  return { owner, created, seedProfile };
+}
+
 beforeEach(() => {
   vi.resetModules();
 });
@@ -457,6 +508,230 @@ describe('production composition after a failed database bootstrap', () => {
     expect(attempts).toBe(2);
     expect(adapter.initCalls).toBe(1);
     expect(owner.isOpen).toBe(true);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Lifecycle changes invalidate cached feature compositions
+ * ------------------------------------------------------------------ */
+
+describe('feature composition follows the canonical database lifecycle', () => {
+  it('recomposes every cached default factory on the NEW adapter after close/reopen', async () => {
+    const ctx = await installMultiLifecycleOwner();
+    const appDb = await import('./app-database');
+    const talk = await import('../../../talk-demo');
+    const listening = await import('../../../listening');
+
+    /* ---- lifecycle 1 ---------------------------------------------------- */
+    const first = await appDb.getAppDatabase();
+    expect(first.lifecycleId).toBe(1);
+    const learner1 = await ctx.seedProfile(first.adapter, 'Lifecycle One');
+
+    const talk1 = await talk.createDefaultTalkComposition();
+    const listening1 = await listening.createDefaultListeningService();
+    expect(talk1.databaseAdapter).toBe(first.adapter);
+    expect(await listening1.resolveLearnerId()).toBe(learner1);
+
+    // Within ONE lifecycle a successful composition is still shared…
+    expect(await talk.createDefaultTalkComposition()).toBe(talk1);
+    expect(await listening.createDefaultListeningService()).toBe(listening1);
+    // …and it took exactly one adapter + one initialization (one migration run).
+    expect(ctx.created).toHaveLength(1);
+    expect(ctx.created[0].initCalls).toBe(1);
+    expect(ctx.created[0].closeCalls).toBe(0);
+
+    /* ---- app-level close invalidates the lifecycle ---------------------- */
+    await appDb.closeAppDatabase();
+    expect(first.isClosed()).toBe(true);
+    expect(ctx.created[0].closeCalls).toBe(1);
+    expect(first.adapter.connected).toBe(false);
+
+    /* ---- reopen => lifecycle 2 ----------------------------------------- */
+    const second = await appDb.reopenAppDatabase();
+    expect(second.lifecycleId).toBe(2);
+    expect(second.adapter).not.toBe(first.adapter);
+    expect(ctx.created).toHaveLength(2);
+    const learner2 = await ctx.seedProfile(second.adapter, 'Lifecycle Two');
+    expect(learner2).not.toBe(learner1); // a genuinely different database
+
+    // Concurrent callers inside the NEW lifecycle still share ONE composition,
+    // and the feature is composed on the NEW adapter — never the closed one.
+    const [concurrentA, concurrentB] = await Promise.all([
+      listening.createDefaultListeningService(),
+      listening.createDefaultListeningService(),
+    ]);
+    const talk2 = await talk.createDefaultTalkComposition();
+
+    expect(concurrentA).toBe(concurrentB);
+    expect(concurrentA).not.toBe(listening1);
+    expect(talk2).not.toBe(talk1);
+    expect(talk2.databaseAdapter).toBe(second.adapter);
+    expect(talk2.databaseAdapter).not.toBe(first.adapter);
+    expect(await concurrentA.resolveLearnerId()).toBe(learner2);
+    expect(ctx.created).toHaveLength(2);
+    expect(ctx.created[1].initCalls).toBe(1);
+
+    /* ---- one more close/reopen => lifecycle 3 --------------------------- */
+    await appDb.closeAppDatabase();
+    expect(second.isClosed()).toBe(true);
+    const third = await appDb.reopenAppDatabase();
+    expect(third.lifecycleId).toBe(3);
+    const learner3 = await ctx.seedProfile(third.adapter, 'Lifecycle Three');
+
+    const talk3 = await talk.createDefaultTalkComposition();
+    const listening3 = await listening.createDefaultListeningService();
+    expect(talk3).not.toBe(talk2);
+    expect(listening3).not.toBe(concurrentA);
+    expect(talk3.databaseAdapter).toBe(third.adapter);
+    expect(await listening3.resolveLearnerId()).toBe(learner3);
+    expect(ctx.created).toHaveLength(3);
+    expect(ctx.created[2].initCalls).toBe(1);
+    expect(await talk.createDefaultTalkComposition()).toBe(talk3);
+  });
+
+  it('a bare app-level close is enough to invalidate the cached compositions', async () => {
+    const ctx = await installMultiLifecycleOwner();
+    const appDb = await import('./app-database');
+    const talk = await import('../../../talk-demo');
+
+    const first = await appDb.getAppDatabase();
+    await ctx.seedProfile(first.adapter, 'Before Close');
+    const talk1 = await talk.createDefaultTalkComposition();
+    expect(talk1.databaseAdapter).toBe(first.adapter);
+
+    await appDb.closeAppDatabase();
+
+    // No explicit reopen needed: obtaining the database again starts a NEW
+    // lifecycle, and the feature must be composed on it.
+    const talk2 = await talk.createDefaultTalkComposition();
+    expect(talk2).not.toBe(talk1);
+    expect(talk2.databaseAdapter).not.toBe(first.adapter);
+    expect(ctx.created).toHaveLength(2);
+    expect(talk2.databaseAdapter).toBe(ctx.owner.connection?.adapter);
+    expect(ctx.owner.connection?.isClosed()).toBe(false);
+  });
+
+  it('every cached default composition in the wider feature set follows the NEW lifecycle', async () => {
+    const ctx = await installMultiLifecycleOwner();
+    const appDb = await import('./app-database');
+
+    const talk = await import('../../../talk-demo');
+    const listening = await import('../../../listening');
+    const pronunciation = await import('../../../pronunciation');
+    const dailyTutor = await import('../../../daily-tutor');
+    const onboarding = await import('../../../onboarding');
+    const progress = await import('../../../progress-dashboard');
+    const workspace = await import('../../../vocabulary-workspace');
+    const adaptive = await import('../../../adaptive-lessons');
+    const deepSpeaking = await import('../../../deep-speaking');
+    const fluency = await import('../../../fluency');
+    const reassessment = await import('../../../reassessment');
+    const { createReviewService } = await import('../../../review/factory');
+    const { createConversationMemoryService } = await import(
+      '../../../talk-demo/conversation-memory'
+    );
+    const { createVocabularyPersistenceService } = await import(
+      '../../../talk-demo/vocabulary-persistence'
+    );
+    const { createLearningPersistenceService } = await import(
+      '../../../talk-demo/learning-persistence'
+    );
+
+    // Lifecycle 1: compose the whole feature set (and write real evidence).
+    const first = await appDb.getAppDatabase();
+    await ctx.seedProfile(first.adapter, 'Lifecycle One');
+    const preCloseTalk = await talk.createDefaultTalkComposition();
+    const preCloseListening = await listening.createDefaultListeningService();
+
+    await appDb.closeAppDatabase();
+
+    const second = await appDb.reopenAppDatabase();
+    expect(second.lifecycleId).toBe(2);
+    const learnerId = await ctx.seedProfile(second.adapter, 'Lifecycle Two');
+
+    async function probeEveryFeature(): Promise<void> {
+      // Talk / Listening / Pronunciation / Daily Tutor / Onboarding / Progress
+      // / Vocabulary workspace / Adaptive Lessons: cached default factories.
+      const talkComposition = await talk.createDefaultTalkComposition();
+      expect(talkComposition.databaseAdapter).toBe(second.adapter);
+      expect(await listening.createDefaultListeningService()).not.toBe(preCloseListening);
+      expect(await (await listening.createDefaultListeningService()).resolveLearnerId()).toBe(
+        learnerId,
+      );
+      expect(await pronunciation.createDefaultPronunciationEngine()).toBeDefined();
+      const dailyTutorService = await dailyTutor.createDefaultDailyTutorService();
+      expect(await dailyTutorService.getToday()).toBeDefined();
+      expect(await (await onboarding.createDefaultOnboardingService()).loadPrefill()).toBeDefined();
+      expect(await (await progress.createDefaultProgressDashboardService()).getActiveLearnerId()).toBe(
+        learnerId,
+      );
+      expect(
+        await (await workspace.createDefaultVocabularyWorkspaceService()).getActiveLearnerId(),
+      ).toBe(learnerId);
+      expect(await (await adaptive.createDefaultAdaptiveLessonService()).resolveLearnerId()).toBe(
+        learnerId,
+      );
+
+      // Deep Speaking / Fluency: default composition resolved through Talk.
+      const speaking = await deepSpeaking.resolveDefaultSpeakingComposition();
+      expect(speaking?.adapter).toBe(second.adapter);
+      expect(await fluency.createDefaultFluencyService()).toBeDefined();
+
+      // Review: the screen path composes on the canonical adapter.
+      const reviewService = createReviewService(
+        (await appDb.getAppDatabase()).adapter,
+        false,
+      );
+      expect(await reviewService.getDashboardSummary(learnerId)).toBeDefined();
+
+      // Reassessment: default composition on the canonical adapter.
+      const reassessmentService = reassessment.createReassessmentService();
+      expect(await reassessmentService.getHistory(learnerId)).toEqual([]);
+
+      // Conversation memory, vocabulary persistence and learning persistence:
+      // default (non-injected) compositions must also resolve the NEW adapter.
+      const memory = createConversationMemoryService();
+      expect(await memory.listRecentConversations(5)).toEqual([]);
+      const vocabulary = await createVocabularyPersistenceService().saveVocabulary({
+        headword: 'deadline',
+        type: 'word',
+        meaning: 'the latest time by which something must be done',
+        example: 'We need to meet the deadline by Friday.',
+      });
+      expect(vocabulary).not.toBeNull();
+      await createLearningPersistenceService().recordFeedbackEvidence({
+        correction: {
+          original: 'Yesterday I go to school',
+          improved: 'Yesterday I went to school',
+          explanation: 'Use the past tense after yesterday.',
+          severity: 'incorrect',
+        },
+      });
+    }
+
+    await probeEveryFeature();
+
+    // ONE adapter for lifecycle 2 — nothing in the feature set opened a second
+    // connection, and the pre-close Talk composition was never reused.
+    expect(ctx.created).toHaveLength(2);
+    expect(ctx.created[1].initCalls).toBe(1);
+    expect(ctx.created[1].closeCalls).toBe(0);
+    expect((await talk.createDefaultTalkComposition()).databaseAdapter).toBe(second.adapter);
+    expect(preCloseTalk.databaseAdapter).toBe(first.adapter);
+    expect(preCloseTalk.databaseAdapter).not.toBe(second.adapter);
+
+    // The evidence written through those default compositions really landed in
+    // the lifecycle-2 database.
+    const { SQLiteVocabularyRepository, SQLiteMistakeRepository } = await import(
+      './repositories'
+    );
+    const vocabularyItems = await new SQLiteVocabularyRepository(second.adapter).list(learnerId);
+    expect(vocabularyItems.map((item) => item.headword)).toContain('deadline');
+    const mistakes = await new SQLiteMistakeRepository(second.adapter).listMistakes(learnerId);
+    expect(mistakes.length).toBeGreaterThan(0);
+
+    // Still exactly ONE connection after all of that reuse.
+    expect(ctx.created).toHaveLength(2);
   });
 });
 
