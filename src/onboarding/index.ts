@@ -7,9 +7,13 @@
  * `createDefaultOnboardingService()`, which composes the EXISTING systems on the
  * SAME canonical app database (no second database, no second profile
  * repository, no second AI provider).
+ *
+ * DATABASE OWNERSHIP (Wave 2): the default composition reuses the CANONICAL
+ * application database owner instead of opening its own adapter.
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import { getApplicationDatabase } from '../data/local/sqlite/ApplicationDatabase';
 import { createTalkComposition } from '../talk-demo';
 import { createListeningService } from '../listening';
 import { createPronunciationEngine } from '../pronunciation';
@@ -46,17 +50,15 @@ export function createOnboardingServiceOn(adapter: DatabaseAdapter): OnboardingS
   });
 }
 
-// Default composition bootstrap — adapter lifecycle lives behind composition,
-// never inside UI screens (SAME pattern as Talk / Listening / Pronunciation).
+// Default composition bootstrap — the adapter lifecycle lives behind the
+// CANONICAL owner, never inside UI screens.
 let defaultServicePromise: Promise<OnboardingService> | null = null;
 
-/** Compose the service on the default app database (reused across calls). */
+/** Compose the service on the canonical application database (reused app-wide). */
 export function createDefaultOnboardingService(): Promise<OnboardingService> {
   if (!defaultServicePromise) {
     defaultServicePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
+      const adapter = await getApplicationDatabase().getAdapter();
       return createOnboardingServiceOn(adapter);
     })().catch((error: unknown) => {
       // Allow a later retry instead of caching a failed bootstrap forever.
