@@ -219,6 +219,7 @@ export class ReviewService {
         reviewItem.id,
         evaluation.result,
         evaluation.feedback,
+        attemptKey,
       );
     }
 
