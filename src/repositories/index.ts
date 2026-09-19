@@ -218,6 +218,12 @@ export interface WeaknessRepository {
 export interface VocabularyRepository {
   upsert(item: Omit<VocabularyItem, 'id' | 'createdAt' | 'updatedAt'>): Promise<VocabularyItem>;
   get(id: string): Promise<VocabularyItem | null>;
+  /** Exact lookup by (learnerId, headword, type) – never a capped scan. */
+  getByHeadword?(
+    learnerId: string,
+    headword: string,
+    type: VocabularyItem['type'],
+  ): Promise<VocabularyItem | null>;
   list(learnerId: string, opts?: { state?: string; limit?: number; types?: readonly VocabularyItem['type'][] }): Promise<readonly VocabularyItem[]>;
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly VocabularyItem[]>;
   update(id: string, patch: Partial<Omit<VocabularyItem, 'id' | 'createdAt'>>): Promise<VocabularyItem>;
@@ -245,6 +251,12 @@ export interface VocabularyRepository {
 export interface ExpressionRepository {
   upsert(item: Omit<ExpressionItem, 'id' | 'createdAt' | 'updatedAt'>): Promise<ExpressionItem>;
   get(id: string): Promise<ExpressionItem | null>;
+  /** Exact lookup by (learnerId, expression, type) – never a capped scan. */
+  getByExpression?(
+    learnerId: string,
+    expression: string,
+    type: ExpressionItem['type'],
+  ): Promise<ExpressionItem | null>;
   list(learnerId: string, opts?: { limit?: number }): Promise<readonly ExpressionItem[]>;
   listDue(learnerId: string, now: string, limit?: number): Promise<readonly ExpressionItem[]>;
   update(id: string, patch: Partial<Omit<ExpressionItem, 'id' | 'createdAt'>>): Promise<ExpressionItem>;
@@ -283,6 +295,7 @@ export interface ReviewRepository {
     id: string,
     result: 'correct' | 'incorrect' | 'partial',
     feedback?: string,
+    attemptId?: string,
   ): Promise<ReviewItem>;
   upsert?(
     item: Omit<ReviewItem, 'id' | 'createdAt'> & { id?: string },

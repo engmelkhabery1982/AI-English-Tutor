@@ -107,9 +107,9 @@ export class SqlJsAdapter implements DatabaseAdapter {
   async transaction(steps: readonly SqlStep[]): Promise<readonly SqlExecuteResult[]> {
     this.ensureOpen();
     const results: SqlExecuteResult[] = [];
-    // sql.js has no native transaction API exposed here, so we use
-    // BEGIN/COMMIT/ROLLBACK via exec to get atomicity semantics.
-    this.db!.exec('BEGIN');
+    // Use IMMEDIATE to acquire write lock early, preventing lost updates
+    // when two repository instances race on the same logical row.
+    this.db!.exec('BEGIN IMMEDIATE');
     try {
       for (const step of steps) {
         this.db!.run(step.sql, toUnknownArray(step.params));
