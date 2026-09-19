@@ -43,6 +43,7 @@ import {
   type ReviewVoiceStatus,
 } from '../review/voice-controller';
 import { resolveReviewProviders } from '../review/providers';
+import { readReviewLearnerProfile } from '../review/profile-guard';
 import { DEMO_REVIEW_NOTICE, selectReviewSessionCandidates } from '../review/demo-items';
 import { generateId } from '../shared/id';
 
@@ -308,16 +309,18 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       }
 
       const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
-      const profile = await profileRepo.get();
-      if (!profile || !profile.id) {
-        // A previous Demo dashboard must never be relabelled as learner history.
+      const profileOutcome = await readReviewLearnerProfile(profileRepo);
+      if (profileOutcome.status === 'missing') {
+        // First launch: no profile yet is a NORMAL state, not a load
+        // failure. A previous Demo dashboard must never be relabelled as
+        // learner history either.
         setSummary({ totalDue: 0, dueVocabularyCount: 0, dueExpressionCount: 0, activeWeaknessCount: 0, categories: [] });
         setActiveWeaknesses([]);
         setHasNoProfile(true);
         return;
       }
       setHasNoProfile(false);
-      const learnerId = profile.id;
+      const learnerId = profileOutcome.learnerId;
 
       const dashSummary = await reviewServiceRef.current.getDashboardSummary(learnerId);
       const weaknesses = await reviewServiceRef.current.getActiveWeaknesses(learnerId);
@@ -395,12 +398,15 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       setLoading(true);
       setSessionError(null);
       const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
-      const profile = await profileRepo.get();
-      if (!profile || !profile.id) {
+      const profileOutcome = await readReviewLearnerProfile(profileRepo);
+      if (profileOutcome.status === 'missing') {
+        // First launch: nothing to review yet — the existing no-profile
+        // state, never a "could not load the review queue" error and
+        // never fabricated items.
         setHasNoProfile(true);
         return;
       }
-      const learnerId = profile.id;
+      const learnerId = profileOutcome.learnerId;
 
       // Daily Tutor launch: a BOUNDED subset of the existing review queue
       // (the Daily Tutor plans WHAT; this screen still owns HOW the review
