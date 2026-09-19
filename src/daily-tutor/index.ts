@@ -3,20 +3,12 @@
  *
  * Public surface of the Daily AI Tutor Loop.
  *
- * COMPOSITION RULES FOLLOWED HERE (same as every existing engine)
- * - Reuse, never rebuild: the LearnerModel, the curriculum planner, the
- *   Review/Listening/Adaptive Lesson/Deep Speaking/Professional English
- *   flows and the SQLite repository layer are composed as-is. The Daily
- *   Tutor owns ONLY daily-session orchestration state (its own additive
- *   repository over the same database).
- * - Screens never touch SQLite: they receive an injected DailyTutorService
- *   or await createDefaultDailyTutorService(), which owns the adapter
- *   bootstrap and is shared app-wide (the same pattern that makes Adaptive
- *   Lessons and Deep Speaking recoverable across navigation).
- * - No AI is used for planning: the daily plan is deterministic and local.
+ * DATABASE OWNERSHIP (Wave 2): the default composition reuses the CANONICAL
+ * application database owner instead of opening its own adapter.
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import { getApplicationDatabase } from '../data/local/sqlite/ApplicationDatabase';
 import {
   SQLiteConversationRepository,
   SQLiteDailyTutorRepository,
@@ -44,9 +36,7 @@ export * from './service';
 
 /**
  * Assemble the EXISTING repository facade on one adapter — the same shape
- * the other composition factories use. The Daily Tutor adds only its own
- * additive repository next to it; every other repository stays the real,
- * shared one so the LearnerModel reads exactly what the other engines read.
+ * the other composition factories use similar to before.
  */
 function createAppRepositories(adapter: DatabaseAdapter): AppRepositories {
   return {
@@ -66,13 +56,10 @@ function createAppRepositories(adapter: DatabaseAdapter): AppRepositories {
 
 /**
  * Compose the Daily Tutor service on an existing adapter + repository set.
- * The learner model reads the SAME repositories every other engine uses;
- * the Daily Tutor repository is the only new (additive) store.
  */
 export function createDailyTutorService(
   adapter: DatabaseAdapter,
   options?: {
-    /** Explicit repositories override (tests/embedding). */
     readonly repositories?: AppRepositories;
   },
 ): DailyTutorService {
@@ -86,21 +73,20 @@ export function createDailyTutorService(
   });
 }
 
-// Default composition bootstrap. The dynamic Expo SQLite import and adapter
-// lifecycle live HERE — behind composition — never inside UI screens. The
-// promise is shared so Home and the Daily Tutor screen see ONE service (and
-// therefore one in-flight plan/session), exactly like the other engines.
+// Default composition bootstrap. The adapter lifecycle lives HERE behind the
+// CANONICAL owner — never inside UI screens and never a second connection.
 let defaultServicePromise: Promise<DailyTutorService> | null = null;
 
-/** Compose the service on the default local database (reused across calls). */
+/** Compose the service on the canonical application database (reused app-wide). */
 export function createDefaultDailyTutorService(): Promise<DailyTutorService> {
   if (!defaultServicePromise) {
     defaultServicePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
+      const adapter = await getApplicationDatabase().getAdapter();
       return createDailyTutorService(adapter);
-    })();
+    })().catch((error: unknown) => {
+      defaultServicePromise = null;
+      throw error;
+    });
   }
   return defaultServicePromise;
 }

@@ -1,18 +1,14 @@
 /**
  * src/vocabulary-workspace/index.ts
  *
- * Public surface of the Vocabulary & Expressions Workspace:
- * types, pure view helpers, the workspace service, and composition
- * factories that wire the EXISTING SQLite repositories plus the EXISTING
- * Adaptive Review service. No new persistence layer is introduced.
+ * Public surface of the Vocabulary & Expressions Workspace.
  *
- * UI screens must not touch SQLite types directly: they either receive an
- * injected VocabularyWorkspaceService or await
- * createDefaultVocabularyWorkspaceService(), which owns the adapter
- * bootstrap and learner resolution behind the service.
+ * DATABASE OWNERSHIP (Wave 2): the default composition reuses the CANONICAL
+ * application database owner instead of opening its own adapter.
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import { getApplicationDatabase } from '../data/local/sqlite/ApplicationDatabase';
 import {
   SQLiteUserProfileRepository,
   SQLiteVocabularyRepository,
@@ -49,23 +45,25 @@ export function createVocabularyWorkspaceService(
   });
 }
 
-// Default composition bootstrap. The dynamic import and adapter lifecycle
-// live HERE — behind composition — never inside UI screens.
+// Default composition bootstrap. The adapter lifecycle lives behind the
+// CANONICAL owner — never inside UI screens and never a second connection.
 let defaultServicePromise: Promise<VocabularyWorkspaceService> | null = null;
 
 /**
- * Compose the workspace on the default local database. Safe to call
- * repeatedly: the adapter initialization and service composition happen
- * once and are reused.
+ * Compose the workspace on the canonical application database. Safe to call
+ * repeatedly: the shared initialization and service composition happen once
+ * and are reused; a failed bootstrap releases the cached promise so a later
+ * attempt retries.
  */
 export function createDefaultVocabularyWorkspaceService(): Promise<VocabularyWorkspaceService> {
   if (!defaultServicePromise) {
     defaultServicePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
+      const adapter = await getApplicationDatabase().getAdapter();
       return createVocabularyWorkspaceService(adapter);
-    })();
+    })().catch((error: unknown) => {
+      defaultServicePromise = null;
+      throw error;
+    });
   }
   return defaultServicePromise;
 }

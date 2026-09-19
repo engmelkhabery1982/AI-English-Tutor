@@ -1,14 +1,14 @@
 /**
  * src/pronunciation/index.ts
  *
- * Public surface of the Pronunciation Engine (Phase 1): types, the
- * baseline transcript-comparison provider, the engine, and a composition
- * factory that wires the EXISTING SQLite repositories. Screens never
- * touch SQLite: they receive an injected engine or await
- * createDefaultPronunciationEngine().
+ * Public surface of the Pronunciation Engine (Phase 1).
+ *
+ * DATABASE OWNERSHIP (Wave 2): the default composition reuses the CANONICAL
+ * application database owner instead of opening its own adapter.
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import { getApplicationDatabase } from '../data/local/sqlite/ApplicationDatabase';
 import {
   SQLiteUserProfileRepository,
   SQLiteVocabularyRepository,
@@ -27,15 +27,7 @@ export * from './feedback';
 
 /**
  * Compose a PronunciationEngine on the given adapter using the EXISTING
- * repositories. The baseline provider is deterministic and offline —
- * zero cost, zero network.
- *
- * WP-4 production wiring: the EXISTING success-observation recorder is
- * composed over the SAME weakness repository this engine already uses, so an
- * explicit supported positive result (clear intelligibility from a real
- * evidence source) persists strength evidence on the canonical app database.
- * No second database, no second repository stack and no fabricated
- * confidence: without a real learner the engine still persists nothing.
+ * repositories. The baseline provider is deterministic and offline.
  */
 export function createPronunciationEngine(adapter: DatabaseAdapter): PronunciationEngine {
   const pronunciation = new SQLitePronunciationRepository(adapter);
@@ -54,19 +46,20 @@ export function createPronunciationEngine(adapter: DatabaseAdapter): Pronunciati
   });
 }
 
-// Default composition bootstrap — adapter lifecycle lives behind
-// composition, never inside UI screens.
+// Default composition bootstrap — the adapter lifecycle lives behind the
+// CANONICAL owner, never inside UI screens.
 let defaultEnginePromise: Promise<PronunciationEngine> | null = null;
 
-/** Compose the engine on the default local database (reused across calls). */
+/** Compose the engine on the canonical application database (reused app-wide). */
 export function createDefaultPronunciationEngine(): Promise<PronunciationEngine> {
   if (!defaultEnginePromise) {
     defaultEnginePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
+      const adapter = await getApplicationDatabase().getAdapter();
       return createPronunciationEngine(adapter);
-    })();
+    })().catch((error: unknown) => {
+      defaultEnginePromise = null;
+      throw error;
+    });
   }
   return defaultEnginePromise;
 }
