@@ -42,6 +42,12 @@
         }
       ],
       "expo-secure-store"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "6de6c776-f628-4c77-bc8d-7f0056f93aa8"
+      }
+    },
+    "owner": "engelkhaberys-team"
   }
 }
