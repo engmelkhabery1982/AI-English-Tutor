@@ -3,14 +3,14 @@
  *
  * Public surface of the Real Progress Dashboard: view-model types, the
  * read-only dashboard service, and composition factories that wire the
- * EXISTING SQLite repositories. UI screens never touch SQLite types:
- * they either receive an injected ProgressDashboardService or await
- * createDefaultProgressDashboardService(), which owns the adapter
- * bootstrap behind the service (same discipline as the vocabulary
- * workspace).
+ * EXISTING SQLite repositories. UI screens never touch SQLite types.
+ *
+ * DATABASE OWNERSHIP (Wave 2): the default composition reuses the CANONICAL
+ * application database owner instead of opening its own adapter.
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import { getApplicationDatabase } from '../data/local/sqlite/ApplicationDatabase';
 import {
   SQLiteUserProfileRepository,
   SQLiteVocabularyRepository,
@@ -62,23 +62,25 @@ export function createProgressDashboardService(
   });
 }
 
-// Default composition bootstrap. The dynamic import and adapter lifecycle
-// live HERE — behind composition — never inside UI screens.
+// Default composition bootstrap. The adapter lifecycle lives behind the
+// CANONICAL owner — never inside UI screens and never a second connection.
 let defaultServicePromise: Promise<ProgressDashboardService> | null = null;
 
 /**
- * Compose the dashboard on the default local database. Safe to call
- * repeatedly: the adapter initialization and service composition happen
- * once and are reused.
+ * Compose the dashboard on the canonical application database. Safe to call
+ * repeatedly: the shared initialization and service composition happen once
+ * and are reused; a failed bootstrap releases the cached promise so a later
+ * attempt retries.
  */
 export function createDefaultProgressDashboardService(): Promise<ProgressDashboardService> {
   if (!defaultServicePromise) {
     defaultServicePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
+      const adapter = await getApplicationDatabase().getAdapter();
       return createProgressDashboardService(adapter);
-    })();
+    })().catch((error: unknown) => {
+      defaultServicePromise = null;
+      throw error;
+    });
   }
   return defaultServicePromise;
 }
