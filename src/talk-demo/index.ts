@@ -33,6 +33,13 @@ import type { AIProvider } from '../providers/ai';
 import { createDemoAIProvider } from '../providers/ai/demo';
 import { createGeminiAIProvider } from '../providers/ai/gemini';
 import {
+  createAIProviderError,
+  createAIProviderFailure,
+  type AIProviderResult,
+  type AIStreamCallback,
+  type ConversationRequest,
+} from '../providers/ai';
+import {
   createDemoSTTProvider,
   createGeminiSTTProvider,
   type SpeechToTextProvider,
@@ -145,12 +152,22 @@ export type {
   ConversationFeedbackVocabulary,
 } from '../providers/ai';
 
-export type TalkProviderKind = 'gemini' | 'demo';
+/**
+ * Which provider is ACTUALLY behind a Talk conversation.
+ *
+ * - `gemini`      — a real AI provider answered the conversation.
+ * - `demo`        — the deterministic offline script, reachable ONLY through an
+ *                   explicit Demo Mode request. Never an automatic fallback.
+ * - `unavailable` — nothing is configured. NO provider replies at all: the
+ *                   conversation cannot produce tutor output, and the learner is
+ *                   told that configuration (or explicit Demo Mode) is required.
+ */
+export type TalkProviderKind = 'gemini' | 'demo' | 'unavailable';
 
 /**
  * Honest description of what kind of tutoring the active conversation is.
  *
- * The Demo provider is a deterministic OFFLINE script kept for demo/offline
+ * The Demo provider is a deterministic OFFLINE script kept for explicit demo
  * use. It is not real AI tutoring, it cannot adapt to the learner, and nothing
  * it produces may be presented as genuine personalized AI feedback. Every
  * surface that renders tutor output must read these flags instead of assuming
@@ -168,10 +185,53 @@ export interface TalkProviderInfo {
 
 export const TALK_REAL_AI_LABEL = 'Gemini • Real AI tutor';
 export const TALK_DEMO_LABEL = 'Offline demo • Not real AI';
+export const TALK_PROVIDER_UNAVAILABLE_LABEL = 'Real AI unavailable • Configuration required';
 
-/** Shown when the learner tries to start a real voice conversation offline. */
+/** Shown when the learner asks for real AI but none is configured. */
 export const TALK_REAL_AI_UNAVAILABLE_MESSAGE =
   'Real AI conversation is not available right now (no real AI provider is configured). This offline demo can still be used to try the flow, but nothing here is real AI tutoring or personalized feedback.';
+
+/**
+ * Shown when NO provider is configured and Demo Mode was not chosen.
+ *
+ * Nothing is substituted: there is no scripted tutor reply, and the learner is
+ * pointed at the honest next step instead.
+ */
+export const TALK_CONFIGURATION_REQUIRED_MESSAGE =
+  'Real AI is not configured on this device, so no tutor replies can be generated. Add an API key in Settings to talk with the real tutor. Nothing scripted is substituted here.';
+
+/** Honest failure text for a conversation with no configured provider. */
+export const TALK_AI_CONFIGURATION_REQUIRED_ERROR =
+  'No AI provider is configured on this device, so this conversation cannot generate tutor replies. Configure a provider in Settings.';
+
+/**
+ * An AI provider that NEVER fabricates anything.
+ *
+ * Used when no real provider is configured and Demo Mode was not chosen: every
+ * request fails honestly instead of returning scripted text. This is the same
+ * pattern already used for speech recognition
+ * (`createUnavailableSTTProvider`) — the difference being that this one makes
+ * it impossible for a tutor reply to exist at all.
+ */
+export function createUnavailableAIProvider(
+  message: string = TALK_AI_CONFIGURATION_REQUIRED_ERROR,
+): AIProvider {
+  const failure = (): AIProviderResult =>
+    createAIProviderFailure(createAIProviderError('unavailable', message, false));
+
+  return {
+    id: 'ai-unavailable',
+    async generate(_request: ConversationRequest): Promise<AIProviderResult> {
+      return failure();
+    },
+    async generateStream(
+      _request: ConversationRequest,
+      _onChunk: AIStreamCallback,
+    ): Promise<AIProviderResult> {
+      return failure();
+    },
+  };
+}
 
 function describeProviderKind(kind: TalkProviderKind): TalkProviderInfo {
   if (kind === 'gemini') {
@@ -180,6 +240,14 @@ function describeProviderKind(kind: TalkProviderKind): TalkProviderInfo {
       isRealAI: true,
       label: TALK_REAL_AI_LABEL,
       allowsPersonalizedFeedback: true,
+    };
+  }
+  if (kind === 'unavailable') {
+    return {
+      kind,
+      isRealAI: false,
+      label: TALK_PROVIDER_UNAVAILABLE_LABEL,
+      allowsPersonalizedFeedback: false,
     };
   }
   return {
@@ -212,6 +280,13 @@ export interface CreateTalkSessionOptions extends VocabularyPersistenceOptions {
    * before the first turn instead of composing a second model instance.
    */
   readonly learnerModel?: LearnerModel;
+  /**
+   * EXPLICIT Demo Mode. Demo AI is reachable ONLY when the caller asks for it
+   * here (or uses `createTalkDemoSession`). Without it, a missing credential
+   * yields an honest `unavailable` conversation instead of a scripted one.
+   * Takes precedence over a configured key: the caller asked for Demo.
+   */
+  readonly isDemo?: boolean;
 }
 
 export interface CreateVoiceCoordinatorOptions {
@@ -271,8 +346,14 @@ export function createTalkVoiceCoordinator(
       // is told honestly instead of having a scripted transcript heard as if it
       // were their own speech.
       sttProvider = createUnavailableSTTProvider();
+    } else if (options.providerKind === 'unavailable') {
+      // Nothing is configured and Demo Mode was not chosen: no scripted
+      // transcript may stand in for the learner's own speech either.
+      sttProvider = createUnavailableSTTProvider(
+        'Speech recognition is not configured on this device. Configure a provider in Settings.',
+      );
     } else {
-      // Offline demo only — clearly advertised as such by the caller.
+      // Explicit Demo Mode only — clearly advertised as such by the caller.
       sttProvider = createDemoSTTProvider();
     }
   }
@@ -357,7 +438,13 @@ export function createTalkLearnerModel(adapter: DatabaseAdapter): LearnerModel |
 
 /**
  * Creates an end-to-end runnable ConversationSession bundle.
- * Uses Gemini AI Provider when an API key is available, falling back to Demo AI Provider.
+ *
+ * Provider selection is EXPLICIT — there is no automatic Demo fallback:
+ *
+ *   options.isDemo === true  → Demo AI (explicit Demo Mode, clearly labelled)
+ *   a credential is available → Gemini (real AI)
+ *   otherwise                 → `unavailable`: no tutor reply can be produced
+ *
  * Connects vocabulary saving to SQLite local persistence via existing repository layer.
  */
 export function createTalkSession(
@@ -389,6 +476,16 @@ export function createTalkSession(
     options?.learnerModel ??
     (options?.databaseAdapter ? createTalkLearnerModel(options.databaseAdapter) : null);
 
+  // EXPLICIT Demo Mode wins: the caller asked for the offline script.
+  if (options?.isDemo === true) {
+    const demoProvider = createDemoAIProvider();
+    return {
+      session: composeSessionWithProvider(sessionConfig, demoProvider, learnerModel ?? undefined),
+      providerKind: 'demo',
+      providerInfo: describeProviderKind('demo'),
+    };
+  }
+
   if (key) {
     const provider = createGeminiAIProvider({
       apiKey: key,
@@ -401,13 +498,19 @@ export function createTalkSession(
     };
   }
 
-  // No real AI provider is configured: the deterministic offline demo session
-  // is returned but is explicitly flagged as NOT real AI tutoring.
-  const provider = createDemoAIProvider();
+  // No real AI provider is configured and Demo Mode was NOT requested. Nothing
+  // is substituted: the session is composed on a provider that fails honestly,
+  // so no scripted or fabricated tutor reply can ever exist, and the surface
+  // reports "configuration required" instead of starting a demo conversation.
+  const unavailableProvider = createUnavailableAIProvider();
   return {
-    session: composeSessionWithProvider(sessionConfig, provider, learnerModel ?? undefined),
-    providerKind: 'demo',
-    providerInfo: describeProviderKind('demo'),
+    session: composeSessionWithProvider(
+      sessionConfig,
+      unavailableProvider,
+      learnerModel ?? undefined,
+    ),
+    providerKind: 'unavailable',
+    providerInfo: describeProviderKind('unavailable'),
   };
 }
 
@@ -526,23 +629,22 @@ export async function resolveTalkCoaching(
  *
  * - When a real AI provider is configured, the coordinator uses real Gemini STT
  *   and the real AI conversation.
- * - When none is configured, the honest offline demo is returned with its
- *   `providerInfo` flag so the UI can state plainly that this is not real AI.
- * - `requireRealAI` returns `session: null` instead of the offline demo, so a
- *   caller that must not present demo output as tutoring can refuse cleanly.
+ * - When none is configured, the bundle reports `unavailable` with its
+ *   `providerInfo` flag: the surface must state that configuration (or explicit
+ *   Demo Mode) is required. There is no automatic Demo fallback.
+ * - `requireRealAI` returns `bundle: null` instead of anything that is not real
+ *   AI, so a caller that must not present demo output as tutoring can refuse
+ *   cleanly.
  */
 export function createTalkVoiceSessionBundle(
   config: ConversationSessionConfig,
   options?: CreateTalkSessionOptions & { readonly requireRealAI?: boolean }
 ): { readonly bundle: TalkSessionBundle | null; readonly realAIUnavailable: boolean } {
-  const key = options?.apiKey?.trim() || getGeminiApiKey();
-  if (!key && options?.requireRealAI) {
+  const bundle = createTalkSession(config, options);
+  if (options?.requireRealAI && bundle.providerKind !== 'gemini') {
     return { bundle: null, realAIUnavailable: true };
   }
-  return {
-    bundle: createTalkSession(config, options),
-    realAIUnavailable: false,
-  };
+  return { bundle, realAIUnavailable: false };
 }
 
 /**

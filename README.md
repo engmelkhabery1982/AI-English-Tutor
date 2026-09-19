@@ -194,8 +194,12 @@ diagnostics never touch the learner database.
   **Demo Mode** (for example Review), that mode is clearly labelled as *not real
   AI* and its results stay out of real learner evidence. Demo is never selected
   on the learner's behalf.
-- Talk's offline demo conversation remains available and is always labelled
-  `Offline demo • Not real AI`.
+- **Talk never substitutes a scripted conversation.** With no key and no
+  explicit Demo request it reports *Real AI unavailable • Configuration
+  required* and a turn cannot produce a tutor reply (the same for voice input:
+  no scripted transcript is presented as your speech). Explicit Demo Mode —
+  `createTalkSession(config, { isDemo: true })` — is the only way Demo AI is
+  used, and it is labelled `Offline demo • Not real AI`.
 - The learner model, review scheduling, listening, adaptive lessons and the
   daily tutor loop are deterministic and run locally against SQLite; they do not
   require network access.
@@ -212,6 +216,10 @@ This repository is a **release-candidate foundation**, not a shippable product:
   no multi-provider picker.
 - Key validity is only asserted after a manual *Test connection*; nothing is
   re-verified in the background.
+- Talk has no learner-facing Demo Mode switch: its demo path exists for explicit
+  callers/tests, while Review remains the learner-visible Demo Mode surface.
+- A change to the stored key applies to the next conversation/session started;
+  a conversation already running keeps the provider it began with.
 
 ## Repository layout
 

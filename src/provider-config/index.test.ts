@@ -157,11 +157,25 @@ describe('no credential on this device', () => {
     expect(demo.sttProvider.id).toBe('demo-stt');
   });
 
-  it('13a. Talk stays honest offline: labelled demo, never presented as real AI', () => {
+  it('13a. Talk reports configuration-required instead of silently demoing', async () => {
+    // With no credential and no explicit Demo request, Talk must NOT substitute
+    // the scripted demo conversation (Wave 2: Demo Mode is always explicit).
     const bundle = createTalkSession({ mode: 'natural' });
-    expect(bundle.providerKind).toBe('demo');
+    expect(bundle.providerKind).toBe('unavailable');
     expect(bundle.providerInfo.isRealAI).toBe(false);
     expect(bundle.providerInfo.allowsPersonalizedFeedback).toBe(false);
+    expect(bundle.providerInfo.label.toLowerCase()).toContain('configuration required');
+
+    // No fabricated AI tutoring: a turn cannot produce a tutor reply.
+    const result = await bundle.session.send({ userMessage: 'Hello!' });
+    expect(result.ok).toBe(false);
+    expect(bundle.session.getHistory()).toHaveLength(0);
+  });
+
+  it('13b. explicit Demo Mode is still available and clearly labelled as not real AI', () => {
+    const bundle = createTalkSession({ mode: 'natural' }, { isDemo: true });
+    expect(bundle.providerKind).toBe('demo');
+    expect(bundle.providerInfo.isRealAI).toBe(false);
     expect(bundle.providerInfo.label).toBe(TALK_DEMO_LABEL);
     expect(bundle.providerInfo.label.toLowerCase()).toContain('demo');
     expect(bundle.providerInfo.label.toLowerCase()).toContain('not real');

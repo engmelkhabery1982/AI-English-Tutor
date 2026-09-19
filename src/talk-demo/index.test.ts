@@ -204,6 +204,9 @@ describe('Talk Demo & Composition Stack', () => {
         {
           userProfileRepository: userRepo,
           vocabularyRepository: vocabRepo,
+          // EXPLICIT Demo Mode: this test exercises the offline deterministic
+          // conversation, which is now reachable only by asking for it.
+          isDemo: true,
         }
       );
 
@@ -242,6 +245,7 @@ describe('Talk Demo & Composition Stack', () => {
         {
           vocabularyRepository: mockFailingVocabRepo,
           learnerId: '00000000-0000-4000-8000-000000000003',
+          isDemo: true,
         }
       );
 
@@ -368,12 +372,30 @@ describe('Talk Demo & Composition Stack', () => {
   });
 
   describe('createTalkSession provider selection', () => {
-    it('selects Demo provider when no API key is provided or in env', () => {
+    it('NEVER enters Demo Mode automatically: no key yields the honest unavailable state', async () => {
       delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
 
       const bundle = createTalkSession({ mode: 'natural' });
-      expect(bundle.providerKind).toBe('demo');
+      expect(bundle.providerKind).toBe('unavailable');
       expect(typeof bundle.session.send).toBe('function');
+
+      // No scripted reply can exist: the provider fails honestly instead.
+      const result = await bundle.session.send({ userMessage: 'Hello!' });
+      expect(result.ok).toBe(false);
+      expect(bundle.session.getHistory()).toHaveLength(0);
+    });
+
+    it('enters Demo Mode ONLY when it is explicitly requested', async () => {
+      delete process.env.EXPO_PUBLIC_GEMINI_API_KEY;
+
+      const bundle = createTalkSession({ mode: 'natural' }, { isDemo: true });
+      expect(bundle.providerKind).toBe('demo');
+      expect(bundle.providerInfo.isRealAI).toBe(false);
+      expect(bundle.providerInfo.allowsPersonalizedFeedback).toBe(false);
+
+      // Explicit Demo Mode still works end to end.
+      const result = await bundle.session.send({ userMessage: 'Hello!' });
+      expect(result.ok).toBe(true);
     });
 
     it('selects Gemini provider when API key is provided explicitly in options', () => {
@@ -599,7 +621,10 @@ describe('Talk Demo & Composition Stack', () => {
 
   describe('TalkVoiceCoordinator Integration', () => {
     it('integrates with TalkSession maintaining active recording on second mic press and submitting exactly one turn', async () => {
-      const bundle = createTalkSession({ mode: 'natural', topic: 'Music' });
+      const bundle = createTalkSession(
+        { mode: 'natural', topic: 'Music' },
+        { isDemo: true },
+      );
       const recorder = createDemoAudioRecorder();
       const stt = createDemoSTTProvider({ defaultTranscript: 'I love acoustic guitar.' });
       const tts = createDemoTTSProvider();
