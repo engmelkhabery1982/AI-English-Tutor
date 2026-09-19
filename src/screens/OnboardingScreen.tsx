@@ -314,7 +314,9 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
               handle,
               result.transcript,
               handle.pronunciationTask.sentence,
-              stepToken === null ? undefined : { stepToken },
+              stepToken === null
+                ? { transcriptFromVoice: true }
+                : { stepToken, transcriptFromVoice: true },
             );
           } else {
             // The EXISTING coordinator committed the turn through the EXISTING

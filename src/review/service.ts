@@ -23,11 +23,31 @@ import {
   calculateNextReviewDate,
   transitionWeaknessLifecycle,
 } from './weakness-lifecycle';
+import { deriveReviewAttemptKey, deriveReviewEvidenceId } from './evidence-identity';
 import { nowIso } from '../shared/time';
+
+/**
+ * Per-service cap on remembered attempts. The map only guards against
+ * duplicate delivery of the same attempt (double submit / retry / late
+ * duplicate callback); it is not learner data and holds no evidence.
+ */
+const MAX_REMEMBERED_ATTEMPTS = 500;
+
+export interface ReviewPracticeOptions {
+  /**
+   * Stable identity of ONE practice attempt, owned by the caller (the Review
+   * screen captures one per item attempt). A retry of the same attempt reuses
+   * it — the record is then written exactly once — while a later review of the
+   * same item is a new attempt with new evidence.
+   */
+  readonly attemptId?: string;
+}
 
 export class ReviewService {
   private readonly planner: ReviewPlanner;
   private readonly evaluator: ReviewEvaluator;
+  /** attemptKey → 'in-flight' | 'recorded' (see MAX_REMEMBERED_ATTEMPTS). */
+  private readonly attempts = new Map<string, 'in-flight' | 'recorded'>();
 
   constructor(
     private readonly repos: AppRepositories,
@@ -106,13 +126,75 @@ export class ReviewService {
     userAnswer: string,
     evaluation: EvaluationResult,
     _latencyMs?: number,
+    options?: ReviewPracticeOptions,
   ): Promise<void> {
     const now = nowIso();
 
+    /**
+     * Retry-safe identity: the same attempt delivered twice (double submit, a
+     * retry after a failure, a late duplicate callback) is recorded exactly
+     * once — the schedule does not advance twice and no second evidence row is
+     * written. Two legitimate attempts have two identities, so both are kept
+     * and no historical evidence is ever overwritten.
+     */
+    const attemptKey = deriveReviewAttemptKey({
+      ...(options?.attemptId === undefined ? {} : { attemptId: options.attemptId }),
+      learnerId,
+      referenceId: candidate.referenceId,
+      candidateId: candidate.id,
+      reviewCount: candidate.reviewCount,
+      consecutiveCorrect: candidate.consecutiveCorrect,
+      userAnswer,
+      result: evaluation.result,
+    });
+
+    if (this.attempts.has(attemptKey)) {
+      return;
+    }
+    this.attempts.set(attemptKey, 'in-flight');
+    if (this.attempts.size > MAX_REMEMBERED_ATTEMPTS) {
+      const oldest = this.attempts.keys().next();
+      if (!oldest.done && oldest.value !== attemptKey) {
+        this.attempts.delete(oldest.value);
+      }
+    }
+
+    try {
+      await this.persistPracticeResult(learnerId, candidate, userAnswer, evaluation, attemptKey, now);
+      this.attempts.set(attemptKey, 'recorded');
+    } catch (error) {
+      // A failed attempt is not remembered as recorded: the learner may retry
+      // it, and the retry is then the same attempt identity again.
+      this.attempts.delete(attemptKey);
+      throw error;
+    }
+  }
+
+  private async persistPracticeResult(
+    learnerId: string,
+    candidate: ReviewItemCandidate,
+    userAnswer: string,
+    evaluation: EvaluationResult,
+    attemptKey: string,
+    now: string,
+  ): Promise<void> {
     // 1. Ensure review_items is updated
-    let reviewItem = await this.repos.review.listDue(learnerId, now).then(
-      (items) => items.find((i) => i.id === candidate.id || i.referenceId === candidate.referenceId),
-    );
+    // Exact lookup first: a repeat review of the same reference must reuse its
+    // ONE existing row (including rows already scheduled in the future and
+    // retired rows) instead of silently creating a parallel schedule.
+    let reviewItem = this.repos.review.getByReference
+      ? await this.repos.review.getByReference(learnerId, candidate.kind, candidate.referenceId)
+      : null;
+    if (!reviewItem) {
+      reviewItem =
+        (await this.repos.review
+          .listDue(learnerId, now)
+          .then(
+            (items) =>
+              items.find((i) => i.id === candidate.id || i.referenceId === candidate.referenceId) ??
+              null,
+          )) ?? null;
+    }
 
     if (!reviewItem && this.repos.review.upsert) {
       // Upsert into review_items if needed
@@ -137,6 +219,7 @@ export class ReviewService {
         reviewItem.id,
         evaluation.result,
         evaluation.feedback,
+        attemptKey,
       );
     }
 
@@ -165,7 +248,9 @@ export class ReviewService {
 
         await this.repos.weaknesses.addWeaknessEvidence({
           weaknessId: weakness.id,
-          id: reviewItem?.id ?? candidate.id,
+          // Identity is the ATTEMPT, never the review item: repeated reviews of
+          // the same item each keep their own evidence instead of colliding.
+          id: deriveReviewEvidenceId([learnerId, weakness.id, attemptKey]),
           kind: 'turn',
           at: now,
           summary: `Review practice result: ${evaluation.result}. Answer: "${userAnswer}". Feedback: ${evaluation.feedback}`,

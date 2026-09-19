@@ -31,97 +31,55 @@ import {
 } from '../data/local/sqlite/repositories';
 import {
   createExpoAudioRecorder,
-  createDemoSTTProvider,
-  createGeminiSTTProvider,
   createExpoTTSProvider,
-  getGeminiApiKey,
   type AudioRecorderService,
   type SpeechToTextProvider,
   type TextToSpeechProvider,
 } from '../talk-demo';
+import {
+  ReviewVoiceController,
+  type ReviewVoiceStatus,
+} from '../review/voice-controller';
+import { resolveReviewProviders } from '../review/providers';
+import { DEMO_REVIEW_NOTICE, selectReviewSessionCandidates } from '../review/demo-items';
+import { generateId } from '../shared/id';
 
-// Fallback Mock items for immediate demo / offline practice out of the box
-const MOCK_ITEMS: readonly ReviewItemCandidate[] = [
-  {
-    id: 'demo-1',
-    learnerId: 'demo-user',
-    kind: 'grammar',
-    exerciseType: 'sentence_correction',
-    referenceId: 'weakness-1',
-    prompt: 'Correct the grammatical error in this sentence:',
-    contextSentence: 'She walk to school every day.',
-    expectedAnswer: 'She walks to school every day.',
-    explanation: 'Singular subjects (she, he, it) require the singular verb form ending in -s.',
-    dueAt: new Date().toISOString(),
-    severity: 0.7,
-    status: 'confirmed',
-    consecutiveCorrect: 0,
-    reviewCount: 2,
-  },
-  {
-    id: 'demo-2',
-    learnerId: 'demo-user',
-    kind: 'grammar',
-    exerciseType: 'sentence_correction',
-    referenceId: 'weakness-2',
-    prompt: 'Correct the grammatical error in this sentence:',
-    contextSentence: 'I am interested on learning English.',
-    expectedAnswer: 'I am interested in learning English.',
-    explanation: 'The adjective "interested" is paired with the preposition "in", not "on".',
-    dueAt: new Date().toISOString(),
-    severity: 0.5,
-    status: 'observed',
-    consecutiveCorrect: 0,
-    reviewCount: 1,
-  },
-  {
-    id: 'demo-3',
-    learnerId: 'demo-user',
-    kind: 'vocabulary',
-    exerciseType: 'vocabulary_recall',
-    referenceId: 'vocab-1',
-    prompt: 'What word matches this definition?',
-    definition: 'A sudden, intuitive perception of or insight into the reality or essential meaning of something.',
-    expectedAnswer: 'Epiphany',
-    explanation: 'An epiphany is a moment of sudden revelation or insight.',
-    dueAt: new Date().toISOString(),
-    status: 'active_training',
-    consecutiveCorrect: 0,
-    reviewCount: 1,
-  },
-  {
-    id: 'demo-4',
-    learnerId: 'demo-user',
-    kind: 'vocabulary',
-    exerciseType: 'fill_the_gap',
-    referenceId: 'vocab-2',
-    prompt: 'Fill in the blank with the appropriate word:',
-    contextSentence: 'The _____ plants survived the harsh winter.',
-    definition: 'Able to withstand or recover quickly from difficult conditions.',
-    expectedAnswer: 'resilient',
-    explanation: 'Resilient means able to withstand or recover quickly from difficult conditions.',
-    dueAt: new Date().toISOString(),
-    status: 'active_training',
-    consecutiveCorrect: 0,
-    reviewCount: 2,
-  },
-  {
-    id: 'demo-5',
-    learnerId: 'demo-user',
-    kind: 'expression',
-    exerciseType: 'expression_use',
-    referenceId: 'expr-1',
-    prompt: 'Complete or paraphrase this sentence using the expression "Bite the bullet":',
-    contextSentence: 'Bite the bullet',
-    definition: 'Face a difficult situation with courage and resign oneself to it.',
-    expectedAnswer: 'bite the bullet',
-    explanation: 'To bite the bullet means to accept a difficult or inevitable situation with fortitude.',
-    dueAt: new Date().toISOString(),
-    status: 'active_training',
-    consecutiveCorrect: 0,
-    reviewCount: 0,
+// Demo practice cards live in the review package (`demo-items`) and are
+// reachable ONLY through explicit Demo Mode — never mixed into a real queue.
+
+/**
+ * Demo-Mode-only grading of the pre-built practice cards. Clearly advertised
+ * demo practice; the result is never persisted as learner evidence.
+ */
+function evaluateDemoAnswerLocally(
+  candidate: ReviewItemCandidate,
+  answer: string,
+): EvaluationResult {
+  const normUser = answer.trim().toLowerCase();
+  const normExpected = candidate.expectedAnswer.trim().toLowerCase();
+  if (normUser === normExpected) {
+    return {
+      result: 'correct',
+      feedback: 'Excellent! Your answer matches perfectly.',
+      explanation: candidate.explanation,
+      suggestedCorrection: candidate.expectedAnswer,
+    };
   }
-];
+  if (normUser.length > 2 && normExpected.includes(normUser)) {
+    return {
+      result: 'partial',
+      feedback: 'Almost! Check the phrasing or spelling.',
+      explanation: candidate.explanation,
+      suggestedCorrection: candidate.expectedAnswer,
+    };
+  }
+  return {
+    result: 'incorrect',
+    feedback: 'Not quite. Check the suggested answer.',
+    explanation: candidate.explanation,
+    suggestedCorrection: candidate.expectedAnswer,
+  };
+}
 
 export interface ReviewScreenProps {
   readonly initialDemoMode?: boolean;
@@ -206,20 +164,83 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
   const reviewServiceRef = useRef<ReviewService | null>(null);
   const dbAdapterRef = useRef<DatabaseAdapter | null>(null);
   const startTimeRef = useRef<number>(0);
+  /** Synchronous invalidation token: leaving an item/session makes its work stale. */
+  const sessionGenerationRef = useRef<number>(0);
+  const currentIndexRef = useRef<number>(0);
+  const mountedRef = useRef<boolean>(true);
+  /** ONE identity per item attempt: a retry reuses it, a new attempt does not. */
+  const attemptIdRef = useRef<string | null>(null);
+  /** Synchronous single-flight guard for submission (state updates are async). */
+  const submitInFlightRef = useRef<boolean>(false);
 
-  // Voice recording and STT refs and state
-  const [isRecording, setIsRecording] = useState<boolean>(false);
-  const [recorderError, setRecorderError] = useState<string | null>(null);
-  const recorderRef = useRef<AudioRecorderService | null>(null);
-  const sttRef = useRef<SpeechToTextProvider | null>(null);
+  // Voice recording and STT refs and state (the EXISTING Review voice controller)
+  const voiceRef = useRef<ReviewVoiceController | null>(null);
+  const [voiceStatus, setVoiceStatus] = useState<ReviewVoiceStatus>({
+    state: 'idle',
+    isRecording: false,
+    isTranscribing: false,
+    isBusy: false,
+    isDisposed: false,
+    isAvailable: true,
+    transcript: '',
+    error: null,
+  });
+  const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
+  const [sessionEmpty, setSessionEmpty] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const ttsRef = useRef<TextToSpeechProvider | null>(props?.ttsProvider ?? null);
   const [isPlayingListening, setIsPlayingListening] = useState<boolean>(false);
 
+  const isRecording = voiceStatus.isRecording;
+  const isTranscribing = voiceStatus.isTranscribing;
+  const recorderError = voiceStatus.error;
+
   useEffect(() => {
-    recorderRef.current = props?.recorder || createExpoAudioRecorder();
-    const apiKey = getGeminiApiKey();
-    sttRef.current = props?.sttProvider || (apiKey ? createGeminiSTTProvider({ apiKey }) : createDemoSTTProvider());
-  }, [props?.recorder, props?.sttProvider]);
+    currentIndexRef.current = currentIndex;
+  }, [currentIndex]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      // Terminal: synchronously invalidates every in-flight callback, then
+      // tears the shared recorder and playback down best-effort.
+      voiceRef.current?.dispose();
+      voiceRef.current = null;
+      void ttsRef.current?.stop().catch(() => undefined);
+    };
+  }, []);
+
+  /**
+   * Voice provider resolution (the EXISTING honest rules): real speech
+   * recognition, explicit Demo Mode, or an honest "unavailable" state. A real
+   * review never receives a scripted transcript, and Demo Mode can never
+   * persist anything.
+   */
+  useEffect(() => {
+    const providers = resolveReviewProviders({
+      isDemo: isDemoMode,
+      ...(props?.sttProvider ? { sttProvider: props.sttProvider } : {}),
+    });
+    const controller = new ReviewVoiceController(
+      props?.recorder || createExpoAudioRecorder(),
+      providers.sttProvider,
+      {
+        unavailable: providers.kind === 'unavailable',
+        unavailableMessage: providers.voiceUnavailableMessage ?? null,
+      },
+    );
+    voiceRef.current = controller;
+    setVoiceStatus(controller.getStatus());
+    setVoiceNotice(providers.voiceUnavailableMessage ?? null);
+
+    return () => {
+      controller.dispose();
+      if (voiceRef.current === controller) {
+        voiceRef.current = null;
+      }
+    };
+  }, [isDemoMode, props?.recorder, props?.sttProvider]);
 
   // Initialize DB Adapter and ReviewService
   useEffect(() => {
@@ -260,15 +281,19 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     try {
       setLoading(true);
       if (isDemoMode) {
+        // Demo metrics describe the DEMO queue itself (never learner history).
+        const demoItems = selectReviewSessionCandidates({ isDemo: true, planned: [] });
+        const demoDue = (kind: ReviewItemCandidate['kind']) =>
+          demoItems.filter((item) => item.kind === kind).length;
         setSummary({
-          totalDue: 5,
-          dueVocabularyCount: 2,
-          dueExpressionCount: 1,
-          activeWeaknessCount: 2,
+          totalDue: demoItems.length,
+          dueVocabularyCount: demoDue('vocabulary'),
+          dueExpressionCount: demoDue('expression'),
+          activeWeaknessCount: demoDue('grammar'),
           categories: [
-            { key: 'grammar', label: 'Grammar & Phrasing', dueCount: 2 },
-            { key: 'vocabulary', label: 'Vocabulary Recall', dueCount: 2 },
-            { key: 'expression', label: 'Expressions & Idioms', dueCount: 1 },
+            { key: 'grammar', label: 'Grammar & Phrasing', dueCount: demoDue('grammar') },
+            { key: 'vocabulary', label: 'Vocabulary Recall', dueCount: demoDue('vocabulary') },
+            { key: 'expression', label: 'Expressions & Idioms', dueCount: demoDue('expression') },
           ],
         });
         setActiveWeaknesses([]);
@@ -297,59 +322,45 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     }
   };
 
+  /**
+   * Mic press. The EXISTING ReviewVoiceController owns the lifecycle: one
+   * operation at a time, generation-invalidated callbacks, and a transcript
+   * that is only ever offered for review (never auto-submitted, never
+   * persisted by itself).
+   */
   const handleToggleRecording = async () => {
-    if (!recorderRef.current || !sttRef.current) return;
-
-    if (isRecording) {
-      try {
-        const result = await recorderRef.current.stopRecording();
-        setIsRecording(false);
-        setRecorderError(null);
-
-        const sttRes = await sttRef.current.transcribe({
-          uri: result.uri,
-          base64: result.base64,
-          mimeType: result.mimeType,
-          durationMs: result.durationMs,
-        });
-
-        if (sttRes.ok && sttRes.transcript) {
-          // Voice transcript populates answer text box only, allowing manual correction
-          setUserAnswer(sttRes.transcript);
-        } else {
-          setRecorderError(sttRes.error || 'Failed to transcribe speech.');
-        }
-      } catch (err) {
-        console.error('Error stopping voice recording:', err);
-        setRecorderError(err instanceof Error ? err.message : 'Error transcribing audio.');
-        setIsRecording(false);
-      }
-    } else {
-      try {
-        setRecorderError(null);
-        const hasPerms = await recorderRef.current.hasPermissions();
-        if (!hasPerms) {
-          const granted = await recorderRef.current.requestPermissions();
-          if (!granted) {
-            setRecorderError('Microphone permissions denied.');
-            return;
-          }
-        }
-        await recorderRef.current.startRecording();
-        setIsRecording(true);
-      } catch (err) {
-        console.error('Error starting voice recording:', err);
-        setRecorderError(err instanceof Error ? err.message : 'Failed to start recording.');
-        setIsRecording(false);
-      }
+    const controller = voiceRef.current;
+    if (!controller || controller.isDisposed) return;
+    const status = await controller.toggleRecording();
+    if (!mountedRef.current) return;
+    setVoiceStatus(status);
+    if (status.transcript) {
+      setUserAnswer(status.transcript);
     }
+  };
+
+  /** Explicit demo toggle: re-composes the service and the voice path. */
+  const enableDemoMode = () => {
+    setIsDemoMode(true);
+    if (dbAdapterRef.current) {
+      reviewServiceRef.current = createReviewService(dbAdapterRef.current, true);
+    }
+    void loadDashboardMetrics();
   };
 
   const handleStartSession = async (
     dailyOptions?: { reviewKind?: 'vocabulary' | 'expression' | 'grammar'; reviewLimit?: number },
   ) => {
+    // Synchronous invalidation: nothing from a previous session may land here.
+    sessionGenerationRef.current += 1;
+    attemptIdRef.current = null;
+    voiceRef.current?.reset();
+    setSaveError(null);
+    setSessionEmpty(null);
+
     if (isDemoMode) {
-      setSessionCandidates(MOCK_ITEMS);
+      // Explicit Demo Mode only: pre-built practice cards, never persisted.
+      setSessionCandidates(selectReviewSessionCandidates({ isDemo: true, planned: [] }));
       setCurrentIndex(0);
       setSessionState('reviewing');
       setUserAnswer('');
@@ -384,9 +395,19 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       const bounded = dailyOptions?.reviewKind
         ? candidates.filter((candidate) => candidate.kind === dailyOptions.reviewKind)
         : candidates;
-      // A real empty queue stays genuinely empty — pre-built cards are only for explicit Demo Mode.
-      setSessionCandidates(bounded);
+      // Real mode returns EXACTLY the planner output: pre-built demo cards are
+      // unreachable here, and an empty queue stays honestly empty.
+      const sessionItems = selectReviewSessionCandidates({ isDemo: false, planned: bounded });
+      if (sessionItems.length === 0) {
+        setSessionCandidates([]);
+        setSessionState('dashboard');
+        setSessionEmpty(
+          'Nothing is due for review right now. Practise in a conversation and the things you struggled with will appear here.',
+        );
+        return;
+      }
 
+      setSessionCandidates(sessionItems);
       setCurrentIndex(0);
       setSessionState('reviewing');
       setUserAnswer('');
@@ -443,58 +464,59 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
 
   const handleSubmitAnswer = async () => {
     const candidate = sessionCandidates[currentIndex];
-    if (!candidate || isEvaluating) return;
+    if (!candidate || submitInFlightRef.current) return;
+
+    submitInFlightRef.current = true;
+    setIsEvaluating(true);
+    setSaveError(null);
+
+    const generation = sessionGenerationRef.current;
+    const itemIndex = currentIndex;
+    // ONE identity per attempt: a retry (double tap, retry after an error)
+    // reuses it so the attempt is recorded exactly once.
+    const attemptId = attemptIdRef.current ?? generateId();
+    attemptIdRef.current = attemptId;
+
+    const isCurrentAttempt = () =>
+      mountedRef.current &&
+      sessionGenerationRef.current === generation &&
+      currentIndexRef.current === itemIndex;
 
     try {
-      setIsEvaluating(true);
-
       let evalResult: EvaluationResult;
       if (isDemoMode || !reviewServiceRef.current) {
-        // Evaluate locally
-        const normUser = userAnswer.trim().toLowerCase();
-        const normExpected = candidate.expectedAnswer.trim().toLowerCase();
-        if (normUser === normExpected) {
-          evalResult = {
-            result: 'correct',
-            feedback: 'Excellent! Your answer matches perfectly.',
-            explanation: candidate.explanation,
-            suggestedCorrection: candidate.expectedAnswer,
-          };
-        } else if (normUser.length > 2 && normExpected.includes(normUser)) {
-          evalResult = {
-            result: 'partial',
-            feedback: 'Almost! Check the phrasing or spelling.',
-            explanation: candidate.explanation,
-            suggestedCorrection: candidate.expectedAnswer,
-          };
-        } else {
-          evalResult = {
-            result: 'incorrect',
-            feedback: 'Not quite. Check the suggested answer.',
-            explanation: candidate.explanation,
-            suggestedCorrection: candidate.expectedAnswer,
-          };
-        }
+        // Explicit demo practice: local comparison only, nothing persisted.
+        evalResult = evaluateDemoAnswerLocally(candidate, userAnswer);
       } else {
-        // Real database/AI evaluation
         evalResult = await reviewServiceRef.current.evaluateAnswer(candidate, userAnswer);
+        if (!isCurrentAttempt()) return;
 
-        // Record practice result in SQLite persistence
         const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
         const profile = await profileRepo.get();
+        if (!isCurrentAttempt()) return;
+
         if (profile && profile.id) {
-          await reviewServiceRef.current.recordPracticeResult(
-            profile.id,
-            candidate,
-            userAnswer,
-            evalResult
-          );
+          try {
+            await reviewServiceRef.current.recordPracticeResult(
+              profile.id,
+              candidate,
+              userAnswer,
+              evalResult,
+              undefined,
+              { attemptId },
+            );
+          } catch (err) {
+            console.error('Error saving review practice result:', err);
+            if (isCurrentAttempt()) {
+              // Honest: graded, but NOT saved as progress.
+              setSaveError('Your answer was graded, but your progress could not be saved.');
+            }
+          }
         }
+        if (!isCurrentAttempt()) return;
       }
 
       setEvaluation(evalResult);
-
-      // Update session metrics tally
       setSessionResults((prev) => {
         if (evalResult.result === 'correct') {
           return { ...prev, correctCount: prev.correctCount + 1 };
@@ -506,13 +528,22 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       });
     } catch (err) {
       console.error('Error evaluating answer:', err);
+      if (isCurrentAttempt()) {
+        setSaveError('That answer could not be graded. Nothing was recorded — please try again.');
+      }
     } finally {
       setIsEvaluating(false);
+      submitInFlightRef.current = false;
     }
   };
 
   const handleNextItem = async () => {
     if (currentIndex + 1 < sessionCandidates.length) {
+      // Item change: invalidate the finished item's voice work synchronously so
+      // a late transcript can never enter the NEXT item.
+      voiceRef.current?.reset();
+      attemptIdRef.current = null;
+      setSaveError(null);
       setCurrentIndex((prev) => prev + 1);
       setUserAnswer('');
       setEvaluation(null);
@@ -556,11 +587,23 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
         });
         setDailyLaunch((current) => finishDailyTutorWorkflow(current));
       }
+      voiceRef.current?.reset();
+      attemptIdRef.current = null;
       setSessionState('completed');
     }
   };
 
   const handleExitSession = () => {
+    // Synchronous invalidation BEFORE anything else: in-flight grading or
+    // speech recognition from this session can neither land on the dashboard
+    // nor persist as evidence after the learner left.
+    sessionGenerationRef.current += 1;
+    submitInFlightRef.current = false;
+    attemptIdRef.current = null;
+    voiceRef.current?.reset();
+    setIsEvaluating(false);
+    setSaveError(null);
+    setSessionEmpty(null);
     setSessionState('dashboard');
     // Leaving the session ends any Daily Tutor visit context — later use of
     // this tab is standalone.
@@ -601,10 +644,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
             </Text>
             <TouchableOpacity
               style={[styles.startSessionButton, { marginTop: 12, backgroundColor: '#059669' }]}
-              onPress={() => {
-                setIsDemoMode(true);
-                loadDashboardMetrics();
-              }}
+              onPress={enableDemoMode}
             >
               <Text style={styles.startSessionButtonText}>Enable Practice Demo Mode</Text>
             </TouchableOpacity>
@@ -616,12 +656,19 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
             <Text style={styles.demoBannerText}>
               💡 Demo Mode active: No historical learning data found yet. Start practice below using pre-loaded high-quality review cards!
             </Text>
+            <Text style={styles.demoBannerText}>{DEMO_REVIEW_NOTICE}</Text>
           </View>
         )}
 
         {sessionError && !isDemoMode && (
           <View style={styles.sessionErrorBanner}>
             <Text style={styles.sessionErrorBannerText}>⚠️ {sessionError}</Text>
+          </View>
+        )}
+
+        {sessionEmpty && !isDemoMode && (
+          <View style={styles.emptyQueueBanner}>
+            <Text style={styles.emptyQueueBannerText}>🗂️ {sessionEmpty}</Text>
           </View>
         )}
 
@@ -728,6 +775,12 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           <View style={[styles.progressBarFill, { width: `${progressPercent}%` }]} />
         </View>
 
+        {saveError && !isDemoMode && (
+          <View style={styles.sessionErrorBanner}>
+            <Text style={styles.sessionErrorBannerText}>⚠️ {saveError}</Text>
+          </View>
+        )}
+
         {/* Practice Card */}
         <View style={styles.card}>
           <View style={styles.cardTypeRow}>
@@ -814,27 +867,48 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
 
               {/* Voice Review Answer Controls */}
               <View style={styles.voiceSection} id="voice_section">
-                <TouchableOpacity
-                  style={[
-                    styles.micButton,
-                    isRecording && styles.micButtonRecording,
-                  ]}
-                  onPress={handleToggleRecording}
-                  accessibilityRole="button"
-                  id="toggle_recording_button"
-                >
-                  <Text style={styles.micButtonText}>
-                    {isRecording ? '🛑 Stop Recording' : '🎤 Answer with Voice'}
-                  </Text>
-                </TouchableOpacity>
-                {isRecording && (
-                  <View style={styles.recordingIndicator}>
-                    <View style={styles.pulseDot} />
-                    <Text style={styles.recordingText}>Listening... Speak your answer now.</Text>
+                {!voiceStatus.isAvailable ? (
+                  // Honest unavailable state: no microphone, no invented
+                  // transcript and no demo speech on a real review.
+                  <View style={styles.voiceUnavailableCard}>
+                    <Text style={styles.voiceUnavailableText}>
+                      {voiceNotice ?? 'Voice answers are unavailable right now. Type your answer instead.'}
+                    </Text>
                   </View>
-                )}
-                {recorderError && (
-                  <Text style={styles.recorderErrorText}>{recorderError}</Text>
+                ) : (
+                  <>
+                    <TouchableOpacity
+                      style={[
+                        styles.micButton,
+                        isRecording && styles.micButtonRecording,
+                        (isTranscribing || isEvaluating) && styles.micButtonDisabled,
+                      ]}
+                      onPress={handleToggleRecording}
+                      disabled={isTranscribing || isEvaluating}
+                      accessibilityRole="button"
+                      id="toggle_recording_button"
+                    >
+                      <Text style={styles.micButtonText}>
+                        {isRecording
+                          ? '🛑 Stop Recording'
+                          : isTranscribing
+                            ? 'Transcribing…'
+                            : '🎤 Answer with Voice'}
+                      </Text>
+                    </TouchableOpacity>
+                    {isRecording && (
+                      <View style={styles.recordingIndicator}>
+                        <View style={styles.pulseDot} />
+                        <Text style={styles.recordingText}>Listening... Speak your answer now.</Text>
+                      </View>
+                    )}
+                    {isDemoMode && (
+                      <Text style={styles.demoVoiceNotice}>{DEMO_REVIEW_NOTICE}</Text>
+                    )}
+                    {recorderError && (
+                      <Text style={styles.recorderErrorText}>{recorderError}</Text>
+                    )}
+                  </>
                 )}
               </View>
             </View>
@@ -987,6 +1061,19 @@ const styles = StyleSheet.create({
   sessionErrorBannerText: {
     fontSize: 13,
     color: '#B91C1C',
+    lineHeight: 18,
+  },
+  emptyQueueBanner: {
+    backgroundColor: '#F0F9FF',
+    borderWidth: 1,
+    borderColor: '#BAE6FD',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 20,
+  },
+  emptyQueueBannerText: {
+    fontSize: 13,
+    color: '#075985',
     lineHeight: 18,
   },
   totalDueCard: {
@@ -1459,6 +1546,26 @@ const styles = StyleSheet.create({
   micButtonRecording: {
     backgroundColor: '#FEE2E2',
     borderColor: '#F87171',
+  },
+  micButtonDisabled: {
+    opacity: 0.6,
+  },
+  voiceUnavailableCard: {
+    backgroundColor: '#F9FAFB',
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    borderRadius: 8,
+    padding: 12,
+  },
+  voiceUnavailableText: {
+    fontSize: 12,
+    color: '#4B5563',
+    lineHeight: 17,
+  },
+  demoVoiceNotice: {
+    fontSize: 12,
+    color: '#1E40AF',
+    marginTop: 4,
   },
   micButtonText: {
     color: '#374151',

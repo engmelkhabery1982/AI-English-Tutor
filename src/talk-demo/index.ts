@@ -237,15 +237,18 @@ export const TALK_REAL_STT_UNAVAILABLE_MESSAGE =
   'Real speech recognition is unavailable, so your speech could not be transcribed. Check the real AI provider configuration and try again.';
 
 /**
- * Speech-to-text provider used when a REAL conversation was requested but no
- * real speech recognition is configured: it fails honestly instead of returning
- * a scripted demo transcript that would look like the learner's own speech.
+ * Speech-to-text provider used when a REAL voice interaction was requested but
+ * no real speech recognition is configured: it fails honestly instead of
+ * returning a scripted demo transcript that would look like the learner's own
+ * speech. Shared with the Review surface, which passes its own wording.
  */
-function createUnavailableSTTProvider(): SpeechToTextProvider {
+export function createUnavailableSTTProvider(
+  message: string = TALK_REAL_STT_UNAVAILABLE_MESSAGE,
+): SpeechToTextProvider {
   return {
     id: 'stt-unavailable',
     async transcribe(): Promise<STTResult> {
-      return { ok: false, error: TALK_REAL_STT_UNAVAILABLE_MESSAGE };
+      return { ok: false, error: message };
     },
   };
 }

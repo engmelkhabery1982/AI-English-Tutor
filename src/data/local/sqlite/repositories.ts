@@ -1443,8 +1443,12 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
     const existing = await this.adapter.query(`SELECT id FROM learner_weaknesses WHERE id = ?`, [evidence.weaknessId]);
     if (existing.length === 0) throw new Error(`Weakness not found: ${evidence.weaknessId}`);
 
+    // Idempotent per attempt: same evidence id (derived from attemptKey) may be
+    // retried after a restart where the in-memory Map is gone. INSERT OR IGNORE
+    // makes the retry a no-op instead of a UNIQUE violation, preserving
+    // "one row per attempt" guarantee.
     await this.adapter.execute(
-      `INSERT INTO weakness_evidence (id, weakness_id, kind, ref_id, at, summary)
+      `INSERT OR IGNORE INTO weakness_evidence (id, weakness_id, kind, ref_id, at, summary)
        VALUES (?, ?, ?, ?, ?, ?)`,
       [
         evidence.id,
