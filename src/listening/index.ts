@@ -8,9 +8,15 @@
  * Audio playback always goes through the EXISTING TextToSpeechProvider
  * abstraction (talk-demo) — this module adds no second TTS stack and no
  * new dependency.
+ *
+ * DATABASE OWNERSHIP (Wave 2): the default composition reuses the CANONICAL
+ * application database owner (ApplicationDatabase) instead of opening its own
+ * adapter. One connection, one migration run, and a failed bootstrap releases
+ * the cached promise so the next attempt retries cleanly.
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import { getApplicationDatabase } from '../data/local/sqlite/ApplicationDatabase';
 import type { AIProvider } from '../providers/ai/types';
 import { createGeminiAIProvider } from '../providers/ai/gemini';
 import { getGeminiApiKey } from '../talk-demo';
@@ -98,15 +104,18 @@ type ListeningServiceDepsHint = ConstructorParameters<typeof ListeningService>[0
 // composition, never inside UI screens.
 let defaultServicePromise: Promise<ListeningService> | null = null;
 
-/** Compose the service on the default local database (reused across calls). */
+/** Compose the service on the CANONICAL application database (reused app-wide). */
 export function createDefaultListeningService(): Promise<ListeningService> {
   if (!defaultServicePromise) {
     defaultServicePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
+      const adapter = await getApplicationDatabase().getAdapter();
       return createListeningService(adapter);
-    })();
+    })().catch((error: unknown) => {
+      // Release the cached promise so a later attempt retries instead of the
+      // feature being disabled for the whole app run.
+      defaultServicePromise = null;
+      throw error;
+    });
   }
   return defaultServicePromise;
 }
