@@ -6,12 +6,14 @@
  * REUSES the existing onboarding diagnostic engine and aggregator.
  * DOES NOT create a second diagnostic or placement engine.
  * DOES NOT silently replace current level: level update requires explicit user acceptance.
+ *
+ * DATABASE OWNERSHIP (Wave 2): when no adapter is injected, the service reuses
+ * the CANONICAL application database owner instead of opening its own adapter.
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
-import {
-  SQLiteWeaknessRepository,
-} from '../data/local/sqlite/repositories';
+import { getApplicationDatabase } from '../data/local/sqlite/ApplicationDatabase';
+import { SQLiteWeaknessRepository } from '../data/local/sqlite/repositories';
 import type { LearnerModel } from '../learner-model';
 import type { ConversationMode } from '../domain/shared/types';
 import type { LearnerStrength, LearnerWeakness } from '../domain/models/learner';
@@ -80,11 +82,10 @@ export function createReassessmentService(
   let activeHandle: DiagnosticHandle | null = null;
 
   async function resolveDependencies() {
+    // Wave 2: reuse the CANONICAL application database owner. No second
+    // connection is opened and no second migration run occurs.
     if (!adapterInstance && !onboardingInstance) {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
-      adapterInstance = adapter;
+      adapterInstance = await getApplicationDatabase().getAdapter();
     }
 
     if (!onboardingInstance && adapterInstance) {
@@ -325,8 +326,6 @@ export function createReassessmentService(
           reason: updateResult.record?.decision === 'kept' ? 'kept' : 'already-accepted',
         };
       }
-
-
 
       if (deps.learnerModel) {
         try {
