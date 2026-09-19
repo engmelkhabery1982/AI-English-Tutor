@@ -181,6 +181,9 @@ export class VoiceSessionCoordinator {
    * session that is on its way out.
    */
   private switching: boolean = false;
+  private appStateSub: { remove: () => void } | null = null;
+  private lastAppState: string = 'active';
+  private lastAudioUri: string | null = null;
 
   constructor(config: VoiceSessionCoordinatorConfig) {
     this.recorder = config.recorder;
@@ -188,6 +191,42 @@ export class VoiceSessionCoordinator {
     this.ttsProvider = config.ttsProvider;
     this.session = config.session;
     this.isMuted = config.isMuted ?? false;
+    this.setupAppStateGuard();
+  }
+
+  private async cleanupAudio(uri: string | null): Promise<void> {
+    if (!uri) return;
+    try {
+      const { cleanupAudioFile } = await import('./audio-cleanup');
+      await cleanupAudioFile(uri);
+    } catch {
+      // Cleanup failures never become evidence or crash
+    }
+  }
+
+  private setupAppStateGuard(): void {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { AppState } = require('react-native');
+      if (AppState && typeof AppState.addEventListener === 'function') {
+        this.lastAppState = AppState.currentState ?? 'active';
+        const sub = AppState.addEventListener('change', (next: string) => {
+          const prev = this.lastAppState;
+          this.lastAppState = next;
+          const goingBackground =
+            (prev === 'active' && (next === 'background' || next === 'inactive')) ||
+            (prev === 'inactive' && next === 'background');
+          if (goingBackground) {
+            this.handleBackground();
+          } else if ((prev === 'background' || prev === 'inactive') && next === 'active') {
+            this.handleForeground();
+          }
+        });
+        this.appStateSub = sub;
+      }
+    } catch {
+      // No AppState in test environment – ignore
+    }
   }
 
   /**
@@ -498,6 +537,7 @@ export class VoiceSessionCoordinator {
     let audio;
     try {
       audio = await this.recorder.stopRecording();
+      this.lastAudioUri = audio?.uri ?? null;
     } catch (err: unknown) {
       this.processing = false;
       const message =
@@ -509,6 +549,10 @@ export class VoiceSessionCoordinator {
     if (!this.isCurrent(session, generation)) {
       // The session was replaced while the audio was being captured: the audio
       // belongs to the previous conversation, so it is not transcribed.
+      // Cleanup owned temp file – stale/disposed cleans owned
+      const toClean = this.lastAudioUri;
+      this.lastAudioUri = null;
+      void this.cleanupAudio(toClean);
       this.processing = false;
       return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
     }
@@ -518,6 +562,9 @@ export class VoiceSessionCoordinator {
     try {
       sttResult = await this.sttProvider.transcribe(audio);
     } catch (err: unknown) {
+      const toClean = this.lastAudioUri;
+      this.lastAudioUri = null;
+      void this.cleanupAudio(toClean);
       this.processing = false;
       const message =
         err instanceof Error ? err.message : 'Could not recognize speech. Please try speaking again.';
@@ -527,18 +574,32 @@ export class VoiceSessionCoordinator {
 
     if (!this.isCurrent(session, generation)) {
       // A late STT result must never be attached to the replacement session.
+      const toClean = this.lastAudioUri;
+      this.lastAudioUri = null;
+      void this.cleanupAudio(toClean);
       this.processing = false;
       return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
     }
 
     if (!sttResult.ok || !sttResult.transcript || sttResult.transcript.trim().length === 0) {
+      const toClean = this.lastAudioUri;
+      this.lastAudioUri = null;
+      void this.cleanupAudio(toClean);
       this.processing = false;
       const errorMsg =
         sttResult.error || 'Could not recognize speech. Please try speaking again.';
       this.setStateIfCurrent(session, generation, 'error', errorMsg);
-      // CRITICAL: ConversationSession history remains unchanged!
+      // CRITICAL: ConversationSession history remains unchanged! Failed STT no evidence
       return { ok: false, error: errorMsg };
     }
+
+    // STT succeeded – file no longer needed by STT, cleanup after dependent pronunciation done.
+    // For conversational path, pronunciation happens later in TalkScreen, so we keep uri until after send?
+    // Actually STT consumer done, but pronunciation may still need transcript only, not file.
+    // So cleanup now is safe – file not needed by other consumer (transcript already extracted).
+    const audioUriForCleanup = this.lastAudioUri;
+    this.lastAudioUri = null;
+    void this.cleanupAudio(audioUriForCleanup);
 
     const transcript = sttResult.transcript.trim();
     this.recognizedTranscript = transcript;
@@ -643,6 +704,7 @@ export class VoiceSessionCoordinator {
     let audio;
     try {
       audio = await this.recorder.stopRecording();
+      this.lastAudioUri = audio?.uri ?? null;
     } catch (err: unknown) {
       this.processing = false;
       const message = err instanceof Error ? err.message : 'Failed to stop audio recording.';
@@ -651,8 +713,9 @@ export class VoiceSessionCoordinator {
     }
 
     if (!this.isCurrent(session, generation)) {
-      // The session was replaced while the audio was captured: it belongs to a
-      // previous conversation and is not transcribed.
+      const toClean = this.lastAudioUri;
+      this.lastAudioUri = null;
+      void this.cleanupAudio(toClean);
       this.processing = false;
       return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
     }
@@ -661,6 +724,9 @@ export class VoiceSessionCoordinator {
     try {
       sttResult = await this.sttProvider.transcribe(audio);
     } catch (err: unknown) {
+      const toClean = this.lastAudioUri;
+      this.lastAudioUri = null;
+      void this.cleanupAudio(toClean);
       this.processing = false;
       const message =
         err instanceof Error
@@ -671,19 +737,30 @@ export class VoiceSessionCoordinator {
     }
 
     if (!this.isCurrent(session, generation)) {
-      // A late STT result must never be handed to a replaced/disposed caller.
+      const toClean = this.lastAudioUri;
+      this.lastAudioUri = null;
+      void this.cleanupAudio(toClean);
       this.processing = false;
       return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
     }
 
     if (!sttResult.ok || !sttResult.transcript || sttResult.transcript.trim().length === 0) {
+      const toClean = this.lastAudioUri;
+      this.lastAudioUri = null;
+      void this.cleanupAudio(toClean);
       this.processing = false;
       const errorMsg = sttResult.error || 'Could not recognize speech. Please try speaking again.';
       this.setStateIfCurrent(session, generation, 'error', errorMsg);
       // CRITICAL: no conversation turn, no feedback and no vocabulary — nothing
-      // was submitted anywhere.
+      // was submitted anywhere. Failed/empty STT no evidence
       return { ok: false, error: errorMsg };
     }
+
+    // STT succeeded – cleanup temp file after dependent pronunciation no longer needs file.
+    // Pronunciation uses transcript only, not file, so safe to cleanup now.
+    const uriToClean = this.lastAudioUri;
+    this.lastAudioUri = null;
+    void this.cleanupAudio(uriToClean);
 
     // STOP HERE (the whole point of this operation): return the real transcript
     // to the caller. Nothing is submitted to the ConversationSession, nothing is
@@ -861,6 +938,71 @@ export class VoiceSessionCoordinator {
   }
 
   /**
+   * AppState / background policy – minimal production-safe.
+   * When app becomes inactive/backgrounded while voice activity is running:
+   * - invalidate active voice attempt SYNCHRONOUSLY (generation++)
+   * - stop active recording safely (best-effort)
+   * - stop active TTS (idempotent)
+   * - prevent late STT/AI results from mutating or persisting
+   * - do not fabricate failure evidence
+   * - do not auto-restart mic on foreground
+   * Foreground returns to stable idle/recoverable state.
+   */
+  handleBackground(): void {
+    if (this.disposed) return;
+    // Synchronous invalidation FIRST
+    this.generation += 1;
+    this.session.abandon?.();
+    // Stop timer synchronously
+    if (this.timerHandle) {
+      clearInterval(this.timerHandle);
+      this.timerHandle = null;
+    }
+    // Cleanup owned temp audio file – stale/disposed cleans owned, failures no evidence/crash
+    const ownedUri = this.lastAudioUri;
+    this.lastAudioUri = null;
+    if (ownedUri) void this.cleanupAudio(ownedUri);
+    // Invalidate recorder synchronously if it supports it, else best-effort stop
+    try {
+      const recAny = this.recorder as any;
+      if (typeof recAny.invalidate === 'function') {
+        recAny.invalidate();
+      } else if (this.recorder.isRecording()) {
+        // Best-effort async stop, but we already cleared active state synchronously
+        this.recorder.stopRecording().catch(() => {});
+      }
+    } catch {}
+    // Invalidate TTS synchronously
+    try {
+      const ttsAny = this.ttsProvider as any;
+      if (typeof ttsAny.invalidate === 'function') {
+        ttsAny.invalidate();
+      } else {
+        void this.stopPlayback();
+      }
+    } catch {}
+    // Return to stable idle – no evidence fabrication
+    this.switching = false;
+    this.processing = false;
+    this.state = 'idle';
+    this.elapsedSeconds = 0;
+    // Keep recognizedTranscript? No – clear to avoid stale transcript populating new task
+    this.recognizedTranscript = null;
+    this.errorMessage = null;
+    this.notifyListeners();
+  }
+
+  /** Foreground – ensure idle recoverable state, no auto-restart */
+  handleForeground(): void {
+    if (this.disposed) return;
+    // Already idle after background, but ensure stable state
+    if (this.state !== 'idle' && this.state !== 'error') {
+      this.state = 'idle';
+      this.notifyListeners();
+    }
+  }
+
+  /**
    * Safe teardown (screen unmount): in-flight voice work is invalidated, the
    * ACTIVE conversation session is closed immediately, an active recording is
    * stopped and any playback is stopped. Late STT/AI results are discarded
@@ -890,6 +1032,19 @@ export class VoiceSessionCoordinator {
     // 1. Terminal flag + invalidate every in-flight operation.
     this.disposed = true;
     this.generation += 1;
+    if (this.appStateSub) {
+      try {
+        this.appStateSub.remove();
+      } catch {}
+      this.appStateSub = null;
+    }
+    const ownedUri = this.lastAudioUri;
+    this.lastAudioUri = null;
+    if (ownedUri) {
+      try {
+        await this.cleanupAudio(ownedUri);
+      } catch {}
+    }
     // 2. The ACTIVE session becomes non-writable IMMEDIATELY — before any
     //    awaited teardown — so a late STT/AI result that resolves during cleanup
     //    can never commit history, feedback or vocabulary persistence.

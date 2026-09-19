@@ -87,7 +87,7 @@ function createSpySTT(inner: SpeechToTextProvider): SpeechToTextProvider & {
  * single-turn guarantee can be tested independently of the recorder.
  */
 class PermissiveRecorder extends DemoAudioRecorder {
-  private readonly lastResult = {
+  private readonly permissiveLastResult = {
     uri: 'file:///mock/permissive-audio.m4a',
     base64: 'cGVybWlzc2l2ZS1hdWRpbw==',
     mimeType: 'audio/m4a',
@@ -98,7 +98,7 @@ class PermissiveRecorder extends DemoAudioRecorder {
     try {
       return await super.stopRecording();
     } catch {
-      return this.lastResult;
+      return this.permissiveLastResult;
     }
   }
 }
@@ -379,7 +379,7 @@ function createTalkFlow<T extends TextToSpeechProvider = ReturnType<typeof creat
     provider?: AIProvider;
     stt?: SpeechToTextProvider;
     tts?: T;
-    recorder?: ReturnType<typeof createDemoAudioRecorder> | GatedRecorder;
+    recorder?: ReturnType<typeof createDemoAudioRecorder> | GatedRecorder | PermissiveRecorder;
     mode?: 'natural' | 'coach' | 'intensive';
   } = {},
 ) {

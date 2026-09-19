@@ -74,6 +74,9 @@ export class ReviewVoiceController {
 
   private readonly unavailable: boolean;
   private readonly unavailableMessage: string | null;
+  private appStateSub: { remove: () => void } | null = null;
+  private lastAppState: string = 'active';
+  private lastAudioUri: string | null = null;
 
   constructor(
     private readonly recorder: AudioRecorderService,
@@ -82,6 +85,56 @@ export class ReviewVoiceController {
   ) {
     this.unavailable = options.unavailable ?? false;
     this.unavailableMessage = options.unavailableMessage ?? null;
+    this.setupAppStateGuard();
+  }
+
+  private async cleanupAudio(uri: string | null): Promise<void> {
+    if (!uri) return;
+    try {
+      const { cleanupAudioFile } = await import('../voice/audio-cleanup');
+      await cleanupAudioFile(uri);
+    } catch {
+      // Cleanup failures never become evidence/crash
+    }
+  }
+
+  private setupAppStateGuard(): void {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { AppState } = require('react-native');
+      if (AppState && typeof AppState.addEventListener === 'function') {
+        this.lastAppState = AppState.currentState ?? 'active';
+        const sub = AppState.addEventListener('change', (next: string) => {
+          const prev = this.lastAppState;
+          this.lastAppState = next;
+          const goingBackground =
+            (prev === 'active' && (next === 'background' || next === 'inactive')) ||
+            (prev === 'inactive' && next === 'background');
+          if (goingBackground) {
+            this.handleBackground();
+          }
+        });
+        this.appStateSub = sub;
+      }
+    } catch {}
+  }
+
+  handleBackground(): void {
+    if (this._disposed) return;
+    // Synchronous invalidation – same as reset() but for background
+    const wasRecording = this._isRecording;
+    this.generation += 1;
+    this.abandonActiveOperation();
+    this._userAnswer = '';
+    this._error = null;
+    this._isRecording = false;
+    this._state = 'idle';
+    const owned = this.lastAudioUri;
+    this.lastAudioUri = null;
+    if (owned) void this.cleanupAudio(owned);
+    if (wasRecording) {
+      this.trackTeardown(this.recorder.stopRecording());
+    }
   }
 
   get isRecording(): boolean {
@@ -165,6 +218,9 @@ export class ReviewVoiceController {
     this._error = null;
     this._isRecording = false;
     this._state = 'idle';
+    const owned = this.lastAudioUri;
+    this.lastAudioUri = null;
+    if (owned) void this.cleanupAudio(owned);
     if (wasRecording) {
       this.trackTeardown(this.recorder.stopRecording());
     }
@@ -191,6 +247,15 @@ export class ReviewVoiceController {
     this._state = 'idle';
     this._userAnswer = '';
     this._error = null;
+    const owned = this.lastAudioUri;
+    this.lastAudioUri = null;
+    if (owned) void this.cleanupAudio(owned);
+    if (this.appStateSub) {
+      try {
+        this.appStateSub.remove();
+      } catch {}
+      this.appStateSub = null;
+    }
     if (wasRecording) {
       this.trackTeardown(this.recorder.stopRecording());
     }
@@ -283,9 +348,15 @@ export class ReviewVoiceController {
     this._isRecording = false;
     this._state = 'transcribing';
     const generation = this.generation;
+    let capturedUri: string | null = null;
     try {
       const result = await this.recorder.stopRecording();
+      capturedUri = result.uri ?? null;
+      this.lastAudioUri = capturedUri;
       if (this.isStale(generation)) {
+        const owned = this.lastAudioUri;
+        this.lastAudioUri = null;
+        void this.cleanupAudio(owned);
         return this.getStatus();
       }
 
@@ -299,21 +370,34 @@ export class ReviewVoiceController {
       // A transcript that arrives after the attempt was invalidated (item
       // switch, leave, unmount) is discarded — it belongs to the old attempt.
       if (this.isStale(generation)) {
+        const owned = this.lastAudioUri;
+        this.lastAudioUri = null;
+        void this.cleanupAudio(owned);
         return this.getStatus();
       }
+
+      // STT done – cleanup file after dependent no longer needs it (transcript only)
+      const toClean = this.lastAudioUri;
+      this.lastAudioUri = null;
+      void this.cleanupAudio(toClean);
 
       if (sttRes.ok && sttRes.transcript) {
         this._userAnswer = sttRes.transcript;
         this._error = null;
         this._state = 'idle';
       } else if (sttRes.ok) {
+        // Empty STT – no evidence, honest error
         this._error = 'No speech was recognized. Try again or type your answer.';
         this._state = 'error';
       } else {
+        // Failed STT – no evidence
         this._error = sttRes.error || 'Failed to transcribe speech.';
         this._state = 'error';
       }
     } catch (error) {
+      const owned = this.lastAudioUri;
+      this.lastAudioUri = null;
+      void this.cleanupAudio(owned);
       if (!this.isStale(generation)) {
         this._isRecording = false;
         this._state = 'error';

@@ -50,6 +50,8 @@ import {
   finishDailyTutorWorkflow,
   reportDailyTutorCompletion,
 } from '../daily-tutor';
+import { TTSController } from '../voice/tts-controller';
+import { useVoiceAppStateGuard } from '../voice/use-app-state-guard';
 
 export interface ListeningScreenProps {
   /** Injectable service (tests/composition); defaults to the real factory. */
@@ -100,6 +102,15 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
   /** Auto-start guard: at most one auto-start per Daily Tutor activity. */
   const dailyAutoStartedRef = useRef<string | null>(null);
   const routeLaunch = route.params?.dailyTutor;
+  // Background policy – stop TTS safely, no fake completion, idle on foreground
+  useVoiceAppStateGuard({
+    invalidate: () => {
+      try {
+        ttsControllerRef.current?.invalidate();
+      } catch {}
+      setIsPlaying(false);
+    },
+  });
   useEffect(() => {
     if (!routeLaunch) return;
     setDailyLaunch((current) => captureDailyTutorLaunch(current, { dailyTutor: routeLaunch }).state);
@@ -142,6 +153,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
 
   const serviceRef = useRef<ListeningService | null>(props?.service ?? null);
   const ttsRef = useRef<TextToSpeechProvider | null>(props?.ttsProvider ?? null);
+  const ttsControllerRef = useRef<TTSController | null>(null);
   const resultsRef = useRef<{ problems: number; understood: number }>({
     problems: 0,
     understood: 0,
@@ -242,24 +254,53 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
     setSavedItems([]);
   };
 
-  /** Play/replay via the EXISTING TTS provider. Failure-safe: the exercise is never lost. */
+  useEffect(() => {
+    return () => {
+      try {
+        ttsControllerRef.current?.dispose();
+      } catch {}
+      ttsControllerRef.current = null;
+    };
+  }, []);
+
+  /** Play/replay via the EXISTING TTS provider hardened by TTSController. */
   const handlePlay = async () => {
     if (!currentExercise) return;
+    let doneFired = false;
     try {
       if (!ttsRef.current) {
         const { createExpoTTSProvider } = await import('../talk-demo');
         ttsRef.current = createExpoTTSProvider();
       }
+      if (!ttsControllerRef.current) {
+        ttsControllerRef.current = new TTSController(ttsRef.current);
+      }
       setIsPlaying(true);
-      await ttsRef.current.speak(
+      await ttsControllerRef.current.speak(
         currentExercise.question
           ? `${currentExercise.speakText} ${currentExercise.question}`
           : currentExercise.speakText,
+        {
+          onDone: () => {
+            doneFired = true;
+            setIsPlaying(false);
+            setReplayCount((count) => count + 1);
+          },
+          onError: () => {
+            doneFired = true;
+            setIsPlaying(false);
+            setErrorMessage(
+              'Audio playback failed. Use Replay to try again — your exercise and answer are kept.',
+            );
+          },
+        },
       );
-      setIsPlaying(false);
-      setReplayCount((count) => count + 1);
+      if (!doneFired) {
+        setIsPlaying(false);
+        setReplayCount((count) => count + 1);
+      }
     } catch {
-      setIsPlaying(false);
+      if (!doneFired) setIsPlaying(false);
       setErrorMessage(
         'Audio playback failed. Use Replay to try again — your exercise and answer are kept.',
       );
@@ -268,9 +309,9 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
 
   const handleStop = async () => {
     try {
-      await ttsRef.current?.stop();
+      await ttsControllerRef.current?.stop();
     } catch {
-      // Stop failures are harmless.
+      // Stop failures are harmless – idempotent
     } finally {
       setIsPlaying(false);
     }

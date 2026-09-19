@@ -175,6 +175,11 @@ export class PronunciationEngine {
    * Analyze one spoken turn and persist meaningful observations.
    * Returns null when there is no learner or analysis was skipped;
    * never throws into the conversation flow.
+   *
+   * Hardened:
+   * - checkStale() – if true, late result after dispose/session switch cannot persist
+   * - failed provider cannot become positive evidence
+   * - cancellation/disposal terminal (caller checks stale before and after)
    */
   async analyzeSpokenTurn(input: {
     transcript: string;
@@ -182,12 +187,16 @@ export class PronunciationEngine {
     context?: string;
     mode?: ConversationMode;
     now?: IsoDate;
+    checkStale?: () => boolean;
   }): Promise<PronunciationTurnOutcome | null> {
     const mode = input.mode ?? 'coach';
     const at = input.now ?? new Date().toISOString();
 
+    if (input.checkStale?.()) return null;
+
     const learnerId = await this.getActiveLearnerId();
     if (!learnerId || !input.transcript.trim()) return null;
+    if (input.checkStale?.()) return null;
 
     let analysis: PronunciationAnalysis;
     try {
@@ -200,6 +209,7 @@ export class PronunciationEngine {
     } catch {
       // Provider failure is non-destructive: conversation continues,
       // no fabricated pronunciation result is shown or persisted.
+      // Failed pronunciation provider cannot become positive evidence
       return {
         analysis: {
           provider: this.deps.provider.id,
@@ -213,6 +223,8 @@ export class PronunciationEngine {
       };
     }
 
+    if (input.checkStale?.()) return null;
+
     // Persist only evidence-backed observations. AI explanations are NOT
     // pronunciation evidence and are never persisted as such.
     const persistable = analysis.observations
@@ -225,10 +237,12 @@ export class PronunciationEngine {
       .slice(0, MAX_PERSISTED_PER_TURN);
 
     if (persistable.length > 0) {
+      if (input.checkStale?.()) return null;
       try {
         // Bounded read ONCE per turn for lexical links — no N+1 queries.
         const lexicalLinks = await this.resolveLexicalLinks(learnerId, persistable);
         for (const observation of persistable) {
+          if (input.checkStale?.()) return null;
           await this.persistObservation(learnerId, observation, {
             at,
             lexicalItemId: lexicalLinks.get(observation.target?.toLowerCase().trim() ?? ''),
@@ -250,6 +264,7 @@ export class PronunciationEngine {
       positiveSignalTarget &&
       hasExplicitPositiveSignal(analysis, input)
     ) {
+      if (input.checkStale?.()) return null;
       const refId = `pron:${positiveSignalTarget.toLowerCase().slice(0, 30)}`;
       try {
         await recordPronunciationSuccess(this.deps.successRecorder, {
@@ -262,6 +277,8 @@ export class PronunciationEngine {
         // Evidence persistence must never break the conversation flow.
       }
     }
+
+    if (input.checkStale?.()) return null;
 
     return {
       analysis,

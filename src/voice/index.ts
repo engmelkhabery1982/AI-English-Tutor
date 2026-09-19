@@ -7,3 +7,7 @@
 export * from './types';
 export * from './recorder';
 export * from './coordinator';
+export * from './app-state';
+export * from './use-app-state-guard';
+export * from './tts-controller';
+export * from './audio-cleanup';

@@ -520,6 +520,20 @@ export interface ShadowingVoiceDeps {
  * Drives the EXISTING recorder → EXISTING STT → EXISTING pronunciation port
  * for one shadowing session. Every failure path returns an honest message and
  * sends NOTHING: no transcript, no evidence, no attempt.
+ *
+ * Hardened invariants:
+ * - maximum one active recording (single-flight + pendingStop chaining)
+ * - double mic tap cannot create two recordings (isBusy + startInProgress guard)
+ * - stop/start cannot overlap native teardown (pendingStop)
+ * - stale STT after new item blocked (generation token)
+ * - stale pronunciation after new item blocked (same token covers STT+pronunciation)
+ * - transcript/pronunciation pair must belong to same attempt (same token)
+ * - repeated Stop safe (idempotent, returns failure without crash)
+ * - repeated Submit exactly once (generation + isBusy guard, state machine)
+ * - support progression only from current valid attempt (session.submit checks stale)
+ * - TTS does not create evidence (playback is outside this controller)
+ * - backgrounding terminates safely via invalidate()
+ * - audio cleanup after use (best-effort, never crashes)
  */
 export class ShadowingVoiceController {
   private readonly recorder: AudioRecorderService | null;
@@ -530,6 +544,12 @@ export class ShadowingVoiceController {
   private state: 'idle' | 'recording' | 'transcribing' = 'idle';
   private disposed = false;
   private generation = 0;
+  private operationToken = 0;
+  private activeOperation: number | null = null;
+  private pendingStop: Promise<void> | null = null;
+  private lastAudioUri: string | null = null;
+  private appStateSub: { remove: () => void } | null = null;
+  private lastAppState: string = 'active';
 
   constructor(
     private readonly session: ShadowingSession,
@@ -540,6 +560,26 @@ export class ShadowingVoiceController {
     this.port = deps.port;
     this.now = deps.now;
     this.submitOverride = deps.submit;
+    this.setupAppStateGuard();
+  }
+
+  private setupAppStateGuard(): void {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { AppState } = require('react-native');
+      if (AppState && typeof AppState.addEventListener === 'function') {
+        this.lastAppState = AppState.currentState ?? 'active';
+        const sub = AppState.addEventListener('change', (next: string) => {
+          const prev = this.lastAppState;
+          this.lastAppState = next;
+          const goingBackground =
+            (prev === 'active' && (next === 'background' || next === 'inactive')) ||
+            (prev === 'inactive' && next === 'background');
+          if (goingBackground) this.handleBackground();
+        });
+        this.appStateSub = sub;
+      }
+    } catch {}
   }
 
   /** True when a real microphone path exists (no silent demo fallback). */
@@ -551,30 +591,105 @@ export class ShadowingVoiceController {
     return this.state !== 'idle';
   }
 
+  private trackTeardown(p: Promise<unknown>): void {
+    const safe = p.then(() => undefined).catch(() => undefined);
+    if (this.pendingStop) {
+      const prev = this.pendingStop;
+      this.pendingStop = prev.then(() => safe).catch(() => undefined);
+    } else {
+      this.pendingStop = safe;
+    }
+    const cur = this.pendingStop;
+    cur.finally(() => {
+      if (this.pendingStop === cur) this.pendingStop = null;
+    });
+  }
+
+  private isStale(gen: number): boolean {
+    return this.disposed || gen !== this.generation;
+  }
+
+  private finishOp(token: number): void {
+    if (this.activeOperation === token) this.activeOperation = null;
+  }
+
+  /** Synchronous invalidation for task switch / background – stale callbacks impossible */
+  invalidate(): void {
+    this.generation += 1;
+    this.activeOperation = null;
+    const wasRecording = this.state === 'recording';
+    this.state = 'idle';
+    if (wasRecording && this.recorder) {
+      const rec = this.recorder;
+      this.trackTeardown(
+        (async () => {
+          try {
+            if (rec.isRecording()) await rec.stopRecording();
+          } catch {}
+          // Cleanup owned temp file for abandoned attempt
+          if (this.lastAudioUri) {
+            try {
+              const { cleanupAudioFile } = await import('../../voice/audio-cleanup');
+              await cleanupAudioFile(this.lastAudioUri);
+            } catch {}
+            this.lastAudioUri = null;
+          }
+        })(),
+      );
+    }
+  }
+
+  handleBackground(): void {
+    this.invalidate();
+  }
+
   async startRecording(): Promise<ShadowingVoiceSuccess | ShadowingVoiceFailure> {
     if (this.disposed || this.session.exhausted) {
       return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
     }
-    if (this.isBusy) return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+    if (this.isBusy || this.activeOperation !== null) {
+      return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+    }
     const recorder = this.recorder;
     const stt = this.stt;
     if (!recorder || !stt) {
       return this.failure('voice-unavailable', SHADOWING_VOICE_UNAVAILABLE_MESSAGE);
     }
+    const token = ++this.operationToken;
+    this.activeOperation = token;
+    const gen = this.generation;
     try {
+      // Fast record-stop-record: wait for any pending teardown
+      if (this.pendingStop) {
+        await this.pendingStop;
+        if (this.isStale(gen)) {
+          this.finishOp(token);
+          return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+        }
+      }
+
       const granted = (await recorder.hasPermissions()) || (await recorder.requestPermissions());
+      if (this.isStale(gen)) {
+        this.finishOp(token);
+        return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+      }
       if (!granted) {
+        this.finishOp(token);
         return this.failure('permission-denied', SHADOWING_PERMISSION_DENIED_MESSAGE);
       }
       this.state = 'recording';
       await recorder.startRecording();
-      if (this.disposed) {
+      if (this.isStale(gen)) {
         await this.discardRecording();
+        this.state = 'idle';
+        this.finishOp(token);
         return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
       }
+      this.finishOp(token);
       return { ok: true };
     } catch {
       this.state = 'idle';
+      this.finishOp(token);
       return this.failure('recording-failed', SHADOWING_RECORDING_FAILED_MESSAGE);
     }
   }
@@ -582,26 +697,49 @@ export class ShadowingVoiceController {
   /**
    * Stop, transcribe with the EXISTING STT and judge through the EXISTING
    * pronunciation port. A transcription failure records nothing.
+   * Ensures transcript/pronunciation pair belongs to same attempt via same token.
    */
   async stopAndJudge(): Promise<ShadowingAttempt | ShadowingVoiceFailure> {
-    const token = ++this.generation;
-    if (this.disposed) return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
-    if (this.state !== 'recording') return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+    const token = ++this.operationToken;
+    this.activeOperation = token;
+    const gen = ++this.generation; // bump for this attempt – new item invalidates previous
+    // But we need stable token for this attempt's STT+pronunciation pair
+    // Use gen as the attempt identity, token as operation guard
+    if (this.disposed) {
+      this.finishOp(token);
+      return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+    }
+    if (this.state !== 'recording') {
+      this.finishOp(token);
+      return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
+    }
     const recorder = this.recorder;
     const stt = this.stt;
     if (!recorder || !stt) {
+      this.finishOp(token);
       return this.failure('voice-unavailable', SHADOWING_VOICE_UNAVAILABLE_MESSAGE);
     }
 
     let audio: AudioRecordingResult;
     try {
       audio = await recorder.stopRecording();
-      if (this.disposed || this.generation !== token) {
+      this.lastAudioUri = audio.uri || null;
+      if (this.isStale(gen)) {
         this.state = 'idle';
+        this.finishOp(token);
+        // Cleanup stale attempt's file
+        if (this.lastAudioUri) {
+          try {
+            const { cleanupAudioFile } = await import('../../voice/audio-cleanup');
+            await cleanupAudioFile(this.lastAudioUri);
+          } catch {}
+          this.lastAudioUri = null;
+        }
         return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
       }
     } catch {
       this.state = 'idle';
+      this.finishOp(token);
       return this.failure('recording-failed', SHADOWING_RECORDING_FAILED_MESSAGE);
     }
 
@@ -614,47 +752,99 @@ export class ShadowingVoiceController {
         mimeType: audio.mimeType,
         durationMs: audio.durationMs,
       });
-      if (this.disposed || this.generation !== token) {
+      if (this.isStale(gen)) {
         this.state = 'idle';
+        this.finishOp(token);
         return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
       }
       if (result.ok) transcript = (result.transcript ?? '').trim();
     } catch {
       this.state = 'idle';
+      this.finishOp(token);
       return this.failure('transcription-failed', SHADOWING_TRANSCRIPTION_FAILED_MESSAGE);
     }
     if (!transcript) {
       this.state = 'idle';
+      this.finishOp(token);
+      // Cleanup after failed STT – no evidence, but clean file
+      if (this.lastAudioUri) {
+        try {
+          const { cleanupAudioFile } = await import('../../voice/audio-cleanup');
+          await cleanupAudioFile(this.lastAudioUri);
+        } catch {}
+        this.lastAudioUri = null;
+      }
       return this.failure('transcription-failed', SHADOWING_TRANSCRIPTION_FAILED_MESSAGE);
     }
 
+    // STT succeeded – now pronunciation, same generation token ensures pair belongs together
     this.state = 'idle';
-    if (this.disposed || this.generation !== token) {
+    if (this.isStale(gen)) {
+      this.finishOp(token);
       return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
     }
-    const checkStale = () => this.disposed || this.generation !== token;
+    const checkStale = () => this.isStale(gen);
     let result: ShadowingAttempt;
-    if (this.submitOverride) {
-      result = await this.submitOverride(transcript, checkStale);
-    } else {
-      result = await this.session.submit(transcript, this.port, this.now, checkStale);
+    try {
+      if (this.submitOverride) {
+        result = await this.submitOverride(transcript, checkStale);
+      } else {
+        result = await this.session.submit(transcript, this.port, this.now, checkStale);
+      }
+    } catch {
+      this.finishOp(token);
+      return this.failure('transcription-failed', SHADOWING_TRANSCRIPTION_FAILED_MESSAGE);
     }
     if (checkStale()) {
+      this.finishOp(token);
       return this.failure('busy', SHADOWING_RECORDING_FAILED_MESSAGE);
     }
+
+    // Cleanup after successful use – file no longer needed after STT+pronunciation
+    if (this.lastAudioUri) {
+      try {
+        const { cleanupAudioFile } = await import('../../voice/audio-cleanup');
+        await cleanupAudioFile(this.lastAudioUri);
+      } catch {}
+      this.lastAudioUri = null;
+    }
+
+    this.finishOp(token);
     return result;
   }
 
   /** Abandon the recording without transcribing or judging anything. */
   async cancel(): Promise<void> {
+    this.generation += 1;
+    this.activeOperation = null;
     if (this.state === 'recording') await this.discardRecording();
     this.state = 'idle';
   }
 
   async dispose(): Promise<void> {
+    if (this.disposed) return;
     this.disposed = true;
     this.generation += 1;
+    this.activeOperation = null;
+    if (this.appStateSub) {
+      try {
+        this.appStateSub.remove();
+      } catch {}
+      this.appStateSub = null;
+    }
     await this.cancel();
+    if (this.pendingStop) {
+      try {
+        await this.pendingStop;
+      } catch {}
+    }
+    if (this.lastAudioUri) {
+      try {
+        const { cleanupAudioFile } = await import('../../voice/audio-cleanup');
+        await cleanupAudioFile(this.lastAudioUri);
+      } catch {}
+      this.lastAudioUri = null;
+    }
   }
 
   private failure(
@@ -666,9 +856,19 @@ export class ShadowingVoiceController {
 
   private async discardRecording(): Promise<void> {
     const recorder = this.recorder;
-    if (!recorder || !recorder.isRecording()) return;
+    if (!recorder) return;
     try {
-      await recorder.stopRecording();
+      if (recorder.isRecording()) {
+        const res = await recorder.stopRecording().catch(() => null);
+        if (res && (res as any).uri) {
+          this.lastAudioUri = (res as any).uri;
+          try {
+            const { cleanupAudioFile } = await import('../../voice/audio-cleanup');
+            await cleanupAudioFile(this.lastAudioUri);
+          } catch {}
+          this.lastAudioUri = null;
+        }
+      }
     } catch {
       // Discarding: a stop failure is harmless.
     }

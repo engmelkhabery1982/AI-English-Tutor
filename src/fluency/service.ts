@@ -132,6 +132,8 @@ export interface FluencyStartTaskOptions {
 
 export class FluencyPracticeService {
   private readonly deps: FluencyPracticeServiceDeps;
+  private appStateSub: { remove: () => void } | null = null;
+  private lastAppState = 'active';
 
   private phase: FluencyPhase = 'ready';
   private task: FluencyTask | null = null;
@@ -166,6 +168,26 @@ export class FluencyPracticeService {
 
   constructor(deps: FluencyPracticeServiceDeps) {
     this.deps = deps;
+    this.setupAppStateGuard();
+  }
+
+  private setupAppStateGuard(): void {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { AppState } = require('react-native');
+      if (AppState?.addEventListener) {
+        this.lastAppState = AppState.currentState ?? 'active';
+        const sub = AppState.addEventListener('change', (next: string) => {
+          const prev = this.lastAppState;
+          this.lastAppState = next;
+          const goingBackground =
+            (prev === 'active' && (next === 'background' || next === 'inactive')) ||
+            (prev === 'inactive' && next === 'background');
+          if (goingBackground) this.handleBackground();
+        });
+        this.appStateSub = sub;
+      }
+    } catch {}
   }
 
   private now(): IsoDate {
@@ -746,10 +768,36 @@ export class FluencyPracticeService {
     this.disposed = true;
     this.generation += 1;
     this.conversationSession = null;
+    if (this.appStateSub) {
+      try {
+        this.appStateSub.remove();
+      } catch {}
+      this.appStateSub = null;
+    }
     try {
       await this.deps.speaking.dispose();
     } catch {
       // Disposal failures are non-destructive.
+    }
+  }
+
+  /** Background policy – invalidate active attempt synchronously, no evidence fabrication */
+  handleBackground(): void {
+    if (this.disposed) return;
+    this.generation += 1;
+    this.pendingAttempt = false;
+    this.starting = false;
+    if (this.phase === 'processing' || this.phase === 'preparing') {
+      this.phase = this.task ? 'speaking' : 'ready';
+      this.lastError = null;
+    }
+  }
+
+  handleForeground(): void {
+    if (this.disposed) return;
+    // Return to stable idle/recoverable – learner explicitly starts again
+    if (this.phase === 'processing' || this.phase === 'preparing') {
+      this.phase = this.task ? 'speaking' : 'ready';
     }
   }
 
