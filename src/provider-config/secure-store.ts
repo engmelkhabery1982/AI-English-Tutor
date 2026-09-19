@@ -54,26 +54,28 @@ interface ExpoSecureStoreModule {
   isAvailableAsync?: () => Promise<boolean>;
 }
 
-/** The bundler-provided CommonJS require, or null when it does not exist. */
-type RequireFn = ((id: string) => unknown) | undefined;
-
-function resolveRequire(): RequireFn {
-  // `typeof` on an undeclared identifier is safe even when it does not exist.
-  return typeof require === 'function' ? (require as RequireFn) : undefined;
-}
-
 /**
  * Loads `expo-secure-store` synchronously.
  *
- * Metro resolves the literal specifier at build time. In Node/vitest the call
- * throws and we return null — the caller then reports storage as unavailable
- * rather than fabricating a successful save.
+ * BUNDLING CONSTRAINT (release regression — do not "clean this up"):
+ * the `require('expo-secure-store')` below MUST stay a literal call. Metro
+ * registers bundle dependencies ONLY from literal `require('<module>')`
+ * calls seen by its static analysis. Routing `require` through an aliased
+ * variable and calling the alias with the module name is invisible to
+ * Metro: the dependency is never bundled, and the release app crashes on
+ * startup at the first credential lookup with
+ * `Requiring unknown module "expo-secure-store"`.
+ *
+ * In Node/vitest the native module does not exist: the guard and catch
+ * return null — the caller then reports storage as unavailable rather than
+ * fabricating a successful save.
  */
 export function loadExpoSecureStore(): ExpoSecureStoreModule | null {
-  const loader = resolveRequire();
-  if (!loader) return null;
+  // `typeof` on an undeclared identifier is safe even when it does not exist.
+  if (typeof require !== 'function') return null;
   try {
-    const mod = loader('expo-secure-store') as ExpoSecureStoreModule | null;
+    // Literal specifier — REQUIRED for Metro's static dependency extraction.
+    const mod = require('expo-secure-store') as ExpoSecureStoreModule | null;
     if (mod && typeof mod.getItem === 'function' && typeof mod.setItemAsync === 'function') {
       return mod;
     }
