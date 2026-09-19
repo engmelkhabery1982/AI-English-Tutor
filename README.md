@@ -5,10 +5,15 @@ adaptive lessons, listening, review, pronunciation and a deterministic local
 daily-tutor loop on top of a local SQLite learner model.
 
 > **Status: development / release-candidate foundation — NOT production ready.**
-> This repository now builds reproducibly with a real Android identity and
-> release profiles, but it ships no runtime secret storage and defaults to demo
-> providers when no API key is present. See
-> [Environment variables](#environment-variables) and [Known limitations](#known-limitations).
+> This repository builds reproducibly with a real Android identity and release
+> profiles, and the API key is configured **at runtime** and held in secure
+> device storage. See
+> [Runtime provider configuration](#runtime-provider-configuration) and
+> [Known limitations](#known-limitations).
+
+A key note up front: **Demo is never chosen for you.** When nothing is
+configured, provider-dependent features report that configuration is required;
+offline practice keeps working and no demo provider is substituted silently.
 
 ---
 
@@ -139,16 +144,62 @@ values) is tracked. **No real key belongs in this repository.**
 
 Expo **inlines** every `EXPO_PUBLIC_*` variable into the compiled JavaScript
 bundle in plain text. Anyone who installs the app can extract it. That makes
-`EXPO_PUBLIC_GEMINI_API_KEY` a **development/demo convenience only**. Runtime
-secret storage (device keystore / secure storage) is **not implemented in this
-package** and is tracked as separate follow-up work. Do not ship a production
-key through `EXPO_PUBLIC_*`.
+`EXPO_PUBLIC_GEMINI_API_KEY` a **development convenience only**, and the app
+treats it that way:
+
+- it is honoured **only in a development/test build** (`__DEV__ === true`);
+- in a release build (`preview` / `production`) it is **ignored entirely**, so a
+  bundle can never ship a working secret by accident.
+
+## Runtime provider configuration
+
+The production path for the API key is **Settings → AI provider**:
+
+| Action | Effect |
+| --- | --- |
+| Save / replace key | Written to secure device storage (`expo-secure-store`: Android Keystore-encrypted SharedPreferences, iOS Keychain) |
+| Remove key | Deleted from secure storage |
+| Test connection | One real provider request; reports verified / rejected / network / service error / timeout |
+
+The stored key is **never** displayed again, not even partially, and it is never
+written to SQLite, logged, or included in an error message (the provider redacts
+it and the config layer redacts it again).
+
+Resolution precedence, in order:
+
+1. an injected credential (tests / embedding)
+2. the runtime credential in secure device storage
+3. `EXPO_PUBLIC_GEMINI_API_KEY` — **development builds only**
+4. unavailable
+
+States the app reports honestly, with no invented certainty:
+
+| State | Meaning |
+| --- | --- |
+| `configured` | Stored, and verified by a real request |
+| `unverified` | Stored, never verified — validity is **not** claimed |
+| `development-fallback` | No stored key; a development-only environment key is in effect |
+| `not-configured` | Nothing configured — provider features are unavailable, **not** demo |
+| `invalid-credential` | The provider rejected the key |
+| `temporarily-unavailable` | Network/service problem — says nothing about the key |
+| `storage-unavailable` | Secure storage could not be read/written; the key state is unknown |
+
+A provider or network failure is never recorded as learner weakness, and
+diagnostics never touch the learner database.
 
 ## Development / demo behavior
 
-- With **no** `EXPO_PUBLIC_GEMINI_API_KEY` set (the default for a clean
-  checkout), the app runs against its built-in **demo** AI and speech-to-text
-  providers. This is a developer/demo mode, not a production configuration.
+- With **no** configured key, provider-dependent features report that
+  configuration is required. Where a surface offers an explicit, learner-visible
+  **Demo Mode** (for example Review), that mode is clearly labelled as *not real
+  AI* and its results stay out of real learner evidence. Demo is never selected
+  on the learner's behalf.
+- **Talk never substitutes a scripted conversation.** With no key and no
+  explicit Demo request it reports *Real AI unavailable • Configuration
+  required* and a turn cannot produce a tutor reply (the same for voice input:
+  no scripted transcript is presented as your speech). Explicit Demo Mode —
+  `createTalkSession(config, { isDemo: true })` — is the only way Demo AI is
+  used, and it is labelled `Offline demo • Not real AI`.
 - The learner model, review scheduling, listening, adaptive lessons and the
   daily tutor loop are deterministic and run locally against SQLite; they do not
   require network access.
@@ -158,11 +209,17 @@ key through `EXPO_PUBLIC_*`.
 
 This repository is a **release-candidate foundation**, not a shippable product:
 
-- No runtime API-key entry or secure secret storage (see above).
-- No in-app settings surface for providers.
 - Production release signing is not configured (intentional — no credentials in
   git).
 - iOS has no configured bundle identifier yet; this package scopes Android.
+- Only the Gemini provider family is wired for runtime configuration; there is
+  no multi-provider picker.
+- Key validity is only asserted after a manual *Test connection*; nothing is
+  re-verified in the background.
+- Talk has no learner-facing Demo Mode switch: its demo path exists for explicit
+  callers/tests, while Review remains the learner-visible Demo Mode surface.
+- A change to the stored key applies to the next conversation/session started;
+  a conversation already running keeps the provider it began with.
 
 ## Repository layout
 
@@ -174,5 +231,6 @@ This repository is a **release-candidate foundation**, not a shippable product:
 | `src/content-generation` | Shared AI content request/validation contract |
 | `src/data/local/sqlite` | SQLite schema and repositories |
 | `src/daily-tutor` | Deterministic local daily orchestrator |
+| `src/provider-config` | Runtime provider configuration, secure secret storage and provider diagnostics |
 | `src/screens` | React Native screens (mobile-first) |
 | `src/providers` | Vendor-neutral AI / STT / TTS provider interfaces |

@@ -383,9 +383,11 @@ function createTalkFlow<T extends TextToSpeechProvider = ReturnType<typeof creat
     mode?: 'natural' | 'coach' | 'intensive';
   } = {},
 ) {
+  // Without an injected provider this helper exercises the EXPLICIT offline
+  // demo conversation — Demo Mode is requested, never assumed.
   const session = options.provider
     ? buildSessionWithProvider(options.provider, options.mode ?? 'natural')
-    : createTalkSession({ mode: options.mode ?? 'natural' }).session;
+    : createTalkSession({ mode: options.mode ?? 'natural' }, { isDemo: true }).session;
   const recorder = options.recorder ?? createDemoAudioRecorder();
   const stt = options.stt ?? createDemoSTTProvider({ defaultTranscript: 'Hello there.' });
   const tts = (options.tts ?? createDemoTTSProvider()) as T;
@@ -807,7 +809,7 @@ describe('Talk — tutor-led conversational flow', () => {
 
     // Talk's mode switch invalidates the active voice work (coordinator.reset())
     // and swaps in the session of the new mode.
-    const newSession = createTalkSession({ mode: 'coach' }).session;
+    const newSession = createTalkSession({ mode: 'coach' }, { isDemo: true }).session;
     await coordinator.reset();
     coordinator.setSession(newSession);
 
@@ -833,7 +835,7 @@ describe('Talk — tutor-led conversational flow', () => {
     await tick();
 
     // New Chat: cancel everything, then start the replacement conversation.
-    const newSession = createTalkSession({ mode: 'natural' }).session;
+    const newSession = createTalkSession({ mode: 'natural' }, { isDemo: true }).session;
     await coordinator.reset();
     coordinator.setSession(newSession);
 
@@ -860,7 +862,7 @@ describe('Talk — tutor-led conversational flow', () => {
     await coordinator.startRecording();
     const pending = coordinator.stopRecordingAndProcess();
 
-    const replacement = createTalkSession({ mode: 'natural' }).session;
+    const replacement = createTalkSession({ mode: 'natural' }, { isDemo: true }).session;
     await coordinator.reset();
     coordinator.setSession(replacement);
 
@@ -884,7 +886,7 @@ describe('Talk — tutor-led conversational flow', () => {
     await tick(3);
     expect(coordinator.getStatus().state).toBe('sending');
 
-    const replacement = createTalkSession({ mode: 'natural' }).session;
+    const replacement = createTalkSession({ mode: 'natural' }, { isDemo: true }).session;
     await coordinator.reset();
     coordinator.setSession(replacement);
 
@@ -1185,7 +1187,7 @@ describe('Talk — tutor-led conversational flow', () => {
     expect(screenSource).not.toContain('AdaptiveLessonService');
 
     // The Talk session only exposes the EXISTING session API surface.
-    const session = createTalkSession({ mode: 'natural' }).session as unknown as Record<
+    const session = createTalkSession({ mode: 'natural' }, { isDemo: true }).session as unknown as Record<
       string,
       unknown
     >;
@@ -1258,8 +1260,19 @@ describe('Talk — tutor-led conversational flow', () => {
 
   // ──────────────────────────────────────────────────────── provider honesty
 
-  it('26. offline demo conversations are clearly labelled and never claimed as real AI', () => {
-    const demo = createTalkSession({ mode: 'natural' });
+  it('26. Demo is explicit, and with no provider at all the state is "configuration required"', async () => {
+    // With no key and no Demo request there is NO provider: nothing is scripted.
+    const unconfigured = createTalkSession({ mode: 'natural' });
+    expect(unconfigured.providerKind).toBe('unavailable');
+    expect(unconfigured.providerInfo.isRealAI).toBe(false);
+    expect(unconfigured.providerInfo.allowsPersonalizedFeedback).toBe(false);
+    expect(unconfigured.providerInfo.label.toLowerCase()).toContain('configuration required');
+    const blocked = await unconfigured.session.send({ userMessage: 'Hello!' });
+    expect(blocked.ok).toBe(false);
+    expect(unconfigured.session.getHistory()).toEqual([]);
+
+    // Explicit Demo Mode is still precisely labelled as NOT real AI.
+    const demo = createTalkSession({ mode: 'natural' }, { isDemo: true });
     expect(demo.providerKind).toBe('demo');
     expect(demo.providerInfo.isRealAI).toBe(false);
     expect(demo.providerInfo.allowsPersonalizedFeedback).toBe(false);
@@ -1275,9 +1288,9 @@ describe('Talk — tutor-led conversational flow', () => {
   });
 
   it('27. a real conversation never silently falls back to scripted demo speech recognition', async () => {
-    // Offline demo is honest about being a demo: the deterministic transcript is
-    // intentional and the bundle says so.
-    const demo = createTalkSession({ mode: 'natural' });
+    // Explicit Demo Mode is honest about being a demo: the deterministic
+    // transcript is intentional and the bundle says so.
+    const demo = createTalkSession({ mode: 'natural' }, { isDemo: true });
     const demoCoordinator = createTalkVoiceCoordinator({
       session: demo.session,
       providerKind: demo.providerKind,
@@ -1309,6 +1322,24 @@ describe('Talk — tutor-led conversational flow', () => {
     expect(realResult.error).toBe(TALK_REAL_STT_UNAVAILABLE_MESSAGE);
     expect(real.session.getHistory()).toEqual([]);
     expect(real.session.getLastFeedback()).toBeNull();
+
+    // The unconfigured state (no key, no Demo request) gets NO scripted
+    // transcript either: it fails honestly and leaves no history.
+    const unconfigured = createTalkSession({ mode: 'natural' });
+    expect(unconfigured.providerKind).toBe('unavailable');
+    const unconfiguredCoordinator = createTalkVoiceCoordinator({
+      session: unconfigured.session,
+      providerKind: unconfigured.providerKind,
+      recorder: createDemoAudioRecorder(),
+      ttsProvider: createDemoTTSProvider(),
+    });
+    await unconfiguredCoordinator.startRecording();
+    const unconfiguredResult = await unconfiguredCoordinator.stopRecordingAndProcess();
+    expect(unconfiguredResult.ok).toBe(false);
+    expect(unconfiguredResult.transcript ?? '').not.toContain(
+      'Yesterday I went to a meeting with my manager.',
+    );
+    expect(unconfigured.session.getHistory()).toEqual([]);
   });
 
   // ──────────────────────────────────────────────────────────── typed fallback
@@ -1439,7 +1470,7 @@ describe('Talk — tutor-led conversational flow', () => {
     await tick();
 
     // …while the coordinator is already moved to a NEW session that records.
-    const newSession = createTalkSession({ mode: 'natural' }).session;
+    const newSession = createTalkSession({ mode: 'natural' }, { isDemo: true }).session;
     coordinator.setSession(newSession);
     const started = await coordinator.startRecording();
     expect(started).toBe(true);
@@ -1469,7 +1500,7 @@ describe('Talk — tutor-led conversational flow', () => {
     await tick();
 
     // The new session starts speaking while the old reset is still pending.
-    const newSession = createTalkSession({ mode: 'natural' }).session;
+    const newSession = createTalkSession({ mode: 'natural' }, { isDemo: true }).session;
     coordinator.setSession(newSession);
     const speaking = coordinator.speakResponse('Hello from the new conversation.');
     await tick();
@@ -1497,7 +1528,7 @@ describe('Talk — tutor-led conversational flow', () => {
     expect(recorder.isRecording()).toBe(true);
 
     recorder.holdStop = true;
-    const replacement = createTalkSession({ mode: 'coach' }).session;
+    const replacement = createTalkSession({ mode: 'coach' }, { isDemo: true }).session;
     const switching = coordinator.switchSession(replacement);
     await tick();
 
@@ -1528,7 +1559,7 @@ describe('Talk — tutor-led conversational flow', () => {
     expect(coordinator.getStatus().state).toBe('speaking');
 
     tts.holdStop = true;
-    const replacement = createTalkSession({ mode: 'natural' }).session;
+    const replacement = createTalkSession({ mode: 'natural' }, { isDemo: true }).session;
     const switching = coordinator.switchSession(replacement);
     await tick();
     expect(coordinator.getStatus().isSwitching).toBe(true);
@@ -1561,7 +1592,7 @@ describe('Talk — tutor-led conversational flow', () => {
     expect(recorder.isRecording()).toBe(true);
 
     // New Chat = atomic switch to a fresh session (talk screen behaviour).
-    const replacement = createTalkSession({ mode: 'natural' }).session;
+    const replacement = createTalkSession({ mode: 'natural' }, { isDemo: true }).session;
     const installed = await coordinator.switchSession(replacement);
 
     expect(installed).toBe(replacement);
@@ -1618,7 +1649,7 @@ describe('Talk — tutor-led conversational flow', () => {
     await tick();
     expect(coordinator.getStatus().state).toBe('requesting_permission');
 
-    const replacement = createTalkSession({ mode: 'natural' }).session;
+    const replacement = createTalkSession({ mode: 'natural' }, { isDemo: true }).session;
     const installed = await coordinator.switchSession(replacement);
     expect(installed).toBe(replacement);
 

@@ -154,12 +154,24 @@ describe('Talk — real persisted-learner composition', () => {
     expect(prompt).toContain('Active Weaknesses (Persisted):\n- [grammar] Severity: 0.8, Occurrences: 6');
     expect(prompt).toContain('Contexts: weekly status updates');
 
-    // A Talk session composed from that resolution is a real AI conversation.
+    // A Talk session composed from that resolution is a real AI conversation
+    // when a credential is present (the provider is never assumed to be demo).
+    const fetchImpl = async () =>
+      new Response(
+        JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Hello!' }] } }] }),
+        { status: 200 },
+      );
     const bundle = createTalkSession(
       { mode: 'natural' },
-      { databaseAdapter: resolution.databaseAdapter, learnerModel: resolution.learnerModel! },
+      {
+        databaseAdapter: resolution.databaseAdapter,
+        learnerModel: resolution.learnerModel!,
+        apiKey: 'mock-key',
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      },
     );
-    expect(bundle.providerKind).toBe('demo'); // no API key in tests: offline demo AI
+    expect(bundle.providerKind).toBe('gemini');
+    expect(bundle.providerInfo.isRealAI).toBe(true);
     expect(bundle.session.getConfig().mode).toBe('natural');
 
     await adapter.close();
@@ -209,14 +221,24 @@ describe('Talk — real persisted-learner composition', () => {
     expect(resolution.learnerModel).toBeUndefined();
     expect(resolution.databaseAdapter).toBeUndefined();
 
-    // The demo fallback is still an explicit, working offline conversation…
+    // …and with no provider configured Talk reports configuration-required
+    // rather than silently substituting the offline script.
     const bundle = createTalkSession(
       { mode: 'natural' },
       { learnerModel: resolution.learnerModel },
     );
+    expect(bundle.providerKind).toBe('unavailable');
     expect(bundle.providerInfo.isRealAI).toBe(false);
     expect(bundle.providerInfo.allowsPersonalizedFeedback).toBe(false);
-    expect(bundle.providerInfo.label).toBe(TALK_DEMO_LABEL);
+    expect(bundle.providerInfo.label).toContain('Configuration required');
+
+    // Explicit Demo Mode is a separate, clearly-labelled choice.
+    const demoBundle = createTalkSession(
+      { mode: 'natural' },
+      { learnerModel: resolution.learnerModel, isDemo: true },
+    );
+    expect(demoBundle.providerKind).toBe('demo');
+    expect(demoBundle.providerInfo.label).toBe(TALK_DEMO_LABEL);
 
     // …and the shared bootstrap promise is retryable rather than latched broken.
     await expect(createDefaultTalkComposition()).rejects.toThrow();
@@ -271,7 +293,13 @@ describe('Talk — real persisted-learner composition', () => {
     // on the session switch, and says plainly that the tutor is starting.
     expect(screenSource).toContain('resolveTalkTurnControls({');
     expect(screenSource).toContain('isOpening,');
-    expect(screenSource).toContain('disabled={turnControls.micDisabled}');
+    // Both learner inputs stay blocked while there is no provider at all, so a
+    // conversation cannot be started into nothing.
+    expect(screenSource).toContain(
+      'disabled={turnControls.micDisabled || isProviderUnavailable}',
+    );
+    expect(screenSource).toContain('isProviderUnavailable');
+    expect(screenSource).toContain('TALK_CONFIGURATION_REQUIRED_MESSAGE');
     expect(screenSource).toContain('disabled={isSendDisabled}');
     expect(screenSource).toContain('turnControls.microphoneIsPrimary');
     expect(screenSource).toContain('Your tutor is starting…');

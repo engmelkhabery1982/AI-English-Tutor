@@ -33,7 +33,7 @@ describe('VoiceSessionCoordinator', () => {
   });
 
   it('completes full Voice Conversation MVP loop: Record -> STT -> Session -> TTS', async () => {
-    const { session } = createTalkSession({ mode: 'coach' });
+    const { session } = createTalkSession({ mode: 'coach' }, { isDemo: true });
     const recorder = createDemoAudioRecorder();
     const stt = createDemoSTTProvider({
       defaultTranscript: 'I would like to improve my English fluency.',
@@ -92,7 +92,7 @@ describe('VoiceSessionCoordinator', () => {
   });
 
   it('handles permission denied gracefully without corrupting session history', async () => {
-    const { session } = createTalkSession({ mode: 'natural' });
+    const { session } = createTalkSession({ mode: 'natural' }, { isDemo: true });
     const recorder = createDemoAudioRecorder();
     recorder.setPermission(false);
 
@@ -113,7 +113,7 @@ describe('VoiceSessionCoordinator', () => {
   });
 
   it('handles STT error gracefully without corrupting session history', async () => {
-    const { session } = createTalkSession({ mode: 'natural' });
+    const { session } = createTalkSession({ mode: 'natural' }, { isDemo: true });
     const recorder = createDemoAudioRecorder();
     const stt = createDemoSTTProvider();
     stt.setMockFailure(true, 'Audio was not clear');
@@ -137,7 +137,7 @@ describe('VoiceSessionCoordinator', () => {
   });
 
   it('respects mute setting and suppresses TTS speech', async () => {
-    const { session } = createTalkSession({ mode: 'natural' });
+    const { session } = createTalkSession({ mode: 'natural' }, { isDemo: true });
     const recorder = createDemoAudioRecorder();
     const stt = createDemoSTTProvider({ defaultTranscript: 'Hello there' });
     const tts = createDemoTTSProvider();
@@ -170,7 +170,7 @@ describe('VoiceSessionCoordinator', () => {
   });
 
   it('allows stopping active speech playback', async () => {
-    const { session } = createTalkSession({ mode: 'natural' });
+    const { session } = createTalkSession({ mode: 'natural' }, { isDemo: true });
     const tts = createDemoTTSProvider();
 
     const coordinator = createVoiceSessionCoordinator({
@@ -188,7 +188,7 @@ describe('VoiceSessionCoordinator', () => {
   });
 
   it('regression: calling setSession with same session or second mic press does not cancel active recording', async () => {
-    const { session } = createTalkSession({ mode: 'natural' });
+    const { session } = createTalkSession({ mode: 'natural' }, { isDemo: true });
     const recorder = createDemoAudioRecorder();
     const stt = createDemoSTTProvider({ defaultTranscript: 'I enjoy reading books.' });
     const tts = createDemoTTSProvider();
@@ -225,7 +225,7 @@ describe('VoiceSessionCoordinator', () => {
   });
 
   it('returns unambiguous failure (ok: false) when conversation session fails after STT succeeds', async () => {
-    const { session } = createTalkSession({ mode: 'natural' });
+    const { session } = createTalkSession({ mode: 'natural' }, { isDemo: true });
     vi.spyOn(session, 'send').mockResolvedValueOnce({
       ok: false,
       error: {
@@ -254,7 +254,7 @@ describe('VoiceSessionCoordinator', () => {
   });
 
   it('does not roll back conversation when TTS playback fails', async () => {
-    const { session } = createTalkSession({ mode: 'coach' });
+    const { session } = createTalkSession({ mode: 'coach' }, { isDemo: true });
     const tts = createDemoTTSProvider();
     vi.spyOn(tts, 'speak').mockRejectedValueOnce(new Error('Audio playback device error'));
 

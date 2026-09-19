@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { NavigationProp, ParamListBase } from '@react-navigation/native';
+import { useNavigation } from '@react-navigation/native';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { LearnerModel } from '../learner-model';
 import type { PronunciationEngine } from '../pronunciation';
@@ -28,6 +30,7 @@ import {
   CONVERSATION_REVIEW_TITLE,
   resolveTalkTurnControls,
   TALK_REAL_AI_UNAVAILABLE_MESSAGE,
+  TALK_CONFIGURATION_REQUIRED_MESSAGE,
   describeVoiceTurn,
   type AudioRecorderService,
   type ConversationFeedback,
@@ -95,6 +98,7 @@ export function buildTutorOpeningMessage(topic: string): string {
 }
 
 export default function TalkScreen(props?: TalkScreenProps) {
+  const navigation = useNavigation<NavigationProp<ParamListBase>>();
   const [mode, setMode] = useState<ConversationMode>('natural');
   const [topic, setTopic] = useState<string>('');
   const [inputText, setInputText] = useState<string>('');
@@ -104,7 +108,11 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const [lastFeedback, setLastFeedback] = useState<ConversationFeedback | null>(null);
   const [savedWords, setSavedWords] = useState<Record<string, boolean>>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [providerKind, setProviderKind] = useState<TalkProviderKind>('demo');
+  /**
+   * Resolved provider identity. `null` until the composition settles, so the
+   * surface never claims a provider state it has not established yet.
+   */
+  const [providerKind, setProviderKind] = useState<TalkProviderKind | null>(null);
   const [providerInfo, setProviderInfo] = useState<TalkProviderInfo | null>(null);
   const [isOpening, setIsOpening] = useState<boolean>(false);
   /**
@@ -670,6 +678,11 @@ export default function TalkScreen(props?: TalkScreenProps) {
       // record yet. The learner stays in control once the turn completes.
       return;
     }
+    if (providerKind === null || providerKind === 'unavailable') {
+      // The provider identity is not established yet, or nothing is configured:
+      // no turn may start, and no reply can exist.
+      return;
+    }
     // No active conversation yet (still preparing or switching): nothing to do.
     const session = sessionRef.current;
     if (!session || isSwitching) return;
@@ -739,6 +752,11 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const handleSendMessage = async () => {
     const trimmedMessage = inputText.trim();
     if (!trimmedMessage || isSending || !voiceStatus.canSendText) {
+      return;
+    }
+    if (providerKind === null || providerKind === 'unavailable') {
+      // No provider is configured (or not yet established): a message must not
+      // be sent into nothing.
       return;
     }
 
@@ -823,14 +841,31 @@ export default function TalkScreen(props?: TalkScreenProps) {
     isSwitching,
     isPreparing,
   });
-  const isSendDisabled = turnControls.sendDisabled;
   const isGemini = providerKind === 'gemini';
   const isRealAI = providerInfo?.isRealAI ?? isGemini;
-  const providerLabel = providerInfo?.label ?? (isGemini ? 'Gemini • Online' : 'Local Demo • Offline');
+  /**
+   * EXPLICIT Demo Mode only. There is no automatic Demo fallback, so this is
+   * true only when the learner/caller actually asked for the offline script.
+   */
+  const isOfflineDemo = providerKind === 'demo';
+  /**
+   * Nothing is configured and Demo Mode was not chosen: no tutor reply can be
+   * generated at all. The surface must say so and must not start a turn.
+   */
+  const isProviderUnavailable = providerKind === 'unavailable';
+  const providerLabel =
+    providerInfo?.label ??
+    (providerKind === null
+      ? 'Checking provider…'
+      : isGemini
+      ? 'Gemini • Online'
+      : isOfflineDemo
+      ? 'Local Demo • Offline'
+      : 'Real AI unavailable • Configuration required');
+  const isSendDisabled = turnControls.sendDisabled || isProviderUnavailable;
 
   // Learner-facing turn phase, derived from the EXISTING voice status model.
   const turnView = describeVoiceTurn(voiceStatus, isSending || isOpening);
-  const isOfflineDemo = !isRealAI;
   // Honest coaching status: personalization is claimed ONLY when the real
   // persisted learner model is in use.
   const usesDemoLearnerModel = coachingSource === 'demo-fallback';
@@ -927,10 +962,26 @@ export default function TalkScreen(props?: TalkScreenProps) {
         )}
 
         {/*
-          Provider honesty: offline demo output is never presented as real AI
-          tutoring. The notice is explicit and stays visible for the whole
-          conversation.
+          Provider honesty. Two distinct states, neither of which is ever
+          substituted for the other:
+          - no provider configured and Demo not chosen → configuration required,
+            with no tutor reply of any kind;
+          - explicit Demo Mode → the offline script, labelled as not real AI.
+          The notice stays visible for the whole conversation.
         */}
+        {isProviderUnavailable && (
+          <View style={styles.offlineNotice}>
+            <Text style={styles.offlineNoticeText}>{TALK_CONFIGURATION_REQUIRED_MESSAGE}</Text>
+            <TouchableOpacity
+              style={styles.offlineNoticeAction}
+              onPress={() => navigation.navigate('Settings')}
+              accessibilityRole="button"
+              accessibilityLabel="Open Settings to configure a provider"
+            >
+              <Text style={styles.offlineNoticeActionText}>Open provider settings</Text>
+            </TouchableOpacity>
+          </View>
+        )}
         {isOfflineDemo && (
           <View style={styles.offlineNotice}>
             <Text style={styles.offlineNoticeText}>
@@ -974,14 +1025,20 @@ export default function TalkScreen(props?: TalkScreenProps) {
               </View>
             ) : (
               <Text style={styles.emptyStateTitle}>
-                {isOfflineDemo ? 'Offline demo conversation' : 'Your tutor will start'}
+                {isProviderUnavailable
+                  ? 'Real AI is not configured'
+                  : isOfflineDemo
+                  ? 'Offline demo conversation'
+                  : 'Your tutor will start'}
               </Text>
             )}
             <Text style={styles.emptyStateDescription}>
               {isPreparing
                 ? 'Preparing your tutor with your saved level, weaknesses, vocabulary and progress before the conversation begins.'
+                : isProviderUnavailable
+                ? 'No AI provider is configured, so this conversation cannot generate tutor replies. Add an API key in Settings — nothing scripted or demo is substituted for a real tutor.'
                 : isOfflineDemo
-                ? 'No real AI tutor is available, so replies come from the offline demo script. You can still try the flow, but nothing here is real AI conversation or personalized feedback.'
+                ? 'You chose Demo Mode, so replies come from the offline demo script. You can still try the flow, but nothing here is real AI conversation or personalized feedback.'
                 : 'Pick a mode and an optional topic — your tutor opens the conversation. Then just tap the microphone and talk naturally.'}
             </Text>
             <View style={styles.suggestionsContainer}>
@@ -1271,7 +1328,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
               styles.micButtonDisabled,
           ]}
           onPress={handleToggleRecording}
-          disabled={turnControls.micDisabled}
+          disabled={turnControls.micDisabled || isProviderUnavailable}
           accessibilityRole="button"
           accessibilityLabel={micLabel}
           accessibilityHint={turnView.hint}
@@ -1302,6 +1359,8 @@ export default function TalkScreen(props?: TalkScreenProps) {
               ? 'Listening to your speech…'
               : turnPhase === 'transcribing'
               ? 'Transcribing audio…'
+              : isProviderUnavailable
+              ? 'Configure a provider in Settings to talk…'
               : isOfflineDemo
               ? 'Type a message (offline demo, not real AI)…'
               : 'Or type your reply in English…'
@@ -1311,7 +1370,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
           onChangeText={setInputText}
           multiline
           maxLength={1000}
-          editable={!isSending && !isOpening && voiceStatus.canSendText}
+          editable={!isSending && !isOpening && voiceStatus.canSendText && !isProviderUnavailable}
         />
         <TouchableOpacity
           style={[
@@ -1394,6 +1453,21 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     borderWidth: 1,
     borderColor: '#FDE68A',
+  },
+  offlineNoticeAction: {
+    marginTop: 8,
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#F59E0B',
+  },
+  offlineNoticeActionText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#92400E',
   },
   offlineNoticeText: {
     fontSize: 12,
