@@ -16,6 +16,10 @@
  *   honestly instead of receiving demo data labeled as personalization.
  * - The EXISTING progress store is composed here (behind the service) so the
  *   screen never opens a database.
+ *
+ * DATABASE OWNERSHIP (Wave 2): the default composition routes through the
+ * CANONICAL application database owner via `resolveTalkCoaching`, so no second
+ * adapter is opened.
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
@@ -70,8 +74,8 @@ export function createSpeakingService(
   });
 }
 
-// Default composition bootstrap — adapter lifecycle lives behind composition,
-// never inside UI screens (SAME pattern as Talk / Adaptive Lessons / etc.).
+// Default composition bootstrap — adapter lifecycle lives behind composition
+// (the CANONICAL owner), never inside UI screens.
 let defaultCompositionPromise: Promise<DefaultSpeakingComposition> | null = null;
 
 /**
@@ -87,7 +91,7 @@ export interface DefaultSpeakingComposition {
   readonly adapter: DatabaseAdapter;
 }
 
-/** Compose (once, reused) on the default app database. */
+/** Compose (once, reused) on the canonical application database. */
 export function createDefaultSpeakingComposition(): Promise<DefaultSpeakingComposition> {
   if (!defaultCompositionPromise) {
     defaultCompositionPromise = (async () => {
@@ -114,14 +118,14 @@ export function createDefaultSpeakingComposition(): Promise<DefaultSpeakingCompo
   return defaultCompositionPromise;
 }
 
-/** Compose the service on the default app database (reused across calls). */
+/** Compose the service on the canonical app database (reused across calls). */
 export async function createDefaultSpeakingService(): Promise<SpeakingPracticeService> {
   return (await createDefaultSpeakingComposition()).service;
 }
 
 /**
  * The canonical composition, or null when no persisted learner state can be
- * composed (the honest "unavailable" answer — never demo data presented as
+ * composed (the honest \"unavailable\" answer — never demo data presented as
  * real state).
  */
 export async function resolveDefaultSpeakingComposition(): Promise<DefaultSpeakingComposition | null> {
