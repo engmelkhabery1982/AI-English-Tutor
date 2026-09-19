@@ -28,6 +28,7 @@ import {
   SQLiteWeaknessRepository,
 } from '../data/local/sqlite/repositories';
 import { createLearnerModel, type LearnerModel } from '../learner-model';
+import { resolveGeminiApiKey } from '../provider-config';
 import type { AIProvider } from '../providers/ai';
 import { createDemoAIProvider } from '../providers/ai/demo';
 import { createGeminiAIProvider } from '../providers/ai/gemini';
@@ -289,14 +290,23 @@ export function createTalkVoiceCoordinator(
 }
 
 /**
- * Resolves the active Gemini API key from environment or explicit parameter.
+ * The ONE canonical API-key lookup used by every provider factory in the app
+ * (Talk, Review, Listening, Adaptive Lessons, Deep Speaking and the screens
+ * that build voice input).
+ *
+ * Resolution is owned by `src/provider-config` and follows an explicit
+ * precedence:
+ *   1. injected credential (tests / embedding)
+ *   2. runtime credential held in SECURE DEVICE STORAGE (the production path)
+ *   3. `EXPO_PUBLIC_GEMINI_API_KEY` — DEVELOPMENT BUILDS ONLY
+ *   4. unavailable (null)
+ *
+ * `EXPO_PUBLIC_*` values are inlined into the compiled JS bundle, so they are
+ * never used as production secret storage: in a release build the environment
+ * fallback is disabled.
  */
 export function getGeminiApiKey(): string | null {
-  const envKey = process.env.EXPO_PUBLIC_GEMINI_API_KEY;
-  if (typeof envKey === 'string' && envKey.trim().length > 0) {
-    return envKey.trim();
-  }
-  return null;
+  return resolveGeminiApiKey();
 }
 
 /**
