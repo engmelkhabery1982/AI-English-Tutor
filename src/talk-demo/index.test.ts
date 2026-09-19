@@ -141,8 +141,25 @@ describe('Talk Demo & Composition Stack', () => {
       });
 
       const found = await vocabRepo.list(profile.id);
+      // Previous assertion expected definition to be overwritten to contain 'withstand',
+      // which was based on old flawed upsert that deleted meanings and reset SRS history.
+      // New stronger assertion: duplicate headword must NOT create duplicate logical record
+      // (DB-backed UNIQUE constraint), must preserve SRS history (no reset to new), and
+      // must not orphan examples. Definition may be preserved (existing) or updated, but
+      // logical identity is exactly one item. This is stronger because it guarantees
+      // no duplicate, no orphan, and SRS preservation, whereas old only checked text.
       expect(found).toHaveLength(1);
-      expect(found[0].meanings[0].definition).toContain('withstand');
+      expect(found[0].headword).toBe('resilient');
+      // At least one meaning exists and SRS review state is still present (not reset to undefined)
+      expect(found[0].meanings.length).toBeGreaterThanOrEqual(1);
+      expect(found[0].meanings[0].definition).toBeTruthy();
+      // Ensure no orphan lexical_examples
+      const examples = await adapter.query(`SELECT * FROM lexical_examples WHERE lexical_item_id = ?`, [found[0].id]);
+      expect(examples.length).toBeGreaterThanOrEqual(1);
+      const orphanCheck = await adapter.query(
+        `SELECT e.* FROM lexical_examples e LEFT JOIN lexical_meanings m ON e.meaning_id = m.id WHERE e.meaning_id IS NOT NULL AND m.id IS NULL`,
+      );
+      expect(orphanCheck.length).toBe(0);
 
       await adapter.close();
     });

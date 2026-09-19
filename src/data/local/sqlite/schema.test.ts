@@ -320,8 +320,14 @@ describe('SQLite schema migrations (sql.js)', () => {
   });
 
   describe('Migration version 2: expression metadata', () => {
-    it('CURRENT_SCHEMA_VERSION is 5', async () => {
-      expect(CURRENT_SCHEMA_VERSION).toBe(5);
+    it('CURRENT_SCHEMA_VERSION is 6 (v6 adds DB-backed logical uniqueness + singleton)', async () => {
+      // Previous assertion expected 5, which was correct before v6.
+      // v6 is additive and stronger: it adds UNIQUE constraints for
+      // lexical_items(learner_id, headword, type), review_items,
+      // weaknesses, strengths, pronunciation, plus singleton profile
+      // CHECK(id='singleton') and race-safe upserts. No data loss,
+      // only stricter integrity. So the correct current version is 6.
+      expect(CURRENT_SCHEMA_VERSION).toBe(6);
     });
 
     it('migration v2 exists with correct description', async () => {

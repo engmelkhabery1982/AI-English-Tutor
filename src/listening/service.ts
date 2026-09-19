@@ -89,8 +89,8 @@ export interface ListeningServiceDeps {
       referenceId: string,
     ) => Promise<Awaited<ReturnType<ReviewRepository['listDue']>>[number] | null>;
   };
-  readonly vocabulary: Pick<VocabularyRepository, 'list' | 'listDue' | 'upsert' | 'get'>;
-  readonly expressions?: Pick<ExpressionRepository, 'list' | 'listDue' | 'upsert'>;
+  readonly vocabulary: Pick<VocabularyRepository, 'list' | 'listDue' | 'upsert' | 'get' | 'getByHeadword'>;
+  readonly expressions?: Pick<ExpressionRepository, 'list' | 'listDue' | 'upsert' | 'getByExpression'>;
   /** Existing progress records — counts only, never legacy score fields. */
   readonly progress?: Pick<ProgressRepository, 'record'>;
   /** EXISTING AI provider — only for open-ended comprehension evaluation. */
@@ -604,6 +604,13 @@ export class ListeningService {
     opts?: { meaning?: string; exampleText?: string },
   ): Promise<{ item: Awaited<ReturnType<VocabularyRepository['upsert']>>; created: boolean }> {
     const normalized = headword.toLowerCase().trim();
+    // Exact lookup – never capped list – to preserve SRS and avoid missing due to limit
+    if (this.deps.vocabulary.getByHeadword) {
+      try {
+        const exact = await this.deps.vocabulary.getByHeadword(learnerId, headword.trim(), 'word');
+        if (exact) return { item: exact, created: false };
+      } catch {}
+    }
     const saved = await this.deps.vocabulary.list(learnerId, { limit: 500 });
     const existing = saved.find((v) => v.headword.toLowerCase().trim() === normalized);
     if (existing) return { item: existing, created: false };
@@ -642,6 +649,12 @@ export class ListeningService {
   ): Promise<{ item: ExpressionItem; created: boolean } | null> {
     if (!this.deps.expressions) return null;
     const normalized = expression.toLowerCase().trim();
+    if (this.deps.expressions.getByExpression) {
+      try {
+        const exact = await this.deps.expressions.getByExpression(learnerId, expression.trim(), 'common_expression');
+        if (exact) return { item: exact, created: false };
+      } catch {}
+    }
     const saved = await this.deps.expressions.list(learnerId, { limit: 500 });
     const existing = saved.find((e) => e.expression.toLowerCase().trim() === normalized);
     if (existing) return { item: existing, created: false };

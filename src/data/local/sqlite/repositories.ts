@@ -1,15 +1,15 @@
 /**
  * src/data/local/sqlite/repositories.ts
  *
- * SQLite implementations of UserProfileRepository and ConversationRepository.
+ * SQLite implementations of repositories with hardened transactional integrity.
  *
- * These implementations:
- * - Use parameterized SQL only
- * - Map DB rows (snake_case) to domain objects (camelCase)
- * - Handle optional fields safely
- * - Preserve id/createdAt on updates
- * - Update updatedAt on modifications
- * - Do not leak raw SQL outside this layer
+ * Fixes:
+ * - Atomic lexical rewrites via transaction
+ * - SRS history preservation on re-save
+ * - markReviewed atomic + idempotent + no lost update
+ * - DB-backed uniqueness via v6 migration + race-safe upserts
+ * - Profile singleton race protection
+ * - Lexical orphan cleanup integrity
  */
 
 import type {
@@ -100,6 +100,15 @@ function safeJsonParse<T>(value: unknown, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+  return msg.includes('unique constraint failed') || msg.includes('unique constraint') || msg.includes('duplicate') || msg.includes('unique');
+}
+
+function normalizeDef(def: string): string {
+  return def.trim().toLowerCase();
 }
 
 /** Map learner_profile row to UserProfile domain object. */
@@ -194,11 +203,8 @@ function buildSessionUpdate(
     }
   }
 
-  // Always update updatedAt
   fields.push('updated_at = ?');
   params.push(nowIso());
-
-  // WHERE clause
   params.push(id);
 
   const sql = `UPDATE conversation_sessions SET ${fields.join(', ')} WHERE id = ?`;
@@ -211,7 +217,6 @@ function assertValidSessionId(id: string): void {
   }
 }
 
-/** Validates the required fields of a conversation session row. */
 function assertValidSessionInput(
   session: Pick<ConversationSession, 'learnerId' | 'mode' | 'status' | 'startedAt'>,
 ): void {
@@ -229,7 +234,6 @@ function assertValidSessionInput(
   }
 }
 
-/** Validates the required fields of a conversation turn row. */
 function assertValidTurnInput(turn: {
   sessionId: string;
   speaker?: ConversationTurn['speaker'];
@@ -254,7 +258,6 @@ function assertValidTurnInput(turn: {
   }
 }
 
-/** INSERT SQL for conversation_sessions (single source of truth). */
 function sessionInsertSql(): string {
   return `INSERT INTO conversation_sessions (
         id, learner_id, mode, title, topic, topic_source, status,
@@ -263,7 +266,6 @@ function sessionInsertSql(): string {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 }
 
-/** INSERT params for conversation_sessions (single source of truth). */
 function sessionInsertParams(
   id: string,
   session: Omit<ConversationSession, 'id' | 'createdAt' | 'updatedAt'>,
@@ -289,7 +291,6 @@ function sessionInsertParams(
   ];
 }
 
-/** INSERT SQL for conversation_turns (single source of truth). */
 function turnInsertSql(): string {
   return `INSERT INTO conversation_turns (
         id, session_id, speaker, text, audio_ref, detected_language,
@@ -298,7 +299,6 @@ function turnInsertSql(): string {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 }
 
-/** INSERT params for conversation_turns (id first, single source of truth). */
 function turnInsertParams(
   sessionId: string,
   turn: {
@@ -333,7 +333,6 @@ function turnInsertParams(
   ];
 }
 
-/** Build partial UPDATE SQL and params for a profile. */
 function buildProfileUpdate(
   id: string,
   patch: Partial<Omit<UserProfile, 'id' | 'createdAt'>>,
@@ -363,11 +362,8 @@ function buildProfileUpdate(
     }
   }
 
-  // Always update updatedAt
   fields.push('updated_at = ?');
   params.push(nowIso());
-
-  // WHERE clause
   params.push(id);
 
   const sql = `UPDATE learner_profile SET ${fields.join(', ')} WHERE id = ?`;
@@ -376,9 +372,7 @@ function buildProfileUpdate(
 
 /**
  * SQLiteUserProfileRepository
- *
- * Single-profile implementation for a personal app.
- * Does not add authentication, accounts, or cloud sync.
+ * Race-safe via singleton UNIQUE constraint and INSERT handling.
  */
 export class SQLiteUserProfileRepository implements UserProfileRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
@@ -387,26 +381,21 @@ export class SQLiteUserProfileRepository implements UserProfileRepository {
     const rows = await this.adapter.query(
       `SELECT * FROM learner_profile LIMIT 1`,
     );
-
     if (rows.length === 0) {
       throw new Error('No user profile found. Call update() first to create one.');
     }
-
     return rowToUserProfile(rows[0]);
   }
 
   async update(
     patch: Partial<Omit<UserProfile, 'id' | 'createdAt'>>,
   ): Promise<UserProfile> {
-    // Check if profile exists
     const existing = await this.adapter.query(
       `SELECT id FROM learner_profile LIMIT 1`,
     );
-
     const now = nowIso();
 
     if (existing.length === 0) {
-      // Create new profile - require minimal fields
       const id = generateId();
       const displayName = patch.displayName ?? 'Learner';
       const targetLanguage = patch.targetLanguage ?? 'en';
@@ -416,43 +405,79 @@ export class SQLiteUserProfileRepository implements UserProfileRepository {
       const preferredModes = patch.preferredModes ?? [];
       const nativeLanguage = patch.nativeLanguage ?? null;
 
-      await this.adapter.execute(
-        `INSERT INTO learner_profile (
-          id, display_name, native_language, target_language,
-          target_level, current_level, learning_goals, preferred_modes,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          id,
-          displayName,
-          nativeLanguage,
-          targetLanguage,
-          targetLevel,
-          currentLevel,
-          JSON.stringify(learningGoals),
-          JSON.stringify(preferredModes),
-          now,
-          now,
-        ],
-      );
-
+      try {
+        // Include singleton=1 for the unique single-profile invariant.
+        // If column doesn't exist yet (pre-v6 DB during migration), fallback without it.
+        try {
+          await this.adapter.execute(
+            `INSERT INTO learner_profile (
+              id, display_name, native_language, target_language,
+              target_level, current_level, learning_goals, preferred_modes,
+              created_at, updated_at, singleton
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+            [
+              id,
+              displayName,
+              nativeLanguage,
+              targetLanguage,
+              targetLevel,
+              currentLevel,
+              JSON.stringify(learningGoals),
+              JSON.stringify(preferredModes),
+              now,
+              now,
+            ],
+          );
+        } catch (e) {
+          if (String((e as Error).message).toLowerCase().includes('no column') && String((e as Error).message).toLowerCase().includes('singleton')) {
+            await this.adapter.execute(
+              `INSERT INTO learner_profile (
+                id, display_name, native_language, target_language,
+                target_level, current_level, learning_goals, preferred_modes,
+                created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                id,
+                displayName,
+                nativeLanguage,
+                targetLanguage,
+                targetLevel,
+                currentLevel,
+                JSON.stringify(learningGoals),
+                JSON.stringify(preferredModes),
+                now,
+                now,
+              ],
+            );
+          } else {
+            throw e;
+          }
+        }
+      } catch (err) {
+        if (isUniqueViolation(err)) {
+          // Race: another instance inserted first. Load existing and apply patch.
+          const raced = await this.adapter.query(`SELECT id FROM learner_profile LIMIT 1`);
+          if (raced.length > 0) {
+            const racedId = raced[0].id as string;
+            const { sql, params } = buildProfileUpdate(racedId, patch);
+            await this.adapter.execute(sql, params);
+            return this.get();
+          }
+        }
+        throw err;
+      }
       return this.get();
     }
 
-    // Update existing profile
     const id = existing[0].id as string;
     const { sql, params } = buildProfileUpdate(id, patch);
     await this.adapter.execute(sql, params);
-
     return this.get();
   }
 }
 
 /**
  * SQLiteConversationRepository
- *
- * Implements ConversationRepository contract using SQLite.
- * All methods use parameterized queries and explicit row mapping.
  */
 export class SQLiteConversationRepository implements ConversationRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
@@ -462,8 +487,6 @@ export class SQLiteConversationRepository implements ConversationRepository {
       readonly id?: string;
     },
   ): Promise<ConversationSession> {
-    // An explicit id lets callers persist with a deterministic domain identity
-    // (retry-safe conversation memory); otherwise a fresh id is generated.
     const id = session.id ?? generateId();
     const now = nowIso();
     assertValidSessionId(id);
@@ -478,20 +501,12 @@ export class SQLiteConversationRepository implements ConversationRepository {
       `SELECT * FROM conversation_sessions WHERE id = ?`,
       [id],
     );
-
     if (rows.length === 0) {
       throw new Error('Failed to create session');
     }
-
     return rowToConversationSession(rows[0]);
   }
 
-  /**
-   * Persist a COMPLETE conversation atomically (session + every turn) using the
-   * adapter transaction contract: if any step fails the whole write rolls back,
-   * so a partial conversation record can never be left behind. Combined with a
-   * caller-provided deterministic id this makes persistence retry-safe.
-   */
   async persistConversation(input: PersistConversationInput): Promise<ConversationSession> {
     const session = input.session;
     const id = session.id ?? generateId();
@@ -507,7 +522,6 @@ export class SQLiteConversationRepository implements ConversationRepository {
       steps.push({ sql: turnInsertSql(), params: turnInsertParams(id, turn, now) });
     }
 
-    // The completed status/endedAt/turnCount are written in the SAME transaction.
     const completion = buildSessionUpdate(id, {
       status: session.status,
       turnCount: session.turnCount ?? input.turns.length,
@@ -529,14 +543,11 @@ export class SQLiteConversationRepository implements ConversationRepository {
 
   async getSession(id: string): Promise<ConversationSession | null> {
     if (!isValidUuid(id)) return null;
-
     const rows = await this.adapter.query(
       `SELECT * FROM conversation_sessions WHERE id = ?`,
       [id],
     );
-
     if (rows.length === 0) return null;
-
     return rowToConversationSession(rows[0]);
   }
 
@@ -545,15 +556,12 @@ export class SQLiteConversationRepository implements ConversationRepository {
     limit?: number,
   ): Promise<readonly ConversationSession[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `SELECT * FROM conversation_sessions WHERE learner_id = ? ORDER BY started_at DESC`;
     const params: SqlParam[] = [learnerId];
-
     if (limit !== undefined && limit > 0) {
       sql += ` LIMIT ?`;
       params.push(limit);
     }
-
     const rows = await this.adapter.query(sql, params);
     return rows.map(rowToConversationSession);
   }
@@ -565,21 +573,16 @@ export class SQLiteConversationRepository implements ConversationRepository {
     if (!isValidUuid(id)) {
       throw new Error('Invalid session id');
     }
-
-    // Verify session exists
     const existing = await this.getSession(id);
     if (!existing) {
       throw new Error(`Session not found: ${id}`);
     }
-
     const { sql, params } = buildSessionUpdate(id, patch);
     await this.adapter.execute(sql, params);
-
     const updated = await this.getSession(id);
     if (!updated) {
       throw new Error('Session disappeared after update');
     }
-
     return updated;
   }
 
@@ -588,8 +591,6 @@ export class SQLiteConversationRepository implements ConversationRepository {
   ): Promise<ConversationTurn> {
     const id = generateId();
     const now = nowIso();
-
-    // Validate required fields
     if (!turn.sessionId || !isValidUuid(turn.sessionId)) {
       throw new Error('Invalid sessionId');
     }
@@ -605,7 +606,6 @@ export class SQLiteConversationRepository implements ConversationRepository {
     if (!turn.startedAt) {
       throw new Error('startedAt is required');
     }
-
     await this.adapter.execute(
       turnInsertSql(),
       [
@@ -613,34 +613,25 @@ export class SQLiteConversationRepository implements ConversationRepository {
         ...turnInsertParams(turn.sessionId, turn, now).slice(1),
       ],
     );
-
     const rows = await this.adapter.query(
       `SELECT * FROM conversation_turns WHERE id = ?`,
       [id],
     );
-
     if (rows.length === 0) {
       throw new Error('Failed to create turn');
     }
-
     return rowToConversationTurn(rows[0]);
   }
 
   async listTurns(sessionId: string): Promise<readonly ConversationTurn[]> {
     if (!isValidUuid(sessionId)) return [];
-
     const rows = await this.adapter.query(
       `SELECT * FROM conversation_turns WHERE session_id = ? ORDER BY sequence_number ASC`,
       [sessionId],
     );
-
     return rows.map(rowToConversationTurn);
   }
 
-  /**
-   * Exact aggregate counts over persisted sessions (optionally bounded to a
-   * started-at range). Single GROUP-free aggregate query — never loads rows.
-   */
   async getActivityStats(
     learnerId: string,
     opts?: { startedAfter?: string; startedUntil?: string },
@@ -648,7 +639,6 @@ export class SQLiteConversationRepository implements ConversationRepository {
     if (!isValidUuid(learnerId)) {
       return { sessionsTotal: 0, sessionsCompleted: 0, turnsTotal: 0 };
     }
-
     let sql = `SELECT
         COUNT(*) AS sessions_total,
         COALESCE(SUM(CASE WHEN status IN ('completed', 'summarized') THEN 1 ELSE 0 END), 0) AS sessions_completed,
@@ -663,7 +653,6 @@ export class SQLiteConversationRepository implements ConversationRepository {
       sql += ` AND started_at < ?`;
       params.push(opts.startedUntil);
     }
-
     const rows = await this.adapter.query(sql, params);
     const row = rows[0] ?? {};
     return {
@@ -674,7 +663,6 @@ export class SQLiteConversationRepository implements ConversationRepository {
   }
 }
 
-/** Map grammar_mistakes row to GrammarMistake domain object. */
 function rowToGrammarMistake(row: SqlRow): GrammarMistake {
   return {
     id: row.id as string,
@@ -697,7 +685,6 @@ function rowToGrammarMistake(row: SqlRow): GrammarMistake {
   };
 }
 
-/** Map pronunciation_weaknesses row to PronunciationWeakness domain object. */
 function rowToPronunciationWeakness(row: SqlRow): PronunciationWeakness {
   return {
     id: row.id as string,
@@ -719,7 +706,6 @@ function rowToPronunciationWeakness(row: SqlRow): PronunciationWeakness {
   };
 }
 
-/** Map learner_weaknesses row to LearnerWeakness domain object. */
 function rowToLearnerWeakness(row: SqlRow): LearnerWeakness {
   return {
     id: row.id as string,
@@ -740,7 +726,6 @@ function rowToLearnerWeakness(row: SqlRow): LearnerWeakness {
   };
 }
 
-/** Map learner_strengths row to LearnerStrength domain object. */
 function rowToLearnerStrength(row: SqlRow): LearnerStrength {
   return {
     id: row.id as string,
@@ -758,14 +743,13 @@ function rowToLearnerStrength(row: SqlRow): LearnerStrength {
   };
 }
 
-/** Build partial UPDATE SQL and params for a grammar mistake. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- kept for reference, now using monotonic timestamp path
 function buildGrammarMistakeUpdate(
   id: string,
   patch: Partial<Omit<GrammarMistake, 'id' | 'createdAt'>>,
 ): { sql: string; params: SqlParam[] } {
   const fields: string[] = [];
   const params: SqlParam[] = [];
-
   const fieldMap: Record<string, string> = {
     learnerId: 'learner_id',
     category: 'category',
@@ -782,7 +766,6 @@ function buildGrammarMistakeUpdate(
     originTurnId: 'origin_turn_id',
     resolved: 'resolved',
   };
-
   for (const [key, column] of Object.entries(fieldMap)) {
     const value = patch[key as keyof typeof patch];
     if (value !== undefined) {
@@ -796,23 +779,19 @@ function buildGrammarMistakeUpdate(
       }
     }
   }
-
   fields.push('updated_at = ?');
   params.push(nowIso());
   params.push(id);
-
   const sql = `UPDATE grammar_mistakes SET ${fields.join(', ')} WHERE id = ?`;
   return { sql, params };
 }
 
-/** Build partial UPDATE SQL and params for a learner weakness. */
 function buildLearnerWeaknessUpdate(
   id: string,
   patch: Partial<Omit<LearnerWeakness, 'id' | 'createdAt'>>,
 ): { sql: string; params: SqlParam[] } {
   const fields: string[] = [];
   const params: SqlParam[] = [];
-
   const fieldMap: Record<string, string> = {
     learnerId: 'learner_id',
     type: 'type',
@@ -827,7 +806,6 @@ function buildLearnerWeaknessUpdate(
     notes: 'notes',
     resolved: 'resolved',
   };
-
   for (const [key, column] of Object.entries(fieldMap)) {
     const value = patch[key as keyof typeof patch];
     if (value !== undefined) {
@@ -841,23 +819,19 @@ function buildLearnerWeaknessUpdate(
       }
     }
   }
-
   fields.push('updated_at = ?');
   params.push(nowIso());
   params.push(id);
-
   const sql = `UPDATE learner_weaknesses SET ${fields.join(', ')} WHERE id = ?`;
   return { sql, params };
 }
 
-/** Build partial UPDATE SQL and params for a learner strength. */
 function buildLearnerStrengthUpdate(
   id: string,
   patch: Partial<Omit<LearnerStrength, 'id' | 'createdAt'>>,
 ): { sql: string; params: SqlParam[] } {
   const fields: string[] = [];
   const params: SqlParam[] = [];
-
   const fieldMap: Record<string, string> = {
     learnerId: 'learner_id',
     type: 'type',
@@ -869,7 +843,6 @@ function buildLearnerStrengthUpdate(
     evidence: 'evidence',
     notes: 'notes',
   };
-
   for (const [key, column] of Object.entries(fieldMap)) {
     const value = patch[key as keyof typeof patch];
     if (value !== undefined) {
@@ -881,20 +854,13 @@ function buildLearnerStrengthUpdate(
       }
     }
   }
-
   fields.push('updated_at = ?');
   params.push(nowIso());
   params.push(id);
-
   const sql = `UPDATE learner_strengths SET ${fields.join(', ')} WHERE id = ?`;
   return { sql, params };
 }
 
-/**
- * SQLiteMistakeRepository
- *
- * Implements MistakeRepository for grammar mistakes.
- */
 export class SQLiteMistakeRepository implements MistakeRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
 
@@ -903,29 +869,15 @@ export class SQLiteMistakeRepository implements MistakeRepository {
   ): Promise<GrammarMistake> {
     const id = generateId();
     const now = nowIso();
-
-    // Validate required fields
     if (!mistake.learnerId || !isValidUuid(mistake.learnerId)) {
       throw new Error('Invalid learnerId');
     }
-    if (!mistake.category) {
-      throw new Error('category is required');
-    }
-    if (!mistake.pattern) {
-      throw new Error('pattern is required');
-    }
-    if (!mistake.correction) {
-      throw new Error('correction is required');
-    }
-    if (!mistake.severity) {
-      throw new Error('severity is required');
-    }
-    if (!mistake.lastSeenAt) {
-      throw new Error('lastSeenAt is required');
-    }
-    if (!mistake.firstSeenAt) {
-      throw new Error('firstSeenAt is required');
-    }
+    if (!mistake.category) throw new Error('category is required');
+    if (!mistake.pattern) throw new Error('pattern is required');
+    if (!mistake.correction) throw new Error('correction is required');
+    if (!mistake.severity) throw new Error('severity is required');
+    if (!mistake.lastSeenAt) throw new Error('lastSeenAt is required');
+    if (!mistake.firstSeenAt) throw new Error('firstSeenAt is required');
 
     await this.adapter.execute(
       `INSERT INTO grammar_mistakes (
@@ -954,16 +906,8 @@ export class SQLiteMistakeRepository implements MistakeRepository {
         now,
       ],
     );
-
-    const rows = await this.adapter.query(
-      `SELECT * FROM grammar_mistakes WHERE id = ?`,
-      [id],
-    );
-
-    if (rows.length === 0) {
-      throw new Error('Failed to create grammar mistake');
-    }
-
+    const rows = await this.adapter.query(`SELECT * FROM grammar_mistakes WHERE id = ?`, [id]);
+    if (rows.length === 0) throw new Error('Failed to create grammar mistake');
     return rowToGrammarMistake(rows[0]);
   }
 
@@ -972,52 +916,34 @@ export class SQLiteMistakeRepository implements MistakeRepository {
     opts?: { resolved?: boolean; limit?: number },
   ): Promise<readonly GrammarMistake[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `SELECT * FROM grammar_mistakes WHERE learner_id = ?`;
     const params: SqlParam[] = [learnerId];
-
     if (opts?.resolved !== undefined) {
       sql += ` AND resolved = ?`;
       params.push(opts.resolved ? 1 : 0);
     }
-
     sql += ` ORDER BY last_seen_at DESC`;
-
     if (opts?.limit !== undefined && opts.limit > 0) {
       sql += ` LIMIT ?`;
       params.push(opts.limit);
     }
-
     const rows = await this.adapter.query(sql, params);
     return rows.map(rowToGrammarMistake);
   }
 
   async markResolved(id: string, resolved: boolean): Promise<GrammarMistake> {
-    if (!isValidUuid(id)) {
-      throw new Error('Invalid mistake id');
-    }
-
-    const existing = await this.adapter.query(
-      `SELECT * FROM grammar_mistakes WHERE id = ?`,
-      [id],
+    if (!isValidUuid(id)) throw new Error('Invalid mistake id');
+    const existing = await this.adapter.query(`SELECT * FROM grammar_mistakes WHERE id = ?`, [id]);
+    if (existing.length === 0) throw new Error(`Grammar mistake not found: ${id}`);
+    const prevUpdatedAt = existing[0].updated_at as string;
+    const newUpdatedAt = generateMonotonicTimestamp(prevUpdatedAt);
+    // Use monotonic timestamp to guarantee updatedAt advances, preventing flaky test where nowIso() equals previous ms
+    await this.adapter.execute(
+      `UPDATE grammar_mistakes SET resolved = ?, updated_at = ? WHERE id = ?`,
+      [resolved ? 1 : 0, newUpdatedAt, id],
     );
-
-    if (existing.length === 0) {
-      throw new Error(`Grammar mistake not found: ${id}`);
-    }
-
-    const { sql, params } = buildGrammarMistakeUpdate(id, { resolved });
-    await this.adapter.execute(sql, params);
-
-    const rows = await this.adapter.query(
-      `SELECT * FROM grammar_mistakes WHERE id = ?`,
-      [id],
-    );
-
-    if (rows.length === 0) {
-      throw new Error('Grammar mistake disappeared after update');
-    }
-
+    const rows = await this.adapter.query(`SELECT * FROM grammar_mistakes WHERE id = ?`, [id]);
+    if (rows.length === 0) throw new Error('Grammar mistake disappeared after update');
     return rowToGrammarMistake(rows[0]);
   }
 
@@ -1025,41 +951,54 @@ export class SQLiteMistakeRepository implements MistakeRepository {
     id: string,
     patch: Partial<Omit<GrammarMistake, 'id' | 'createdAt'>>,
   ): Promise<GrammarMistake> {
-    if (!isValidUuid(id)) {
-      throw new Error('Invalid mistake id');
+    if (!isValidUuid(id)) throw new Error('Invalid mistake id');
+    const existing = await this.adapter.query(`SELECT * FROM grammar_mistakes WHERE id = ?`, [id]);
+    if (existing.length === 0) throw new Error(`Grammar mistake not found: ${id}`);
+    const prevUpdatedAt = existing[0].updated_at as string;
+    const newUpdatedAt = generateMonotonicTimestamp(prevUpdatedAt);
+
+    const fields: string[] = [];
+    const params: SqlParam[] = [];
+    const fieldMap: Record<string, string> = {
+      learnerId: 'learner_id',
+      category: 'category',
+      pattern: 'pattern',
+      correction: 'correction',
+      explanation: 'explanation',
+      severity: 'severity',
+      occurrenceCount: 'occurrence_count',
+      lastSeenAt: 'last_seen_at',
+      firstSeenAt: 'first_seen_at',
+      contexts: 'contexts',
+      exampleTurnIds: 'example_turn_ids',
+      originSessionId: 'origin_session_id',
+      originTurnId: 'origin_turn_id',
+      resolved: 'resolved',
+    };
+    for (const [key, column] of Object.entries(fieldMap)) {
+      const value = (patch as any)[key];
+      if (value !== undefined) {
+        fields.push(`${column} = ?`);
+        if (key === 'contexts' || key === 'exampleTurnIds') {
+          params.push(JSON.stringify(value));
+        } else if (key === 'resolved') {
+          params.push(value ? 1 : 0);
+        } else {
+          params.push(value as SqlParam);
+        }
+      }
     }
-
-    const existing = await this.adapter.query(
-      `SELECT * FROM grammar_mistakes WHERE id = ?`,
-      [id],
-    );
-
-    if (existing.length === 0) {
-      throw new Error(`Grammar mistake not found: ${id}`);
-    }
-
-    const { sql, params } = buildGrammarMistakeUpdate(id, patch);
+    fields.push('updated_at = ?');
+    params.push(newUpdatedAt);
+    params.push(id);
+    const sql = `UPDATE grammar_mistakes SET ${fields.join(', ')} WHERE id = ?`;
     await this.adapter.execute(sql, params);
-
-    const rows = await this.adapter.query(
-      `SELECT * FROM grammar_mistakes WHERE id = ?`,
-      [id],
-    );
-
-    if (rows.length === 0) {
-      throw new Error('Grammar mistake disappeared after update');
-    }
-
+    const rows = await this.adapter.query(`SELECT * FROM grammar_mistakes WHERE id = ?`, [id]);
+    if (rows.length === 0) throw new Error('Grammar mistake disappeared after update');
     return rowToGrammarMistake(rows[0]);
   }
 }
 
-/**
- * SQLitePronunciationRepository
- *
- * Implements PronunciationRepository for pronunciation weaknesses.
- * NO fabricated pronunciation scores - only evidence/observations.
- */
 export class SQLitePronunciationRepository implements PronunciationRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
 
@@ -1068,57 +1007,52 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
   ): Promise<PronunciationWeakness> {
     const id = generateId();
     const now = nowIso();
+    if (!weakness.learnerId || !isValidUuid(weakness.learnerId)) throw new Error('Invalid learnerId');
+    if (!weakness.targetSound) throw new Error('targetSound is required');
+    if (!weakness.lastSeenAt) throw new Error('lastSeenAt is required');
+    if (!weakness.firstSeenAt) throw new Error('firstSeenAt is required');
 
-    // Validate required fields
-    if (!weakness.learnerId || !isValidUuid(weakness.learnerId)) {
-      throw new Error('Invalid learnerId');
-    }
-    if (!weakness.targetSound) {
-      throw new Error('targetSound is required');
-    }
-    if (!weakness.lastSeenAt) {
-      throw new Error('lastSeenAt is required');
-    }
-    if (!weakness.firstSeenAt) {
-      throw new Error('firstSeenAt is required');
-    }
-
-    await this.adapter.execute(
-      `INSERT INTO pronunciation_weaknesses (
-        id, learner_id, target_sound, word_examples, occurrence_count,
-        last_seen_at, first_seen_at, contexts, example_turn_ids,
-        origin_session_id, origin_turn_id, resolved, notes, evidence_log,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        weakness.learnerId,
-        weakness.targetSound,
-        JSON.stringify(weakness.wordExamples ?? []),
-        weakness.occurrenceCount ?? 1,
-        weakness.lastSeenAt,
-        weakness.firstSeenAt,
-        JSON.stringify(weakness.contexts ?? []),
-        JSON.stringify(weakness.exampleTurnIds ?? []),
-        weakness.originSessionId ?? null,
-        weakness.originTurnId ?? null,
-        weakness.resolved ? 1 : 0,
-        weakness.notes ?? null,
-        JSON.stringify(weakness.evidenceLog ?? []),
-        now,
-        now,
-      ],
-    );
-
-    const rows = await this.adapter.query(
-      `SELECT * FROM pronunciation_weaknesses WHERE id = ?`,
-      [id],
-    );
-
-    if (rows.length === 0) {
-      throw new Error('Failed to create pronunciation weakness');
+    try {
+      await this.adapter.execute(
+        `INSERT INTO pronunciation_weaknesses (
+          id, learner_id, target_sound, word_examples, occurrence_count,
+          last_seen_at, first_seen_at, contexts, example_turn_ids,
+          origin_session_id, origin_turn_id, resolved, notes, evidence_log,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          weakness.learnerId,
+          weakness.targetSound,
+          JSON.stringify(weakness.wordExamples ?? []),
+          weakness.occurrenceCount ?? 1,
+          weakness.lastSeenAt,
+          weakness.firstSeenAt,
+          JSON.stringify(weakness.contexts ?? []),
+          JSON.stringify(weakness.exampleTurnIds ?? []),
+          weakness.originSessionId ?? null,
+          weakness.originTurnId ?? null,
+          weakness.resolved ? 1 : 0,
+          weakness.notes ?? null,
+          JSON.stringify(weakness.evidenceLog ?? []),
+          now,
+          now,
+        ],
+      );
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        // Race: another instance inserted same logical identity. Return existing via observation path.
+        const existing = await this.adapter.query(
+          `SELECT * FROM pronunciation_weaknesses WHERE learner_id = ? AND target_sound = ?`,
+          [weakness.learnerId, weakness.targetSound],
+        );
+        if (existing.length > 0) return rowToPronunciationWeakness(existing[0]);
+      }
+      throw err;
     }
 
+    const rows = await this.adapter.query(`SELECT * FROM pronunciation_weaknesses WHERE id = ?`, [id]);
+    if (rows.length === 0) throw new Error('Failed to create pronunciation weakness');
     return rowToPronunciationWeakness(rows[0]);
   }
 
@@ -1127,85 +1061,43 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
     opts?: { resolved?: boolean; limit?: number },
   ): Promise<readonly PronunciationWeakness[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `SELECT * FROM pronunciation_weaknesses WHERE learner_id = ?`;
     const params: SqlParam[] = [learnerId];
-
     if (opts?.resolved !== undefined) {
       sql += ` AND resolved = ?`;
       params.push(opts.resolved ? 1 : 0);
     }
-
     sql += ` ORDER BY last_seen_at DESC`;
-
     if (opts?.limit !== undefined && opts.limit > 0) {
       sql += ` LIMIT ?`;
       params.push(opts.limit);
     }
-
     const rows = await this.adapter.query(sql, params);
     return rows.map(rowToPronunciationWeakness);
   }
 
   async markResolved(id: string, resolved: boolean): Promise<PronunciationWeakness> {
-    if (!isValidUuid(id)) {
-      throw new Error('Invalid pronunciation weakness id');
-    }
-
-    const existing = await this.adapter.query(
-      `SELECT * FROM pronunciation_weaknesses WHERE id = ?`,
-      [id],
-    );
-
-    if (existing.length === 0) {
-      throw new Error(`Pronunciation weakness not found: ${id}`);
-    }
-
+    if (!isValidUuid(id)) throw new Error('Invalid pronunciation weakness id');
+    const existing = await this.adapter.query(`SELECT * FROM pronunciation_weaknesses WHERE id = ?`, [id]);
+    if (existing.length === 0) throw new Error(`Pronunciation weakness not found: ${id}`);
     const previousUpdatedAt = existing[0].updated_at as string;
     const newUpdatedAt = generateMonotonicTimestamp(previousUpdatedAt);
-
     await this.adapter.execute(
       `UPDATE pronunciation_weaknesses SET resolved = ?, updated_at = ? WHERE id = ?`,
       [resolved ? 1 : 0, newUpdatedAt, id],
     );
-
-    const rows = await this.adapter.query(
-      `SELECT * FROM pronunciation_weaknesses WHERE id = ?`,
-      [id],
-    );
-
-    if (rows.length === 0) {
-      throw new Error('Pronunciation weakness disappeared after update');
-    }
-
+    const rows = await this.adapter.query(`SELECT * FROM pronunciation_weaknesses WHERE id = ?`, [id]);
+    if (rows.length === 0) throw new Error('Pronunciation weakness disappeared after update');
     return rowToPronunciationWeakness(rows[0]);
   }
 
-  /**
-   * Record one pronunciation observation under a stable identity.
-   * First observation creates the row; repeated observations increment
-   * occurrence data (dedup by learner + target_sound identity).
-   */
   async recordObservation(
     input: PronunciationObservationInput,
   ): Promise<PronunciationObservationRecord> {
-    if (!input.learnerId || !isValidUuid(input.learnerId)) {
-      throw new Error('Invalid learnerId');
-    }
-    if (!input.identity) {
-      throw new Error('identity is required');
-    }
+    if (!input.learnerId || !isValidUuid(input.learnerId)) throw new Error('Invalid learnerId');
+    if (!input.identity) throw new Error('identity is required');
+    if (!input.evidenceSource) throw new Error('evidenceSource is required');
 
-    const existingRows = await this.adapter.query(
-      `SELECT id FROM pronunciation_weaknesses WHERE learner_id = ? AND target_sound = ?`,
-      [input.learnerId, input.identity],
-    );
-
-    if (!input.evidenceSource) {
-      throw new Error('evidenceSource is required');
-    }
-
-    // Evidence entry for THIS occurrence (what/when/source — no scores).
     const evidenceEntry = {
       at: input.at,
       source: input.evidenceSource,
@@ -1213,80 +1105,132 @@ export class SQLitePronunciationRepository implements PronunciationRepository {
       ...(input.exampleText ? { observed: input.exampleText } : {}),
     };
 
+    // Try fast path: check existing
+    const existingRows = await this.adapter.query(
+      `SELECT id FROM pronunciation_weaknesses WHERE learner_id = ? AND target_sound = ?`,
+      [input.learnerId, input.identity],
+    );
+
     if (existingRows.length > 0) {
       const id = existingRows[0].id as string;
-      const current = rowToPronunciationWeakness(
-        (await this.adapter.query(`SELECT * FROM pronunciation_weaknesses WHERE id = ?`, [id]))[0],
-      );
+      const currentRows = await this.adapter.query(`SELECT * FROM pronunciation_weaknesses WHERE id = ?`, [id]);
+      if (currentRows.length === 0) {
+        // Race deleted, fall through to create
+      } else {
+        const current = rowToPronunciationWeakness(currentRows[0]);
+        const wordExamples = [
+          ...(input.exampleText ? [input.exampleText] : []),
+          ...current.wordExamples,
+        ].slice(0, 10);
+        const contexts = Array.from(
+          new Set([...(input.context ? [input.context] : []), ...current.contexts]),
+        ).slice(0, 10);
+        const evidenceLog = [...(current.evidenceLog ?? []), evidenceEntry].slice(-20);
 
-      // Keep the most recent examples/contexts, bounded.
-      const wordExamples = [
-        ...(input.exampleText ? [input.exampleText] : []),
-        ...current.wordExamples,
-     ].slice(0, 10);
-      const contexts = Array.from(
-        new Set([...(input.context ? [input.context] : []), ...current.contexts]),
-      ).slice(0, 10);
-      // Append (never reset) the evidence log, bounded to the most recent 20.
-      const evidenceLog = [...(current.evidenceLog ?? []), evidenceEntry].slice(-20);
+        try {
+          await this.adapter.transaction([
+            {
+              sql: `UPDATE pronunciation_weaknesses SET
+                occurrence_count = occurrence_count + 1,
+                last_seen_at = ?,
+                word_examples = ?,
+                contexts = ?,
+                evidence_log = ?,
+                updated_at = ?
+              WHERE id = ?`,
+              params: [
+                input.at,
+                JSON.stringify(wordExamples),
+                JSON.stringify(contexts),
+                JSON.stringify(evidenceLog),
+                input.at,
+                id,
+              ],
+            },
+          ]);
+        } catch (err) {
+          if (isUniqueViolation(err)) {
+            // Another writer raced, reload
+            const reloaded = await this.adapter.query(`SELECT * FROM pronunciation_weaknesses WHERE id = ?`, [id]);
+            if (reloaded.length > 0) {
+              return { weakness: rowToPronunciationWeakness(reloaded[0]), created: false };
+            }
+          } else {
+            throw err;
+          }
+        }
 
-      await this.adapter.execute(
-        `UPDATE pronunciation_weaknesses SET
-          occurrence_count = occurrence_count + 1,
-          last_seen_at = ?,
-          word_examples = ?,
-          contexts = ?,
-          evidence_log = ?,
-          updated_at = ?
-        WHERE id = ?`,
-        [
-          input.at,
-          JSON.stringify(wordExamples),
-          JSON.stringify(contexts),
-          JSON.stringify(evidenceLog),
-          input.at,
-          id,
-        ],
-      );
-
-      const updatedRows = await this.adapter.query(
-        `SELECT * FROM pronunciation_weaknesses WHERE id = ?`,
-        [id],
-      );
-      return { weakness: rowToPronunciationWeakness(updatedRows[0]), created: false };
+        const updatedRows = await this.adapter.query(`SELECT * FROM pronunciation_weaknesses WHERE id = ?`, [id]);
+        return { weakness: rowToPronunciationWeakness(updatedRows[0]), created: false };
+      }
     }
 
-    const created = await this.recordWeakness({
-      learnerId: input.learnerId,
-      targetSound: input.identity,
-      wordExamples: input.exampleText ? [input.exampleText] : [],
-      occurrenceCount: 1,
-      lastSeenAt: input.at,
-      firstSeenAt: input.at,
-      contexts: input.context ? [input.context] : [],
-      exampleTurnIds: [],
-      resolved: false,
-      notes: input.target,
-      evidenceLog: [evidenceEntry],
-    });
-    return { weakness: created, created: true };
+    // Try to create, handling race via unique constraint
+    try {
+      const created = await this.recordWeakness({
+        learnerId: input.learnerId,
+        targetSound: input.identity,
+        wordExamples: input.exampleText ? [input.exampleText] : [],
+        occurrenceCount: 1,
+        lastSeenAt: input.at,
+        firstSeenAt: input.at,
+        contexts: input.context ? [input.context] : [],
+        exampleTurnIds: [],
+        resolved: false,
+        notes: input.target,
+        evidenceLog: [evidenceEntry],
+      });
+      return { weakness: created, created: true };
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        // Race: another instance created same identity concurrently. Retry as update.
+        const racedRows = await this.adapter.query(
+          `SELECT id FROM pronunciation_weaknesses WHERE learner_id = ? AND target_sound = ?`,
+          [input.learnerId, input.identity],
+        );
+        if (racedRows.length > 0) {
+          const id = racedRows[0].id as string;
+          const currentRows = await this.adapter.query(`SELECT * FROM pronunciation_weaknesses WHERE id = ?`, [id]);
+          const current = rowToPronunciationWeakness(currentRows[0]);
+          const wordExamples = [
+            ...(input.exampleText ? [input.exampleText] : []),
+            ...current.wordExamples,
+          ].slice(0, 10);
+          const contexts = Array.from(
+            new Set([...(input.context ? [input.context] : []), ...current.contexts]),
+          ).slice(0, 10);
+          const evidenceLog = [...(current.evidenceLog ?? []), evidenceEntry].slice(-20);
+
+          await this.adapter.execute(
+            `UPDATE pronunciation_weaknesses SET
+              occurrence_count = occurrence_count + 1,
+              last_seen_at = ?,
+              word_examples = ?,
+              contexts = ?,
+              evidence_log = ?,
+              updated_at = ?
+            WHERE id = ?`,
+            [
+              input.at,
+              JSON.stringify(wordExamples),
+              JSON.stringify(contexts),
+              JSON.stringify(evidenceLog),
+              input.at,
+              id,
+            ],
+          );
+          const updatedRows = await this.adapter.query(`SELECT * FROM pronunciation_weaknesses WHERE id = ?`, [id]);
+          return { weakness: rowToPronunciationWeakness(updatedRows[0]), created: false };
+        }
+      }
+      throw err;
+    }
   }
 }
 
-/**
- * SQLiteWeaknessRepository
- *
- * Implements WeaknessRepository for learner weaknesses and strengths.
- * Includes persistence methods for upserting weaknesses/strengths and adding evidence.
- */
 export class SQLiteWeaknessRepository implements WeaknessRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
 
-  /**
-   * Exact lookup by (learnerId, type, referenceId). A single-row SELECT —
-   * immune to any list cap, so lifecycle identity can never be lost just
-   * because a learner has many weaknesses.
-   */
   async getWeaknessByReference(
     learnerId: string,
     type: LearnerWeakness['type'],
@@ -1305,30 +1249,24 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
 
   async listWeaknesses(learnerId: string, limit?: number): Promise<readonly LearnerWeakness[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `SELECT * FROM learner_weaknesses WHERE learner_id = ? ORDER BY last_seen_at DESC`;
     const params: SqlParam[] = [learnerId];
-
     if (limit !== undefined && limit > 0) {
       sql += ` LIMIT ?`;
       params.push(limit);
     }
-
     const rows = await this.adapter.query(sql, params);
     return rows.map(rowToLearnerWeakness);
   }
 
   async listStrengths(learnerId: string, limit?: number): Promise<readonly LearnerStrength[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `SELECT * FROM learner_strengths WHERE learner_id = ? ORDER BY last_seen_at DESC`;
     const params: SqlParam[] = [learnerId];
-
     if (limit !== undefined && limit > 0) {
       sql += ` LIMIT ?`;
       params.push(limit);
     }
-
     const rows = await this.adapter.query(sql, params);
     return rows.map(rowToLearnerStrength);
   }
@@ -1336,7 +1274,14 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
   async upsertWeakness(
     weakness: Omit<LearnerWeakness, 'id' | 'createdAt' | 'updatedAt'>,
   ): Promise<LearnerWeakness> {
-    // Check if a weakness with same learner_id, type, reference_id exists
+    if (!weakness.learnerId || !isValidUuid(weakness.learnerId)) throw new Error('Invalid learnerId');
+    if (!weakness.type) throw new Error('type is required');
+    if (!weakness.referenceId) throw new Error('referenceId is required');
+    if (!weakness.status) throw new Error('status is required');
+    if (weakness.severity === undefined || weakness.severity === null) throw new Error('severity is required');
+    if (!weakness.lastSeenAt) throw new Error('lastSeenAt is required');
+    if (!weakness.firstSeenAt) throw new Error('firstSeenAt is required');
+
     const existing = await this.adapter.query(
       `SELECT * FROM learner_weaknesses WHERE learner_id = ? AND type = ? AND reference_id = ?`,
       [weakness.learnerId, weakness.type, weakness.referenceId],
@@ -1345,90 +1290,81 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
     const now = nowIso();
 
     if (existing.length > 0) {
-      // Update existing
       const id = existing[0].id as string;
       const { sql, params } = buildLearnerWeaknessUpdate(id, weakness);
-      await this.adapter.execute(sql, params);
-
-      const rows = await this.adapter.query(
-        `SELECT * FROM learner_weaknesses WHERE id = ?`,
-        [id],
-      );
-
-      if (rows.length === 0) {
-        throw new Error('Weakness disappeared after update');
+      try {
+        await this.adapter.execute(sql, params);
+      } catch (err) {
+        if (isUniqueViolation(err)) {
+          // Race: another instance updated concurrently, reload
+          const reloaded = await this.adapter.query(`SELECT * FROM learner_weaknesses WHERE learner_id = ? AND type = ? AND reference_id = ?`, [weakness.learnerId, weakness.type, weakness.referenceId]);
+          if (reloaded.length > 0) return rowToLearnerWeakness(reloaded[0]);
+        }
+        throw err;
       }
-
+      const rows = await this.adapter.query(`SELECT * FROM learner_weaknesses WHERE id = ?`, [id]);
+      if (rows.length === 0) throw new Error('Weakness disappeared after update');
       return rowToLearnerWeakness(rows[0]);
     }
 
-    // Create new
     const id = generateId();
-
-    // Validate required fields
-    if (!weakness.learnerId || !isValidUuid(weakness.learnerId)) {
-      throw new Error('Invalid learnerId');
-    }
-    if (!weakness.type) {
-      throw new Error('type is required');
-    }
-    if (!weakness.referenceId) {
-      throw new Error('referenceId is required');
-    }
-    if (!weakness.status) {
-      throw new Error('status is required');
-    }
-    if (weakness.severity === undefined || weakness.severity === null) {
-      throw new Error('severity is required');
-    }
-    if (!weakness.lastSeenAt) {
-      throw new Error('lastSeenAt is required');
-    }
-    if (!weakness.firstSeenAt) {
-      throw new Error('firstSeenAt is required');
-    }
-
-    await this.adapter.execute(
-      `INSERT INTO learner_weaknesses (
-        id, learner_id, type, reference_id, status, severity,
-        occurrence_count, last_seen_at, first_seen_at, contexts,
-        evidence, notes, resolved, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        weakness.learnerId,
-        weakness.type,
-        weakness.referenceId,
-        weakness.status,
-        weakness.severity,
-        weakness.occurrenceCount ?? 1,
-        weakness.lastSeenAt,
-        weakness.firstSeenAt,
-        JSON.stringify(weakness.contexts ?? []),
-        JSON.stringify(weakness.evidence ?? []),
-        weakness.notes ?? null,
-        weakness.resolved ? 1 : 0,
-        now,
-        now,
-      ],
-    );
-
-    const rows = await this.adapter.query(
-      `SELECT * FROM learner_weaknesses WHERE id = ?`,
-      [id],
-    );
-
-    if (rows.length === 0) {
-      throw new Error('Failed to create learner weakness');
+    try {
+      await this.adapter.execute(
+        `INSERT INTO learner_weaknesses (
+          id, learner_id, type, reference_id, status, severity,
+          occurrence_count, last_seen_at, first_seen_at, contexts,
+          evidence, notes, resolved, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          weakness.learnerId,
+          weakness.type,
+          weakness.referenceId,
+          weakness.status,
+          weakness.severity,
+          weakness.occurrenceCount ?? 1,
+          weakness.lastSeenAt,
+          weakness.firstSeenAt,
+          JSON.stringify(weakness.contexts ?? []),
+          JSON.stringify(weakness.evidence ?? []),
+          weakness.notes ?? null,
+          weakness.resolved ? 1 : 0,
+          now,
+          now,
+        ],
+      );
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        const raced = await this.adapter.query(
+          `SELECT * FROM learner_weaknesses WHERE learner_id = ? AND type = ? AND reference_id = ?`,
+          [weakness.learnerId, weakness.type, weakness.referenceId],
+        );
+        if (raced.length > 0) {
+          const racedId = raced[0].id as string;
+          const { sql, params } = buildLearnerWeaknessUpdate(racedId, weakness);
+          await this.adapter.execute(sql, params);
+          const rows = await this.adapter.query(`SELECT * FROM learner_weaknesses WHERE id = ?`, [racedId]);
+          return rowToLearnerWeakness(rows[0]);
+        }
+      }
+      throw err;
     }
 
+    const rows = await this.adapter.query(`SELECT * FROM learner_weaknesses WHERE id = ?`, [id]);
+    if (rows.length === 0) throw new Error('Failed to create learner weakness');
     return rowToLearnerWeakness(rows[0]);
   }
 
   async upsertStrength(
     strength: Omit<LearnerStrength, 'id' | 'createdAt' | 'updatedAt'>,
   ): Promise<LearnerStrength> {
-    // Check if a strength with same learner_id, type, reference_id exists
+    if (!strength.learnerId || !isValidUuid(strength.learnerId)) throw new Error('Invalid learnerId');
+    if (!strength.type) throw new Error('type is required');
+    if (!strength.referenceId) throw new Error('referenceId is required');
+    if (strength.confidence === undefined || strength.confidence === null) throw new Error('confidence is required');
+    if (!strength.lastSeenAt) throw new Error('lastSeenAt is required');
+    if (!strength.firstSeenAt) throw new Error('firstSeenAt is required');
+
     const existing = await this.adapter.query(
       `SELECT * FROM learner_strengths WHERE learner_id = ? AND type = ? AND reference_id = ?`,
       [strength.learnerId, strength.type, strength.referenceId],
@@ -1437,103 +1373,75 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
     const now = nowIso();
 
     if (existing.length > 0) {
-      // Update existing
       const id = existing[0].id as string;
       const { sql, params } = buildLearnerStrengthUpdate(id, strength);
-      await this.adapter.execute(sql, params);
-
-      const rows = await this.adapter.query(
-        `SELECT * FROM learner_strengths WHERE id = ?`,
-        [id],
-      );
-
-      if (rows.length === 0) {
-        throw new Error('Strength disappeared after update');
+      try {
+        await this.adapter.execute(sql, params);
+      } catch (err) {
+        if (isUniqueViolation(err)) {
+          const reloaded = await this.adapter.query(`SELECT * FROM learner_strengths WHERE learner_id = ? AND type = ? AND reference_id = ?`, [strength.learnerId, strength.type, strength.referenceId]);
+          if (reloaded.length > 0) return rowToLearnerStrength(reloaded[0]);
+        }
+        throw err;
       }
-
+      const rows = await this.adapter.query(`SELECT * FROM learner_strengths WHERE id = ?`, [id]);
+      if (rows.length === 0) throw new Error('Strength disappeared after update');
       return rowToLearnerStrength(rows[0]);
     }
 
-    // Create new
     const id = generateId();
-
-    // Validate required fields
-    if (!strength.learnerId || !isValidUuid(strength.learnerId)) {
-      throw new Error('Invalid learnerId');
-    }
-    if (!strength.type) {
-      throw new Error('type is required');
-    }
-    if (!strength.referenceId) {
-      throw new Error('referenceId is required');
-    }
-    if (strength.confidence === undefined || strength.confidence === null) {
-      throw new Error('confidence is required');
-    }
-    if (!strength.lastSeenAt) {
-      throw new Error('lastSeenAt is required');
-    }
-    if (!strength.firstSeenAt) {
-      throw new Error('firstSeenAt is required');
-    }
-
-    await this.adapter.execute(
-      `INSERT INTO learner_strengths (
-        id, learner_id, type, reference_id, confidence,
-        last_seen_at, first_seen_at, contexts, evidence, notes,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        strength.learnerId,
-        strength.type,
-        strength.referenceId,
-        strength.confidence,
-        strength.lastSeenAt,
-        strength.firstSeenAt,
-        JSON.stringify(strength.contexts ?? []),
-        JSON.stringify(strength.evidence ?? []),
-        strength.notes ?? null,
-        now,
-        now,
-      ],
-    );
-
-    const rows = await this.adapter.query(
-      `SELECT * FROM learner_strengths WHERE id = ?`,
-      [id],
-    );
-
-    if (rows.length === 0) {
-      throw new Error('Failed to create learner strength');
+    try {
+      await this.adapter.execute(
+        `INSERT INTO learner_strengths (
+          id, learner_id, type, reference_id, confidence,
+          last_seen_at, first_seen_at, contexts, evidence, notes,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          strength.learnerId,
+          strength.type,
+          strength.referenceId,
+          strength.confidence,
+          strength.lastSeenAt,
+          strength.firstSeenAt,
+          JSON.stringify(strength.contexts ?? []),
+          JSON.stringify(strength.evidence ?? []),
+          strength.notes ?? null,
+          now,
+          now,
+        ],
+      );
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        const raced = await this.adapter.query(
+          `SELECT * FROM learner_strengths WHERE learner_id = ? AND type = ? AND reference_id = ?`,
+          [strength.learnerId, strength.type, strength.referenceId],
+        );
+        if (raced.length > 0) {
+          const racedId = raced[0].id as string;
+          const { sql, params } = buildLearnerStrengthUpdate(racedId, strength);
+          await this.adapter.execute(sql, params);
+          const rows = await this.adapter.query(`SELECT * FROM learner_strengths WHERE id = ?`, [racedId]);
+          return rowToLearnerStrength(rows[0]);
+        }
+      }
+      throw err;
     }
 
+    const rows = await this.adapter.query(`SELECT * FROM learner_strengths WHERE id = ?`, [id]);
+    if (rows.length === 0) throw new Error('Failed to create learner strength');
     return rowToLearnerStrength(rows[0]);
   }
 
   async addWeaknessEvidence(evidence: Omit<EvidenceRef, 'kind'> & { weaknessId: string; kind: EvidenceRef['kind'] }): Promise<void> {
-    if (!isValidUuid(evidence.weaknessId)) {
-      throw new Error('Invalid weaknessId');
-    }
-    if (!isValidUuid(evidence.id)) {
-      throw new Error('Invalid evidence id');
-    }
-    if (!evidence.kind) {
-      throw new Error('kind is required');
-    }
-    if (!evidence.at) {
-      throw new Error('at is required');
-    }
+    if (!isValidUuid(evidence.weaknessId)) throw new Error('Invalid weaknessId');
+    if (!isValidUuid(evidence.id)) throw new Error('Invalid evidence id');
+    if (!evidence.kind) throw new Error('kind is required');
+    if (!evidence.at) throw new Error('at is required');
 
-    // Verify weakness exists
-    const existing = await this.adapter.query(
-      `SELECT id FROM learner_weaknesses WHERE id = ?`,
-      [evidence.weaknessId],
-    );
-
-    if (existing.length === 0) {
-      throw new Error(`Weakness not found: ${evidence.weaknessId}`);
-    }
+    const existing = await this.adapter.query(`SELECT id FROM learner_weaknesses WHERE id = ?`, [evidence.weaknessId]);
+    if (existing.length === 0) throw new Error(`Weakness not found: ${evidence.weaknessId}`);
 
     await this.adapter.execute(
       `INSERT INTO weakness_evidence (id, weakness_id, kind, ref_id, at, summary)
@@ -1542,25 +1450,20 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
         evidence.id,
         evidence.weaknessId,
         evidence.kind,
-        evidence.id, // ref_id uses the same id as evidence id
+        evidence.id,
         evidence.at,
         evidence.summary ?? null,
       ],
     );
   }
 
-  /** Exact unresolved-weakness counts grouped by persisted lifecycle state. */
   async getUnresolvedStatusCounts(learnerId: string): Promise<WeaknessStatusCounts> {
-    if (!isValidUuid(learnerId)) {
-      return { unresolved: 0, byStatus: {} };
-    }
-
+    if (!isValidUuid(learnerId)) return { unresolved: 0, byStatus: {} };
     const rows = await this.adapter.query(
       `SELECT status, COUNT(*) AS c FROM learner_weaknesses
        WHERE learner_id = ? AND resolved = 0 GROUP BY status`,
       [learnerId],
     );
-
     const byStatus: Partial<Record<WeaknessStatus, number>> = {};
     let unresolved = 0;
     for (const row of rows) {
@@ -1572,13 +1475,11 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
     return { unresolved, byStatus };
   }
 
-  /** Exact count of unresolved weaknesses first seen in an optional range. */
   async countUnresolved(
     learnerId: string,
     opts?: { firstSeenAfter?: string; firstSeenUntil?: string },
   ): Promise<number> {
     if (!isValidUuid(learnerId)) return 0;
-
     let sql = `SELECT COUNT(*) AS c FROM learner_weaknesses WHERE learner_id = ? AND resolved = 0`;
     const params: SqlParam[] = [learnerId];
     if (opts?.firstSeenAfter !== undefined) {
@@ -1593,13 +1494,11 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
     return Number(rows[0]?.c ?? 0);
   }
 
-  /** Exact count of persisted weakness-evidence rows in an optional range. */
   async countEvidence(
     learnerId: string,
     opts?: { atAfter?: string; atUntil?: string },
   ): Promise<number> {
     if (!isValidUuid(learnerId)) return 0;
-
     let sql = `SELECT COUNT(*) AS c
       FROM weakness_evidence e
       INNER JOIN learner_weaknesses w ON e.weakness_id = w.id
@@ -1618,7 +1517,6 @@ export class SQLiteWeaknessRepository implements WeaknessRepository {
   }
 }
 
-/** Map lexical_items row to VocabularyItem domain object (without meanings). */
 function rowToVocabularyItem(row: SqlRow): Omit<VocabularyItem, 'meanings'> {
   return {
     id: row.id as string,
@@ -1641,7 +1539,6 @@ function rowToVocabularyItem(row: SqlRow): Omit<VocabularyItem, 'meanings'> {
   };
 }
 
-/** Map lexical_meanings row to Meaning domain object. */
 function rowToMeaning(row: SqlRow): Meaning {
   const reviewState = row.review_state as MasteryState | undefined;
   const review: ReviewSchedule | undefined = reviewState
@@ -1666,18 +1563,15 @@ function rowToMeaning(row: SqlRow): Meaning {
   };
 }
 
-/** Map DB source to domain ExampleSource. */
 function dbSourceToDomain(source: string): ExampleSource {
-  // DB stores the same canonical values as domain
   return source as ExampleSource;
 }
 
-/** Map domain ExampleSource to DB source. */
 function domainSourceToDb(source: ExampleSource): string {
   return source;
 }
 
-/** Insert examples for a meaning into lexical_examples table. */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- retained for potential reuse, current impl uses inline inserts
 async function insertExamplesForMeaning(
   adapter: DatabaseAdapter,
   lexicalItemId: string,
@@ -1708,7 +1602,6 @@ async function insertExamplesForMeaning(
   }
 }
 
-/** Fetch examples for a meaning from lexical_examples table. */
 async function fetchExamplesForMeaning(
   adapter: DatabaseAdapter,
   meaningId: string,
@@ -1717,7 +1610,6 @@ async function fetchExamplesForMeaning(
     `SELECT * FROM lexical_examples WHERE meaning_id = ? ORDER BY created_at`,
     [meaningId],
   );
-
   return rows.map((row) => ({
     text: row.text as string,
     translation: (row.translation as string) ?? undefined,
@@ -1730,71 +1622,51 @@ async function fetchExamplesForMeaning(
 }
 
 /**
- * Delete a lexical item (vocabulary word or expression) and all dependent
- * rows. Children are deleted explicitly so correctness does not depend on
- * PRAGMA foreign_keys being enabled. Existence is checked up front so the
- * boolean result is reliable across backends regardless of how each
- * adapter reports rowsAffected for DELETE. Returns true when the item
- * row existed.
+ * Delete a lexical item and all dependent rows atomically.
  */
 async function deleteLexicalItemCompletely(
   adapter: DatabaseAdapter,
   id: string,
 ): Promise<boolean> {
   if (!isValidUuid(id)) return false;
-
-  const existing = await adapter.query(
-    `SELECT id FROM lexical_items WHERE id = ?`,
-    [id],
-  );
+  const existing = await adapter.query(`SELECT id FROM lexical_items WHERE id = ?`, [id]);
   if (existing.length === 0) return false;
 
-  await adapter.execute(
-    `DELETE FROM lexical_examples WHERE lexical_item_id = ?`,
-    [id],
-  );
-  await adapter.execute(
-    `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
-    [id],
-  );
-  await adapter.execute(
-    `DELETE FROM lexical_items WHERE id = ?`,
-    [id],
-  );
+  await adapter.transaction([
+    { sql: `DELETE FROM lexical_examples WHERE lexical_item_id = ?`, params: [id] },
+    { sql: `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`, params: [id] },
+    { sql: `DELETE FROM lexical_items WHERE id = ?`, params: [id] },
+  ]);
   return true;
 }
 
 /**
- * Replace all meanings of a lexical item with the provided list.
- * Per-meaning review data is whatever the caller supplies; callers that
- * loaded the item first naturally preserve review history.
+ * Replace all meanings of a lexical item atomically, preserving orphan integrity.
  */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- retained for atomic rewrite reference
 async function replaceLexicalMeanings(
   adapter: DatabaseAdapter,
   lexicalItemId: string,
   meanings: readonly Meaning[],
   now: string,
 ): Promise<void> {
-  await adapter.execute(
-    `DELETE FROM lexical_examples WHERE lexical_item_id = ?`,
-    [lexicalItemId],
-  );
-  await adapter.execute(
-    `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
-    [lexicalItemId],
-  );
+  const steps: { sql: string; params: SqlParam[] }[] = [];
+
+  // Delete examples and meanings for this item in same transaction
+  steps.push({ sql: `DELETE FROM lexical_examples WHERE lexical_item_id = ?`, params: [lexicalItemId] });
+  steps.push({ sql: `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`, params: [lexicalItemId] });
 
   for (const meaning of meanings) {
     const meaningId = generateId();
-    await adapter.execute(
-      `INSERT INTO lexical_meanings (
+    steps.push({
+      sql: `INSERT INTO lexical_meanings (
         id, lexical_item_id, definition, part_of_speech, examples,
         usage_notes, register, domain,
         review_state, review_last_review_at, review_next_review_at,
         review_review_count, review_consecutive_correct, review_ease_factor,
         review_mastered_at, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
+      params: [
         meaningId,
         lexicalItemId,
         meaning.definition,
@@ -1809,58 +1681,60 @@ async function replaceLexicalMeanings(
         meaning.review?.reviewCount ?? 0,
         meaning.review?.consecutiveCorrect ?? 0,
         meaning.review?.easeFactor ?? null,
-        meaning.review?.masteredAt ?? null,
+        (meaning.review as any)?.masteredAt ?? null,
         now,
         now,
       ],
-    );
+    });
 
     if (meaning.examples && meaning.examples.length > 0) {
-      await insertExamplesForMeaning(adapter, lexicalItemId, meaningId, meaning.examples, now);
+      for (const example of meaning.examples) {
+        const exampleId = generateId();
+        steps.push({
+          sql: `INSERT INTO lexical_examples (
+            id, lexical_item_id, meaning_id, text, translation, context,
+            source, origin_conversation_id, origin_turn_id, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
+            exampleId,
+            lexicalItemId,
+            meaningId,
+            example.text,
+            example.translation ?? null,
+            example.context ?? null,
+            domainSourceToDb(example.source),
+            example.originConversationId ?? null,
+            example.originTurnId ?? null,
+            example.createdAt ?? now,
+          ],
+        });
+      }
     }
   }
+
+  await adapter.transaction(steps);
 }
 
-/**
- * Atomically delete a lexical item together with every review row that
- * points at it (same referenceId + same kind only), including the dependent
- * review_history rows. All deletes run in ONE adapter transaction: if any
- * step fails, the adapter rolls everything back and the lexical item, its
- * review items, and their history all remain exactly as before.
- *
- * Unrelated reviews (other referenceIds or other kinds — grammar,
- * weakness, pronunciation, other lexical items) are never touched.
- *
- * Returns true when the lexical item existed and was deleted; returns
- * false (without touching anything) when it did not exist.
- */
 async function deleteLexicalItemWithReviews(
   adapter: DatabaseAdapter,
   lexicalItemId: string,
   kind: 'vocabulary' | 'expression',
 ): Promise<boolean> {
   if (!isValidUuid(lexicalItemId)) return false;
-
-  const existing = await adapter.query(
-    `SELECT id FROM lexical_items WHERE id = ?`,
-    [lexicalItemId],
-  );
+  const existing = await adapter.query(`SELECT id FROM lexical_items WHERE id = ?`, [lexicalItemId]);
   if (existing.length === 0) return false;
 
   await adapter.transaction([
-    // Review history of the matching review rows first.
     {
       sql: `DELETE FROM review_history WHERE review_item_id IN (
         SELECT id FROM review_items WHERE reference_id = ? AND kind = ?
       )`,
       params: [lexicalItemId, kind],
     },
-    // The review rows themselves — same referenceId AND same kind only.
     {
       sql: `DELETE FROM review_items WHERE reference_id = ? AND kind = ?`,
       params: [lexicalItemId, kind],
     },
-    // Then the lexical item and its children.
     {
       sql: `DELETE FROM lexical_examples WHERE lexical_item_id = ?`,
       params: [lexicalItemId],
@@ -1878,16 +1752,6 @@ async function deleteLexicalItemWithReviews(
   return true;
 }
 
-/**
- * Exact review-bucket counts for lexical rows of the given types (or all
- * types when null), computed fully in SQL from the authoritative
- * per-meaning review columns. Bucket semantics match the shared
- * deriveReviewBucket helper in vocabulary-workspace:
- *   due      — any meaning with nextReviewAt <= now
- *   mastered — not due, >=1 reviewed meaning, all reviewed mastered/retired
- *   familiar — not due, >=1 reviewed meaning, all reviewed familiar or better
- *   learning — everything else (includes never-reviewed items)
- */
 async function lexicalBucketCounts(
   adapter: DatabaseAdapter,
   learnerId: string,
@@ -1897,7 +1761,6 @@ async function lexicalBucketCounts(
   if (!isValidUuid(learnerId)) {
     return { total: 0, due: 0, learning: 0, familiar: 0, mastered: 0 };
   }
-
   const typeFilter = types && types.length > 0
     ? ` AND li.type IN (${types.map(() => '?').join(', ')})`
     : '';
@@ -1936,7 +1799,6 @@ async function lexicalBucketCounts(
   };
 }
 
-/** Exact count of lexical rows created in an optional range (optionally by type). */
 async function countLexicalCreated(
   adapter: DatabaseAdapter,
   learnerId: string,
@@ -1944,7 +1806,6 @@ async function countLexicalCreated(
   opts?: { createdAfter?: string; createdUntil?: string },
 ): Promise<number> {
   if (!isValidUuid(learnerId)) return 0;
-
   let sql = `SELECT COUNT(*) AS c FROM lexical_items WHERE learner_id = ?`;
   const params: SqlParam[] = [learnerId];
   if (opts?.createdAfter !== undefined) {
@@ -1959,19 +1820,16 @@ async function countLexicalCreated(
     sql += ` AND type IN (${types.map(() => '?').join(', ')})`;
     params.push(...types);
   }
-
   const rows = await adapter.query(sql, params);
   return Number(rows[0]?.c ?? 0);
 }
 
-/** Build partial UPDATE SQL and params for a lexical item. */
 function buildLexicalItemUpdate(
   id: string,
   patch: Partial<Omit<VocabularyItem, 'id' | 'createdAt' | 'meanings'>>,
 ): { sql: string; params: SqlParam[] } {
   const fields: string[] = [];
   const params: SqlParam[] = [];
-
   const fieldMap: Record<string, string> = {
     learnerId: 'learner_id',
     headword: 'headword',
@@ -1983,7 +1841,6 @@ function buildLexicalItemUpdate(
     source: 'source',
     tags: 'tags',
   };
-
   for (const [key, column] of Object.entries(fieldMap)) {
     const value = patch[key as keyof typeof patch];
     if (value !== undefined) {
@@ -1995,20 +1852,15 @@ function buildLexicalItemUpdate(
       }
     }
   }
-
   fields.push('updated_at = ?');
   params.push(nowIso());
   params.push(id);
-
   const sql = `UPDATE lexical_items SET ${fields.join(', ')} WHERE id = ?`;
   return { sql, params };
 }
 
 /**
- * SQLiteVocabularyRepository
- *
- * Implements VocabularyRepository for lexical_items + lexical_meanings.
- * Uses transactions for atomic upsert across both tables.
+ * SQLiteVocabularyRepository with atomic rewrites and SRS preservation
  */
 export class SQLiteVocabularyRepository implements VocabularyRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
@@ -2016,7 +1868,12 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
   async upsert(
     item: Omit<VocabularyItem, 'id' | 'createdAt' | 'updatedAt'>,
   ): Promise<VocabularyItem> {
-    // Check if an item with same learner_id, headword, type exists
+    if (!item.learnerId || !isValidUuid(item.learnerId)) throw new Error('Invalid learnerId');
+    if (!item.headword) throw new Error('headword is required');
+    if (!item.type) throw new Error('type is required');
+    if (!item.source) throw new Error('source is required');
+
+    // Exact identity lookup – never capped list
     const existing = await this.adapter.query(
       `SELECT * FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ?`,
       [item.learnerId, item.headword, item.type],
@@ -2024,30 +1881,299 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
 
     const now = nowIso();
 
-    if (existing.length > 0) {
-      // Update existing item
-      const id = existing[0].id as string;
-      const { sql, params } = buildLexicalItemUpdate(id, item);
-      await this.adapter.execute(sql, params);
+    if (existing.length === 0) {
+      // New item – insert atomically
+      const id = generateId();
+      const steps: { sql: string; params: SqlParam[] }[] = [
+        {
+          sql: `INSERT INTO lexical_items (
+            id, learner_id, headword, type, pronunciation, synonyms,
+            antonyms, related_expressions, source, tags, created_at, updated_at, singleton
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+          ON CONFLICT(learner_id, headword, type) DO NOTHING`,
+          params: [
+            id,
+            item.learnerId,
+            item.headword,
+            item.type,
+            JSON.stringify(item.pronunciation ?? {}),
+            JSON.stringify(item.synonyms ?? []),
+            JSON.stringify(item.antonyms ?? []),
+            JSON.stringify(item.relatedExpressions ?? []),
+            JSON.stringify(item.source),
+            JSON.stringify(item.tags ?? []),
+            now,
+            now,
+          ],
+        },
+      ];
 
-      // Update meanings: delete existing and insert new ones
-      await this.adapter.execute(
-        `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
-        [id],
+      // Fallback for pre-v6 DB without singleton column or without unique index
+      // We'll try with singleton, and if fails due to no column, retry without.
+      // For simplicity, attempt transaction with fallback handling outside.
+
+      try {
+        // Try with singleton column
+        await this.adapter.transaction(steps);
+      } catch (err) {
+        const msg = String((err as Error).message).toLowerCase();
+        if (msg.includes('no column') && msg.includes('singleton')) {
+          // Retry without singleton
+          const fallbackSteps = [
+            {
+              sql: `INSERT INTO lexical_items (
+                id, learner_id, headword, type, pronunciation, synonyms,
+                antonyms, related_expressions, source, tags, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(learner_id, headword, type) DO NOTHING`,
+              params: [
+                id,
+                item.learnerId,
+                item.headword,
+                item.type,
+                JSON.stringify(item.pronunciation ?? {}),
+                JSON.stringify(item.synonyms ?? []),
+                JSON.stringify(item.antonyms ?? []),
+                JSON.stringify(item.relatedExpressions ?? []),
+                JSON.stringify(item.source),
+                JSON.stringify(item.tags ?? []),
+                now,
+                now,
+              ],
+            },
+          ];
+          try {
+            await this.adapter.transaction(fallbackSteps);
+          } catch (inner) {
+            if (isUniqueViolation(inner)) {
+              // Race: another instance inserted same identity, fall through to existing path
+              const raced = await this.adapter.query(
+                `SELECT * FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ?`,
+                [item.learnerId, item.headword, item.type],
+              );
+              if (raced.length > 0) {
+                return this.upsertExisting(raced[0].id as string, item, now);
+              }
+            }
+            throw inner;
+          }
+        } else if (isUniqueViolation(err)) {
+          const raced = await this.adapter.query(
+            `SELECT * FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ?`,
+            [item.learnerId, item.headword, item.type],
+          );
+          if (raced.length > 0) {
+            return this.upsertExisting(raced[0].id as string, item, now);
+          }
+          throw err;
+        } else {
+          throw err;
+        }
+      }
+
+      // Check if insert actually happened (ON CONFLICT DO NOTHING may have done nothing)
+      const check = await this.adapter.query(
+        `SELECT id FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ?`,
+        [item.learnerId, item.headword, item.type],
       );
+      const finalId = check.length > 0 ? (check[0].id as string) : id;
 
-      // Insert new meanings
+      // If this was a race and we got existing id different from our generated one,
+      // we need to treat as existing item preservation
+      if (finalId !== id) {
+        return this.upsertExisting(finalId, item, now);
+      }
+
+      // Insert meanings and examples atomically
+      const meaningSteps: { sql: string; params: SqlParam[] }[] = [];
       for (const meaning of item.meanings) {
         const meaningId = generateId();
-        await this.adapter.execute(
-          `INSERT INTO lexical_meanings (
+        meaningSteps.push({
+          sql: `INSERT INTO lexical_meanings (
             id, lexical_item_id, definition, part_of_speech, examples,
             usage_notes, register, domain,
             review_state, review_last_review_at, review_next_review_at,
             review_review_count, review_consecutive_correct, review_ease_factor,
             review_mastered_at, created_at, updated_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
+          params: [
+            meaningId,
+            finalId,
+            meaning.definition,
+            meaning.partOfSpeech ?? null,
+            JSON.stringify(meaning.examples ?? []),
+            JSON.stringify(meaning.usageNotes ?? []),
+            meaning.register ?? null,
+            meaning.domain ?? null,
+            meaning.review?.state ?? 'new',
+            meaning.review?.lastReviewAt ?? null,
+            meaning.review?.nextReviewAt ?? null,
+            meaning.review?.reviewCount ?? 0,
+            meaning.review?.consecutiveCorrect ?? 0,
+            meaning.review?.easeFactor ?? null,
+            (meaning.review as any)?.masteredAt ?? null,
+            now,
+            now,
+          ],
+        });
+
+        if (meaning.examples && meaning.examples.length > 0) {
+          for (const ex of meaning.examples) {
+            const exId = generateId();
+            meaningSteps.push({
+              sql: `INSERT INTO lexical_examples (
+                id, lexical_item_id, meaning_id, text, translation, context,
+                source, origin_conversation_id, origin_turn_id, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              params: [
+                exId,
+                finalId,
+                meaningId,
+                ex.text,
+                ex.translation ?? null,
+                ex.context ?? null,
+                domainSourceToDb(ex.source),
+                ex.originConversationId ?? null,
+                ex.originTurnId ?? null,
+                ex.createdAt ?? now,
+              ],
+            });
+          }
+        }
+      }
+
+      if (meaningSteps.length > 0) {
+        await this.adapter.transaction(meaningSteps);
+      }
+
+      return this.getFullItem(finalId);
+    }
+
+    // Existing item – preserve SRS history
+    const id = existing[0].id as string;
+    return this.upsertExisting(id, item, now);
+  }
+
+  private async upsertExisting(
+    id: string,
+    item: Omit<VocabularyItem, 'id' | 'createdAt' | 'updatedAt'>,
+    now: string,
+  ): Promise<VocabularyItem> {
+    // Load existing meanings to preserve SRS
+    const existingMeaningRows = await this.adapter.query(
+      `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
+      [id],
+    );
+
+    const existingByDef = new Map<string, SqlRow>();
+    for (const row of existingMeaningRows) {
+      const def = row.definition as string;
+      existingByDef.set(normalizeDef(def), row);
+    }
+
+    const steps: { sql: string; params: SqlParam[] }[] = [];
+
+    // Update lexical_items non-SRS fields (preserve created_at, update updated_at)
+    const { sql, params } = buildLexicalItemUpdate(id, item);
+    steps.push({ sql, params });
+
+    // For each incoming meaning, if definition matches existing, preserve its review
+    // Otherwise insert as new. We KEEP existing meanings that are not in incoming list
+    // to avoid data loss on re-observation.
+    const incomingDefs = new Set<string>();
+    for (const meaning of item.meanings) {
+      const norm = normalizeDef(meaning.definition);
+      incomingDefs.add(norm);
+      const existingRow = existingByDef.get(norm);
+
+      if (existingRow) {
+        // Preserve existing review fields
+        const existingReviewState = existingRow.review_state as string;
+        const existingLast = existingRow.review_last_review_at as string | null;
+        const existingNext = existingRow.review_next_review_at as string | null;
+        const existingCount = existingRow.review_review_count as number;
+        const existingConsec = existingRow.review_consecutive_correct as number;
+        const existingEase = existingRow.review_ease_factor as number | null;
+        const existingMastered = existingRow.review_mastered_at as string | null;
+
+        steps.push({
+          sql: `UPDATE lexical_meanings SET
+            definition = ?,
+            part_of_speech = ?,
+            examples = ?,
+            usage_notes = ?,
+            register = ?,
+            domain = ?,
+            review_state = ?,
+            review_last_review_at = ?,
+            review_next_review_at = ?,
+            review_review_count = ?,
+            review_consecutive_correct = ?,
+            review_ease_factor = ?,
+            review_mastered_at = ?,
+            updated_at = ?
+          WHERE id = ?`,
+          params: [
+            meaning.definition,
+            meaning.partOfSpeech ?? (existingRow.part_of_speech as string | null),
+            JSON.stringify(meaning.examples ?? safeJsonParse(existingRow.examples, [])),
+            JSON.stringify(meaning.usageNotes ?? safeJsonParse(existingRow.usage_notes, [])),
+            meaning.register ?? (existingRow.register as string | null),
+            meaning.domain ?? (existingRow.domain as string | null),
+            existingReviewState ?? meaning.review?.state ?? 'new',
+            existingLast ?? meaning.review?.lastReviewAt ?? null,
+            existingNext ?? meaning.review?.nextReviewAt ?? null,
+            existingCount ?? meaning.review?.reviewCount ?? 0,
+            existingConsec ?? meaning.review?.consecutiveCorrect ?? 0,
+            existingEase ?? meaning.review?.easeFactor ?? null,
+            existingMastered ?? (meaning.review as any)?.masteredAt ?? null,
+            now,
+            existingRow.id as string,
+          ],
+        });
+
+        // Handle examples: delete old examples for this meaning and re-insert
+        // We do delete + insert in same transaction to prevent orphan and ensure consistency
+        steps.push({
+          sql: `DELETE FROM lexical_examples WHERE meaning_id = ?`,
+          params: [existingRow.id as string],
+        });
+
+        const examplesToInsert = meaning.examples && meaning.examples.length > 0 ? meaning.examples : safeJsonParse(existingRow.examples, []);
+        for (const ex of examplesToInsert) {
+          const exId = generateId();
+          const exObj = typeof ex === 'string' ? { text: ex, source: 'manual' as ExampleSource } : ex;
+          steps.push({
+            sql: `INSERT INTO lexical_examples (
+              id, lexical_item_id, meaning_id, text, translation, context,
+              source, origin_conversation_id, origin_turn_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              exId,
+              id,
+              existingRow.id as string,
+              (exObj as UsageExample).text,
+              (exObj as UsageExample).translation ?? null,
+              (exObj as UsageExample).context ?? null,
+              domainSourceToDb((exObj as UsageExample).source ?? 'manual'),
+              (exObj as UsageExample).originConversationId ?? null,
+              (exObj as UsageExample).originTurnId ?? null,
+              (exObj as UsageExample).createdAt ?? now,
+            ],
+          });
+        }
+      } else {
+        // New meaning – insert with its review (new or provided)
+        const meaningId = generateId();
+        steps.push({
+          sql: `INSERT INTO lexical_meanings (
+            id, lexical_item_id, definition, part_of_speech, examples,
+            usage_notes, register, domain,
+            review_state, review_last_review_at, review_next_review_at,
+            review_review_count, review_consecutive_correct, review_ease_factor,
+            review_mastered_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
             meaningId,
             id,
             meaning.definition,
@@ -2062,126 +2188,52 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
             meaning.review?.reviewCount ?? 0,
             meaning.review?.consecutiveCorrect ?? 0,
             meaning.review?.easeFactor ?? null,
-            meaning.review?.masteredAt ?? null,
+            (meaning.review as any)?.masteredAt ?? null,
             now,
             now,
           ],
-        );
+        });
 
-        // Insert examples for this meaning
         if (meaning.examples && meaning.examples.length > 0) {
-          await insertExamplesForMeaning(this.adapter, id, meaningId, meaning.examples, now);
+          for (const ex of meaning.examples) {
+            const exId = generateId();
+            steps.push({
+              sql: `INSERT INTO lexical_examples (
+                id, lexical_item_id, meaning_id, text, translation, context,
+                source, origin_conversation_id, origin_turn_id, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              params: [
+                exId,
+                id,
+                meaningId,
+                ex.text,
+                ex.translation ?? null,
+                ex.context ?? null,
+                domainSourceToDb(ex.source),
+                ex.originConversationId ?? null,
+                ex.originTurnId ?? null,
+                ex.createdAt ?? now,
+              ],
+            });
+          }
         }
       }
-
-      const rows = await this.adapter.query(
-        `SELECT * FROM lexical_items WHERE id = ?`,
-        [id],
-      );
-
-      if (rows.length === 0) {
-        throw new Error('Vocabulary item disappeared after update');
-      }
-
-      return this.getFullItem(id);
     }
 
-    // Create new item
-    const id = generateId();
+    // Existing meanings not in incoming list are kept as-is (no deletion) to preserve SRS
 
-    // Validate required fields
-    if (!item.learnerId || !isValidUuid(item.learnerId)) {
-      throw new Error('Invalid learnerId');
-    }
-    if (!item.headword) {
-      throw new Error('headword is required');
-    }
-    if (!item.type) {
-      throw new Error('type is required');
-    }
-    if (!item.source) {
-      throw new Error('source is required');
-    }
-
-    await this.adapter.execute(
-      `INSERT INTO lexical_items (
-        id, learner_id, headword, type, pronunciation, synonyms,
-        antonyms, related_expressions, source, tags, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        item.learnerId,
-        item.headword,
-        item.type,
-        JSON.stringify(item.pronunciation ?? {}),
-        JSON.stringify(item.synonyms ?? []),
-        JSON.stringify(item.antonyms ?? []),
-        JSON.stringify(item.relatedExpressions ?? []),
-        JSON.stringify(item.source),
-        JSON.stringify(item.tags ?? []),
-        now,
-        now,
-      ],
-    );
-
-    // Insert meanings
-    for (const meaning of item.meanings) {
-      const meaningId = generateId();
-      await this.adapter.execute(
-        `INSERT INTO lexical_meanings (
-          id, lexical_item_id, definition, part_of_speech, examples,
-          usage_notes, register, domain,
-          review_state, review_last_review_at, review_next_review_at,
-          review_review_count, review_consecutive_correct, review_ease_factor,
-          review_mastered_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          meaningId,
-          id,
-          meaning.definition,
-          meaning.partOfSpeech ?? null,
-          JSON.stringify(meaning.examples ?? []),
-          JSON.stringify(meaning.usageNotes ?? []),
-          meaning.register ?? null,
-          meaning.domain ?? null,
-          meaning.review?.state ?? 'new',
-          meaning.review?.lastReviewAt ?? null,
-          meaning.review?.nextReviewAt ?? null,
-          meaning.review?.reviewCount ?? 0,
-          meaning.review?.consecutiveCorrect ?? 0,
-          meaning.review?.easeFactor ?? null,
-          meaning.review?.masteredAt ?? null,
-          now,
-          now,
-        ],
-      );
-
-      // Insert examples for this meaning
-      if (meaning.examples && meaning.examples.length > 0) {
-        await insertExamplesForMeaning(this.adapter, id, meaningId, meaning.examples, now);
-      }
-    }
-
+    await this.adapter.transaction(steps);
     return this.getFullItem(id);
   }
 
   private async getFullItem(id: string): Promise<VocabularyItem> {
-    const itemRows = await this.adapter.query(
-      `SELECT * FROM lexical_items WHERE id = ?`,
-      [id],
-    );
-
-    if (itemRows.length === 0) {
-      throw new Error('Vocabulary item not found after upsert');
-    }
-
+    const itemRows = await this.adapter.query(`SELECT * FROM lexical_items WHERE id = ?`, [id]);
+    if (itemRows.length === 0) throw new Error('Vocabulary item not found after upsert');
     const item = rowToVocabularyItem(itemRows[0]);
-
     const meaningRows = await this.adapter.query(
       `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
       [id],
     );
-
     const meanings: Meaning[] = [];
     for (const meaningRow of meaningRows) {
       const meaning = rowToMeaning(meaningRow);
@@ -2193,30 +2245,18 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
         meanings.push(meaning);
       }
     }
-
-    return {
-      ...item,
-      meanings,
-    };
+    return { ...item, meanings };
   }
 
   async get(id: string): Promise<VocabularyItem | null> {
     if (!isValidUuid(id)) return null;
-
-    const itemRows = await this.adapter.query(
-      `SELECT * FROM lexical_items WHERE id = ?`,
-      [id],
-    );
-
+    const itemRows = await this.adapter.query(`SELECT * FROM lexical_items WHERE id = ?`, [id]);
     if (itemRows.length === 0) return null;
-
     const item = rowToVocabularyItem(itemRows[0]);
-
     const meaningRows = await this.adapter.query(
       `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
       [id],
     );
-
     const meanings: Meaning[] = [];
     for (const meaningRow of meaningRows) {
       const meaning = rowToMeaning(meaningRow);
@@ -2228,11 +2268,21 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
         meanings.push(meaning);
       }
     }
+    return { ...item, meanings };
+  }
 
-    return {
-      ...item,
-      meanings,
-    };
+  async getByHeadword(
+    learnerId: string,
+    headword: string,
+    type: VocabularyItem['type'],
+  ): Promise<VocabularyItem | null> {
+    if (!isValidUuid(learnerId) || !headword || !type) return null;
+    const rows = await this.adapter.query(
+      `SELECT * FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ? LIMIT 1`,
+      [learnerId, headword, type],
+    );
+    if (rows.length === 0) return null;
+    return this.get(rows[0].id as string);
   }
 
   async list(
@@ -2240,43 +2290,27 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
     opts?: { state?: string; limit?: number; types?: readonly VocabularyItem['type'][] },
   ): Promise<readonly VocabularyItem[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `SELECT * FROM lexical_items WHERE learner_id = ?`;
     const params: SqlParam[] = [learnerId];
-
-    // Optional type filter (e.g. vocabulary dashboard reads only word/phrase
-    // rows; expression rows live in the same table under different types).
     if (opts?.types !== undefined && opts.types.length > 0) {
       const placeholders = opts.types.map(() => '?').join(', ');
       sql += ` AND type IN (${placeholders})`;
       params.push(...opts.types);
     }
-
-    // Note: state filter would require joining with lexical_meanings
-    // For now, we don't implement state filter as it requires item-level review aggregate
-    // which we don't fabricate. Per-meaning review is authoritative.
-
     sql += ` ORDER BY created_at DESC`;
-
     if (opts?.limit !== undefined && opts.limit > 0) {
       sql += ` LIMIT ?`;
       params.push(opts.limit);
     }
-
     const rows = await this.adapter.query(sql, params);
-
     const items: VocabularyItem[] = [];
     for (const row of rows) {
-      const item = rowToVocabularyItem(row);
       const itemId = row.id;
-      if (!itemId || typeof itemId !== 'string') {
-        throw new Error('Invalid vocabulary item row: missing id');
-      }
+      if (!itemId || typeof itemId !== 'string') throw new Error('Invalid vocabulary item row: missing id');
       const meaningRows = await this.adapter.query(
         `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
         [itemId],
       );
-
       const meanings: Meaning[] = [];
       for (const meaningRow of meaningRows) {
         const meaning = rowToMeaning(meaningRow);
@@ -2288,9 +2322,9 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
           meanings.push(meaning);
         }
       }
-      items.push({ ...item, meanings });
+      const base = rowToVocabularyItem(row);
+      items.push({ ...base, meanings });
     }
-
     return items;
   }
 
@@ -2300,9 +2334,6 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
     limit?: number,
   ): Promise<readonly VocabularyItem[]> {
     if (!isValidUuid(learnerId)) return [];
-
-    // Find lexical items that have at least one meaning with review_next_review_at <= now
-    // Use a subquery to get distinct lexical_item_ids with due meanings
     let sql = `
       SELECT DISTINCT li.* FROM lexical_items li
       INNER JOIN lexical_meanings lm ON lm.lexical_item_id = li.id
@@ -2312,26 +2343,19 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
       ORDER BY lm.review_next_review_at ASC
     `;
     const params: SqlParam[] = [learnerId, now];
-
     if (limit !== undefined && limit > 0) {
       sql += ` LIMIT ?`;
       params.push(limit);
     }
-
     const rows = await this.adapter.query(sql, params);
-
     const items: VocabularyItem[] = [];
     for (const row of rows) {
-      const item = rowToVocabularyItem(row);
       const itemId = row.id;
-      if (!itemId || typeof itemId !== 'string') {
-        throw new Error('Invalid vocabulary item row: missing id');
-      }
+      if (!itemId || typeof itemId !== 'string') throw new Error('Invalid vocabulary item row: missing id');
       const meaningRows = await this.adapter.query(
         `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
         [itemId],
       );
-
       const meanings: Meaning[] = [];
       for (const meaningRow of meaningRows) {
         const meaning = rowToMeaning(meaningRow);
@@ -2343,9 +2367,9 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
           meanings.push(meaning);
         }
       }
-      items.push({ ...item, meanings });
+      const base = rowToVocabularyItem(row);
+      items.push({ ...base, meanings });
     }
-
     return items;
   }
 
@@ -2353,41 +2377,35 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
     id: string,
     patch: Partial<Omit<VocabularyItem, 'id' | 'createdAt'>>,
   ): Promise<VocabularyItem> {
-    if (!isValidUuid(id)) {
-      throw new Error('Invalid vocabulary item id');
-    }
-
+    if (!isValidUuid(id)) throw new Error('Invalid vocabulary item id');
     const existing = await this.get(id);
-    if (!existing) {
-      throw new Error(`Vocabulary item not found: ${id}`);
-    }
+    if (!existing) throw new Error(`Vocabulary item not found: ${id}`);
 
-    // Update lexical_item fields if provided
+    const now = nowIso();
+    const steps: { sql: string; params: SqlParam[] }[] = [];
+
     const { meanings, ...itemPatch } = patch;
     if (Object.keys(itemPatch).length > 0) {
       const { sql, params } = buildLexicalItemUpdate(id, itemPatch);
-      await this.adapter.execute(sql, params);
+      steps.push({ sql, params });
     }
 
-    // Update meanings if explicitly provided
     if (meanings !== undefined) {
-      await this.adapter.execute(
-        `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
-        [id],
-      );
+      // Atomic replacement: delete examples and meanings, then insert new
+      steps.push({ sql: `DELETE FROM lexical_examples WHERE lexical_item_id = ?`, params: [id] });
+      steps.push({ sql: `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`, params: [id] });
 
-      const now = nowIso();
       for (const meaning of meanings) {
         const meaningId = generateId();
-        await this.adapter.execute(
-          `INSERT INTO lexical_meanings (
+        steps.push({
+          sql: `INSERT INTO lexical_meanings (
             id, lexical_item_id, definition, part_of_speech, examples,
             usage_notes, register, domain,
             review_state, review_last_review_at, review_next_review_at,
             review_review_count, review_consecutive_correct, review_ease_factor,
             review_mastered_at, created_at, updated_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
+          params: [
             meaningId,
             id,
             meaning.definition,
@@ -2402,34 +2420,49 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
             meaning.review?.reviewCount ?? 0,
             meaning.review?.consecutiveCorrect ?? 0,
             meaning.review?.easeFactor ?? null,
-            meaning.review?.masteredAt ?? null,
+            (meaning.review as any)?.masteredAt ?? null,
             now,
             now,
           ],
-        );
+        });
 
-        // Insert examples for this meaning
         if (meaning.examples && meaning.examples.length > 0) {
-          await insertExamplesForMeaning(this.adapter, id, meaningId, meaning.examples, now);
+          for (const ex of meaning.examples) {
+            const exId = generateId();
+            steps.push({
+              sql: `INSERT INTO lexical_examples (
+                id, lexical_item_id, meaning_id, text, translation, context,
+                source, origin_conversation_id, origin_turn_id, created_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              params: [
+                exId,
+                id,
+                meaningId,
+                ex.text,
+                ex.translation ?? null,
+                ex.context ?? null,
+                domainSourceToDb(ex.source),
+                ex.originConversationId ?? null,
+                ex.originTurnId ?? null,
+                ex.createdAt ?? now,
+              ],
+            });
+          }
         }
       }
+    }
+
+    if (steps.length > 0) {
+      await this.adapter.transaction(steps);
     }
 
     return this.getFullItem(id);
   }
 
-  /**
-   * Delete a vocabulary item and all of its meanings/examples.
-   * Returns true when the item existed and was removed.
-   */
   async delete(id: string): Promise<boolean> {
     return deleteLexicalItemCompletely(this.adapter, id);
   }
 
-  /**
-   * Exact review-bucket counts over word/phrase rows, computed in SQL.
-   * Defaults to the vocabulary-type rows when no type filter is given.
-   */
   async getBucketCounts(
     learnerId: string,
     opts: { now: string; types?: readonly VocabularyItem['type'][] },
@@ -2438,7 +2471,6 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
     return lexicalBucketCounts(this.adapter, learnerId, types, opts.now);
   }
 
-  /** Exact count of vocabulary rows created in an optional range. */
   async countCreated(
     learnerId: string,
     opts?: { createdAfter?: string; createdUntil?: string; types?: readonly VocabularyItem['type'][] },
@@ -2448,7 +2480,6 @@ export class SQLiteVocabularyRepository implements VocabularyRepository {
   }
 }
 
-/** Map lexical_items row to ExpressionItem domain object. */
 function rowToExpressionItem(row: SqlRow): Omit<ExpressionItem, 'meanings'> {
   return {
     id: row.id as string,
@@ -2469,29 +2500,17 @@ function rowToExpressionItem(row: SqlRow): Omit<ExpressionItem, 'meanings'> {
   };
 }
 
-/**
- * SQLiteExpressionRepository
- *
- * Implements ExpressionRepository for expressions stored in lexical_items + lexical_meanings.
- */
 export class SQLiteExpressionRepository implements ExpressionRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
 
   private async getFullItem(id: string): Promise<ExpressionItem> {
-    const rows = await this.adapter.query(
-      `SELECT * FROM lexical_items WHERE id = ?`,
-      [id],
-    );
-    if (rows.length === 0) {
-      throw new Error(`Expression item not found: ${id}`);
-    }
-
+    const rows = await this.adapter.query(`SELECT * FROM lexical_items WHERE id = ?`, [id]);
+    if (rows.length === 0) throw new Error(`Expression item not found: ${id}`);
     const base = rowToExpressionItem(rows[0]);
     const meaningRows = await this.adapter.query(
       `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
       [id],
     );
-
     const meanings: Meaning[] = [];
     for (const meaningRow of meaningRows) {
       const meaning = rowToMeaning(meaningRow);
@@ -2503,22 +2522,15 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
         meanings.push(meaning);
       }
     }
-
     return { ...base, meanings };
   }
 
   async upsert(
     item: Omit<ExpressionItem, 'id' | 'createdAt' | 'updatedAt'>,
   ): Promise<ExpressionItem> {
-    if (!item.learnerId || !isValidUuid(item.learnerId)) {
-      throw new Error('Invalid learnerId');
-    }
-    if (!item.expression) {
-      throw new Error('expression is required');
-    }
-    if (!item.type) {
-      throw new Error('type is required');
-    }
+    if (!item.learnerId || !isValidUuid(item.learnerId)) throw new Error('Invalid learnerId');
+    if (!item.expression) throw new Error('expression is required');
+    if (!item.type) throw new Error('type is required');
 
     const existing = await this.adapter.query(
       `SELECT * FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ?`,
@@ -2527,45 +2539,293 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
 
     const now = nowIso();
 
-    if (existing.length > 0) {
-      const id = existing[0].id as string;
-      await this.adapter.execute(
-        `UPDATE lexical_items SET
-          natural_alternatives = ?,
-          register = ?,
-          domain = ?,
-          source = ?,
-          tags = ?,
-          updated_at = ?
-        WHERE id = ?`,
-        [
-          JSON.stringify(item.naturalAlternatives ?? []),
-          item.register ?? null,
-          item.domain ?? null,
-          JSON.stringify(item.source ?? {}),
-          JSON.stringify(item.tags ?? []),
-          now,
-          id,
-        ],
-      );
+    if (existing.length === 0) {
+      const id = generateId();
+      const steps: { sql: string; params: SqlParam[] }[] = [
+        {
+          sql: `INSERT INTO lexical_items (
+            id, learner_id, headword, type, pronunciation,
+            synonyms, antonyms, related_expressions, natural_alternatives,
+            register, domain, source, tags, created_at, updated_at, singleton
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+          ON CONFLICT(learner_id, headword, type) DO NOTHING`,
+          params: [
+            id,
+            item.learnerId,
+            item.expression,
+            item.type,
+            JSON.stringify(item.pronunciation ?? {}),
+            JSON.stringify([]),
+            JSON.stringify([]),
+            JSON.stringify([]),
+            JSON.stringify(item.naturalAlternatives ?? []),
+            item.register ?? null,
+            item.domain ?? null,
+            JSON.stringify(item.source ?? {}),
+            JSON.stringify(item.tags ?? []),
+            now,
+            now,
+          ],
+        },
+      ];
 
-      // Replace meanings
-      await this.adapter.execute(
-        `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`,
-        [id],
-      );
+      try {
+        await this.adapter.transaction(steps);
+      } catch (err) {
+        const msg = String((err as Error).message).toLowerCase();
+        if (msg.includes('no column') && msg.includes('singleton')) {
+          const fallback = [
+            {
+              sql: `INSERT INTO lexical_items (
+                id, learner_id, headword, type, pronunciation,
+                synonyms, antonyms, related_expressions, natural_alternatives,
+                register, domain, source, tags, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(learner_id, headword, type) DO NOTHING`,
+              params: [
+                id,
+                item.learnerId,
+                item.expression,
+                item.type,
+                JSON.stringify(item.pronunciation ?? {}),
+                JSON.stringify([]),
+                JSON.stringify([]),
+                JSON.stringify([]),
+                JSON.stringify(item.naturalAlternatives ?? []),
+                item.register ?? null,
+                item.domain ?? null,
+                JSON.stringify(item.source ?? {}),
+                JSON.stringify(item.tags ?? []),
+                now,
+                now,
+              ],
+            },
+          ];
+          try {
+            await this.adapter.transaction(fallback);
+          } catch (inner) {
+            if (isUniqueViolation(inner)) {
+              const raced = await this.adapter.query(
+                `SELECT * FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ?`,
+                [item.learnerId, item.expression, item.type],
+              );
+              if (raced.length > 0) return this.upsertExisting(raced[0].id as string, item, now);
+            }
+            throw inner;
+          }
+        } else if (isUniqueViolation(err)) {
+          const raced = await this.adapter.query(
+            `SELECT * FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ?`,
+            [item.learnerId, item.expression, item.type],
+          );
+          if (raced.length > 0) return this.upsertExisting(raced[0].id as string, item, now);
+          throw err;
+        } else {
+          throw err;
+        }
+      }
 
+      const check = await this.adapter.query(
+        `SELECT id FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ?`,
+        [item.learnerId, item.expression, item.type],
+      );
+      const finalId = check.length > 0 ? (check[0].id as string) : id;
+      if (finalId !== id) {
+        return this.upsertExisting(finalId, item, now);
+      }
+
+      const meaningSteps: { sql: string; params: SqlParam[] }[] = [];
       for (const meaning of item.meanings ?? []) {
         const meaningId = generateId();
-        await this.adapter.execute(
-          `INSERT INTO lexical_meanings (
+        meaningSteps.push({
+          sql: `INSERT INTO lexical_meanings (
             id, lexical_item_id, definition, part_of_speech, examples,
             usage_notes, register, domain,
             review_state, review_last_review_at, review_next_review_at,
             review_review_count, review_consecutive_correct, review_ease_factor,
             review_mastered_at, created_at, updated_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
+          params: [
+            meaningId,
+            finalId,
+            meaning.definition,
+            meaning.partOfSpeech ?? null,
+            JSON.stringify(meaning.examples ?? []),
+            JSON.stringify(meaning.usageNotes ?? []),
+            meaning.register ?? null,
+            meaning.domain ?? null,
+            meaning.review?.state ?? 'new',
+            meaning.review?.lastReviewAt ?? null,
+            meaning.review?.nextReviewAt ?? null,
+            meaning.review?.reviewCount ?? 0,
+            meaning.review?.consecutiveCorrect ?? 0,
+            meaning.review?.easeFactor ?? null,
+            (meaning.review as any)?.masteredAt ?? null,
+            now,
+            now,
+          ],
+        });
+        for (const ex of meaning.examples ?? []) {
+          const exId = generateId();
+          meaningSteps.push({
+            sql: `INSERT INTO lexical_examples (
+              id, lexical_item_id, meaning_id, text, translation, context,
+              source, origin_conversation_id, origin_turn_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              exId,
+              finalId,
+              meaningId,
+              ex.text,
+              ex.translation ?? null,
+              ex.context ?? null,
+              domainSourceToDb(ex.source),
+              ex.originConversationId ?? null,
+              ex.originTurnId ?? null,
+              ex.createdAt ?? now,
+            ],
+          });
+        }
+      }
+
+      if (meaningSteps.length > 0) {
+        await this.adapter.transaction(meaningSteps);
+      }
+
+      return this.getFullItem(finalId);
+    }
+
+    const id = existing[0].id as string;
+    return this.upsertExisting(id, item, now);
+  }
+
+  private async upsertExisting(
+    id: string,
+    item: Omit<ExpressionItem, 'id' | 'createdAt' | 'updatedAt'>,
+    now: string,
+  ): Promise<ExpressionItem> {
+    const existingMeaningRows = await this.adapter.query(
+      `SELECT * FROM lexical_meanings WHERE lexical_item_id = ? ORDER BY created_at`,
+      [id],
+    );
+
+    const existingByDef = new Map<string, SqlRow>();
+    for (const row of existingMeaningRows) {
+      existingByDef.set(normalizeDef(row.definition as string), row);
+    }
+
+    const steps: { sql: string; params: SqlParam[] }[] = [];
+
+    steps.push({
+      sql: `UPDATE lexical_items SET
+        natural_alternatives = ?,
+        register = ?,
+        domain = ?,
+        source = ?,
+        tags = ?,
+        updated_at = ?
+      WHERE id = ?`,
+      params: [
+        JSON.stringify(item.naturalAlternatives ?? []),
+        item.register ?? null,
+        item.domain ?? null,
+        JSON.stringify(item.source ?? {}),
+        JSON.stringify(item.tags ?? []),
+        now,
+        id,
+      ],
+    });
+
+    const incomingDefs = new Set<string>();
+    for (const meaning of item.meanings ?? []) {
+      const norm = normalizeDef(meaning.definition);
+      incomingDefs.add(norm);
+      const existingRow = existingByDef.get(norm);
+
+      if (existingRow) {
+        const existingReviewState = existingRow.review_state as string;
+        const existingLast = existingRow.review_last_review_at as string | null;
+        const existingNext = existingRow.review_next_review_at as string | null;
+        const existingCount = existingRow.review_review_count as number;
+        const existingConsec = existingRow.review_consecutive_correct as number;
+        const existingEase = existingRow.review_ease_factor as number | null;
+        const existingMastered = existingRow.review_mastered_at as string | null;
+
+        steps.push({
+          sql: `UPDATE lexical_meanings SET
+            definition = ?,
+            part_of_speech = ?,
+            examples = ?,
+            usage_notes = ?,
+            register = ?,
+            domain = ?,
+            review_state = ?,
+            review_last_review_at = ?,
+            review_next_review_at = ?,
+            review_review_count = ?,
+            review_consecutive_correct = ?,
+            review_ease_factor = ?,
+            review_mastered_at = ?,
+            updated_at = ?
+          WHERE id = ?`,
+          params: [
+            meaning.definition,
+            meaning.partOfSpeech ?? (existingRow.part_of_speech as string | null),
+            JSON.stringify(meaning.examples ?? safeJsonParse(existingRow.examples, [])),
+            JSON.stringify(meaning.usageNotes ?? safeJsonParse(existingRow.usage_notes, [])),
+            meaning.register ?? (existingRow.register as string | null),
+            meaning.domain ?? (existingRow.domain as string | null),
+            existingReviewState ?? meaning.review?.state ?? 'new',
+            existingLast ?? meaning.review?.lastReviewAt ?? null,
+            existingNext ?? meaning.review?.nextReviewAt ?? null,
+            existingCount ?? meaning.review?.reviewCount ?? 0,
+            existingConsec ?? meaning.review?.consecutiveCorrect ?? 0,
+            existingEase ?? meaning.review?.easeFactor ?? null,
+            existingMastered ?? (meaning.review as any)?.masteredAt ?? null,
+            now,
+            existingRow.id as string,
+          ],
+        });
+
+        steps.push({
+          sql: `DELETE FROM lexical_examples WHERE meaning_id = ?`,
+          params: [existingRow.id as string],
+        });
+
+        const examplesToInsert = meaning.examples && meaning.examples.length > 0 ? meaning.examples : safeJsonParse(existingRow.examples, []);
+        for (const ex of examplesToInsert) {
+          const exId = generateId();
+          const exObj = typeof ex === 'string' ? { text: ex, source: 'manual' as ExampleSource } : ex;
+          steps.push({
+            sql: `INSERT INTO lexical_examples (
+              id, lexical_item_id, meaning_id, text, translation, context,
+              source, origin_conversation_id, origin_turn_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              exId,
+              id,
+              existingRow.id as string,
+              (exObj as UsageExample).text,
+              (exObj as UsageExample).translation ?? null,
+              (exObj as UsageExample).context ?? null,
+              domainSourceToDb((exObj as UsageExample).source ?? 'manual'),
+              (exObj as UsageExample).originConversationId ?? null,
+              (exObj as UsageExample).originTurnId ?? null,
+              (exObj as UsageExample).createdAt ?? now,
+            ],
+          });
+        }
+      } else {
+        const meaningId = generateId();
+        steps.push({
+          sql: `INSERT INTO lexical_meanings (
+            id, lexical_item_id, definition, part_of_speech, examples,
+            usage_notes, register, domain,
+            review_state, review_last_review_at, review_next_review_at,
+            review_review_count, review_consecutive_correct, review_ease_factor,
+            review_mastered_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
             meaningId,
             id,
             meaning.definition,
@@ -2580,80 +2840,37 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
             meaning.review?.reviewCount ?? 0,
             meaning.review?.consecutiveCorrect ?? 0,
             meaning.review?.easeFactor ?? null,
-            meaning.review?.masteredAt ?? null,
+            (meaning.review as any)?.masteredAt ?? null,
             now,
             now,
           ],
-        );
-        // Persist examples in the lexical_examples table as well, so the
-        // read path (fetchExamplesForMeaning) returns them.
-        await insertExamplesForMeaning(this.adapter, id, meaningId, meaning.examples ?? [], now);
+        });
+
+        for (const ex of meaning.examples ?? []) {
+          const exId = generateId();
+          steps.push({
+            sql: `INSERT INTO lexical_examples (
+              id, lexical_item_id, meaning_id, text, translation, context,
+              source, origin_conversation_id, origin_turn_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              exId,
+              id,
+              meaningId,
+              ex.text,
+              ex.translation ?? null,
+              ex.context ?? null,
+              domainSourceToDb(ex.source),
+              ex.originConversationId ?? null,
+              ex.originTurnId ?? null,
+              ex.createdAt ?? now,
+            ],
+          });
+        }
       }
-
-      return this.getFullItem(id);
     }
 
-    const id = generateId();
-    await this.adapter.execute(
-      `INSERT INTO lexical_items (
-        id, learner_id, headword, type, pronunciation,
-        synonyms, antonyms, related_expressions, natural_alternatives,
-        register, domain, source, tags, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        item.learnerId,
-        item.expression,
-        item.type,
-        JSON.stringify(item.pronunciation ?? {}),
-        JSON.stringify([]),
-        JSON.stringify([]),
-        JSON.stringify([]),
-        JSON.stringify(item.naturalAlternatives ?? []),
-        item.register ?? null,
-        item.domain ?? null,
-        JSON.stringify(item.source ?? {}),
-        JSON.stringify(item.tags ?? []),
-        now,
-        now,
-      ],
-    );
-
-    for (const meaning of item.meanings ?? []) {
-      const meaningId = generateId();
-      await this.adapter.execute(
-        `INSERT INTO lexical_meanings (
-          id, lexical_item_id, definition, part_of_speech, examples,
-          usage_notes, register, domain,
-          review_state, review_last_review_at, review_next_review_at,
-          review_review_count, review_consecutive_correct, review_ease_factor,
-          review_mastered_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          meaningId,
-          id,
-          meaning.definition,
-          meaning.partOfSpeech ?? null,
-          JSON.stringify(meaning.examples ?? []),
-          JSON.stringify(meaning.usageNotes ?? []),
-          meaning.register ?? null,
-          meaning.domain ?? null,
-          meaning.review?.state ?? 'new',
-          meaning.review?.lastReviewAt ?? null,
-          meaning.review?.nextReviewAt ?? null,
-          meaning.review?.reviewCount ?? 0,
-          meaning.review?.consecutiveCorrect ?? 0,
-          meaning.review?.easeFactor ?? null,
-          meaning.review?.masteredAt ?? null,
-          now,
-          now,
-        ],
-      );
-      // Persist examples in the lexical_examples table as well, so the
-      // read path (fetchExamplesForMeaning) returns them.
-      await insertExamplesForMeaning(this.adapter, id, meaningId, meaning.examples ?? [], now);
-    }
-
+    await this.adapter.transaction(steps);
     return this.getFullItem(id);
   }
 
@@ -2666,12 +2883,25 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
     }
   }
 
+  async getByExpression(
+    learnerId: string,
+    expression: string,
+    type: ExpressionItem['type'],
+  ): Promise<ExpressionItem | null> {
+    if (!isValidUuid(learnerId) || !expression || !type) return null;
+    const rows = await this.adapter.query(
+      `SELECT * FROM lexical_items WHERE learner_id = ? AND headword = ? AND type = ? LIMIT 1`,
+      [learnerId, expression, type],
+    );
+    if (rows.length === 0) return null;
+    return this.get(rows[0].id as string);
+  }
+
   async list(
     learnerId: string,
     opts?: { limit?: number },
   ): Promise<readonly ExpressionItem[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `
       SELECT * FROM lexical_items
       WHERE learner_id = ?
@@ -2679,12 +2909,10 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
       ORDER BY created_at DESC
     `;
     const params: SqlParam[] = [learnerId];
-
     if (opts?.limit !== undefined && opts.limit > 0) {
       sql += ` LIMIT ?`;
       params.push(opts.limit);
     }
-
     const rows = await this.adapter.query(sql, params);
     const items: ExpressionItem[] = [];
     for (const row of rows) {
@@ -2700,7 +2928,6 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
     limit?: number,
   ): Promise<readonly ExpressionItem[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `
       SELECT DISTINCT li.* FROM lexical_items li
       INNER JOIN lexical_meanings lm ON lm.lexical_item_id = li.id
@@ -2711,12 +2938,10 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
       ORDER BY lm.review_next_review_at ASC
     `;
     const params: SqlParam[] = [learnerId, now];
-
     if (limit !== undefined && limit > 0) {
       sql += ` LIMIT ?`;
       params.push(limit);
     }
-
     const rows = await this.adapter.query(sql, params);
     const items: ExpressionItem[] = [];
     for (const row of rows) {
@@ -2735,15 +2960,17 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
     if (!existing) throw new Error(`Expression item not found: ${id}`);
 
     const now = nowIso();
-    await this.adapter.execute(
-      `UPDATE lexical_items SET
+    const steps: { sql: string; params: SqlParam[] }[] = [];
+
+    steps.push({
+      sql: `UPDATE lexical_items SET
         headword = COALESCE(?, headword),
         natural_alternatives = COALESCE(?, natural_alternatives),
         register = COALESCE(?, register),
         domain = COALESCE(?, domain),
         updated_at = ?
       WHERE id = ?`,
-      [
+      params: [
         patch.expression ?? null,
         patch.naturalAlternatives ? JSON.stringify(patch.naturalAlternatives) : null,
         patch.register ?? null,
@@ -2751,27 +2978,75 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
         now,
         id,
       ],
-    );
+    });
 
-    // Replace meanings when explicitly provided. Callers that loaded the
-    // item first supply the existing per-meaning review data unchanged,
-    // so review history is preserved.
     if (patch.meanings !== undefined) {
-      await replaceLexicalMeanings(this.adapter, id, patch.meanings, now);
+      steps.push({ sql: `DELETE FROM lexical_examples WHERE lexical_item_id = ?`, params: [id] });
+      steps.push({ sql: `DELETE FROM lexical_meanings WHERE lexical_item_id = ?`, params: [id] });
+
+      for (const meaning of patch.meanings) {
+        const meaningId = generateId();
+        steps.push({
+          sql: `INSERT INTO lexical_meanings (
+            id, lexical_item_id, definition, part_of_speech, examples,
+            usage_notes, register, domain,
+            review_state, review_last_review_at, review_next_review_at,
+            review_review_count, review_consecutive_correct, review_ease_factor,
+            review_mastered_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          params: [
+            meaningId,
+            id,
+            meaning.definition,
+            meaning.partOfSpeech ?? null,
+            JSON.stringify(meaning.examples ?? []),
+            JSON.stringify(meaning.usageNotes ?? []),
+            meaning.register ?? null,
+            meaning.domain ?? null,
+            meaning.review?.state ?? 'new',
+            meaning.review?.lastReviewAt ?? null,
+            meaning.review?.nextReviewAt ?? null,
+            meaning.review?.reviewCount ?? 0,
+            meaning.review?.consecutiveCorrect ?? 0,
+            meaning.review?.easeFactor ?? null,
+            (meaning.review as any)?.masteredAt ?? null,
+            now,
+            now,
+          ],
+        });
+
+        for (const ex of meaning.examples ?? []) {
+          const exId = generateId();
+          steps.push({
+            sql: `INSERT INTO lexical_examples (
+              id, lexical_item_id, meaning_id, text, translation, context,
+              source, origin_conversation_id, origin_turn_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            params: [
+              exId,
+              id,
+              meaningId,
+              ex.text,
+              ex.translation ?? null,
+              ex.context ?? null,
+              domainSourceToDb(ex.source),
+              ex.originConversationId ?? null,
+              ex.originTurnId ?? null,
+              ex.createdAt ?? now,
+            ],
+          });
+        }
+      }
     }
 
+    await this.adapter.transaction(steps);
     return this.getFullItem(id);
   }
 
-  /**
-   * Delete an expression item and all of its meanings/examples.
-   * Returns true when the item existed and was removed.
-   */
   async delete(id: string): Promise<boolean> {
     return deleteLexicalItemCompletely(this.adapter, id);
   }
 
-  /** Exact review-bucket counts over expression-type rows, computed in SQL. */
   async getBucketCounts(
     learnerId: string,
     opts: { now: string },
@@ -2787,7 +3062,6 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
     return lexicalBucketCounts(this.adapter, learnerId, types, opts.now);
   }
 
-  /** Exact count of expression rows created in an optional range. */
   async countCreated(
     learnerId: string,
     opts?: { createdAfter?: string; createdUntil?: string },
@@ -2804,7 +3078,6 @@ export class SQLiteExpressionRepository implements ExpressionRepository {
   }
 }
 
-/** Map review_items row to ReviewItem domain object. */
 function rowToReviewItem(row: SqlRow): ReviewItem {
   return {
     id: row.id as string,
@@ -2825,11 +3098,6 @@ function rowToReviewItem(row: SqlRow): ReviewItem {
   };
 }
 
-/**
- * SQLiteReviewRepository
- *
- * Implements ReviewRepository for review_items + review_history.
- */
 export class SQLiteReviewRepository implements ReviewRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
 
@@ -2839,7 +3107,6 @@ export class SQLiteReviewRepository implements ReviewRepository {
     limit?: number,
   ): Promise<readonly ReviewItem[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `
       SELECT * FROM review_items
       WHERE learner_id = ?
@@ -2848,34 +3115,20 @@ export class SQLiteReviewRepository implements ReviewRepository {
       ORDER BY due_at ASC
     `;
     const params: SqlParam[] = [learnerId, now];
-
     if (limit !== undefined && limit > 0) {
       sql += ` LIMIT ?`;
       params.push(limit);
     }
-
     const rows = await this.adapter.query(sql, params);
     return rows.map(rowToReviewItem);
   }
 
   async get(id: string): Promise<ReviewItem | null> {
     if (!isValidUuid(id)) return null;
-    const rows = await this.adapter.query(
-      `SELECT * FROM review_items WHERE id = ?`,
-      [id],
-    );
+    const rows = await this.adapter.query(`SELECT * FROM review_items WHERE id = ?`, [id]);
     return rows.length > 0 ? rowToReviewItem(rows[0]) : null;
   }
 
-  /**
-   * Exact existence lookup by (learnerId, kind, referenceId). Unlike
-   * listDue, this also finds items scheduled for the FUTURE, so callers
-   * can avoid resetting already-practiced reviews. Retired items DO count
-   * as existing: this matches upsert's own (learnerId, kind, referenceId)
-   * lookup, so a caller that treats "not found" as "create initial item"
-   * can never overwrite a retired row's review history. Reactivating a
-   * retired item must be an explicit, history-preserving operation.
-   */
   async getByReference(
     learnerId: string,
     kind: ReviewItem['kind'],
@@ -2897,15 +3150,12 @@ export class SQLiteReviewRepository implements ReviewRepository {
     limit?: number,
   ): Promise<readonly ReviewItem[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `SELECT * FROM review_items WHERE learner_id = ? ORDER BY due_at ASC`;
     const params: SqlParam[] = [learnerId];
-
     if (limit !== undefined && limit > 0) {
       sql += ` LIMIT ?`;
       params.push(limit);
     }
-
     const rows = await this.adapter.query(sql, params);
     return rows.map(rowToReviewItem);
   }
@@ -2913,98 +3163,134 @@ export class SQLiteReviewRepository implements ReviewRepository {
   async upsert(
     item: Omit<ReviewItem, 'id' | 'createdAt'> & { id?: string },
   ): Promise<ReviewItem> {
-    if (!item.learnerId || !isValidUuid(item.learnerId)) {
-      throw new Error('Invalid learnerId');
-    }
-    if (!item.prompt) {
-      throw new Error('prompt is required');
-    }
-
+    if (!item.learnerId || !isValidUuid(item.learnerId)) throw new Error('Invalid learnerId');
+    if (!item.prompt) throw new Error('prompt is required');
     const now = nowIso();
 
-    // Check if exists by explicit id, or by learnerId + referenceId + kind.
-    // An explicit id that is not persisted yet must fall through to INSERT,
-    // not take the UPDATE branch (planner candidates carry fresh ids).
     let existingId: string | null = null;
     if (item.id) {
-      const byId = await this.adapter.query(
-        `SELECT id FROM review_items WHERE id = ?`,
-        [item.id],
-      );
-      if (byId.length > 0) {
-        existingId = byId[0].id as string;
-      }
+      const byId = await this.adapter.query(`SELECT id FROM review_items WHERE id = ?`, [item.id]);
+      if (byId.length > 0) existingId = byId[0].id as string;
     }
     if (!existingId && item.referenceId) {
       const existing = await this.adapter.query(
         `SELECT id FROM review_items WHERE learner_id = ? AND reference_id = ? AND kind = ?`,
         [item.learnerId, item.referenceId, item.kind],
       );
-      if (existing.length > 0) {
-        existingId = existing[0].id as string;
-      }
+      if (existing.length > 0) existingId = existing[0].id as string;
     }
 
     if (existingId) {
-      await this.adapter.execute(
-        `UPDATE review_items SET
-          prompt = ?,
-          expected_response = ?,
-          context_topic = ?,
-          state = ?,
-          due_at = ?,
-          last_review_at = ?,
-          review_count = ?,
-          consecutive_correct = ?,
-          ease_factor = ?,
-          outcome_history = ?
-        WHERE id = ?`,
-        [
-          item.prompt,
-          item.expectedResponse ?? null,
-          item.contextTopic ?? null,
-          item.state,
-          item.dueAt,
-          item.lastReviewAt ?? null,
-          item.reviewCount,
-          item.consecutiveCorrect,
-          item.easeFactor ?? null,
-          JSON.stringify(item.outcomeHistory ?? []),
-          existingId,
-        ],
-      );
-
+      try {
+        await this.adapter.execute(
+          `UPDATE review_items SET
+            prompt = ?,
+            expected_response = ?,
+            context_topic = ?,
+            state = ?,
+            due_at = ?,
+            last_review_at = ?,
+            review_count = ?,
+            consecutive_correct = ?,
+            ease_factor = ?,
+            outcome_history = ?
+          WHERE id = ?`,
+          [
+            item.prompt,
+            item.expectedResponse ?? null,
+            item.contextTopic ?? null,
+            item.state,
+            item.dueAt,
+            item.lastReviewAt ?? null,
+            item.reviewCount,
+            item.consecutiveCorrect,
+            item.easeFactor ?? null,
+            JSON.stringify(item.outcomeHistory ?? []),
+            existingId,
+          ],
+        );
+      } catch (err) {
+        if (isUniqueViolation(err)) {
+          const reloaded = await this.adapter.query(`SELECT id FROM review_items WHERE learner_id = ? AND reference_id = ? AND kind = ?`, [item.learnerId, item.referenceId, item.kind]);
+          if (reloaded.length > 0) existingId = reloaded[0].id as string;
+        } else {
+          throw err;
+        }
+      }
       const updated = await this.get(existingId);
       if (!updated) throw new Error('Failed to retrieve updated review item');
       return updated;
     }
 
     const id = item.id || generateId();
-    await this.adapter.execute(
-      `INSERT INTO review_items (
-        id, learner_id, kind, reference_id, prompt,
-        expected_response, context_topic, state, due_at,
-        created_at, last_review_at, review_count, consecutive_correct,
-        ease_factor, outcome_history
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        item.learnerId,
-        item.kind,
-        item.referenceId,
-        item.prompt,
-        item.expectedResponse ?? null,
-        item.contextTopic ?? null,
-        item.state,
-        item.dueAt,
-        now,
-        item.lastReviewAt ?? null,
-        item.reviewCount ?? 0,
-        item.consecutiveCorrect ?? 0,
-        item.easeFactor ?? null,
-        JSON.stringify(item.outcomeHistory ?? []),
-      ],
-    );
+    try {
+      await this.adapter.execute(
+        `INSERT INTO review_items (
+          id, learner_id, kind, reference_id, prompt,
+          expected_response, context_topic, state, due_at,
+          created_at, last_review_at, review_count, consecutive_correct,
+          ease_factor, outcome_history
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          item.learnerId,
+          item.kind,
+          item.referenceId,
+          item.prompt,
+          item.expectedResponse ?? null,
+          item.contextTopic ?? null,
+          item.state,
+          item.dueAt,
+          now,
+          item.lastReviewAt ?? null,
+          item.reviewCount ?? 0,
+          item.consecutiveCorrect ?? 0,
+          item.easeFactor ?? null,
+          JSON.stringify(item.outcomeHistory ?? []),
+        ],
+      );
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        const raced = await this.adapter.query(
+          `SELECT id FROM review_items WHERE learner_id = ? AND kind = ? AND reference_id = ?`,
+          [item.learnerId, item.kind, item.referenceId],
+        );
+        if (raced.length > 0) {
+          const racedId = raced[0].id as string;
+          await this.adapter.execute(
+            `UPDATE review_items SET
+              prompt = ?,
+              expected_response = ?,
+              context_topic = ?,
+              state = ?,
+              due_at = ?,
+              last_review_at = ?,
+              review_count = ?,
+              consecutive_correct = ?,
+              ease_factor = ?,
+              outcome_history = ?
+            WHERE id = ?`,
+            [
+              item.prompt,
+              item.expectedResponse ?? null,
+              item.contextTopic ?? null,
+              item.state,
+              item.dueAt,
+              item.lastReviewAt ?? null,
+              item.reviewCount,
+              item.consecutiveCorrect,
+              item.easeFactor ?? null,
+              JSON.stringify(item.outcomeHistory ?? []),
+              racedId,
+            ],
+          );
+          const updated = await this.get(racedId);
+          if (!updated) throw new Error('Failed to retrieve raced review item');
+          return updated;
+        }
+      }
+      throw err;
+    }
 
     const created = await this.get(id);
     if (!created) throw new Error('Failed to retrieve created review item');
@@ -3015,103 +3301,131 @@ export class SQLiteReviewRepository implements ReviewRepository {
     id: string,
     result: 'correct' | 'incorrect' | 'partial',
     note?: string,
+    attemptId?: string,
   ): Promise<ReviewItem> {
     if (!isValidUuid(id)) throw new Error('Invalid review item id');
 
-    const existing = await this.get(id);
-    if (!existing) {
-      throw new Error(`Review item not found: ${id}`);
-    }
-
+    const historyId = attemptId ?? generateId();
     const now = nowIso();
-    const newOutcome: ReviewOutcome = {
-      at: now,
-      result,
-      note,
-    };
 
-    let newConsecutiveCorrect = existing.consecutiveCorrect;
-    if (result === 'correct') {
-      newConsecutiveCorrect += 1;
-    } else if (result === 'incorrect') {
-      newConsecutiveCorrect = 0;
+    // Idempotency: if attemptId provided and already exists, return current item
+    if (attemptId) {
+      const existingHistory = await this.adapter.query(
+        `SELECT id FROM review_history WHERE id = ?`,
+        [attemptId],
+      );
+      if (existingHistory.length > 0) {
+        const current = await this.get(id);
+        if (!current) throw new Error(`Review item not found: ${id}`);
+        return current;
+      }
     }
 
-    // Determine state
-    let newState: MasteryState = existing.state;
-    if (newConsecutiveCorrect >= 3) {
-      newState = 'mastered';
-    } else if (result === 'incorrect') {
-      newState = existing.reviewCount >= 1 ? 'struggling' : 'learning';
-    } else if (result === 'correct') {
-      newState = newConsecutiveCorrect >= 2 ? 'familiar' : 'learning';
+    // Use explicit BEGIN IMMEDIATE to prevent lost updates between two repo instances
+    await this.adapter.execute(`BEGIN IMMEDIATE`);
+    try {
+      const rows = await this.adapter.query(`SELECT * FROM review_items WHERE id = ?`, [id]);
+      if (rows.length === 0) {
+        await this.adapter.execute(`ROLLBACK`);
+        throw new Error(`Review item not found: ${id}`);
+      }
+
+      const existing = rowToReviewItem(rows[0]);
+
+      const newOutcome: ReviewOutcome = {
+        at: now,
+        result,
+        note,
+      };
+
+      let newConsecutiveCorrect = existing.consecutiveCorrect;
+      if (result === 'correct') {
+        newConsecutiveCorrect += 1;
+      } else if (result === 'incorrect') {
+        newConsecutiveCorrect = 0;
+      }
+
+      let newState: MasteryState = existing.state;
+      if (newConsecutiveCorrect >= 3) {
+        newState = 'mastered';
+      } else if (result === 'incorrect') {
+        newState = existing.reviewCount >= 1 ? 'struggling' : 'learning';
+      } else if (result === 'correct') {
+        newState = newConsecutiveCorrect >= 2 ? 'familiar' : 'learning';
+      }
+
+      let intervalDays = 1;
+      if (result === 'correct') {
+        if (newConsecutiveCorrect === 1) intervalDays = 1;
+        else if (newConsecutiveCorrect === 2) intervalDays = 3;
+        else if (newConsecutiveCorrect === 3) intervalDays = 7;
+        else if (newConsecutiveCorrect === 4) intervalDays = 14;
+        else intervalDays = 30;
+      } else if (result === 'partial') {
+        intervalDays = 1;
+      } else {
+        intervalDays = 1;
+      }
+
+      const nextDueDate = new Date(Date.now() + intervalDays * 86400000).toISOString();
+      const updatedHistory = [...existing.outcomeHistory, newOutcome];
+
+      // Atomic update + history insert
+      await this.adapter.execute(
+        `UPDATE review_items SET
+          last_review_at = ?,
+          review_count = review_count + 1,
+          consecutive_correct = ?,
+          state = ?,
+          due_at = ?,
+          outcome_history = ?
+        WHERE id = ?`,
+        [
+          now,
+          newConsecutiveCorrect,
+          newState,
+          nextDueDate,
+          JSON.stringify(updatedHistory),
+          id,
+        ],
+      );
+
+      await this.adapter.execute(
+        `INSERT INTO review_history (id, review_item_id, at, result, note)
+         VALUES (?, ?, ?, ?, ?)`,
+        [historyId, id, now, result, note ?? null],
+      );
+
+      await this.adapter.execute(`COMMIT`);
+    } catch (err) {
+      try {
+        await this.adapter.execute(`ROLLBACK`);
+      } catch {
+        // ignore
+      }
+
+      // If rollback due to unique violation on history id, treat as idempotent success
+      if (attemptId && isUniqueViolation(err)) {
+        const current = await this.get(id);
+        if (current) return current;
+      }
+
+      throw err;
     }
-
-    // Determine next interval (days)
-    let intervalDays = 1;
-    if (result === 'correct') {
-      if (newConsecutiveCorrect === 1) intervalDays = 1;
-      else if (newConsecutiveCorrect === 2) intervalDays = 3;
-      else if (newConsecutiveCorrect === 3) intervalDays = 7;
-      else if (newConsecutiveCorrect === 4) intervalDays = 14;
-      else intervalDays = 30;
-    } else if (result === 'partial') {
-      intervalDays = 1;
-    } else {
-      intervalDays = 1;
-    }
-
-    const nextDueDate = new Date(Date.now() + intervalDays * 86400000).toISOString();
-    const updatedHistory = [...existing.outcomeHistory, newOutcome];
-
-    await this.adapter.execute(
-      `UPDATE review_items SET
-        last_review_at = ?,
-        review_count = review_count + 1,
-        consecutive_correct = ?,
-        state = ?,
-        due_at = ?,
-        outcome_history = ?
-      WHERE id = ?`,
-      [
-        now,
-        newConsecutiveCorrect,
-        newState,
-        nextDueDate,
-        JSON.stringify(updatedHistory),
-        id,
-      ],
-    );
-
-    // Also record in review_history table
-    const historyId = generateId();
-    await this.adapter.execute(
-      `INSERT INTO review_history (id, review_item_id, at, result, note)
-       VALUES (?, ?, ?, ?, ?)`,
-      [historyId, id, now, result, note ?? null],
-    );
 
     const updated = await this.get(id);
     if (!updated) throw new Error('Review item disappeared after update');
     return updated;
   }
 
-  /**
-   * Delete review rows pointing at a domain object, restricted to one kind,
-   * together with their review_history rows. Kind-restricted by design so
-   * unrelated grammar/weakness/expression reviews are never touched.
-   * Returns the number of review_items rows removed.
-   */
   async deleteByReference(referenceId: string, kind: ReviewItem['kind']): Promise<number> {
     if (!isValidUuid(referenceId)) return 0;
-
     await this.adapter.execute(
       `DELETE FROM review_history WHERE review_item_id IN (
         SELECT id FROM review_items WHERE reference_id = ? AND kind = ?
       )`,
       [referenceId, kind],
     );
-
     const result = await this.adapter.execute(
       `DELETE FROM review_items WHERE reference_id = ? AND kind = ?`,
       [referenceId, kind],
@@ -3119,10 +3433,8 @@ export class SQLiteReviewRepository implements ReviewRepository {
     return result.rowsAffected;
   }
 
-  /** Exact count of reviews due at `now` — single aggregate query. */
   async countDue(learnerId: string, now: string): Promise<number> {
     if (!isValidUuid(learnerId)) return 0;
-
     const rows = await this.adapter.query(
       `SELECT COUNT(*) AS c FROM review_items WHERE learner_id = ? AND due_at <= ?`,
       [learnerId, now],
@@ -3130,13 +3442,11 @@ export class SQLiteReviewRepository implements ReviewRepository {
     return Number(rows[0]?.c ?? 0);
   }
 
-  /** Exact count of reviews completed in an optional last-review range. */
   async countReviewed(
     learnerId: string,
     opts?: { lastReviewAfter?: string; lastReviewUntil?: string },
   ): Promise<number> {
     if (!isValidUuid(learnerId)) return 0;
-
     let sql = `SELECT COUNT(*) AS c FROM review_items
        WHERE learner_id = ? AND last_review_at IS NOT NULL`;
     const params: SqlParam[] = [learnerId];
@@ -3153,7 +3463,6 @@ export class SQLiteReviewRepository implements ReviewRepository {
   }
 }
 
-/** Map progress_records row to ProgressRecord domain object. */
 function rowToProgressRecord(row: SqlRow): ProgressRecord {
   return {
     id: row.id as string,
@@ -3177,21 +3486,13 @@ function rowToProgressRecord(row: SqlRow): ProgressRecord {
   };
 }
 
-/**
- * SQLiteProgressRepository
- *
- * Implements ProgressRepository for progress_records.
- */
 export class SQLiteProgressRepository implements ProgressRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
 
   async record(
     record: Omit<ProgressRecord, 'id'>,
   ): Promise<ProgressRecord> {
-    if (!record.learnerId || !isValidUuid(record.learnerId)) {
-      throw new Error('Invalid learnerId');
-    }
-
+    if (!record.learnerId || !isValidUuid(record.learnerId)) throw new Error('Invalid learnerId');
     const id = generateId();
     await this.adapter.execute(
       `INSERT INTO progress_records (
@@ -3222,14 +3523,8 @@ export class SQLiteProgressRepository implements ProgressRepository {
         record.notes ?? null,
       ],
     );
-
-    const rows = await this.adapter.query(
-      `SELECT * FROM progress_records WHERE id = ?`,
-      [id],
-    );
-    if (rows.length === 0) {
-      throw new Error('Failed to retrieve recorded progress');
-    }
+    const rows = await this.adapter.query(`SELECT * FROM progress_records WHERE id = ?`, [id]);
+    if (rows.length === 0) throw new Error('Failed to retrieve recorded progress');
     return rowToProgressRecord(rows[0]);
   }
 
@@ -3238,22 +3533,18 @@ export class SQLiteProgressRepository implements ProgressRepository {
     limit?: number,
   ): Promise<readonly ProgressRecord[]> {
     if (!isValidUuid(learnerId)) return [];
-
     let sql = `SELECT * FROM progress_records WHERE learner_id = ? ORDER BY recorded_at DESC`;
     const params: SqlParam[] = [learnerId];
-
     if (limit !== undefined && limit > 0) {
       sql += ` LIMIT ?`;
       params.push(limit);
     }
-
     const rows = await this.adapter.query(sql, params);
     return rows.map(rowToProgressRecord);
   }
 
   async latest(learnerId: string): Promise<ProgressRecord | null> {
     if (!isValidUuid(learnerId)) return null;
-
     const rows = await this.adapter.query(
       `SELECT * FROM progress_records WHERE learner_id = ? ORDER BY recorded_at DESC LIMIT 1`,
       [learnerId],
@@ -3261,13 +3552,11 @@ export class SQLiteProgressRepository implements ProgressRepository {
     return rows.length > 0 ? rowToProgressRecord(rows[0]) : null;
   }
 
-  /** Exact count of persisted progress records in an optional range. */
   async countRecords(
     learnerId: string,
     opts?: { recordedAfter?: string; recordedUntil?: string },
   ): Promise<number> {
     if (!isValidUuid(learnerId)) return 0;
-
     let sql = `SELECT COUNT(*) AS c FROM progress_records WHERE learner_id = ?`;
     const params: SqlParam[] = [learnerId];
     if (opts?.recordedAfter !== undefined) {
@@ -3285,11 +3574,6 @@ export class SQLiteProgressRepository implements ProgressRepository {
 
 export { deleteLexicalItemWithReviews };
 
-/* ------------------------------------------------------------------ *
- * Daily Tutor (additive storage for the Daily Tutor Loop)
- * ------------------------------------------------------------------ */
-
-/** Valid session statuses for writes. */
 const DAILY_SESSION_STATUSES: ReadonlySet<string> = new Set([
   'planned',
   'in_progress',
@@ -3297,7 +3581,6 @@ const DAILY_SESSION_STATUSES: ReadonlySet<string> = new Set([
   'abandoned',
 ]);
 
-/** Valid activity statuses for writes. */
 const DAILY_ACTIVITY_STATUSES: ReadonlySet<string> = new Set([
   'pending',
   'in_progress',
@@ -3305,7 +3588,6 @@ const DAILY_ACTIVITY_STATUSES: ReadonlySet<string> = new Set([
   'skipped',
 ]);
 
-/** Map a daily_tutor_sessions row (+ activities) to the record shape. */
 function rowToDailySessionRecord(
   row: SqlRow,
   activities: readonly DailyTutorActivityRecord[],
@@ -3325,7 +3607,6 @@ function rowToDailySessionRecord(
   };
 }
 
-/** Map a daily_tutor_activities row to the record shape. */
 function rowToDailyActivityRecord(row: SqlRow): DailyTutorActivityRecord {
   return {
     id: row.id as string,
@@ -3334,9 +3615,6 @@ function rowToDailyActivityRecord(row: SqlRow): DailyTutorActivityRecord {
     title: row.title as string,
     reason: row.reason as string,
     estimatedMinutes: Number(row.estimated_minutes ?? 0),
-    // Corrupt JSON degrades to {} — the activity routes generically instead
-    // of crashing the session (fails safe; the service still validates the
-    // structural fields it depends on).
     target: safeJsonParse<Record<string, unknown>>(row.target, {}),
     status: row.status as DailyActivityStatus,
     startedAt: (row.started_at as string | null) ?? null,
@@ -3348,31 +3626,19 @@ function rowToDailyActivityRecord(row: SqlRow): DailyTutorActivityRecord {
   };
 }
 
-/** Validate the session-side fields of an insert. */
 function assertValidDailySessionInput(
   session: Omit<DailyTutorSessionRecord, 'activities'>,
 ): void {
-  if (!session.learnerId || !isValidUuid(session.learnerId)) {
-    throw new Error('Invalid learnerId');
-  }
-  if (!isValidDateKey(session.dateKey)) {
-    throw new Error('Invalid dateKey (expected YYYY-MM-DD)');
-  }
-  if (!session.id) {
-    throw new Error('id is required');
-  }
-  if (!DAILY_SESSION_STATUSES.has(session.status)) {
-    throw new Error(`Invalid daily tutor session status: ${String(session.status)}`);
-  }
+  if (!session.learnerId || !isValidUuid(session.learnerId)) throw new Error('Invalid learnerId');
+  if (!isValidDateKey(session.dateKey)) throw new Error('Invalid dateKey (expected YYYY-MM-DD)');
+  if (!session.id) throw new Error('id is required');
+  if (!DAILY_SESSION_STATUSES.has(session.status)) throw new Error(`Invalid daily tutor session status: ${String(session.status)}`);
   if (session.sourceMode !== 'personalized' && session.sourceMode !== 'mixed' && session.sourceMode !== 'general') {
     throw new Error(`Invalid daily tutor source mode: ${String(session.sourceMode)}`);
   }
-  if (typeof session.headline !== 'string') {
-    throw new Error('headline is required');
-  }
+  if (typeof session.headline !== 'string') throw new Error('headline is required');
 }
 
-/** Validate the activity list of an insert. */
 function assertValidDailyActivitiesInput(
   activities: readonly Omit<DailyTutorActivityRecord, 'orderIndex'>[],
 ): void {
@@ -3380,35 +3646,15 @@ function assertValidDailyActivitiesInput(
     throw new Error('A daily tutor session requires at least one activity');
   }
   const ids = new Set<string>();
-  const kinds: string[] = [];
   for (const activity of activities) {
-    if (!activity.id || ids.has(activity.id)) {
-      throw new Error('Activity ids must be non-empty and unique');
-    }
+    if (!activity.id || ids.has(activity.id)) throw new Error('Activity ids must be non-empty and unique');
     ids.add(activity.id);
-    if (!DAILY_ACTIVITY_KINDS.includes(activity.kind)) {
-      throw new Error(`Invalid daily tutor activity kind: ${String(activity.kind)}`);
-    }
-    kinds.push(activity.kind);
-    if (!DAILY_ACTIVITY_STATUSES.has(activity.status)) {
-      throw new Error(`Invalid daily tutor activity status: ${String(activity.status)}`);
-    }
-    if (typeof activity.title !== 'string' || typeof activity.reason !== 'string') {
-      throw new Error('Activity title and reason are required');
-    }
+    if (!DAILY_ACTIVITY_KINDS.includes(activity.kind)) throw new Error(`Invalid daily tutor activity kind: ${String(activity.kind)}`);
+    if (!DAILY_ACTIVITY_STATUSES.has(activity.status)) throw new Error(`Invalid daily tutor activity status: ${String(activity.status)}`);
+    if (typeof activity.title !== 'string' || typeof activity.reason !== 'string') throw new Error('Activity title and reason are required');
   }
 }
 
-/**
- * SQLiteDailyTutorRepository
- *
- * Implements DailyTutorRepository over daily_tutor_sessions +
- * daily_tutor_activities. Writes validate statuses/kinds/date keys; reads
- * return persisted rows as-is (structural validation on load belongs to the
- * Daily Tutor service, which can recover safely). The UNIQUE(learner_id,
- * date_key) constraint backs the insert contract: a second insert for the
- * same learner/date returns null instead of duplicating the session.
- */
 export class SQLiteDailyTutorRepository implements DailyTutorRepository {
   constructor(private readonly adapter: DatabaseAdapter) {}
 
@@ -3454,7 +3700,6 @@ export class SQLiteDailyTutorRepository implements DailyTutorRepository {
     assertValidDailySessionInput(input.session);
     assertValidDailyActivitiesInput(input.activities);
 
-    // Fast path: an existing session for this learner/date wins immediately.
     const existing = await this.adapter.query(
       `SELECT id FROM daily_tutor_sessions WHERE learner_id = ? AND date_key = ?`,
       [input.session.learnerId, input.session.dateKey],
@@ -3512,20 +3757,18 @@ export class SQLiteDailyTutorRepository implements DailyTutorRepository {
     try {
       await this.adapter.transaction(steps);
     } catch (error) {
-      // A concurrent writer may have won the UNIQUE(learner_id, date_key)
-      // race between the check above and this transaction: never duplicate.
-      const raced = await this.adapter.query(
-        `SELECT id FROM daily_tutor_sessions WHERE learner_id = ? AND date_key = ?`,
-        [input.session.learnerId, input.session.dateKey],
-      );
-      if (raced.length > 0) return null;
+      if (isUniqueViolation(error)) {
+        const raced = await this.adapter.query(
+          `SELECT id FROM daily_tutor_sessions WHERE learner_id = ? AND date_key = ?`,
+          [input.session.learnerId, input.session.dateKey],
+        );
+        if (raced.length > 0) return null;
+      }
       throw error;
     }
 
     const stored = await this.getSession(input.session.id);
-    if (!stored) {
-      throw new Error('Failed to persist daily tutor session');
-    }
+    if (!stored) throw new Error('Failed to persist daily tutor session');
     return stored;
   }
 
@@ -3535,9 +3778,7 @@ export class SQLiteDailyTutorRepository implements DailyTutorRepository {
       throw new Error(`Invalid daily tutor session status: ${String(patch.status)}`);
     }
     const existing = await this.getSession(id);
-    if (!existing) {
-      throw new Error(`Daily tutor session not found: ${id}`);
-    }
+    if (!existing) throw new Error(`Daily tutor session not found: ${id}`);
 
     const fields: string[] = [];
     const params: SqlParam[] = [];
@@ -3564,9 +3805,7 @@ export class SQLiteDailyTutorRepository implements DailyTutorRepository {
     }
 
     const updated = await this.getSession(id);
-    if (!updated) {
-      throw new Error('Daily tutor session disappeared after update');
-    }
+    if (!updated) throw new Error('Daily tutor session disappeared after update');
     return updated;
   }
 
@@ -3580,12 +3819,8 @@ export class SQLiteDailyTutorRepository implements DailyTutorRepository {
       throw new Error(`Invalid daily tutor activity status: ${String(patch.status)}`);
     }
     const existing = await this.getSession(sessionId);
-    if (!existing) {
-      throw new Error(`Daily tutor session not found: ${sessionId}`);
-    }
-    if (!existing.activities.some((activity) => activity.id === activityId)) {
-      throw new Error(`Daily tutor activity not found: ${activityId}`);
-    }
+    if (!existing) throw new Error(`Daily tutor session not found: ${sessionId}`);
+    if (!existing.activities.some((a) => a.id === activityId)) throw new Error(`Daily tutor activity not found: ${activityId}`);
 
     const fields: string[] = [];
     const params: SqlParam[] = [];
@@ -3616,32 +3851,23 @@ export class SQLiteDailyTutorRepository implements DailyTutorRepository {
     }
 
     const updated = await this.getSession(sessionId);
-    if (!updated) {
-      throw new Error('Daily tutor session disappeared after activity update');
-    }
+    if (!updated) throw new Error('Daily tutor session disappeared after activity update');
     return updated;
   }
 
   async deleteSession(id: string): Promise<boolean> {
     if (!id) return false;
-    const existing = await this.adapter.query(
-      `SELECT id FROM daily_tutor_sessions WHERE id = ?`,
-      [id],
-    );
+    const existing = await this.adapter.query(`SELECT id FROM daily_tutor_sessions WHERE id = ?`, [id]);
     if (existing.length === 0) return false;
-    // Children are deleted explicitly so recovery does not depend on
-    // PRAGMA foreign_keys being enabled (same pattern as lexical deletion).
-    await this.adapter.execute(`DELETE FROM daily_tutor_activities WHERE session_id = ?`, [id]);
-    await this.adapter.execute(`DELETE FROM daily_tutor_sessions WHERE id = ?`, [id]);
+    await this.adapter.transaction([
+      { sql: `DELETE FROM daily_tutor_activities WHERE session_id = ?`, params: [id] },
+      { sql: `DELETE FROM daily_tutor_sessions WHERE id = ?`, params: [id] },
+    ]);
     return true;
   }
 
-  /** Load a session record with its ordered activities. */
   private async loadRecord(id: string): Promise<DailyTutorSessionRecord | null> {
-    const rows = await this.adapter.query(
-      `SELECT * FROM daily_tutor_sessions WHERE id = ?`,
-      [id],
-    );
+    const rows = await this.adapter.query(`SELECT * FROM daily_tutor_sessions WHERE id = ?`, [id]);
     if (rows.length === 0) return null;
     const activityRows = await this.adapter.query(
       `SELECT * FROM daily_tutor_activities WHERE session_id = ? ORDER BY order_index ASC`,
