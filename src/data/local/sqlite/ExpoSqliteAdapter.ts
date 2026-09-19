@@ -38,6 +38,8 @@ export class ExpoSqliteAdapter implements DatabaseAdapter {
   }
 
   private db: SQLite.SQLiteDatabase | null = null;
+  /** In-flight initialization: concurrent init() callers await this one run. */
+  private initPromise: Promise<void> | null = null;
   private readonly options: ExpoSqliteAdapterOptions;
 
   constructor(options: ExpoSqliteAdapterOptions) {
@@ -45,11 +47,39 @@ export class ExpoSqliteAdapter implements DatabaseAdapter {
     this.path = `${options.databaseDirectory ?? ''}${options.databaseName}`;
   }
 
+  /**
+   * Initialize (open + migrate). Idempotent: while an initialization is still
+   * running, every caller awaits THAT run instead of returning early on a
+   * half-migrated connection; a failed run is not cached, so a later call may
+   * try again.
+   */
   async init(): Promise<void> {
     if (this.db) return;
+    if (this.initPromise) return this.initPromise;
+
+    const attempt = this.initialize();
+    this.initPromise = attempt;
+    void attempt.then(
+      () => {
+        if (this.initPromise === attempt) this.initPromise = null;
+      },
+      () => {
+        if (this.initPromise === attempt) this.initPromise = null;
+      },
+    );
+    return attempt;
+  }
+
+  private async initialize(): Promise<void> {
     this.db = SQLite.openDatabaseSync(this.options.databaseName);
     this._connected = true;
-    await runMigrations(this);
+    try {
+      await runMigrations(this);
+    } catch (error) {
+      // A failed initialization must not leave a half-open connection behind.
+      await this.close();
+      throw error;
+    }
   }
 
   async execute(sql: string, params?: readonly SqlParam[]): Promise<SqlExecuteResult> {

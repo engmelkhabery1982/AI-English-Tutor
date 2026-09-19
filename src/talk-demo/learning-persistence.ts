@@ -15,6 +15,7 @@ import {
   SQLiteWeaknessRepository,
   SQLiteUserProfileRepository,
 } from '../data/local/sqlite/repositories';
+import { getAppDatabase } from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 
 function categorizeCorrection(
@@ -58,11 +59,11 @@ export interface LearningPersistenceService {
 export function createLearningPersistenceService(injectedAdapter?: DatabaseAdapter, injectedLearnerId?: string): LearningPersistenceService {
   async function resolveDependencies() {
     try {
+      // Precedence: an explicitly injected adapter first, then the canonical
+      // application database owner (never a feature-local second connection).
       let adapter = injectedAdapter ?? null;
       if (!adapter) {
-        const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-        adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-        await adapter.init();
+        adapter = (await getAppDatabase()).adapter;
       }
 
       let learnerId: string | null = injectedLearnerId ?? null;

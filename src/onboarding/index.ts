@@ -9,7 +9,12 @@
  * repository, no second AI provider).
  */
 
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import { createRecoverableSingleFlight } from '../shared/single-flight';
 import { createTalkComposition } from '../talk-demo';
 import { createListeningService } from '../listening';
 import { createPronunciationEngine } from '../pronunciation';
@@ -46,23 +51,20 @@ export function createOnboardingServiceOn(adapter: DatabaseAdapter): OnboardingS
   });
 }
 
-// Default composition bootstrap — adapter lifecycle lives behind composition,
-// never inside UI screens (SAME pattern as Talk / Listening / Pronunciation).
-let defaultServicePromise: Promise<OnboardingService> | null = null;
+// Default composition bootstrap — the canonical application database owns the
+// adapter lifecycle (see src/data/local/sqlite/app-database.ts); this factory
+// only composes the service ON that shared adapter. A failed bootstrap is not
+// cached, so a later call retries.
+const defaultService = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createOnboardingServiceOn(adapter);
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
-/** Compose the service on the default app database (reused across calls). */
+/** Compose the service on the canonical app database (reused across calls). */
 export function createDefaultOnboardingService(): Promise<OnboardingService> {
-  if (!defaultServicePromise) {
-    defaultServicePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
-      return createOnboardingServiceOn(adapter);
-    })().catch((error: unknown) => {
-      // Allow a later retry instead of caching a failed bootstrap forever.
-      defaultServicePromise = null;
-      throw error;
-    });
-  }
-  return defaultServicePromise;
+  return defaultService();
 }

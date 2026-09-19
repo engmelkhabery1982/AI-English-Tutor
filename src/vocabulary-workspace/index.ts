@@ -12,6 +12,10 @@
  * bootstrap and learner resolution behind the service.
  */
 
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteUserProfileRepository,
@@ -22,6 +26,7 @@ import {
   deleteLexicalItemWithReviews,
 } from '../data/local/sqlite/repositories';
 import { createReviewService } from '../review/factory';
+import { createRecoverableSingleFlight } from '../shared/single-flight';
 import { VocabularyWorkspaceService } from './service';
 
 export * from './types';
@@ -49,23 +54,23 @@ export function createVocabularyWorkspaceService(
   });
 }
 
-// Default composition bootstrap. The dynamic import and adapter lifecycle
-// live HERE — behind composition — never inside UI screens.
-let defaultServicePromise: Promise<VocabularyWorkspaceService> | null = null;
+// Default composition bootstrap. The canonical application database owns the
+// adapter lifecycle (see src/data/local/sqlite/app-database.ts); this factory
+// only builds the workspace ON that shared adapter and caches the instance.
+// A failed bootstrap is not cached, so a later call retries.
+const defaultService = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createVocabularyWorkspaceService(adapter);
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
 /**
- * Compose the workspace on the default local database. Safe to call
- * repeatedly: the adapter initialization and service composition happen
- * once and are reused.
+ * Compose the workspace on the canonical app database. Safe to call
+ * repeatedly: the shared adapter and this service instance are reused.
  */
 export function createDefaultVocabularyWorkspaceService(): Promise<VocabularyWorkspaceService> {
-  if (!defaultServicePromise) {
-    defaultServicePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
-      return createVocabularyWorkspaceService(adapter);
-    })();
-  }
-  return defaultServicePromise;
+  return defaultService();
 }

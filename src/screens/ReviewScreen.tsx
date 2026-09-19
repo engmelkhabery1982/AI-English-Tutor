@@ -14,6 +14,7 @@ import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 import type { ReviewService } from '../review/service';
 import { createReviewService } from '../review/factory';
 import type { ReviewItemCandidate, EvaluationResult, ReviewDashboardSummary } from '../review/types';
+import { getAppDatabase } from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { LearnerWeakness } from '../domain/models/learner';
 import type { DailyTutorReviewLaunch, DailyTutorLaunchState } from '../daily-tutor';
@@ -248,9 +249,9 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
 
     async function init() {
       try {
-        const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-        const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-        await adapter.init();
+        // The CANONICAL application database owns the adapter lifecycle: the
+        // Review flow never opens its own connection to the same file.
+        const { adapter } = await getAppDatabase();
         dbAdapterRef.current = adapter;
 
         // Use the composition root factory instead of manually building SQLite repositories!

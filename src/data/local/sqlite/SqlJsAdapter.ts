@@ -65,6 +65,8 @@ export class SqlJsAdapter implements DatabaseAdapter {
   }
 
   private db: SqlJsDatabase | null = null;
+  /** In-flight initialization: concurrent init() callers await this one run. */
+  private initPromise: Promise<void> | null = null;
   private readonly databaseName: string;
 
   constructor(databaseName: string = ':memory:') {
@@ -72,12 +74,39 @@ export class SqlJsAdapter implements DatabaseAdapter {
     this.path = databaseName;
   }
 
+  /**
+   * Initialize (open + migrate). Idempotent: while an initialization is still
+   * running, every caller awaits THAT run; a failed run is not cached, so a
+   * later call may try again.
+   */
   async init(): Promise<void> {
     if (this.db) return;
+    if (this.initPromise) return this.initPromise;
+
+    const attempt = this.initialize();
+    this.initPromise = attempt;
+    void attempt.then(
+      () => {
+        if (this.initPromise === attempt) this.initPromise = null;
+      },
+      () => {
+        if (this.initPromise === attempt) this.initPromise = null;
+      },
+    );
+    return attempt;
+  }
+
+  private async initialize(): Promise<void> {
     const mod = await loadSqlJs();
     this.db = new mod.Database();
     this._connected = true;
-    await runMigrations(this);
+    try {
+      await runMigrations(this);
+    } catch (error) {
+      // A failed initialization must not leave a half-open connection behind.
+      await this.close();
+      throw error;
+    }
   }
 
   async execute(sql: string, params?: readonly SqlParam[]): Promise<SqlExecuteResult> {

@@ -10,6 +10,10 @@
  * new dependency.
  */
 
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import type { AIProvider } from '../providers/ai/types';
 import { createGeminiAIProvider } from '../providers/ai/gemini';
@@ -23,6 +27,7 @@ import {
   SQLiteWeaknessRepository,
 } from '../data/local/sqlite/repositories';
 import { createPronunciationEngine } from '../pronunciation';
+import { createRecoverableSingleFlight } from '../shared/single-flight';
 import { ListeningService } from './service';
 import { createSuccessObservationRecorder, type SuccessObservationRecorder } from '../reassessment';
 
@@ -94,19 +99,20 @@ export function createListeningService(
 
 type ListeningServiceDepsHint = ConstructorParameters<typeof ListeningService>[0];
 
-// Default composition bootstrap — adapter lifecycle lives behind
-// composition, never inside UI screens.
-let defaultServicePromise: Promise<ListeningService> | null = null;
+// Default composition bootstrap — the canonical application database owns the
+// adapter lifecycle (see src/data/local/sqlite/app-database.ts); this factory
+// only builds the service ON that shared adapter and caches the instance.
+// A failed bootstrap is not cached, so a later call retries.
+const defaultService = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createListeningService(adapter);
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
-/** Compose the service on the default local database (reused across calls). */
+/** Compose the service on the canonical app database (reused across calls). */
 export function createDefaultListeningService(): Promise<ListeningService> {
-  if (!defaultServicePromise) {
-    defaultServicePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
-      return createListeningService(adapter);
-    })();
-  }
-  return defaultServicePromise;
+  return defaultService();
 }

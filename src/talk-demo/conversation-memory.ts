@@ -18,6 +18,11 @@
  *   the service additionally collapses concurrent finalizations of the same id.
  */
 
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+  type AppDatabaseLifecycleToken,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteConversationRepository,
@@ -318,18 +323,37 @@ function createConversationMemoryService(
   options?: ConversationMemoryServiceOptions,
 ): ConversationMemoryService {
   let cachedDeps: ResolvedMemoryDependencies | null = null;
+  /**
+   * Database lifecycle the cached dependencies were built on. Repositories
+   * composed from the canonical database are dropped when it starts a NEW
+   * lifecycle, so a cached repository can never keep using a closed
+   * connection. An injected adapter/repository is the caller's and is never
+   * dropped this way.
+   */
+  let cachedLifecycle: AppDatabaseLifecycleToken | null = null;
   /** In-flight/complete finalizations keyed by conversation memory identity. */
   const finalizations = new Map<string, Promise<FinalizeConversationResult>>();
   let resolvedLearnerId: string | null = options?.learnerId ?? null;
 
   async function resolveDependencies(): Promise<ResolvedMemoryDependencies | null> {
+    const usesInjectedDependencies = Boolean(
+      options?.databaseAdapter || options?.conversationRepository,
+    );
+    if (!usesInjectedDependencies) {
+      const lifecycle = appDatabaseLifecycleToken();
+      // Same lifecycle: the cached repositories still belong to the OPEN
+      // connection. New lifecycle: rebuild them on the new adapter.
+      if (cachedLifecycle !== null && cachedLifecycle !== lifecycle) cachedDeps = null;
+      cachedLifecycle = lifecycle;
+    }
     if (cachedDeps) return cachedDeps;
     try {
+      // Precedence: an explicitly injected adapter/repository first, then the
+      // canonical application database owner (never a feature-local second
+      // connection to the same file).
       let adapter = options?.databaseAdapter;
       if (!adapter && !options?.conversationRepository) {
-        const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-        adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-        await adapter.init();
+        adapter = (await getAppDatabase()).adapter;
       }
 
       const conversationRepo =

@@ -8,6 +8,10 @@
  * createDefaultPronunciationEngine().
  */
 
+import {
+  appDatabaseLifecycleToken,
+  getAppDatabase,
+} from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteUserProfileRepository,
@@ -17,6 +21,7 @@ import {
   SQLiteReviewRepository,
 } from '../data/local/sqlite/repositories';
 import { createSuccessObservationRecorder } from '../reassessment/success-recorder';
+import { createRecoverableSingleFlight } from '../shared/single-flight';
 import { createTranscriptComparisonPronunciationProvider } from './baseline-provider';
 import { PronunciationEngine } from './engine';
 
@@ -54,19 +59,20 @@ export function createPronunciationEngine(adapter: DatabaseAdapter): Pronunciati
   });
 }
 
-// Default composition bootstrap — adapter lifecycle lives behind
-// composition, never inside UI screens.
-let defaultEnginePromise: Promise<PronunciationEngine> | null = null;
+// Default composition bootstrap — the canonical application database owns the
+// adapter lifecycle (see src/data/local/sqlite/app-database.ts); this factory
+// only builds the engine ON that shared adapter and caches the instance.
+// A failed bootstrap is not cached, so a later call retries.
+const defaultEngine = createRecoverableSingleFlight(
+  async () => {
+    const { adapter } = await getAppDatabase();
+    return createPronunciationEngine(adapter);
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
-/** Compose the engine on the default local database (reused across calls). */
+/** Compose the engine on the canonical app database (reused across calls). */
 export function createDefaultPronunciationEngine(): Promise<PronunciationEngine> {
-  if (!defaultEnginePromise) {
-    defaultEnginePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
-      return createPronunciationEngine(adapter);
-    })();
-  }
-  return defaultEnginePromise;
+  return defaultEngine();
 }

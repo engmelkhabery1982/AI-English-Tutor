@@ -19,6 +19,7 @@
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
+import { appDatabaseLifecycleToken } from '../data/local/sqlite/app-database';
 import {
   SQLiteProgressRepository,
   SQLiteWeaknessRepository,
@@ -29,6 +30,7 @@ import {
   type SuccessObservationRecorder,
 } from '../reassessment/success-recorder';
 import { resolveTalkCoaching } from '../talk-demo';
+import { createRecoverableSingleFlight } from '../shared/single-flight';
 import {
   createSpeakingPracticeService,
   type SpeakingPracticeService,
@@ -70,9 +72,32 @@ export function createSpeakingService(
   });
 }
 
-// Default composition bootstrap — adapter lifecycle lives behind composition,
-// never inside UI screens (SAME pattern as Talk / Adaptive Lessons / etc.).
-let defaultCompositionPromise: Promise<DefaultSpeakingComposition> | null = null;
+// Default composition bootstrap — the canonical application database owns the
+// adapter lifecycle (see src/data/local/sqlite/app-database.ts) and Talk is
+// resolved through ITS lifecycle-aware default composition. The value is cached
+// for ONE database lifecycle: a close invalidates it, so the next request
+// re-resolves on the new connection instead of keeping a closed adapter.
+const defaultComposition = createRecoverableSingleFlight<DefaultSpeakingComposition>(
+  async () => {
+    const resolution = await resolveTalkCoaching();
+    if (!resolution.learnerModel || !resolution.databaseAdapter) {
+      // No persisted learner state: Deep Speaking stays unavailable rather
+      // than planning from demo data and calling it personalization.
+      throw new Error(
+        'Persisted learner data could not be composed from the local database.',
+      );
+    }
+    return {
+      service: createSpeakingService(
+        resolution.learnerModel,
+        resolution.databaseAdapter,
+      ),
+      adapter: resolution.databaseAdapter,
+    };
+  },
+  // Cached for ONE database lifecycle only (see app-database.ts).
+  { lifecycleToken: appDatabaseLifecycleToken },
+);
 
 /**
  * The canonical app composition behind the default speaking service: the
@@ -87,31 +112,9 @@ export interface DefaultSpeakingComposition {
   readonly adapter: DatabaseAdapter;
 }
 
-/** Compose (once, reused) on the default app database. */
+/** Compose (once per database lifecycle, reused) on the default app database. */
 export function createDefaultSpeakingComposition(): Promise<DefaultSpeakingComposition> {
-  if (!defaultCompositionPromise) {
-    defaultCompositionPromise = (async () => {
-      const resolution = await resolveTalkCoaching();
-      if (!resolution.learnerModel || !resolution.databaseAdapter) {
-        // No persisted learner state: Deep Speaking stays unavailable rather
-        // than planning from demo data and calling it personalization.
-        throw new Error(
-          'Persisted learner data could not be composed from the local database.',
-        );
-      }
-      return {
-        service: createSpeakingService(
-          resolution.learnerModel,
-          resolution.databaseAdapter,
-        ),
-        adapter: resolution.databaseAdapter,
-      };
-    })().catch((error: unknown) => {
-      defaultCompositionPromise = null;
-      throw error;
-    });
-  }
-  return defaultCompositionPromise;
+  return defaultComposition();
 }
 
 /** Compose the service on the default app database (reused across calls). */
