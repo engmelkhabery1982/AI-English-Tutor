@@ -2,6 +2,12 @@
  * src/providers/tts/expo.ts
  *
  * Real Text-to-Speech provider using official Expo Speech (expo-speech).
+ * Hardened for mobile lifecycle:
+ * - at most one active TTS playback per owned surface (generation token)
+ * - replay interrupts/replaces previous playback safely
+ * - stop/cancel idempotent
+ * - stale completion cannot mutate replacement session (generation check)
+ * - bounded watchdog/timeout to avoid permanent pending promise if native callback never arrives
  */
 
 import type * as ExpoSpeechModule from 'expo-speech';
@@ -16,68 +22,115 @@ async function getSpeechModule(): Promise<typeof ExpoSpeechModule> {
   return speechModulePromise;
 }
 
+const TTS_WATCHDOG_MS = 60_000; // 60s max per utterance – prevents permanent hang if callback lost
+
 export class ExpoTTSProvider implements TextToSpeechProvider {
   readonly id = 'expo-speech';
-  /**
-   * Honest declaration: expo-speech really honors `rate` (0.0–2.0, 1.0 is
-   * normal), so slower/natural/faster playback is a real capability here.
-   */
   readonly supportsSpeechRate = true;
 
+  private generation = 0;
+  private active = false;
+  private disposed = false;
+  private pendingStop: Promise<void> | null = null;
+
+  private trackStop(promise: Promise<unknown>): void {
+    const safe = promise.then(() => undefined).catch(() => undefined);
+    if (this.pendingStop) {
+      const prev = this.pendingStop;
+      this.pendingStop = prev.then(() => safe).catch(() => undefined);
+    } else {
+      this.pendingStop = safe;
+    }
+    const cur = this.pendingStop;
+    cur.finally(() => {
+      if (this.pendingStop === cur) this.pendingStop = null;
+    });
+  }
+
   async speak(text: string, options?: TTSOptions): Promise<void> {
+    if (this.disposed) return;
     const cleanText = sanitizeTextForTTS(text);
     if (!cleanText || cleanText.length === 0) {
       return;
     }
 
-    // Stop any existing speech before starting new speech
-    try {
-      await this.stop();
-    } catch {
-      // Ignore stop error
+    // Invalidate previous playback synchronously – replay interrupts safely
+    this.generation += 1;
+    const gen = this.generation;
+
+    // Stop any existing speech before starting new speech – await teardown
+    if (this.pendingStop) {
+      try {
+        await this.pendingStop;
+      } catch {}
     }
+    try {
+      await this.stopInternal();
+    } catch {}
+
+    if (this.disposed || this.generation !== gen) return;
+
+    this.active = true;
 
     return new Promise(async (resolve) => {
       let resolved = false;
+      let watchdog: ReturnType<typeof setTimeout> | null = null;
 
       const finish = () => {
         if (!resolved) {
           resolved = true;
+          if (watchdog) clearTimeout(watchdog);
+          this.active = false;
           resolve();
         }
       };
 
+      // Bounded watchdog – avoids permanent pending promise if native callback never arrives
+      watchdog = setTimeout(() => {
+        // Do not invent fake completion – just resolve the promise and stop
+        try {
+          this.stopInternal().catch(() => {});
+        } finally {
+          finish();
+        }
+      }, TTS_WATCHDOG_MS);
+
       try {
         const Speech = await getSpeechModule();
+        if (this.disposed || this.generation !== gen) {
+          finish();
+          return;
+        }
         Speech.speak(cleanText, {
           language: options?.language ?? 'en-US',
           rate: options?.rate ?? 1.0,
           pitch: options?.pitch ?? 1.0,
           onStart: () => {
-            options?.onStart?.();
+            if (this.generation === gen) options?.onStart?.();
           },
           onDone: () => {
-            options?.onDone?.();
+            if (this.generation === gen) options?.onDone?.();
             finish();
           },
           onStopped: () => {
-            options?.onDone?.();
+            // Treat stopped as done for lifecycle, but don't mutate replacement
+            if (this.generation === gen) options?.onDone?.();
             finish();
           },
           onError: (err: Error) => {
-            options?.onError?.(err);
+            if (this.generation === gen) options?.onError?.(err);
             finish();
           },
         });
       } catch (err: unknown) {
         const error = err instanceof Error ? err : new Error(String(err));
-        options?.onError?.(error);
+        if (this.generation === gen) options?.onError?.(error);
         finish();
       }
     });
   }
 
-  async stop(): Promise<void> {
+  private async stopInternal(): Promise<void> {
     try {
       const Speech = await getSpeechModule();
       await Speech.stop();
@@ -86,12 +139,47 @@ export class ExpoTTSProvider implements TextToSpeechProvider {
     }
   }
 
+  async stop(): Promise<void> {
+    // Idempotent stop – bump generation to invalidate stale callbacks
+    this.generation += 1;
+    this.active = false;
+    const p = this.stopInternal();
+    this.trackStop(p);
+    try {
+      await p;
+    } catch {}
+  }
+
   async isSpeaking(): Promise<boolean> {
+    if (this.disposed) return false;
+    if (!this.active) return false;
     try {
       const Speech = await getSpeechModule();
       return await Speech.isSpeakingAsync();
     } catch {
-      return false;
+      return this.active;
+    }
+  }
+
+  /** Synchronous invalidation for task switch / background */
+  invalidate(): void {
+    this.generation += 1;
+    this.active = false;
+    this.trackStop(this.stopInternal());
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.generation += 1;
+    this.active = false;
+    try {
+      await this.stopInternal();
+    } catch {}
+    if (this.pendingStop) {
+      try {
+        await this.pendingStop;
+      } catch {}
     }
   }
 }

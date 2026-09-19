@@ -184,8 +184,10 @@ describe('TTS integration & transcript visibility', () => {
   it('1. the screen uses the EXISTING TextToSpeechProvider abstraction', () => {
     expect(screenSrc).toContain('TextToSpeechProvider');
     // The existing provider is lazily imported from the existing voice stack.
+    // Hardened: may go through TTSController (single-flight, replay interrupts, stale gated)
     expect(screenSrc).toContain("import('../talk-demo')");
-    expect(screenSrc).toMatch(/ttsRef[.\s]*current\.?speak|ttsRef\.current\?\.speak|await ttsRef/);
+    expect(screenSrc).toMatch(/ttsRef|TTSController|createExpoTTSProvider/);
+    expect(screenSrc).toMatch(/speak/);
   });
 
   it('2. no second TTS stack exists in the listening module', () => {

@@ -61,11 +61,23 @@ export async function readAudioUriAsBase64(uri: string): Promise<string | null> 
 
 /**
  * Real device audio recorder using Expo SDK 57 expo-audio.
+ * Hardened for mobile lifecycle:
+ * - maximum one active recording (single-flight start)
+ * - double mic tap cannot create two recordings
+ * - stop/start cannot overlap native teardown (pendingStop chaining)
+ * - teardown idempotent
+ * - terminally disposed recorder cannot be reused
+ * - task switch invalidates previous callback via generation
  */
 export class ExpoAudioRecorder implements AudioRecorderService {
   private recordingInstance: { stop: () => Promise<void>; uri: string | null } | null = null;
   private recordingStartTime: number | null = null;
   private active: boolean = false;
+  private disposed: boolean = false;
+  private startInProgress: boolean = false;
+  private pendingTeardown: Promise<void> | null = null;
+  private generation: number = 0;
+  private lastResult: AudioRecordingResult | null = null;
 
   async requestPermissions(): Promise<boolean> {
     try {
@@ -87,41 +99,135 @@ export class ExpoAudioRecorder implements AudioRecorderService {
     }
   }
 
-  async startRecording(): Promise<void> {
-    if (this.active) {
-      throw new Error('Recording is already in progress.');
+  private trackTeardown(promise: Promise<unknown>): void {
+    const safe = promise.then(() => undefined).catch(() => undefined);
+    if (this.pendingTeardown) {
+      const prev = this.pendingTeardown;
+      this.pendingTeardown = prev.then(() => safe).catch(() => undefined);
+    } else {
+      this.pendingTeardown = safe;
     }
+    const cur = this.pendingTeardown;
+    cur.finally(() => {
+      if (this.pendingTeardown === cur) {
+        this.pendingTeardown = null;
+      }
+    });
+  }
 
-    const { AudioModule, RecordingPresets, setAudioModeAsync } = await import('expo-audio');
-
-    // Ensure audio mode allows recording
+  private async restoreAudioMode(): Promise<void> {
     try {
+      const { setAudioModeAsync } = await import('expo-audio');
       await setAudioModeAsync({
-        allowsRecording: true,
+        allowsRecording: false,
         playsInSilentMode: true,
       });
     } catch {
-      // Best-effort audio mode configuration
+      // Best-effort restoration – failure must not crash or create learner evidence
+    }
+  }
+
+  async startRecording(): Promise<void> {
+    if (this.disposed) {
+      throw new Error('Recorder is disposed and cannot be reused.');
+    }
+    if (this.active || this.startInProgress) {
+      throw new Error('Recording is already in progress.');
     }
 
+    // Prevent overlap with native teardown: wait for any pending stop/restoration
+    if (this.pendingTeardown) {
+      await this.pendingTeardown;
+      if (this.disposed) {
+        throw new Error('Recorder is disposed and cannot be reused.');
+      }
+      if (this.active) {
+        throw new Error('Recording is already in progress.');
+      }
+    }
+
+    this.startInProgress = true;
+    const gen = this.generation;
+    let audioModeEnabled = false;
+    let recorderInstance: { stop: () => Promise<void>; uri: string | null } | null = null;
+
     try {
+      // ALL work after setting startInProgress is protected by try/finally
+      const { AudioModule, RecordingPresets, setAudioModeAsync } = await import('expo-audio');
+
+      // Ensure audio mode allows recording
+      try {
+        await setAudioModeAsync({
+          allowsRecording: true,
+          playsInSilentMode: true,
+        });
+        audioModeEnabled = true;
+      } catch {
+        // Best-effort audio mode configuration
+      }
+
       const recorder = new AudioModule.AudioRecorder(RecordingPresets.HIGH_QUALITY);
+      recorderInstance = recorder;
       await recorder.prepareToRecordAsync();
+      if (this.disposed || this.generation !== gen) {
+        // Invalidated while preparing: clean up and abort, restore mode
+        try {
+          await recorder.stop();
+        } catch {}
+        try {
+          await setAudioModeAsync({
+            allowsRecording: false,
+            playsInSilentMode: true,
+          });
+        } catch {}
+        throw new Error('Recording was cancelled.');
+      }
       recorder.record();
 
       this.recordingInstance = recorder;
       this.recordingStartTime = Date.now();
       this.active = true;
+      this.lastResult = null;
     } catch (err) {
+      // No active recorder, no orphan native resource
       this.active = false;
+      if (recorderInstance) {
+        try {
+          await recorderInstance.stop();
+        } catch {}
+      }
       this.recordingInstance = null;
       this.recordingStartTime = null;
+      // Restore recording mode if we enabled it and start failed
+      if (audioModeEnabled) {
+        try {
+          const { setAudioModeAsync } = await import('expo-audio');
+          await setAudioModeAsync({
+            allowsRecording: false,
+            playsInSilentMode: true,
+          });
+        } catch {
+          // Restoration failure must not crash or create learner evidence
+        }
+      }
       throw err;
+    } finally {
+      // Any start failure, including module import failure, must leave startInProgress false and retry possible
+      this.startInProgress = false;
     }
   }
 
   async stopRecording(): Promise<AudioRecordingResult> {
+    if (this.disposed) {
+      throw new Error('Recorder is disposed and cannot be reused.');
+    }
     if (!this.active || !this.recordingInstance) {
+      // Idempotent teardown: if a stop is already in flight, await it
+      // For strict API compatibility, throw when no active recording and no pending
+      // but we make repeated Stop safe by returning last result if available
+      if (this.lastResult) {
+        return this.lastResult;
+      }
       throw new Error('No active recording to stop.');
     }
 
@@ -133,7 +239,26 @@ export class ExpoAudioRecorder implements AudioRecorderService {
     this.recordingInstance = null;
     this.recordingStartTime = null;
 
-    await recorder.stop();
+    const teardownPromise = (async () => {
+      try {
+        await recorder.stop();
+      } catch {
+        // Best-effort stop
+      }
+      // Once recording ownership ends, recording mode is returned to non-recording state
+      try {
+        const { setAudioModeAsync } = await import('expo-audio');
+        await setAudioModeAsync({
+          allowsRecording: false,
+          playsInSilentMode: true,
+        });
+      } catch {
+        // Restoration failure must not crash or create learner evidence
+      }
+    })();
+    // Restoration is serialized with teardown where necessary
+    this.trackTeardown(teardownPromise);
+    await teardownPromise;
 
     const uri = recorder.uri || '';
     let base64: string | undefined;
@@ -155,12 +280,14 @@ export class ExpoAudioRecorder implements AudioRecorderService {
       mimeType = 'audio/wav';
     }
 
-    return {
+    const result: AudioRecordingResult = {
       uri,
       base64,
       mimeType,
       durationMs,
     };
+    this.lastResult = result;
+    return result;
   }
 
   isRecording(): boolean {
@@ -173,10 +300,84 @@ export class ExpoAudioRecorder implements AudioRecorderService {
     }
     return Math.floor((Date.now() - this.recordingStartTime) / 1000);
   }
+
+  /** Synchronous invalidation for task switch / background */
+  invalidate(): void {
+    this.generation += 1;
+    if (this.active && this.recordingInstance) {
+      const rec = this.recordingInstance;
+      this.active = false;
+      this.recordingInstance = null;
+      this.recordingStartTime = null;
+      this.trackTeardown(
+        (async () => {
+          try {
+            await rec.stop();
+          } catch {}
+          // Restore recording mode after ownership ends – background/invalidate path
+          try {
+            const { setAudioModeAsync } = await import('expo-audio');
+            await setAudioModeAsync({
+              allowsRecording: false,
+              playsInSilentMode: true,
+            });
+          } catch {}
+        })(),
+      );
+    } else {
+      // No active recorder, but ensure recording mode is restored if left enabled
+      // (e.g., failed start after audio mode enabled, or background without active recording)
+      this.trackTeardown(
+        (async () => {
+          try {
+            const { setAudioModeAsync } = await import('expo-audio');
+            await setAudioModeAsync({
+              allowsRecording: false,
+              playsInSilentMode: true,
+            });
+          } catch {}
+        })(),
+      );
+    }
+  }
+
+  /** Terminal disposal – idempotent, restores audio mode */
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.generation += 1;
+    this.startInProgress = false;
+    if (this.active && this.recordingInstance) {
+      const rec = this.recordingInstance;
+      this.active = false;
+      this.recordingInstance = null;
+      this.recordingStartTime = null;
+      try {
+        await rec.stop();
+      } catch {}
+    }
+    if (this.pendingTeardown) {
+      try {
+        await this.pendingTeardown;
+      } catch {}
+    }
+    // Dispose remains terminal – restore recording mode best-effort
+    try {
+      const { setAudioModeAsync } = await import('expo-audio');
+      await setAudioModeAsync({
+        allowsRecording: false,
+        playsInSilentMode: true,
+      });
+    } catch {
+      // Restoration failure must not crash
+    }
+  }
 }
 
 /**
  * Deterministic in-memory recorder for tests and demo mode.
+ * Hardened with same invariants as ExpoAudioRecorder for test fidelity,
+ * including audio mode restoration.
  */
 export class DemoAudioRecorder implements AudioRecorderService {
   private permissionGranted: boolean = true;
@@ -189,6 +390,15 @@ export class DemoAudioRecorder implements AudioRecorderService {
     mimeType: 'audio/m4a',
     durationMs: 2500,
   };
+  private disposed: boolean = false;
+  private startInProgress: boolean = false;
+  private pendingTeardown: Promise<void> | null = null;
+  private generation: number = 0;
+  private lastResult: AudioRecordingResult | null = null;
+  private recordingModeEnabled: boolean = false;
+  // For testing hooks – simulate failures
+  private failNextPrepare: boolean = false;
+  private failNextAudioMode: boolean = false;
 
   constructor(options?: { permissionGranted?: boolean; mockDurationMs?: number }) {
     if (options?.permissionGranted !== undefined) {
@@ -214,6 +424,19 @@ export class DemoAudioRecorder implements AudioRecorderService {
     };
   }
 
+  /** Test hook: force next prepare to fail */
+  setFailNextPrepare(fail: boolean): void {
+    this.failNextPrepare = fail;
+  }
+
+  setFailNextAudioMode(fail: boolean): void {
+    this.failNextAudioMode = fail;
+  }
+
+  isAudioModeEnabled(): boolean {
+    return this.recordingModeEnabled;
+  }
+
   async requestPermissions(): Promise<boolean> {
     return this.permissionGranted;
   }
@@ -222,19 +445,88 @@ export class DemoAudioRecorder implements AudioRecorderService {
     return this.permissionGranted;
   }
 
+  private trackTeardown(promise: Promise<unknown>): void {
+    const safe = promise.then(() => undefined).catch(() => undefined);
+    if (this.pendingTeardown) {
+      const prev = this.pendingTeardown;
+      this.pendingTeardown = prev.then(() => safe).catch(() => undefined);
+    } else {
+      this.pendingTeardown = safe;
+    }
+    const cur = this.pendingTeardown;
+    cur.finally(() => {
+      if (this.pendingTeardown === cur) {
+        this.pendingTeardown = null;
+      }
+    });
+  }
+
+  private async restoreAudioMode(): Promise<void> {
+    try {
+      if (this.failNextAudioMode) {
+        this.failNextAudioMode = false;
+        throw new Error('audio mode restore failed');
+      }
+    } catch {
+      // Restoration failure must not crash – but we still clear the flag best-effort
+    } finally {
+      // Even on failure, we consider ownership ended and mode returned to non-recording
+      this.recordingModeEnabled = false;
+    }
+  }
+
   async startRecording(): Promise<void> {
-    if (this.active) {
+    if (this.disposed) {
+      throw new Error('Recorder is disposed and cannot be reused.');
+    }
+    if (this.active || this.startInProgress) {
       throw new Error('Recording is already in progress.');
+    }
+    if (this.pendingTeardown) {
+      await this.pendingTeardown;
+      if (this.disposed) throw new Error('Recorder is disposed and cannot be reused.');
+      if (this.active) throw new Error('Recording is already in progress.');
     }
     if (!this.permissionGranted) {
       throw new Error('Microphone permission not granted.');
     }
-    this.active = true;
-    this.recordingStartTime = Date.now();
+    this.startInProgress = true;
+    let audioModeEnabled = false;
+    try {
+      // Simulate audio mode enable – failure here must also leave startInProgress false
+      if (this.failNextAudioMode) {
+        this.failNextAudioMode = false;
+        throw new Error('audio mode setup failed');
+      }
+      this.recordingModeEnabled = true;
+      audioModeEnabled = true;
+
+      if (this.failNextPrepare) {
+        this.failNextPrepare = false;
+        throw new Error('prepare failed');
+      }
+
+      this.active = true;
+      this.recordingStartTime = Date.now();
+      this.lastResult = null;
+    } catch (err) {
+      this.active = false;
+      this.recordingStartTime = null;
+      if (audioModeEnabled) {
+        await this.restoreAudioMode();
+      }
+      throw err;
+    } finally {
+      this.startInProgress = false;
+    }
   }
 
   async stopRecording(): Promise<AudioRecordingResult> {
+    if (this.disposed) {
+      throw new Error('Recorder is disposed and cannot be reused.');
+    }
     if (!this.active) {
+      if (this.lastResult) return this.lastResult;
       throw new Error('No active recording to stop.');
     }
     const elapsed = this.recordingStartTime
@@ -242,11 +534,18 @@ export class DemoAudioRecorder implements AudioRecorderService {
       : this.mockDurationMs;
     this.active = false;
     this.recordingStartTime = null;
-
-    return {
+    const result = {
       ...this.mockResult,
       durationMs: Math.max(elapsed, this.mockDurationMs),
     };
+    this.lastResult = result;
+    // Simulate async teardown including audio mode restoration, serialized
+    const teardown = (async () => {
+      await this.restoreAudioMode();
+    })();
+    this.trackTeardown(teardown);
+    await teardown;
+    return result;
   }
 
   isRecording(): boolean {
@@ -258,6 +557,41 @@ export class DemoAudioRecorder implements AudioRecorderService {
       return 0;
     }
     return Math.floor((Date.now() - this.recordingStartTime) / 1000);
+  }
+
+  invalidate(): void {
+    this.generation += 1;
+    if (this.active) {
+      this.active = false;
+      this.recordingStartTime = null;
+      this.trackTeardown(
+        (async () => {
+          await this.restoreAudioMode();
+        })(),
+      );
+    } else {
+      // Ensure mode restored even if no active recorder (background path)
+      this.trackTeardown(
+        (async () => {
+          await this.restoreAudioMode();
+        })(),
+      );
+    }
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.generation += 1;
+    this.startInProgress = false;
+    this.active = false;
+    this.recordingStartTime = null;
+    if (this.pendingTeardown) {
+      try {
+        await this.pendingTeardown;
+      } catch {}
+    }
+    await this.restoreAudioMode();
   }
 }
 
