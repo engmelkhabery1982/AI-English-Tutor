@@ -1745,12 +1745,12 @@ describe('Onboarding — integration with the rest of the app', () => {
     const screen = readFileSync(join(__dirname, '..', 'screens', 'OnboardingScreen.tsx'), 'utf8');
     // The old false promise is gone.
     expect(screen).not.toContain('Nothing on your profile changes unless you accept it');
-    expect(screen).toContain('Your learning preferences are saved when you start the diagnostic');
+    expect(screen).toContain('Your learning preferences are saved when you start the assessment');
     expect(screen).toContain('changes only if you accept the estimate at the end');
     // A failed start never claims the profile was untouched.
     expect(screen).not.toContain('Your profile was not changed');
-    expect(screen).toContain('Your learning preferences were saved, but the diagnostic could not start.');
-    expect(screen).toContain('Your learning preferences could not be saved, so the diagnostic was not started.');
+    expect(screen).toContain('Your learning preferences were saved, but the assessment could not start.');
+    expect(screen).toContain('Your learning preferences could not be saved, so the assessment was not started.');
   });
 
   it('61. the dedicated pronunciation task is the one the screen presents and repeats', () => {

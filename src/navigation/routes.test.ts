@@ -28,6 +28,8 @@ describe('route tables (single source of truth)', () => {
       'ProfessionalEnglish',
       'Onboarding',
       'Reassessment',
+      'Pronunciation',
+      'Shadowing',
     ]);
   });
 

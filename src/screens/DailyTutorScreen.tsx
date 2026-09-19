@@ -1,3 +1,4 @@
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/DailyTutorScreen.tsx
  *
@@ -29,7 +30,6 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
@@ -173,6 +173,7 @@ export default function DailyTutorScreen(props?: DailyTutorScreenProps) {
       navigation.navigate(route.routeName, route.params);
     } catch {
       // Navigation/launch failure changes nothing; the learner can retry.
+      if (!unmountedRef.current) setMessage('Could not open this activity. Try again; no practice was recorded.');
     } finally {
       startingRef.current = false;
       if (!unmountedRef.current) {
@@ -200,6 +201,7 @@ export default function DailyTutorScreen(props?: DailyTutorScreenProps) {
       }
     } catch {
       // A failed skip changes nothing.
+      if (!unmountedRef.current) setMessage('Could not skip this activity. Your plan is unchanged. Try again.');
     } finally {
       skippingRef.current = false;
       if (!unmountedRef.current) {
@@ -219,8 +221,8 @@ export default function DailyTutorScreen(props?: DailyTutorScreenProps) {
 
   if (phase !== 'ready' || !session) {
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-        <Text style={styles.screenTitle}>Today’s Practice</Text>
+      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
+        <Text style={styles.screenTitle}>Daily Tutor</Text>
         <View style={styles.card}>
           <Text style={styles.cardTitle}>
             {phase === 'no-profile' ? 'Set up your learning plan first' : 'Daily practice unavailable'}
@@ -237,7 +239,7 @@ export default function DailyTutorScreen(props?: DailyTutorScreenProps) {
               style={styles.linkButton}
               onPress={() => navigation.navigate('Onboarding')}
             >
-              <Text style={styles.linkText}>Open onboarding</Text>
+              <Text style={styles.linkText}>Set up my learning plan</Text>
             </TouchableOpacity>
           ) : null}
         </View>
@@ -249,8 +251,9 @@ export default function DailyTutorScreen(props?: DailyTutorScreenProps) {
   const current = view.current;
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <Text style={styles.screenTitle}>Today’s Practice</Text>
+    <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
+      <Text style={styles.screenTitle}>Daily Tutor</Text>
+      {message ? <Text accessibilityRole="alert" style={styles.body}>{message}</Text> : null}
 
       <View style={styles.card}>
         <View style={styles.cardHeader}>
@@ -365,6 +368,7 @@ const styles = StyleSheet.create({
   },
   cardHeader: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'center',
     justifyContent: 'space-between',
     marginBottom: 8,
@@ -409,7 +413,7 @@ const styles = StyleSheet.create({
     marginLeft: 8,
     marginTop: 2,
   },
-  activityStatusText: { fontSize: 11, color: '#3a3a3c', fontWeight: '600' },
+  activityStatusText: { fontSize: 12, color: '#3a3a3c', fontWeight: '600' },
   primaryButton: {
     backgroundColor: '#007AFF',
     borderRadius: 12,

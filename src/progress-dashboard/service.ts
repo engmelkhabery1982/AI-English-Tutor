@@ -75,7 +75,7 @@ export interface ProgressDashboardServiceDeps {
   /** Existing profile repository — the only source of the learner id. */
   readonly profile?: Pick<UserProfileRepository, 'get'>;
   readonly conversations: Pick<ConversationRepository, 'listSessions'>;
-  readonly weaknesses: Pick<WeaknessRepository, 'listWeaknesses'>;
+  readonly weaknesses: Pick<WeaknessRepository, 'listWeaknesses'> & Partial<Pick<WeaknessRepository, 'listStrengths'>>;
   readonly vocabulary: Pick<VocabularyRepository, 'list'>;
   readonly expressions: Pick<ExpressionRepository, 'list'>;
   /** Existing review repository; optional list() powers "recently reviewed". */
@@ -171,6 +171,12 @@ function lexicalStatusCountsOf(
 
 export class ProgressDashboardService {
   constructor(private readonly deps: ProgressDashboardServiceDeps) {}
+
+  /** Bounded, read-only strengths; null means this composition cannot read them. */
+  async loadStrengths(learnerId: string) {
+    if (!this.deps.weaknesses.listStrengths) return null;
+    return this.deps.weaknesses.listStrengths(learnerId, 20);
+  }
 
   /**
    * Resolve the active learner through the existing profile repository.

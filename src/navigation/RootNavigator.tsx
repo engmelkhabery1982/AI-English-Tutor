@@ -3,6 +3,8 @@ import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createStackNavigator } from '@react-navigation/stack';
 import type { StackNavigationOptions } from '@react-navigation/stack';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { PronunciationScreen, ShadowingScreen } from '../screens/SpeechPracticeScreen';
 import { Text } from 'react-native';
 
 import {
@@ -88,6 +90,9 @@ function MainTabs() {
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
+        tabBarItemStyle: route.name === 'Listening' || route.name === 'Vocabulary' ? { display: 'none' } : undefined,
+        tabBarButton: route.name === 'Listening' || route.name === 'Vocabulary' ? () => null : undefined,
+        tabBarLabelStyle: { fontSize: 12 },
         tabBarIcon: () => <Text>{route.name.charAt(0)}</Text>,
         tabBarActiveTintColor: '#007AFF',
         tabBarInactiveTintColor: '#8e8e93',
@@ -112,7 +117,7 @@ const ROOT_SCREENS: readonly RootScreenDef[] = [
   {
     name: 'DailyTutor',
     component: DailyTutorScreen,
-    options: { title: "Today's Practice", headerBackTitle: 'Home' },
+    options: { title: 'Daily Tutor', headerBackTitle: 'Home' },
   },
   {
     name: 'AdaptiveLesson',
@@ -142,8 +147,10 @@ const ROOT_SCREENS: readonly RootScreenDef[] = [
   {
     name: 'Reassessment',
     component: ReassessmentScreen,
-    options: { title: 'Periodic Reassessment', headerBackTitle: 'Back' },
+    options: { title: 'Check my English level', headerBackTitle: 'Back' },
   },
+  { name: 'Pronunciation', component: PronunciationScreen, options: { title: 'Pronunciation', headerBackTitle: 'Back' } },
+  { name: 'Shadowing', component: ShadowingScreen, options: { title: 'Shadowing', headerBackTitle: 'Back' } },
 ];
 
 // Single-source-of-truth check: the rendered root screens must be EXACTLY
@@ -157,6 +164,11 @@ export default function RootNavigator() {
   return (
     <NavigationContainer>
       <Stack.Navigator
+        screenLayout={({ children, route }) => (
+          <SafeAreaView style={{ flex: 1 }} edges={route.name === 'MainTabs' ? ['left', 'right'] : ['left', 'right', 'bottom']}>
+            {children}
+          </SafeAreaView>
+        )}
         screenOptions={{
           headerTintColor: '#007AFF',
           headerTitleStyle: { color: '#1c1c1e', fontWeight: '600' },

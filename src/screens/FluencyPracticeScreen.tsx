@@ -1,3 +1,5 @@
+import ProviderSettingsLink from './components/ProviderSettingsLink';
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/FluencyPracticeScreen.tsx
  *
@@ -53,7 +55,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
@@ -201,13 +202,11 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
           setTask(preselected);
         }
         updatePhase('task_pick');
-      } catch (error) {
+      } catch {
         if (!active || unmountedRef.current) return;
         setTasks([]);
         setLoadMessage(
-          error instanceof Error
-            ? error.message
-            : 'Fluency practice is unavailable right now.',
+          'Fluency practice is unavailable right now.',
         );
         updatePhase('loading');
       }
@@ -289,14 +288,12 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
         if (openingText.trim().length > 0 && !coordinator.getStatus().isMuted) {
           void coordinator.speakResponse(openingText);
         }
-      } catch (error) {
+      } catch {
         if (unmountedRef.current || sessionTokenRef.current !== sessionToken) return;
         setIsPreparing(false);
         updatePhase('task_pick');
         setErrorMessage(
-          error instanceof Error
-            ? error.message
-            : 'This task could not be started. Please try again.',
+          'This task could not be started. Please try again.',
         );
       } finally {
         startingRef.current = false;
@@ -384,13 +381,11 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
           // is already final for this attempt).
           void coordinator.speakResponse(result.tutorReply).catch(() => undefined);
         }
-      } catch (error) {
+      } catch {
         if (unmountedRef.current || turnTokenRef.current !== token) return;
         if (options?.restoreInput) setInputText(options.restoreInput);
         setErrorMessage(
-          error instanceof Error
-            ? error.message
-            : 'Your attempt could not be completed. Please try again.',
+          'Your attempt could not be completed. Please try again.',
         );
       } finally {
         if (turnTokenRef.current === token) {
@@ -475,9 +470,9 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
       setErrorMessage(null);
       // The acknowledged feedback stays visible; the repeat prompt invites
       // the next round of the SAME task.
-    } catch (error) {
+    } catch {
       setErrorMessage(
-        error instanceof Error ? error.message : 'A repetition cannot start right now.',
+        'A repetition cannot start right now.',
       );
     }
   }, []);
@@ -542,12 +537,10 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
       if (openingText.trim().length > 0 && !coordinator.getStatus().isMuted) {
         void coordinator.speakResponse(openingText);
       }
-    } catch (error) {
+    } catch {
       if (unmountedRef.current || sessionTokenRef.current !== sessionToken) return;
       setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : 'Could not prepare the transfer task. Please try again.',
+        'Could not prepare the transfer task. Please try again.',
       );
     } finally {
       setIsPreparing(false);
@@ -600,12 +593,10 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
       setComparison(null);
       setRepair(null);
       updatePhase('summary');
-    } catch (error) {
+    } catch {
       if (unmountedRef.current || restartTokenRef.current !== token) return;
       setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : 'Your practice could not be finished. Nothing was lost.',
+        'Your practice could not be finished. Nothing was lost.',
       );
       updatePhase('practicing');
     } finally {
@@ -658,12 +649,10 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
       serviceRef.current = fresh;
       setTasks(fresh.listTasks());
       updatePhase('task_pick');
-    } catch (error) {
+    } catch {
       if (unmountedRef.current || restartTokenRef.current !== token) return;
       setLoadMessage(
-        error instanceof Error
-          ? error.message
-          : 'Fluency practice is unavailable right now.',
+        'Fluency practice is unavailable right now.',
       );
       updatePhase('loading');
     }
@@ -706,7 +695,7 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
 
   if (phase === 'loading') {
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
         <Text style={styles.screenTitle}>Fluency practice</Text>
         {loadMessage === null ? (
           <View style={styles.card}>
@@ -716,7 +705,10 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
         ) : (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Fluency practice is not ready</Text>
-            <Text style={styles.body}>{loadMessage}</Text>
+            <Text accessibilityRole="alert" style={styles.body}>{loadMessage}</Text>
+            <ProviderSettingsLink />
+            <Text style={styles.body}>Real AI practice needs a configured provider. Check AI provider in Settings, then try again.</Text>
+            <TouchableOpacity style={styles.secondaryButton} onPress={() => void handlePracticeAgain()}><Text style={styles.secondaryButtonText}>Try again</Text></TouchableOpacity>
           </View>
         )}
       </ScrollView>
@@ -725,7 +717,7 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
 
   if (phase === 'task_pick') {
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
         <Text style={styles.screenTitle}>Fluency practice</Text>
         <Text style={styles.subtitle}>
           Repeat the same speaking task, sustain longer answers, and practise
@@ -767,8 +759,9 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
       .map((level) => SUPPORT_LABELS[level])
       .join(' → ');
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
         <Text style={styles.screenTitle}>Practice summary</Text>
+        {summary?.isDemo ? <Text style={styles.demoText}>Demo Mode · Not real AI. These attempts are not learner evidence.</Text> : null}
 
         <View style={styles.card}>
           <Text style={styles.cardTitle}>What happened</Text>
@@ -843,7 +836,7 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
         {isOfflineDemo ? (
           <View style={styles.demoBox}>
             <Text style={styles.demoText}>
-              Offline demo tutor: attempts are counted, but nothing is compared
+              Demo Mode · Not real AI. attempts are counted, but nothing is compared
               or saved.
             </Text>
           </View>
@@ -989,7 +982,7 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
             </TouchableOpacity>
           </View>
 
-          <TextInput
+          <TextInput accessibilityLabel="Your reply in English"
             style={[styles.input, styles.inputMultiline]}
             value={inputText}
             onChangeText={setInputText}
@@ -1057,6 +1050,7 @@ const styles = StyleSheet.create({
   },
   cardHeader: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'center',
     justifyContent: 'space-between',
     marginBottom: 8,
@@ -1089,7 +1083,7 @@ const styles = StyleSheet.create({
     padding: 10,
     marginBottom: 8,
   },
-  turnRole: { fontSize: 11, fontWeight: '700', color: '#8e8e93', marginBottom: 2 },
+  turnRole: { fontSize: 12, fontWeight: '700', color: '#8e8e93', marginBottom: 2 },
   turnText: { fontSize: 14, color: '#1c1c1e' },
   transcriptLine: { fontSize: 13, color: '#4a4a4e', fontStyle: 'italic', marginTop: 4 },
   feedbackBox: {
@@ -1129,7 +1123,7 @@ const styles = StyleSheet.create({
   },
   micButtonDisabled: { opacity: 0.45 },
   micButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  controlRow: { flexDirection: 'row', gap: 8, marginTop: 10 },
+  controlRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 },
   controlButton: {
     flex: 1,
     borderWidth: 1,
@@ -1176,7 +1170,7 @@ const styles = StyleSheet.create({
     marginTop: 6,
   },
   repeatButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  bottomRow: { flexDirection: 'row', gap: 8, marginTop: 8 },
+  bottomRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 8 },
   bottomHalf: { flex: 1 },
   completeButton: {
     borderWidth: 1,

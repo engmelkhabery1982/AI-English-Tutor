@@ -2010,8 +2010,11 @@ describe('Deep Speaking integration', () => {
 
   it('55. Home offers the speaking practice entry without being redesigned', () => {
     const home = read('screens/HomeScreen.tsx');
-    expect(home).toMatch(/Speaking practice/i);
-    expect(home).toContain('DeepSpeaking');
+    expect(home).toContain('PRACTICE_LINKS.map');
+    expect(home).toContain('navigation.navigate(link.route)');
+    const links = read('navigation/learner-journey.ts');
+    expect(links).toContain("route: 'DeepSpeaking'");
+    expect(links).toContain("title: 'Speaking coach'");
   });
 
   it('56. the adaptive lesson keeps its inline speaking path and adds the optional entry', () => {

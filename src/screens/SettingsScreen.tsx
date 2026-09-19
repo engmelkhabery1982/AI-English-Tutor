@@ -1,3 +1,4 @@
+import TouchableOpacity from './components/LearnerButton';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
@@ -5,7 +6,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
@@ -55,7 +55,7 @@ const STATUS_LABELS: Record<ProviderConfigurationSnapshot['status'], string> = {
 
 const STATUS_TONES: Record<ProviderConfigurationSnapshot['status'], string> = {
   configured: '#0f7b3f',
-  unverified: '#8a6d000',
+  unverified: '#8a6d00',
   'development-fallback': '#8a6d00',
   'not-configured': '#8e8e93',
   'invalid-credential': '#b3261e',
@@ -104,6 +104,8 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
       } else {
         setFeedback(result.message);
       }
+    } catch {
+      setFeedback('Could not complete this provider action. Check your connection and secure storage, then try again. Your English progress is unaffected.');
     } finally {
       refreshSnapshot();
       setBusy(false);
@@ -126,6 +128,8 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
       } else {
         setFeedback(result.message);
       }
+    } catch {
+      setFeedback('Could not complete this provider action. Check your connection and secure storage, then try again. Your English progress is unaffected.');
     } finally {
       refreshSnapshot();
       setBusy(false);
@@ -146,6 +150,8 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
         service.recordDiagnostic(result);
       }
       setFeedback(null);
+    } catch {
+      setFeedback('Could not complete this provider action. Check your connection and secure storage, then try again. Your English progress is unaffected.');
     } finally {
       refreshSnapshot();
       setBusy(false);
@@ -155,9 +161,9 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
   const hasStoredKey = snapshot.hasRuntimeCredential;
 
   return (
-    <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+    <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.screen} contentContainerStyle={styles.content}>
       <Text style={styles.title}>Settings</Text>
-      <Text style={styles.subtitle}>Provider configuration</Text>
+      <Text style={styles.subtitle}>AI provider, learning profile and privacy</Text>
 
       {/* ------------------------- provider status ------------------------- */}
       <View style={styles.card}>
@@ -169,7 +175,7 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
               { borderColor: STATUS_TONES[snapshot.status] },
             ]}
           >
-            <Text style={[styles.chipText, { color: STATUS_TONES[snapshot.status] }]}>
+            <Text accessibilityLiveRegion="polite" style={[styles.chipText, { color: STATUS_TONES[snapshot.status] }]}>
               {STATUS_LABELS[snapshot.status]}
             </Text>
           </View>
@@ -211,7 +217,7 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
         </Text>
         <Text style={styles.body}>
           The key is stored in this device&apos;s secure storage (Android Keystore / iOS Keychain).
-          It stays on this device, is never written to the app database, and is never shown again
+          The saved copy stays on this device, is never written to the app database, and is never shown again
           after you save it.
         </Text>
         {hasStoredKey ? (
@@ -305,14 +311,16 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
           it (for example Review&apos;s Demo Mode) and is always labelled as not real AI.
         </Text>
         <Text style={styles.body}>
-          Offline practice that runs locally — review scheduling, listening, adaptive lessons and the
-          daily loop — keeps working without any key and without a demo provider.
+          Local planning, saved vocabulary and built-in listening material do not require an AI key.
+          Real AI conversations and speech recognition need a configured provider and a connection.
+          Demo mode uses simulated content, not real AI or evidence of your English ability.
         </Text>
       </View>
 
       {/* ------------------------ existing entry point --------------------- */}
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Your English level</Text>
+        <Text style={styles.cardTitle}>Learning profile & assessment</Text>
+        <Text style={styles.body}>New here? Set your goals and take your first English assessment.</Text>
         <TouchableOpacity
           testID="settings-assess"
           style={styles.primaryButton}
@@ -321,9 +329,19 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
           <Text style={styles.primaryButtonText}>Assess my English</Text>
         </TouchableOpacity>
         <Text style={styles.note}>
-          Re-runs the diagnostic and updates your working level only if you accept it. Your existing
-          evidence is kept.
+          Set up or update your learning goals. An assessment suggests a level; you choose whether to use it.
         </Text>
+        <TouchableOpacity testID="settings-reassess" style={styles.secondaryButton}
+          onPress={() => navigation.navigate('Reassessment')} accessibilityHint="Compare a new English assessment with your previous learning">
+          <Text style={styles.secondaryButtonText}>Check my English level again</Text>
+        </TouchableOpacity>
+        <Text style={styles.note}>After some practice, reassess to see what has changed. Your working level does not change continuously or without your acceptance.</Text>
+      </View>
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>About & privacy</Text>
+        <Text style={styles.body}>AI English Tutor · English practice with your own learning history.</Text>
+        <Text style={styles.body}>Learning records are stored locally. When you use a real provider, practice text or recorded audio needed for that request is sent to that provider. Your API key is sent to authenticate provider requests, but is never displayed here.</Text>
+        <Text style={styles.note}>Audio replay is a listening aid, not proof of learner practice. Provider or microphone failures are not evidence of a weakness.</Text>
       </View>
     </ScrollView>
   );
@@ -357,7 +375,7 @@ const styles = StyleSheet.create({
     borderColor: '#e2e4e8',
   },
   cardHeader: {
-    flexDirection: 'row',
+    flexDirection: 'row', flexWrap: 'wrap',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 8,
@@ -375,7 +393,7 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
   },
   chipText: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
   },
   body: {
@@ -410,7 +428,7 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   buttonRow: {
-    flexDirection: 'row',
+    flexDirection: 'row', flexWrap: 'wrap',
     gap: 10,
     marginTop: 12,
   },
@@ -448,7 +466,7 @@ const styles = StyleSheet.create({
   dangerButtonText: { color: '#b3261e', fontSize: 14, fontWeight: '700' },
   buttonDisabled: { opacity: 0.5 },
   busyRow: {
-    flexDirection: 'row',
+    flexDirection: 'row', flexWrap: 'wrap',
     alignItems: 'center',
     gap: 8,
     marginTop: 12,

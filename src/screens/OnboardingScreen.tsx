@@ -1,3 +1,5 @@
+import MicrophoneHelp from './components/MicrophoneHelp';
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/OnboardingScreen.tsx
  *
@@ -21,7 +23,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
@@ -225,7 +226,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       });
     } catch {
       setErrorMessage(
-        'Your learning preferences could not be saved, so the diagnostic was not started. Nothing was changed.',
+        'Your learning preferences could not be saved, so the assessment was not started. Nothing was changed.',
       );
       setPhase('error');
       setBusy(false);
@@ -262,7 +263,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       unsubscribeVoiceRef.current = coordinator.subscribe(setVoiceStatus);
       setPhase('diagnostic');
     } catch {
-      setErrorMessage('Your learning preferences were saved, but the diagnostic could not start.');
+      setErrorMessage('Your learning preferences were saved, but the assessment could not start.');
       setPhase('error');
     } finally {
       setBusy(false);
@@ -733,7 +734,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           </Text>
           <TouchableOpacity
             style={styles.secondaryButton}
-            onPress={() => navigation.navigate('MainTabs')}
+            onPress={() => navigation.navigate('MainTabs', { screen: 'Home' })}
           >
             <Text style={styles.secondaryButtonText}>Back to Home</Text>
           </TouchableOpacity>
@@ -744,12 +745,21 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
 
       <TouchableOpacity
         style={styles.linkButton}
-        onPress={() => navigation.navigate('MainTabs')}
+        onPress={() => navigation.navigate('MainTabs', { screen: 'Home' })}
       >
         <Text style={styles.linkText}>Back to Home</Text>
       </TouchableOpacity>
     </View>
   );
+
+  // Presentation follows the existing coordinator; no independent voice lifecycle.
+  const assessmentInputBusy = busy || voiceStatus?.state === 'recording' ||
+    voiceStatus?.state === 'transcribing' || voiceStatus?.state === 'sending' ||
+    voiceStatus?.state === 'requesting_permission';
+  const assessmentMicLabel = voiceStatus?.state === 'recording' ? 'Stop recording'
+    : busy ? 'Processing…'
+    : voiceStatus?.state === 'requesting_permission' ? 'Waiting for microphone permission…'
+    : voiceStatus?.canRecord ? (stepId === 'pronunciation' ? 'Repeat it' : 'Record answer') : 'Microphone unavailable';
 
   // ── render helpers for the diagnostic steps
   const renderSpeakingStep = () => (
@@ -762,10 +772,13 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       <View style={styles.buttonRow}>
         <TouchableOpacity
           style={[styles.micButton, voiceStatus?.state === 'recording' ? styles.micButtonOn : null]}
+          disabled={busy || (!voiceStatus?.canRecord && voiceStatus?.state !== 'recording')}
+          accessibilityLabel={assessmentMicLabel}
+          accessibilityHint="Records a spoken assessment answer; requires microphone permission"
           onPress={() => void pressMic()}
         >
           <Text style={styles.micButtonText}>
-            {voiceStatus?.state === 'recording' ? 'Stop' : 'Speak'}
+            {assessmentMicLabel}
           </Text>
         </TouchableOpacity>
         <TouchableOpacity
@@ -781,18 +794,18 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       {voiceStatus?.errorMessage ? (
         <Text style={styles.errorText}>{voiceStatus.errorMessage}</Text>
       ) : null}
-      <TextInput
+      <TextInput accessibilityLabel="Your typed assessment answer"
         style={styles.input}
-        placeholder="Type your answer (fallback)"
+        placeholder="Or type your answer"
         value={textAnswer}
         onChangeText={setTextAnswer}
         multiline
       />
-      <TouchableOpacity style={styles.secondaryButton} onPress={() => void submitTextAnswer()}>
+      <TouchableOpacity style={styles.secondaryButton} disabled={assessmentInputBusy || !textAnswer.trim()} onPress={() => void submitTextAnswer()}>
         <Text style={styles.secondaryButtonText}>Send typed answer</Text>
       </TouchableOpacity>
       <Text style={styles.muted}>Turns recorded: {turns}</Text>
-      <TouchableOpacity style={styles.primaryButton} onPress={() => void continueStep()}>
+      <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void continueStep()}>
         <Text style={styles.primaryButtonText}>Continue</Text>
       </TouchableOpacity>
     </View>
@@ -824,7 +837,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
               ))}
             </View>
           ) : null}
-          <TextInput
+          <TextInput accessibilityLabel="Your listening answer"
             style={styles.input}
             placeholder="Your answer"
             value={listeningAnswer}
@@ -840,7 +853,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         </Text>
       )}
       {listeningNote && exercise ? <Text style={styles.savedLine}>{listeningNote}</Text> : null}
-      <TouchableOpacity style={styles.primaryButton} onPress={() => void continueStep()}>
+      <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void continueStep()}>
         <Text style={styles.primaryButtonText}>Continue</Text>
       </TouchableOpacity>
     </View>
@@ -856,24 +869,27 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         <View style={styles.buttonRow}>
           <TouchableOpacity
             style={[styles.micButton, voiceStatus?.state === 'recording' ? styles.micButtonOn : null]}
-            onPress={() => void pressMic()}
+            disabled={busy || (!voiceStatus?.canRecord && voiceStatus?.state !== 'recording')}
+          accessibilityLabel={assessmentMicLabel}
+          accessibilityHint="Records a spoken assessment answer; requires microphone permission"
+          onPress={() => void pressMic()}
           >
             <Text style={styles.micButtonText}>
-              {voiceStatus?.state === 'recording' ? 'Stop' : 'Speak'}
+              {assessmentMicLabel}
             </Text>
           </TouchableOpacity>
         </View>
-        <TextInput
+        <TextInput accessibilityLabel="Your typed assessment answer"
           style={styles.input}
-          placeholder="Type your answer (fallback)"
+          placeholder="Or type your answer"
           value={textAnswer}
           onChangeText={setTextAnswer}
           multiline
         />
-        <TouchableOpacity style={styles.secondaryButton} onPress={() => void submitTextAnswer()}>
+        <TouchableOpacity style={styles.secondaryButton} disabled={assessmentInputBusy || !textAnswer.trim()} onPress={() => void submitTextAnswer()}>
           <Text style={styles.secondaryButtonText}>Send typed answer</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.primaryButton} onPress={() => void continueStep()}>
+        <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void continueStep()}>
           <Text style={styles.primaryButtonText}>Continue</Text>
         </TouchableOpacity>
       </View>
@@ -907,10 +923,13 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         <View style={styles.buttonRow}>
           <TouchableOpacity
             style={[styles.micButton, voiceStatus?.state === 'recording' ? styles.micButtonOn : null]}
-            onPress={() => void pressMic()}
+            disabled={busy || (!voiceStatus?.canRecord && voiceStatus?.state !== 'recording')}
+          accessibilityLabel={assessmentMicLabel}
+          accessibilityHint="Records a spoken assessment answer; requires microphone permission"
+          onPress={() => void pressMic()}
           >
             <Text style={styles.micButtonText}>
-              {voiceStatus?.state === 'recording' ? 'Stop' : 'Repeat it'}
+              {assessmentMicLabel}
             </Text>
           </TouchableOpacity>
         </View>
@@ -938,7 +957,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           </Text>
         )}
 
-        <TouchableOpacity style={styles.primaryButton} onPress={() => void continueStep()}>
+        <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void continueStep()}>
           <Text style={styles.primaryButtonText}>Continue</Text>
         </TouchableOpacity>
       </View>
@@ -951,7 +970,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       <Text style={styles.body}>
         That is everything. Your result is based only on what really happened in this session.
       </Text>
-      <TouchableOpacity style={styles.primaryButton} onPress={() => void continueStep()}>
+      <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void continueStep()}>
         <Text style={styles.primaryButtonText}>See my result</Text>
       </TouchableOpacity>
     </View>
@@ -977,7 +996,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     <View style={styles.card}>
       <Text style={styles.cardTitle}>Set up your learning plan</Text>
       <Text style={styles.body}>
-        A few questions, then a short diagnostic conversation. Your existing profile is kept.
+        A few questions, then a short English assessment. Your existing profile is kept.
       </Text>
       {prefill?.hasExistingData ? (
         <Text style={styles.muted}>
@@ -986,7 +1005,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       ) : null}
 
       <Text style={styles.sectionTitle}>Your name</Text>
-      <TextInput
+      <TextInput accessibilityLabel="Your name"
         style={styles.input}
         value={displayName}
         onChangeText={setDisplayName}
@@ -999,6 +1018,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           <TouchableOpacity
             key={option.code}
             style={[styles.chip, nativeLanguage === option.code ? styles.chipOn : null]}
+            accessibilityState={{ selected: nativeLanguage === option.code }}
             onPress={() => setNativeLanguage(option.code)}
           >
             <Text style={styles.chipText}>{option.label}</Text>
@@ -1012,6 +1032,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           <TouchableOpacity
             key={level}
             style={[styles.chip, targetLevel === level ? styles.chipOn : null]}
+            accessibilityState={{ selected: targetLevel === level }}
             onPress={() => setTargetLevel(level)}
           >
             <Text style={styles.chipText}>{level}</Text>
@@ -1025,6 +1046,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           <TouchableOpacity
             key={option.id}
             style={[styles.chip, goals.includes(option.label) ? styles.chipOn : null]}
+            accessibilityState={{ selected: goals.includes(option.label) }}
             onPress={() => toggleGoal(option.label)}
           >
             <Text style={styles.chipText}>{option.label}</Text>
@@ -1038,6 +1060,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           <TouchableOpacity
             key={mode.id}
             style={[styles.chip, modes.includes(mode.id) ? styles.chipOn : null]}
+            accessibilityState={{ selected: modes.includes(mode.id) }}
             onPress={() => toggleMode(mode.id)}
           >
             <Text style={styles.chipText}>{mode.label}</Text>
@@ -1045,21 +1068,21 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         ))}
       </View>
 
-      <TouchableOpacity style={styles.primaryButton} onPress={() => void startDiagnostic()}>
-        <Text style={styles.primaryButtonText}>Start the diagnostic</Text>
+      <TouchableOpacity style={styles.primaryButton} disabled={busy} onPress={() => void startDiagnostic()}>
+        <Text style={styles.primaryButtonText}>Start the assessment</Text>
       </TouchableOpacity>
       <Text style={styles.muted}>
-        Your learning preferences are saved when you start the diagnostic. Your current working
+        Your learning preferences are saved when you start the assessment. Your current working
         level changes only if you accept the estimate at the end.
       </Text>
     </View>
   );
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+    <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
       <Text style={styles.title}>Assess my English</Text>
       <Text style={styles.subtitle}>
-        A short conversation-based diagnostic. It is an estimate for your training, not an official
+        A short conversation-based assessment. It is an estimate for your training, not an official
         exam result.
       </Text>
 
@@ -1084,6 +1107,8 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
 
       {phase === 'diagnostic' ? (
         <>
+          <Text style={styles.muted}>Allow microphone access to give spoken answers. Without permission, no spoken evidence is recorded.</Text>
+          {/permission/i.test(voiceStatus?.errorMessage ?? turnError ?? '') ? <MicrophoneHelp /> : null}
           {busy ? <Text style={styles.muted}>Working…</Text> : null}
           {turnError ? <Text style={styles.errorText}>{turnError}</Text> : null}
           {renderDiagnostic()}

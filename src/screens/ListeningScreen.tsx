@@ -1,3 +1,4 @@
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/ListeningScreen.tsx
  *
@@ -24,7 +25,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
@@ -54,6 +54,7 @@ import { TTSController } from '../voice/tts-controller';
 import { useVoiceAppStateGuard } from '../voice/use-app-state-guard';
 
 export interface ListeningScreenProps {
+  readonly initialPractice?: 'pronunciation' | 'shadowing';
   /** Injectable service (tests/composition); defaults to the real factory. */
   readonly service?: ListeningService;
   /** Injectable TTS (existing provider abstraction). */
@@ -149,7 +150,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
    * be entered while a Daily Tutor workflow is active, so that flow keeps its
    * existing Phase-1 behaviour exactly.
    */
-  const [mode, setMode] = useState<'short' | 'deep'>('short');
+  const [mode, setMode] = useState<'short' | 'deep'>(props?.initialPractice ? 'deep' : 'short');
 
   const serviceRef = useRef<ListeningService | null>(props?.service ?? null);
   const ttsRef = useRef<TextToSpeechProvider | null>(props?.ttsProvider ?? null);
@@ -161,8 +162,10 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
   /** Drives the Daily Tutor auto-start once the shared service exists. */
   const [serviceReady, setServiceReady] = useState<boolean>(props?.service !== undefined);
 
+  const [loadAttempt, setLoadAttempt] = useState(0);
   useEffect(() => {
     if (serviceRef.current) return;
+    setErrorMessage(null);
     let active = true;
     createDefaultListeningService()
       .then((service) => {
@@ -177,7 +180,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
     return () => {
       active = false;
     };
-  }, []);
+  }, [loadAttempt]);
 
   const currentExercise: ListeningExercise | null =
     session && currentIndex < session.exercises.length
@@ -440,31 +443,37 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
     // untouched (and no scroll view is nested inside another one).
     if (mode === 'deep' && !dailyTutorRef) {
       return (
-        <ScrollView style={styles.container} contentContainerStyle={styles.deepContent}>
-          <Text style={styles.title}>🎧 Deep listening</Text>
+        <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.deepContent}>
+          <Text style={styles.title}>{props?.initialPractice === 'pronunciation' ? 'Pronunciation' : props?.initialPractice === 'shadowing' ? 'Shadowing' : 'Listening and imitation'}</Text>
+          <Text style={styles.subtitle}>{props?.initialPractice === 'pronunciation'
+            ? 'Focus on saying the target phrase clearly. Your recorded speech is transcribed and compared with the target by the pronunciation processor — not judged by generic AI opinion. This is word-level feedback, not acoustic or phoneme scoring.'
+            : 'Listen to the model, imitate the phrase, then compare what was recognized. Shadowing uses the same word-level pronunciation processing, with a listening-and-imitation focus.'}</Text>
           <TouchableOpacity
             style={styles.secondaryButtonRow}
-            onPress={() => setMode('short')}
+            onPress={() => props?.initialPractice ? navigation.goBack() : setMode('short')}
             accessibilityRole="button"
-            accessibilityLabel="Back to short exercises"
+            accessibilityLabel={props?.initialPractice ? "Back to learning" : "Back to short exercises"}
           >
-            <Text style={styles.difficultyPillText}>← Short exercises</Text>
+            <Text style={styles.difficultyPillText}>{props?.initialPractice ? "← Back to learning" : "← Short exercises"}</Text>
           </TouchableOpacity>
           {serviceReady && serviceRef.current ? (
             <DeepListeningPanel
               service={serviceRef.current}
+              shadowingOnly={Boolean(props?.initialPractice)}
+              onExit={() => props?.initialPractice ? navigation.goBack() : setMode('short')}
               {...(props?.ttsProvider ? { ttsProvider: props.ttsProvider } : {})}
               {...(props?.recorder ? { recorder: props.recorder } : {})}
               {...(props?.stt ? { stt: props.stt } : {})}
             />
           ) : (
-            <Text style={styles.subtitle}>Loading deep listening…</Text>
+            <View><Text accessibilityLiveRegion="polite" style={styles.subtitle}>{errorMessage ?? 'Loading listening practice…'}</Text>
+              {errorMessage ? <TouchableOpacity onPress={() => setLoadAttempt(n => n + 1)}><Text>Try again</Text></TouchableOpacity> : null}</View>
           )}
         </ScrollView>
       );
     }
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.centerContent}>
+      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.centerContent}>
         <Text style={styles.title}>🎧 Listening</Text>
         {!dailyTutorRef ? (
           <View style={styles.modeRow}>
@@ -496,12 +505,18 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
                   mode === 'deep' && styles.difficultyPillTextActive,
                 ]}
               >
-                Deep listening
+                Listening & imitation
               </Text>
             </TouchableOpacity>
           </View>
         ) : null}
 
+        {!dailyTutorRef ? <View>
+          <TouchableOpacity onPress={() => navigation.navigate('Shadowing')} accessibilityHint="Listen, imitate and compare your spoken words"><Text style={styles.difficultyPillText}>Shadowing · Listen and imitate →</Text></TouchableOpacity>
+          <TouchableOpacity onPress={() => navigation.navigate('Pronunciation')}><Text style={styles.difficultyPillText}>Pronunciation · Repeat and compare →</Text></TouchableOpacity>
+        </View> : null}
+        {!serviceReady ? <Text accessibilityLiveRegion="polite">{errorMessage ?? 'Loading listening practice…'}</Text> : null}
+        {!serviceReady && errorMessage ? <TouchableOpacity onPress={() => setLoadAttempt(n => n + 1)}><Text>Try again</Text></TouchableOpacity> : null}
         <Text style={styles.subtitle}>
           Short listening exercises. Play the audio, answer what you understood, and get
           qualitative feedback — no scores, just real comprehension practice.
@@ -531,7 +546,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
         <TouchableOpacity
           style={[styles.startButton, isStarting && styles.startButtonDisabled]}
           onPress={handleStartSession}
-          disabled={isStarting}
+          disabled={isStarting || !serviceReady}
           testID="start_listening_button"
           accessibilityRole="button"
           accessibilityLabel="Start listening practice"
@@ -586,7 +601,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
 
   // ---------- Active exercise ----------
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.practiceContent}>
+    <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.practiceContent}>
       <View style={styles.headerRow}>
         <Text style={styles.counter}>
           {currentIndex + 1} / {session.exercises.length}
@@ -663,7 +678,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
           </View>
         ) : (
           <View>
-            <TextInput
+            <TextInput accessibilityLabel="Type what you understood…"
               style={styles.answerInput}
               placeholder="Type what you understood…"
               placeholderTextColor="#9CA3AF"
@@ -749,8 +764,8 @@ const styles = StyleSheet.create({
   centerContent: { alignItems: 'center', justifyContent: 'center', padding: 24, flexGrow: 1 },
   title: { fontSize: 28, fontWeight: '700', color: '#1F2937', marginBottom: 8 },
   subtitle: { fontSize: 14, color: '#4B5563', textAlign: 'center', lineHeight: 20, marginBottom: 20 },
-  difficultyRow: { flexDirection: 'row', gap: 8, marginBottom: 20 },
-  modeRow: { flexDirection: 'row', gap: 8, marginBottom: 16 },
+  difficultyRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 20 },
+  modeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 16 },
   deepContent: { padding: 16, paddingBottom: 40 },
   secondaryButtonRow: {
     alignSelf: 'flex-start',
@@ -781,11 +796,11 @@ const styles = StyleSheet.create({
   startButtonDisabled: { opacity: 0.6 },
   startButtonText: { color: '#FFFFFF', fontSize: 16, fontWeight: '600' },
   practiceContent: { padding: 16, paddingBottom: 40 },
-  headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  headerRow: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center' },
   counter: { fontSize: 13, color: '#6B7280', fontWeight: '600' },
   typeLabel: { fontSize: 13, color: '#1F4E9C', fontWeight: '700' },
   sourceNote: { fontSize: 12, color: '#6B7280', marginTop: 2, marginBottom: 10 },
-  playRow: { flexDirection: 'row', gap: 8, marginVertical: 12 },
+  playRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginVertical: 12 },
   playButton: {
     backgroundColor: '#1F4E9C',
     borderRadius: 10,
@@ -863,7 +878,7 @@ const styles = StyleSheet.create({
   },
   feedbackLine: { fontSize: 14, color: '#374151', lineHeight: 20, marginBottom: 4 },
   saveRow: { marginTop: 10, gap: 6 },
-  saveItemRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  saveItemRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 8 },
   saveItemLabel: { fontSize: 13, color: '#1F2937', fontWeight: '600', flexShrink: 1 },
   saveChip: {
     backgroundColor: '#EEF4FF',

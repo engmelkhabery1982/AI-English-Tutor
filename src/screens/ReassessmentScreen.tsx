@@ -1,3 +1,4 @@
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/ReassessmentScreen.tsx
  *
@@ -18,7 +19,6 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  TouchableOpacity,
   View,
 } from 'react-native';
 
@@ -27,7 +27,8 @@ import {
   type ReassessmentEligibility,
   type ReassessmentService,
 } from '../reassessment';
-import type { DiagnosticHandle } from '../onboarding';
+import { createDefaultOnboardingService, type DiagnosticHandle } from '../onboarding';
+import { useNavigation, type NavigationProp, type ParamListBase } from '@react-navigation/native';
 import OnboardingScreen from './OnboardingScreen';
 
 export interface ReassessmentScreenProps {
@@ -38,9 +39,11 @@ export interface ReassessmentScreenProps {
 
 export default function ReassessmentScreen({
   service: injectedService,
-  learnerId = 'default-learner',
+  learnerId,
   onFinish,
 }: ReassessmentScreenProps) {
+  const navigation = useNavigation<NavigationProp<ParamListBase>>();
+  const [noProfile, setNoProfile] = useState(false);
   const [service] = useState<ReassessmentService>(
     () => injectedService ?? createReassessmentService(),
   );
@@ -49,28 +52,33 @@ export default function ReassessmentScreen({
   const generationRef = useRef(0);
   const handleRef = useRef<DiagnosticHandle | null>(null);
 
+  const [retry, setRetry] = useState(0);
+  const [loadError, setLoadError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [eligibility, setEligibility] = useState<ReassessmentEligibility | null>(null);
   const [inProgress, setInProgress] = useState(false);
 
   useEffect(() => {
     mountedRef.current = true;
-    const currentGen = generationRef.current;
+    const currentGen = ++generationRef.current;
 
     (async () => {
       setLoading(true);
+      setLoadError(false);
+      setNoProfile(false);
       try {
-        const elig = await service.checkEligibility(learnerId);
+        const profileId = learnerId ?? (await (await createDefaultOnboardingService()).loadPrefill()).profileId;
+        if (!mountedRef.current || generationRef.current !== currentGen) return;
+        setNoProfile(!profileId);
+        if (!profileId) { setEligibility(null); return; }
+        const elig = await service.checkEligibility(profileId);
         if (mountedRef.current && generationRef.current === currentGen) {
           setEligibility(elig);
         }
       } catch {
         if (mountedRef.current && generationRef.current === currentGen) {
-          setEligibility({
-            available: true,
-            reason: 'manual_request',
-            message: 'Ready for reassessment.',
-          });
+          setEligibility(null);
+          setLoadError(true);
         }
       } finally {
         if (mountedRef.current && generationRef.current === currentGen) {
@@ -87,7 +95,7 @@ export default function ReassessmentScreen({
         handleRef.current = null;
       }
     };
-  }, [service, learnerId]);
+  }, [service, learnerId, retry]);
 
   const startReassessment = (_force = false) => {
     generationRef.current += 1;
@@ -98,7 +106,7 @@ export default function ReassessmentScreen({
     return (
       <View style={styles.centered}>
         <ActivityIndicator size="large" color="#0066CC" />
-        <Text style={styles.loadingText}>Checking reassessment eligibility...</Text>
+        <Text style={styles.loadingText}>Checking your assessment history…</Text>
       </View>
     );
   }
@@ -115,21 +123,24 @@ export default function ReassessmentScreen({
   }
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
-      <Text style={styles.headerTitle}>Periodic Reassessment</Text>
+    <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
+      <Text style={styles.headerTitle}>Check my English level again</Text>
 
+      <Text style={styles.descriptionText}>After a period of practice, take another English assessment to compare what has changed. Your level changes only if you accept the suggested level.</Text>
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Reassessment Status</Text>
+        <Text style={styles.cardTitle}>Is it time to reassess?</Text>
         <Text style={styles.descriptionText}>
-          {eligibility?.message ?? 'Ready to reassess your current English capabilities.'}
+          {eligibility?.message ?? 'Assessment history is unavailable.'}
         </Text>
 
-        {eligibility?.available ? (
+        {noProfile ? <View><Text style={styles.descriptionText}>Set up your learning profile and take your first assessment before checking your level again.</Text>
+          <TouchableOpacity onPress={() => navigation.navigate('Onboarding')}><Text>Assess my English</Text></TouchableOpacity></View> : loadError ? <View><Text accessibilityRole="alert" style={styles.descriptionText}>Could not load your assessment history. Nothing was changed.</Text>
+          <TouchableOpacity onPress={() => setRetry(n => n + 1)}><Text>Try again</Text></TouchableOpacity></View> : eligibility?.available ? (
           <TouchableOpacity
             style={styles.primaryButton}
             onPress={() => startReassessment(false)}
           >
-            <Text style={styles.buttonText}>Start Reassessment</Text>
+            <Text style={styles.buttonText}>Start new assessment</Text>
           </TouchableOpacity>
         ) : (
           <View style={styles.disabledBox}>
@@ -141,7 +152,7 @@ export default function ReassessmentScreen({
               style={styles.secondaryButton}
               onPress={() => startReassessment(true)}
             >
-              <Text style={styles.secondaryButtonText}>Reassess Anyway</Text>
+              <Text style={styles.secondaryButtonText}>Take an assessment anyway</Text>
             </TouchableOpacity>
           </View>
         )}

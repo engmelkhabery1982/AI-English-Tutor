@@ -1,3 +1,6 @@
+import { SafeAreaView } from 'react-native-safe-area-context';
+import SavedItemAudio from './components/SavedItemAudio';
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/VocabularyScreen.tsx
  *
@@ -23,7 +26,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import type { ViewStyle } from 'react-native';
@@ -199,9 +201,9 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
   );
 
   const loadWorkspace = async (quiet: boolean) => {
-    const service = serviceRef.current;
-    if (!service) return;
     try {
+      if (!serviceRef.current) serviceRef.current = await createDefaultVocabularyWorkspaceService();
+      const service = serviceRef.current;
       if (quiet) {
         initialLoadDoneRef.current = true;
       } else {
@@ -439,6 +441,7 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
       <View style={styles.searchWrapper}>
         <TextInput
           style={styles.searchInput}
+          accessibilityLabel="Search saved words, expressions, meanings and examples"
           placeholder="Search words, meanings, examples..."
           placeholderTextColor="#9CA3AF"
           value={searchQuery}
@@ -589,7 +592,7 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
         {isEditing ? (
           <View style={styles.editBlock}>
             <Text style={styles.editFieldLabel}>Definition</Text>
-            <TextInput
+            <TextInput accessibilityLabel="Saved definition"
               style={styles.editInput}
               value={editDefinition}
               onChangeText={setEditDefinition}
@@ -599,7 +602,7 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
             <Text style={styles.editFieldLabel}>Examples</Text>
             {editExamples.map((exampleText, exampleIndex) => (
               <View key={exampleIndex} style={styles.editExampleRow}>
-                <TextInput
+                <TextInput accessibilityLabel="Saved example"
                   style={[styles.editInput, styles.editExampleInput]}
                   value={exampleText}
                   onChangeText={(text) => {
@@ -740,7 +743,7 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
         }}
       >
         {selectedEntry && (
-          <View style={styles.modalContainer}>
+          <SafeAreaView style={styles.modalContainer}>
             <View style={styles.modalHeader}>
               <TouchableOpacity
                 style={styles.modalCloseButton}
@@ -755,8 +758,9 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
               </TouchableOpacity>
             </View>
 
-            <ScrollView contentContainerStyle={styles.modalContent}>
+            <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets contentContainerStyle={styles.modalContent}>
               <Text style={styles.detailTitle}>{selectedEntry.title}</Text>
+              <SavedItemAudio key={selectedEntry.id} text={selectedEntry.title} />
               <View style={styles.detailBadgesRow}>
                 <View style={styles.typeBadge}>
                   <Text style={styles.typeBadgeText}>
@@ -802,7 +806,7 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
                     This item has no definition yet (saved without one). Add the first real
                     meaning — review tracking starts fresh once you do.
                   </Text>
-                  <TextInput
+                  <TextInput accessibilityLabel="New meaning definition"
                     style={styles.editInput}
                     placeholder="Type a definition…"
                     placeholderTextColor="#9CA3AF"
@@ -848,7 +852,7 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
                 )}
               </TouchableOpacity>
             </ScrollView>
-          </View>
+          </SafeAreaView>
         )}
       </Modal>
     </View>
@@ -967,7 +971,7 @@ const styles = StyleSheet.create({
     color: '#111827',
   },
   statLabel: {
-    fontSize: 10,
+    fontSize: 12,
     color: '#6B7280',
     marginTop: 2,
     fontWeight: '600',
@@ -1036,7 +1040,7 @@ const styles = StyleSheet.create({
   filterSectionLabel: {
     marginTop: 14,
     marginBottom: 6,
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
     color: '#6B7280',
     textTransform: 'uppercase',
@@ -1110,14 +1114,14 @@ const styles = StyleSheet.create({
     backgroundColor: '#D1FAE5',
   },
   bucketBadgeText: {
-    fontSize: 10,
+    fontSize: 12,
     fontWeight: '700',
     color: '#374151',
     textTransform: 'uppercase',
   },
   itemTypeLabel: {
     marginTop: 3,
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '600',
     color: '#2563EB',
     textTransform: 'uppercase',
@@ -1131,7 +1135,7 @@ const styles = StyleSheet.create({
   },
   itemMeta: {
     marginTop: 6,
-    fontSize: 11,
+    fontSize: 12,
     color: '#9CA3AF',
   },
   emptyCard: {
@@ -1199,7 +1203,7 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
   },
   typeBadgeText: {
-    fontSize: 10,
+    fontSize: 12,
     fontWeight: '800',
     color: '#3730A3',
     textTransform: 'uppercase',
@@ -1266,7 +1270,7 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
   },
   posBadgeText: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
     color: '#374151',
     fontStyle: 'italic',
@@ -1298,7 +1302,7 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   exampleSource: {
-    fontSize: 10,
+    fontSize: 12,
     color: '#9CA3AF',
     marginTop: 2,
   },
@@ -1309,7 +1313,7 @@ const styles = StyleSheet.create({
     padding: 8,
   },
   reviewDataText: {
-    fontSize: 11,
+    fontSize: 12,
     color: '#6B7280',
     fontWeight: '600',
   },
@@ -1317,7 +1321,7 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   editFieldLabel: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
     color: '#6B7280',
     textTransform: 'uppercase',
