@@ -1,3 +1,7 @@
+import ProviderSettingsLink from '../components/ProviderSettingsLink';
+import { useVoiceAppStateGuard } from '../../voice/use-app-state-guard';
+import MicrophoneHelp from '../components/MicrophoneHelp';
+import TouchableOpacity from '../components/LearnerButton';
 /**
  * src/screens/listening/DeepListeningPanel.tsx
  *
@@ -20,7 +24,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import type { TextToSpeechProvider } from '../../talk-demo';
@@ -57,6 +60,7 @@ import type {
 } from '../../listening';
 
 export interface DeepListeningPanelProps {
+  readonly shadowingOnly?: boolean;
   readonly service: ListeningService;
   /** Injectable EXISTING TTS provider (tests/composition). */
   readonly ttsProvider?: TextToSpeechProvider;
@@ -125,6 +129,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
   const [shadowingResult, setShadowingResult] = useState<ShadowingAttempt | null>(null);
   const [speakerNote, setSpeakerNote] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [voicePending, setVoicePending] = useState(false);
   const [completed, setCompleted] = useState<boolean>(false);
 
   const ttsRef = useRef<TextToSpeechProvider | null>(props.ttsProvider ?? null);
@@ -136,6 +141,16 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
     readonly session: ShadowingSession;
     readonly controller: ShadowingVoiceController;
   } | null>(null);
+
+  useVoiceAppStateGuard({
+    onForeground: () => {
+      // Read only: the controller already owns background cancellation.
+      if (!controllerRef.current?.isBusy) {
+        setIsRecording(false);
+        setVoicePending(false);
+      }
+    },
+  });
 
   const activity: DeepListeningActivity | null =
     activityIndex < activities.length ? activities[activityIndex] : null;
@@ -175,7 +190,8 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
         // The real capability of the provider the learner actually hears.
         speechRateCapability: capabilityRef.current,
         speechRateLevel: 'natural',
-        targetCount: 3,
+        targetCount: props.shadowingOnly ? 1 : 3,
+        ...(props.shadowingOnly ? { taskTypes: ['shadowing'] as const } : {}),
         // Generation is optional and can never block the session.
         allowGeneratedContent: true,
       });
@@ -201,7 +217,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
     } finally {
       setIsStarting(false);
     }
-  }, [isStarting, props.ttsProvider, service]);
+  }, [isStarting, props.ttsProvider, props.shadowingOnly, service]);
 
   // Start exactly once for this mount (the guard keeps the effect safe even
   // though `start` changes identity while it is running).
@@ -379,7 +395,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
 
   const handleShadowingToggle = async (): Promise<void> => {
     const current = shadowing;
-    if (!current) return;
+    if (!current || voicePending || playback?.isPlaying) return;
     const token = shadowingTokenRef.current;
     setErrorMessage(null);
 
@@ -390,6 +406,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
       return;
     }
 
+    setVoicePending(true);
     try {
       if (!isRecording) {
         const started = await current.controller.startRecording();
@@ -413,11 +430,14 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
       if (shadowingTokenRef.current !== token) return;
       setIsRecording(false);
       setErrorMessage('That repeat could not be checked. Nothing was saved.');
+    } finally {
+      if (shadowingTokenRef.current === token) setVoicePending(false);
     }
   };
 
   const handleNext = (): void => {
     setErrorMessage(null);
+    setVoicePending(false);
     shadowingTokenRef.current += 1;
     const activeController = controllerRef.current ?? shadowing?.controller;
     controllerRef.current = null;
@@ -446,10 +466,9 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
   if (completed) {
     return (
       <View style={styles.card}>
-        <Text style={styles.title}>Deep listening complete</Text>
+        <Text style={styles.title}>Practice complete</Text>
         <Text style={styles.body}>
-          {activities.length} activities · longer passages, more than one speaker, connected speech
-          and shadowing.
+          {activities.length} activities completed. Your feedback is based only on the answers you gave.
         </Text>
         <Text style={styles.note}>{sourceNote}</Text>
         <TouchableOpacity style={styles.primaryButton} onPress={() => void start()}>
@@ -457,7 +476,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
         </TouchableOpacity>
         {onExit ? (
           <TouchableOpacity style={styles.secondaryButton} onPress={onExit}>
-            <Text style={styles.secondaryButtonText}>Back to short exercises</Text>
+            <Text style={styles.secondaryButtonText}>{props.shadowingOnly ? 'Back to learning' : 'Back to short exercises'}</Text>
           </TouchableOpacity>
         ) : null}
       </View>
@@ -467,10 +486,9 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
   if (!activity || !playback) {
     return (
       <View style={styles.card}>
-        <Text style={styles.title}>Deep listening</Text>
+        <Text style={styles.title}>{props.shadowingOnly ? "Repeat and compare" : "Listening and imitation"}</Text>
         <Text style={styles.body}>
-          Longer passages, conversations with more than one speaker, connected speech and
-          repeat-after-the-audio practice.
+          {props.shadowingOnly ? 'Listen, repeat the phrase, and check the words recognized from your recording.' : 'Longer passages, conversations and repeat-after-the-audio practice.'}
         </Text>
         <TouchableOpacity
           style={[styles.primaryButton, isStarting ? styles.buttonDisabled : null]}
@@ -478,15 +496,16 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
           disabled={isStarting}
           testID="start_deep_listening_button"
           accessibilityRole="button"
-          accessibilityLabel="Start deep listening"
+          accessibilityLabel={props.shadowingOnly ? "Start repeat and compare practice" : "Start listening and imitation"}
         >
           {isStarting ? (
             <ActivityIndicator color="#FFFFFF" />
           ) : (
-            <Text style={styles.primaryButtonText}>Start deep listening</Text>
+            <Text style={styles.primaryButtonText}>{props.shadowingOnly ? "Start repeat and compare" : "Start listening and imitation"}</Text>
           )}
         </TouchableOpacity>
-        {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+        {isStarting ? <Text accessibilityLiveRegion="polite">Preparing practice…</Text> : null}
+        {errorMessage ? <Text accessibilityRole="alert" style={styles.errorText}>{errorMessage}</Text> : null}
       </View>
     );
   }
@@ -528,7 +547,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
         <TouchableOpacity
           style={styles.primaryButton}
           onPress={() => void handlePlay()}
-          disabled={isPlaying}
+          disabled={isPlaying || voicePending || isRecording}
           testID="deep_play_button"
           accessibilityRole="button"
           accessibilityLabel="Play audio"
@@ -538,7 +557,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
         <TouchableOpacity
           style={styles.secondaryButton}
           onPress={() => void handlePlay()}
-          disabled={isPlaying}
+          disabled={isPlaying || voicePending || isRecording}
           accessibilityRole="button"
           accessibilityLabel="Replay audio"
         >
@@ -579,6 +598,9 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
       {activity.taskType === 'shadowing' ? (
         <View>
           <Text style={styles.sectionLabel}>Repeat after the audio</Text>
+          {!shadowing?.controller.voiceAvailable ? <View><ProviderSettingsLink /><Text accessibilityLiveRegion="polite">Recording needs a configured speech provider. Open Settings → AI provider. Listening alone does not create pronunciation evidence.</Text></View> : null}
+          <Text style={styles.note}>Microphone permission lets us hear your repeat. No permission means no recording or spoken evidence.</Text>
+          {/permission/i.test(errorMessage ?? '') ? <MicrophoneHelp /> : null}
           {maskedChunk ? (
             <View style={styles.transcriptBox}>
               <Text style={styles.transcriptText}>{maskedChunk}</Text>
@@ -591,12 +613,14 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
           <TouchableOpacity
             style={styles.primaryButton}
             onPress={() => void handleShadowingToggle()}
+            disabled={!shadowing?.controller.voiceAvailable || voicePending || Boolean(playback?.isPlaying) || shadowing.session.exhausted}
+            accessibilityState={{ busy: voicePending }}
             testID="shadowing_repeat_button"
             accessibilityRole="button"
-            accessibilityLabel={isRecording ? 'Stop recording' : 'Record your repeat'}
+            accessibilityLabel={voicePending ? 'Processing spoken answer' : isRecording ? 'Stop recording' : 'Record your repeat'}
           >
             <Text style={styles.primaryButtonText}>
-              {isRecording ? 'Stop and check' : 'Record my repeat'}
+              {voicePending ? 'Processing…' : !shadowing?.controller.voiceAvailable ? 'Microphone unavailable' : isRecording ? 'Stop and check' : 'Record my repeat'}
             </Text>
           </TouchableOpacity>
           <Text style={styles.note}>
@@ -618,7 +642,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
               </Text>
             </View>
           ) : null}
-          <TouchableOpacity style={styles.nextButton} onPress={handleNext}>
+          <TouchableOpacity style={styles.nextButton} disabled={voicePending || isRecording || isPlaying} onPress={handleNext}>
             <Text style={styles.nextButtonText}>
               {activityIndex + 1 < activities.length ? 'Next activity' : 'Finish'}
             </Text>
@@ -661,7 +685,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
                   </View>
                 ) : (
                   <View>
-                    <TextInput
+                    <TextInput accessibilityLabel="Type what you understood…"
                       style={styles.answerInput}
                       placeholder="Type what you understood…"
                       placeholderTextColor="#9CA3AF"
@@ -700,7 +724,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
                   {revealed ? (
                     <Text style={styles.transcriptText}>{revealed}</Text>
                   ) : null}
-                  <TouchableOpacity style={styles.nextButton} onPress={handleNext}>
+                  <TouchableOpacity style={styles.nextButton} disabled={voicePending || isRecording || isPlaying} onPress={handleNext}>
                     <Text style={styles.nextButtonText}>
                       {stepIndex + 1 < steps.length
                         ? 'Next question'
@@ -719,7 +743,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
       {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
       {onExit ? (
         <TouchableOpacity style={styles.secondaryButton} onPress={onExit}>
-          <Text style={styles.secondaryButtonText}>Back to short exercises</Text>
+          <Text style={styles.secondaryButtonText}>{props.shadowingOnly ? 'Back to learning' : 'Back to short exercises'}</Text>
         </TouchableOpacity>
       ) : null}
     </View>

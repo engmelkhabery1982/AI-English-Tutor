@@ -1,3 +1,4 @@
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/ProfessionalEnglishScreen.tsx
  *
@@ -19,7 +20,6 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
@@ -152,7 +152,7 @@ export default function ProfessionalEnglishScreen(props?: ProfessionalEnglishScr
   };
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+    <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
       <Text style={styles.title}>Professional English</Text>
       <Text style={styles.subtitle}>
         Choose a workplace scenario. Practice runs in the existing speaking coach — this

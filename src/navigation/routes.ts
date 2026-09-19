@@ -38,6 +38,8 @@ export const ROOT_STACK_ROUTES = [
   'ProfessionalEnglish',
   'Onboarding',
   'Reassessment',
+  'Pronunciation',
+  'Shadowing',
 ] as const;
 
 export type RootStackRouteName = (typeof ROOT_STACK_ROUTES)[number];
@@ -97,6 +99,8 @@ export type RootStackParamList = {
   ProfessionalEnglish: undefined;
   Onboarding: undefined;
   Reassessment: undefined;
+  Pronunciation: undefined;
+  Shadowing: undefined;
 };
 
 /** The nested-navigation envelope returned by toMainTabRoute. */

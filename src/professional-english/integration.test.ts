@@ -553,12 +553,13 @@ describe('Professional English integration', () => {
 
   it('38. Home keeps existing entries and adds Professional English after Speaking practice', () => {
     const home = readSrc('../screens/HomeScreen.tsx');
-    expect(home).toMatch(/Speaking practice/);
-    expect(home).toMatch(/navigate\('DeepSpeaking'\)/);
-    expect(home).toMatch(/Professional English/);
-    expect(home).toMatch(/navigate\('ProfessionalEnglish'\)/);
-    const speakingIndex = home.indexOf("cardTitle}>Speaking practice");
-    const professionalIndex = home.indexOf("cardTitle}>Professional English");
+    expect(home).toContain('PRACTICE_LINKS.map');
+    expect(home).toContain('navigation.navigate(link.route)');
+    const links = readSrc('../navigation/learner-journey.ts');
+    expect(links).toContain("route: 'DeepSpeaking'");
+    expect(links).toContain("route: 'ProfessionalEnglish'");
+    const speakingIndex = links.indexOf("route: 'DeepSpeaking'");
+    const professionalIndex = links.indexOf("route: 'ProfessionalEnglish'");
     expect(speakingIndex).toBeGreaterThan(0);
     expect(professionalIndex).toBeGreaterThan(speakingIndex);
     expect(home).toMatch(/AdaptiveLesson/);

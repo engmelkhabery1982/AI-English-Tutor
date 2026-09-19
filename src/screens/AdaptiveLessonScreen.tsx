@@ -1,3 +1,4 @@
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/AdaptiveLessonScreen.tsx
  *
@@ -44,7 +45,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 
@@ -932,7 +932,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
         ) : null}
         {candidate.definition ? <Text style={styles.context}>{candidate.definition}</Text> : null}
         {renderVoiceControls()}
-        <TextInput
+        <TextInput accessibilityLabel="Type your answer"
           style={styles.input}
           value={answer}
           onChangeText={setAnswer}
@@ -971,7 +971,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
               </TouchableOpacity>
             ))
           : null}
-        <TextInput
+        <TextInput accessibilityLabel="Type what you hear, or tap to speak"
           style={styles.input}
           value={answer}
           onChangeText={setAnswer}
@@ -995,7 +995,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
         ) : null}
         {renderVoiceControls()}
         {material.note ? <Text style={styles.honestNote}>{material.note}</Text> : null}
-        <TextInput
+        <TextInput accessibilityLabel="Say it, then type or record what you said"
           style={styles.input}
           value={answer}
           onChangeText={setAnswer}
@@ -1042,7 +1042,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
         <Text style={styles.prompt}>{material.prompt}</Text>
         {material.note ? <Text style={styles.honestNote}>{material.note}</Text> : null}
         {renderVoiceControls()}
-        <TextInput
+        <TextInput accessibilityLabel="Type your answer, or tap to speak"
           style={[styles.input, styles.inputMultiline]}
           value={answer}
           onChangeText={setAnswer}
@@ -1255,7 +1255,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
   );
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+    <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
       {phase === 'loading' ? (
         <View style={styles.loadingBox}>
           <ActivityIndicator />

@@ -1,3 +1,5 @@
+import MicrophoneHelp from './components/MicrophoneHelp';
+import TouchableOpacity from './components/LearnerButton';
 import React, { useCallback, useEffect, useState, useRef } from 'react';
 import {
   ActivityIndicator,
@@ -5,7 +7,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import type { ViewStyle } from 'react-native';
@@ -243,11 +244,14 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     };
   }, [isDemoMode, props?.recorder, props?.sttProvider]);
 
+  const [loadAttempt, setLoadAttempt] = useState(0);
   // Initialize DB Adapter and ReviewService
   useEffect(() => {
     let active = true;
 
     async function init() {
+      setLoading(true);
+      setError(null);
       try {
         // The CANONICAL application database owns the adapter lifecycle: the
         // Review flow never opens its own connection to the same file.
@@ -264,7 +268,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       } catch (err) {
         console.error('Failed to initialize SQLite Review repositories:', err);
         if (active) {
-          setError('Local storage unavailable. Failed to initialize review database.');
+          setError('Your saved reviews could not be opened. Nothing was reset or changed. Please try again.');
           setLoading(false);
         }
       }
@@ -275,13 +279,14 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     return () => {
       active = false;
     };
-  }, []);
+  }, [loadAttempt]);
 
-  const loadDashboardMetrics = async () => {
+  const loadDashboardMetrics = async (demo = isDemoMode) => {
     if (!reviewServiceRef.current) return;
     try {
       setLoading(true);
-      if (isDemoMode) {
+      setError(null);
+      if (demo) {
         // Demo metrics describe the DEMO queue itself (never learner history).
         const demoItems = selectReviewSessionCandidates({ isDemo: true, planned: [] });
         const demoDue = (kind: ReviewItemCandidate['kind']) =>
@@ -305,6 +310,9 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
       const profile = await profileRepo.get();
       if (!profile || !profile.id) {
+        // A previous Demo dashboard must never be relabelled as learner history.
+        setSummary({ totalDue: 0, dueVocabularyCount: 0, dueExpressionCount: 0, activeWeaknessCount: 0, categories: [] });
+        setActiveWeaknesses([]);
         setHasNoProfile(true);
         return;
       }
@@ -318,10 +326,15 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       setActiveWeaknesses(weaknesses);
     } catch (err) {
       console.error('Error loading review dashboard metrics:', err);
+      setError('Could not load your saved reviews. This is not an empty queue. Please try again.');
     } finally {
       setLoading(false);
     }
   };
+
+  useFocusEffect(useCallback(() => {
+    if (reviewServiceRef.current && sessionState === 'dashboard') void loadDashboardMetrics();
+  }, [sessionState, isDemoMode]));
 
   /**
    * Mic press. The EXISTING ReviewVoiceController owns the lifecycle: one
@@ -346,7 +359,13 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     if (dbAdapterRef.current) {
       reviewServiceRef.current = createReviewService(dbAdapterRef.current, true);
     }
-    void loadDashboardMetrics();
+    void loadDashboardMetrics(true);
+  };
+
+  const leaveDemoMode = () => {
+    setIsDemoMode(false);
+    if (dbAdapterRef.current) reviewServiceRef.current = createReviewService(dbAdapterRef.current, false);
+    void loadDashboardMetrics(false);
   };
 
   const handleStartSession = async (
@@ -616,7 +635,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     return (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color="#2563EB" />
-        <Text style={styles.loadingText}>Loading adaptive review system...</Text>
+        <Text style={styles.loadingText}>Loading your reviews…</Text>
       </View>
     );
   }
@@ -624,7 +643,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
   if (error && sessionState === 'dashboard') {
     return (
       <View style={styles.loadingContainer}>
-        <Text style={[styles.loadingText, { color: '#DC2626' }]}>{error}</Text>
+        <Text accessibilityRole="alert" style={[styles.loadingText, { color: '#DC2626' }]}>{error}</Text>
+        <TouchableOpacity onPress={() => setLoadAttempt(n => n + 1)} accessibilityLabel="Try loading reviews again"><Text>Try again</Text></TouchableOpacity>
       </View>
     );
   }
@@ -632,22 +652,23 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
   // 1. DASHBOARD VIEW
   if (sessionState === 'dashboard') {
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.contentContainer}>
+      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.contentContainer}>
         <View style={styles.header}>
-          <Text style={styles.title} id="review_title">Adaptive Review</Text>
-          <Text style={styles.subtitle}>Spaced repetition practice & weakness retraining</Text>
+          <Text style={styles.title} id="review_title">Review</Text>
+          <Text style={styles.subtitle}>Recall saved language and revisit areas that need practice</Text>
         </View>
 
         {hasNoProfile && (
           <View style={styles.demoBanner}>
             <Text style={styles.demoBannerText}>
-              👤 No active learner profile found. Please complete a conversation first, or click below to enable Demo Mode for instant practice!
+              No learning profile yet. Set up your profile to build your own review queue. Or explicitly choose Demo Mode to try sample cards, not real AI.
             </Text>
+            <TouchableOpacity onPress={() => navigation.navigate('Onboarding')}><Text>Set up my learning profile</Text></TouchableOpacity>
             <TouchableOpacity
               style={[styles.startSessionButton, { marginTop: 12, backgroundColor: '#059669' }]}
               onPress={enableDemoMode}
             >
-              <Text style={styles.startSessionButtonText}>Enable Practice Demo Mode</Text>
+              <Text style={styles.startSessionButtonText}>Try Demo Mode · Not real AI</Text>
             </TouchableOpacity>
           </View>
         )}
@@ -655,9 +676,10 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
         {isDemoMode && (
           <View style={styles.demoBanner}>
             <Text style={styles.demoBannerText}>
-              💡 Demo Mode active: No historical learning data found yet. Start practice below using pre-loaded high-quality review cards!
+              Demo Mode · Not real AI. The cards and counts below are samples, not your learner history.
             </Text>
             <Text style={styles.demoBannerText}>{DEMO_REVIEW_NOTICE}</Text>
+            <TouchableOpacity onPress={leaveDemoMode}><Text>Leave Demo Mode · Show my reviews</Text></TouchableOpacity>
           </View>
         )}
 
@@ -676,7 +698,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
         {/* High-Contrast Due Counter Card */}
         <View style={styles.totalDueCard}>
           <Text style={styles.totalDueNumber}>{summary.totalDue}</Text>
-          <Text style={styles.totalDueLabel}>Items Due for Retraining</Text>
+          <Text style={styles.totalDueLabel}>Items due for review</Text>
+          <Text style={styles.emptyCardText}>Recall language when it is due, so you can use it again. Reviews come from saved items and evaluated practice.</Text>
           <TouchableOpacity
             style={[
               styles.startSessionButton,
@@ -693,7 +716,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
             id="start_review_button"
           >
             <Text style={styles.startSessionButtonText}>
-              {(hasNoProfile && !isDemoMode) ? 'Waiting for profile...' : `Start Practice Session (${Math.min(10, summary.totalDue || 5)} Items)`}
+              {(hasNoProfile && !isDemoMode) ? 'Waiting for profile...' : summary.totalDue > 0 ? `Start review (up to ${Math.min(10, summary.totalDue)} items)` : 'Check for due reviews'}
             </Text>
           </TouchableOpacity>
         </View>
@@ -714,16 +737,16 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           <View style={styles.gridCard}>
             <Text style={styles.gridCardEmoji}>🧠</Text>
             <Text style={styles.gridCardValue}>{summary.activeWeaknessCount}</Text>
-            <Text style={styles.gridCardLabel}>Active Weaknesses</Text>
+            <Text style={styles.gridCardLabel}>Areas to practise</Text>
           </View>
         </View>
 
         {/* Active Weaknesses List */}
-        <Text style={styles.sectionHeader}>Current Priority Weaknesses</Text>
+        <Text style={styles.sectionHeader}>Priority practice areas</Text>
         {activeWeaknesses.length === 0 ? (
           <View style={styles.emptyCard}>
             <Text style={styles.emptyCardText}>
-              🎉 Great job! You have no outstanding grammatical weaknesses. Any errors spotted during conversation practice will appear here automatically.
+              No priority practice areas are recorded here yet. Saved words, expressions and supported observations from real practice can create future reviews. An empty list is not a measurement of your English level.
             </Text>
           </View>
         ) : (
@@ -762,7 +785,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     const progressPercent = ((currentIndex + 1) / sessionCandidates.length) * 100;
 
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.practiceContainer}>
+      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.practiceContainer}>
         {/* Progress Bar Header */}
         <View style={styles.practiceHeader}>
           <Text style={styles.practiceProgressText}>
@@ -776,6 +799,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           <View style={[styles.progressBarFill, { width: `${progressPercent}%` }]} />
         </View>
 
+        {isDemoMode ? <Text accessibilityLiveRegion="polite" style={styles.demoBannerText}>Demo Mode · Not real AI. These sample answers and feedback are not saved as your learning evidence.</Text> : null}
         {saveError && !isDemoMode && (
           <View style={styles.sessionErrorBanner}>
             <Text style={styles.sessionErrorBannerText}>⚠️ {saveError}</Text>
@@ -833,7 +857,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           {!evaluation ? (
             <View>
               <View style={styles.inputWrapper}>
-                <TextInput
+                <TextInput accessibilityLabel="Your practice answer"
                   style={styles.answerInput}
                   placeholder={
                     candidate.exerciseType === 'pronunciation_repeat'
@@ -846,6 +870,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
                   autoCorrect={false}
                   autoCapitalize="none"
                   multiline={candidate.exerciseType === 'sentence_correction' || candidate.exerciseType === 'natural_phrasing'}
+                  editable={!isEvaluating && !isRecording && !isTranscribing}
                   id="answer_input_field"
                 />
                 <TouchableOpacity
@@ -854,8 +879,9 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
                     !userAnswer.trim() && styles.submitButtonDisabled,
                   ]}
                   onPress={handleSubmitAnswer}
-                  disabled={!userAnswer.trim() || isEvaluating}
+                  disabled={!userAnswer.trim() || isEvaluating || isRecording || isTranscribing}
                   accessibilityRole="button"
+                  accessibilityLabel={isEvaluating ? "Checking answer" : "Submit answer"}
                   id="submit_answer_button"
                 >
                   {isEvaluating ? (
@@ -868,6 +894,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
 
               {/* Voice Review Answer Controls */}
               <View style={styles.voiceSection} id="voice_section">
+                <Text style={styles.emptyCardText}>Type your answer, or allow microphone access to answer aloud.</Text>
+                {/permission/i.test(recorderError ?? '') ? <MicrophoneHelp /> : null}
                 {!voiceStatus.isAvailable ? (
                   // Honest unavailable state: no microphone, no invented
                   // transcript and no demo speech on a real review.
@@ -887,6 +915,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
                       onPress={handleToggleRecording}
                       disabled={isTranscribing || isEvaluating}
                       accessibilityRole="button"
+                      accessibilityLabel={isTranscribing ? 'Transcribing spoken answer' : isRecording ? 'Stop recording' : 'Record a spoken answer'}
                       id="toggle_recording_button"
                     >
                       <Text style={styles.micButtonText}>
@@ -963,12 +992,13 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
 
   // 3. PRACTICE SESSION COMPLETION VIEW
   return (
-    <View style={styles.container}>
+    <ScrollView style={styles.container} contentContainerStyle={styles.contentContainer}>
       <View style={styles.completionCard}>
         <Text style={styles.completionIcon}>🎓</Text>
-        <Text style={styles.completionTitle}>Session Completed!</Text>
+        <Text style={styles.completionTitle}>Review complete</Text>
+        {isDemoMode ? <Text style={styles.demoBannerText}>Demo Mode · Not real AI. These are sample results, not your learner history.</Text> : null}
         <Text style={styles.completionSubtitle}>
-          You finished practicing {sessionCandidates.length} personalized cards.
+          You finished {sessionCandidates.length} {isDemoMode ? 'sample' : 'review'} cards.
         </Text>
 
         <View style={styles.scoreRow}>
@@ -992,7 +1022,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           accessibilityRole="button"
           id="finish_session_done_button"
         >
-          <Text style={styles.doneButtonText}>Return to Dashboard</Text>
+          <Text style={styles.doneButtonText}>Back to Review</Text>
         </TouchableOpacity>
         {dailyLaunch.showReturn ? (
           <TouchableOpacity
@@ -1006,7 +1036,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           </TouchableOpacity>
         ) : null}
       </View>
-    </View>
+    </ScrollView>
   );
 }
 
@@ -1148,7 +1178,7 @@ const styles = StyleSheet.create({
     marginBottom: 2,
   },
   gridCardLabel: {
-    fontSize: 11,
+    fontSize: 12,
     color: '#6B7280',
     fontWeight: '600',
   },
@@ -1195,7 +1225,7 @@ const styles = StyleSheet.create({
   statusBadge_active_training: { backgroundColor: '#FEE2E2' },
   statusBadge_relapsed: { backgroundColor: '#FEE2E2' },
   statusBadgeText: {
-    fontSize: 10,
+    fontSize: 12,
     fontWeight: '700',
     textTransform: 'uppercase',
     color: '#374151',
@@ -1300,7 +1330,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   typeBadgeText: {
-    fontSize: 10,
+    fontSize: 12,
     fontWeight: '800',
     color: '#374151',
   },
@@ -1338,7 +1368,7 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
   definitionLabel: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
     color: '#4B5563',
     textTransform: 'uppercase',
@@ -1490,7 +1520,7 @@ const styles = StyleSheet.create({
   scoreValuePartial: { color: '#F59E0B' },
   scoreValueIncorrect: { color: '#EF4444' },
   scoreLabel: {
-    fontSize: 11,
+    fontSize: 12,
     color: '#6B7280',
     fontWeight: '600',
   },

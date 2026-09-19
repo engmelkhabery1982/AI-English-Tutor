@@ -1,3 +1,6 @@
+import { SafeAreaView } from 'react-native-safe-area-context';
+import MicrophoneHelp from './components/MicrophoneHelp';
+import TouchableOpacity from './components/LearnerButton';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 import { useNavigation } from '@react-navigation/native';
@@ -14,7 +17,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import {
@@ -812,9 +814,9 @@ export default function TalkScreen(props?: TalkScreenProps) {
           result.error.message || 'The tutor returned an error. Please try again.'
         );
       }
-    } catch (err: unknown) {
+    } catch {
       const message =
-        err instanceof Error ? err.message : 'An unexpected error occurred while sending.';
+        'An unexpected error occurred while sending.';
       const session = sessionRef.current;
       if (session) {
         setHistory(session.getHistory());
@@ -860,7 +862,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
       : isGemini
       ? 'Gemini • Online'
       : isOfflineDemo
-      ? 'Local Demo • Offline'
+      ? 'Demo Mode • Not real AI'
       : 'Real AI unavailable • Configuration required');
   const isSendDisabled = turnControls.sendDisabled || isProviderUnavailable;
 
@@ -945,7 +947,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
           })}
         </View>
 
-        <TextInput
+        <TextInput accessibilityLabel="Conversation topic"
           style={[styles.topicInput, !topicEditable && styles.topicInputLocked]}
           placeholder="Optional topic (e.g. Travel, Job Interview)"
           placeholderTextColor="#9CA3AF"
@@ -1282,7 +1284,6 @@ export default function TalkScreen(props?: TalkScreenProps) {
               turnPhase === 'recording' && styles.turnStatusLabelActive,
               turnPhase === 'error' && styles.turnStatusLabelError,
             ]}
-            numberOfLines={2}
           >
             {turnPhase === 'recording'
               ? `${turnView.label} (${voiceStatus.elapsedSeconds}s)`
@@ -1301,6 +1302,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
         )}
       </View>
       <Text style={styles.turnHint}>{turnView.hint}</Text>
+      {/permission|microphone access/i.test(errorMessage ?? voiceStatus.errorMessage ?? '') ? <MicrophoneHelp /> : null}
       {voiceStatus.recognizedTranscript &&
         (voiceStatus.state === 'sending' ||
           turnPhase === 'speaking' ||
@@ -1349,7 +1351,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
           )}
         </TouchableOpacity>
 
-        <TextInput
+        <TextInput accessibilityLabel="Your reply in English"
           style={[
             styles.composerInput,
             !voiceStatus.canSendText && styles.composerInputDisabled,
@@ -1404,7 +1406,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
         animationType="fade"
         onRequestClose={() => setConversationReview(null)}
       >
-        <View style={styles.reviewBackdrop}>
+        <SafeAreaView style={styles.reviewBackdrop}>
           <View style={styles.reviewCard}>
             <Text style={styles.reviewTitle}>{CONVERSATION_REVIEW_TITLE}</Text>
             <Text style={styles.reviewSubtitle}>
@@ -1413,7 +1415,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
                 : `Mode: ${conversationReview?.mode ?? 'natural'}`}
             </Text>
             <Text style={styles.reviewNotice}>{conversationReview?.notice}</Text>
-            <ScrollView style={styles.reviewScroll} contentContainerStyle={styles.reviewScrollContent}>
+            <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.reviewScroll} contentContainerStyle={styles.reviewScrollContent}>
               {(conversationReview?.sections ?? []).map((section) => (
                 <View key={section.id} style={styles.reviewSection}>
                   <Text style={styles.reviewSectionTitle}>{section.title}</Text>
@@ -1434,7 +1436,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
               <Text style={styles.reviewButtonText}>Start new conversation</Text>
             </TouchableOpacity>
           </View>
-        </View>
+        </SafeAreaView>
       </Modal>
     </KeyboardAvoidingView>
   );

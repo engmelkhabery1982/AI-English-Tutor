@@ -1,3 +1,4 @@
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/HomeScreen.tsx
  *
@@ -24,11 +25,12 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
+
+import { PRACTICE_LINKS } from '../navigation/learner-journey';
 
 import type { AdaptiveLessonService, AdaptiveTodayPractice } from '../adaptive-lessons';
 import { createDefaultAdaptiveLessonService } from '../adaptive-lessons';
@@ -146,23 +148,6 @@ export default function HomeScreen(props?: HomeScreenProps) {
     navigation.navigate('AdaptiveLesson');
   };
 
-  /**
-   * Speaking practice entry: a voice-first session with the Deep Speaking coach.
-   * Home stays an entry point — it never builds the plan or the conversation
-   * itself, and it makes no claim about the learner's speaking level.
-   */
-  const openSpeakingPractice = () => {
-    navigation.navigate('DeepSpeaking');
-  };
-
-  const openFluencyPractice = () => {
-    navigation.navigate('FluencyPractice');
-  };
-
-  const openProfessionalEnglish = () => {
-    navigation.navigate('ProfessionalEnglish');
-  };
-
   const renderReady = (today: Extract<AdaptiveTodayPractice, { status: 'ready' }>) => {
     const plan = today.plan;
     const modeLabel =
@@ -214,9 +199,9 @@ export default function HomeScreen(props?: HomeScreenProps) {
           </Text>
         </View>
 
-        <TouchableOpacity style={styles.primaryButton} onPress={openLesson}>
-          <Text style={styles.primaryButtonText}>
-            {today.resume ? 'Continue lesson' : 'Start lesson'}
+        <TouchableOpacity style={styles.secondaryButton} onPress={openLesson}>
+          <Text style={styles.secondaryButtonText}>
+            {today.resume ? 'Continue adaptive lesson' : 'Open adaptive lesson'}
           </Text>
         </TouchableOpacity>
       </View>
@@ -242,16 +227,18 @@ export default function HomeScreen(props?: HomeScreenProps) {
   );
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+    <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
       <Text style={styles.title}>AI English Tutor</Text>
       <Text style={styles.subtitle}>
-        One lesson at a time, chosen from your own practice history.
+        Start with Daily Tutor for your guided daily practice. Or choose a specific skill below.
       </Text>
 
+      {!dailyCard && !dailyUnavailable ? <Text accessibilityLiveRegion="polite">Loading Daily Tutor…</Text> : null}
+      {dailyCard && dailyUnavailable ? <Text accessibilityRole="alert">{dailyUnavailable} Showing the last loaded plan.</Text> : null}
       {dailyCard ? (
         <View style={[styles.card, styles.dailyCard]}>
           <View style={styles.cardHeader}>
-            <Text style={styles.cardTitle}>{dailyCard.title}</Text>
+            <Text style={styles.cardTitle}>Daily Tutor</Text>
             <View style={[styles.pill, dailyCard.state === 'completed' ? styles.pillPersonal : null]}>
               <Text style={styles.pillText}>
                 {dailyCard.state === 'new'
@@ -275,7 +262,7 @@ export default function HomeScreen(props?: HomeScreenProps) {
       {!dailyCard && dailyUnavailable ? (
         <View style={styles.card}>
           <View style={styles.cardHeader}>
-            <Text style={styles.cardTitle}>Today&apos;s Practice</Text>
+            <Text style={styles.cardTitle}>Daily Tutor</Text>
             <View style={styles.pill}>
               <Text style={styles.pillText}>Not ready</Text>
             </View>
@@ -287,78 +274,40 @@ export default function HomeScreen(props?: HomeScreenProps) {
         </View>
       ) : null}
 
-      {prefill && !prefill.isComplete ? (
-        <View style={styles.card}>
-          <View style={styles.cardHeader}>
-            <Text style={styles.cardTitle}>Set up your learning plan</Text>
-            <View style={styles.pill}>
-              <Text style={styles.pillText}>New</Text>
-            </View>
-          </View>
-          <Text style={styles.body}>
-            A few questions and a short diagnostic so your practice is built around your goals and
-            your real level.
-          </Text>
-          <Text style={styles.sourceNote}>Still missing: {prefill.missingFields.join(', ')}</Text>
-          <TouchableOpacity style={styles.primaryButton} onPress={openOnboarding}>
-            <Text style={styles.primaryButtonText}>Start onboarding</Text>
-          </TouchableOpacity>
-        </View>
-      ) : null}
-
-      {prefill && prefill.isComplete ? (
-        <View style={styles.card}>
-          <View style={styles.cardHeader}>
-            <Text style={styles.cardTitle}>Your learning plan</Text>
-            <View style={styles.pillPersonal}>
-              <Text style={styles.pillText}>{prefill.currentLevel}</Text>
-            </View>
-          </View>
-          <Text style={styles.body}>
-            Target: {prefill.targetLevel} · {prefill.learningGoals.slice(0, 2).join(', ')}
-          </Text>
-          <TouchableOpacity
-            style={styles.secondaryButton}
-            onPress={openOnboarding}
-          >
-            <Text style={styles.secondaryButtonText}>Assess my English again</Text>
-          </TouchableOpacity>
-        </View>
-      ) : null}
-
       <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.cardTitle}>Speaking practice</Text>
-          <View style={styles.pill}>
-            <Text style={styles.pillText}>Voice</Text>
-          </View>
-        </View>
-        <Text style={styles.body}>
-          A longer, voice-first conversation with a speaking coach, built from your own practice
-          history. You can stop at any time.
-        </Text>
-        <TouchableOpacity style={styles.primaryButton} onPress={openSpeakingPractice}>
-          <Text style={styles.primaryButtonText}>Start speaking practice</Text>
+        <Text style={styles.cardTitle}>Practise and review</Text>
+        <TouchableOpacity style={styles.secondaryButton} onPress={() => navigation.navigate('Talk')}
+          accessibilityLabel="Talk — open conversation" accessibilityHint="Speak or type to your tutor">
+          <Text style={styles.secondaryButtonText}>Talk · Open conversation</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.secondaryButton} onPress={openFluencyPractice}>
-          <Text style={styles.secondaryButtonText}>Start fluency & automaticity practice</Text>
+        <Text style={styles.body}>Speak freely with your tutor, or type your answer.</Text>
+        <TouchableOpacity style={styles.secondaryButton} onPress={() => navigation.navigate('Review')}
+          accessibilityLabel="Review — revisit what is due">
+          <Text style={styles.secondaryButtonText}>Review · Revisit what is due</Text>
         </TouchableOpacity>
+        <Text style={styles.body}>Recall saved language and practise areas that need attention.</Text>
       </View>
 
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.cardTitle}>Professional English</Text>
-          <View style={styles.pill}>
-            <Text style={styles.pillText}>Workplace</Text>
-          </View>
+      {prefill && !prefill.isComplete ? (
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Set up your learning plan</Text>
+          <Text style={styles.body}>Choose your goals and take a short English assessment.</Text>
+          <TouchableOpacity style={styles.secondaryButton} onPress={openOnboarding}>
+            <Text style={styles.secondaryButtonText}>Assess my English</Text>
+          </TouchableOpacity>
         </View>
-        <Text style={styles.body}>
-          Practise meetings, interviews, negotiations and other workplace scenarios. The
-          existing speaking coach runs the conversation.
-        </Text>
-        <TouchableOpacity style={styles.primaryButton} onPress={openProfessionalEnglish}>
-          <Text style={styles.primaryButtonText}>Start professional English</Text>
-        </TouchableOpacity>
+      ) : null}
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Choose a skill</Text>
+        {PRACTICE_LINKS.map((link) => (
+          <TouchableOpacity key={link.route} style={styles.practiceLink}
+            onPress={() => navigation.navigate(link.route)} accessibilityLabel={link.title}
+            accessibilityHint={link.description}>
+            <Text style={styles.secondaryButtonText}>{link.title} →</Text>
+            <Text style={styles.body}>{link.description}</Text>
+          </TouchableOpacity>
+        ))}
       </View>
 
       {isLoading ? (
@@ -368,7 +317,8 @@ export default function HomeScreen(props?: HomeScreenProps) {
         </View>
       ) : null}
 
-      {loadError ? <Text style={styles.errorText}>{loadError}</Text> : null}
+      {loadError ? <View><Text accessibilityRole="alert" style={styles.errorText}>{loadError}</Text>
+        <TouchableOpacity onPress={() => void loadPractice()}><Text>Try loading your lesson again</Text></TouchableOpacity></View> : null}
 
       {!isLoading && practice ? (
         practice.status === 'ready' ? renderReady(practice) : renderNotReady(practice)
@@ -409,7 +359,7 @@ const styles = StyleSheet.create({
     borderWidth: 2,
   },
   cardHeader: {
-    flexDirection: 'row',
+    flexDirection: 'row', flexWrap: 'wrap',
     alignItems: 'center',
     justifyContent: 'space-between',
     marginBottom: 8,
@@ -441,7 +391,9 @@ const styles = StyleSheet.create({
     marginTop: 14,
   },
   primaryButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  practiceLink: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#e6e9ef', gap: 4 },
   secondaryButton: {
+    marginVertical: 8, paddingHorizontal: 12,
     borderWidth: 1,
     borderColor: '#007AFF',
     borderRadius: 10,

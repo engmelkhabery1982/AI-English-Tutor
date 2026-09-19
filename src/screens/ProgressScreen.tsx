@@ -1,3 +1,5 @@
+import type { LearnerStrength } from '../domain/models/learner';
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/ProgressScreen.tsx
  *
@@ -22,7 +24,6 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import type { ViewStyle } from 'react-native';
@@ -97,6 +98,8 @@ function formatDateTime(iso: string | null | undefined): string {
 export default function ProgressScreen(props?: ProgressScreenProps) {
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
 
+  const [strengths, setStrengths] = useState<readonly LearnerStrength[] | null>(null);
+  const [strengthsError, setStrengthsError] = useState(false);
   const [loading, setLoading] = useState<boolean>(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [hasNoProfile, setHasNoProfile] = useState<boolean>(false);
@@ -151,9 +154,9 @@ export default function ProgressScreen(props?: ProgressScreenProps) {
   );
 
   const loadDashboard = async (quiet: boolean, selectedWindow: DashboardWindow = window) => {
-    const service = serviceRef.current;
-    if (!service) return;
     try {
+      if (!serviceRef.current) serviceRef.current = await createDefaultProgressDashboardService();
+      const service = serviceRef.current;
       if (quiet) {
         initialLoadDoneRef.current = true;
       } else {
@@ -173,6 +176,13 @@ export default function ProgressScreen(props?: ProgressScreenProps) {
 
       const nextSnapshot = await service.loadDashboard(learnerId, { window: selectedWindow });
       setSnapshot(nextSnapshot);
+      try {
+        setStrengths(await service.loadStrengths(learnerId));
+        setStrengthsError(false);
+      } catch {
+        setStrengths(null);
+        setStrengthsError(true);
+      }
     } catch (err) {
       console.error('Error loading progress dashboard:', err);
       // Keep any previously loaded data visible; never fabricate replacements.
@@ -212,7 +222,7 @@ export default function ProgressScreen(props?: ProgressScreenProps) {
       { value: overview.vocabularySaved, label: 'Words saved' },
       { value: overview.expressionsSaved, label: 'Expressions saved' },
       { value: overview.reviewsDue, label: 'Reviews due' },
-      { value: overview.activeWeaknesses, label: 'Active weaknesses' },
+      { value: overview.activeWeaknesses, label: 'Areas to practise' },
     ];
     return (
       <View style={styles.card}>
@@ -537,8 +547,29 @@ export default function ProgressScreen(props?: ProgressScreenProps) {
           </TouchableOpacity>
         </View>
       ) : snapshot ? (
-        <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
+        <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.scroll} contentContainerStyle={styles.scrollContent}>
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>Your English level</Text>
+            <Text style={styles.emptyInlineText}>After some practice, take a new assessment to compare what has changed. Your working level changes only when you accept it.</Text>
+            <TouchableOpacity style={styles.primaryButton} onPress={() => navigation.navigate('Reassessment')}
+              accessibilityLabel="Check my English level again">
+              <Text style={styles.primaryButtonText}>Check my English level again</Text>
+            </TouchableOpacity>
+          </View>
           {renderWindowSelector()}
+          <View style={styles.card}>
+            <Text style={styles.sectionTitle}>Demonstrated strengths</Text>
+            <Text style={styles.emptyInlineText}>Based on saved successful practice, across your learning history — not a score or a level.</Text>
+            {strengthsError ? <Text accessibilityRole="alert">Could not load strengths. Try refreshing your progress.</Text>
+              : strengths === null ? <Text>Strength information is unavailable.</Text>
+              : strengths.length === 0 ? <Text>No strengths recorded yet. Successfully evaluated practice can create these records over time.</Text>
+              : strengths.map(strength => <View key={strength.id} style={styles.progressRow}>
+                <Text style={styles.progressDate}>{strength.type.replace(/_/g, ' ')} · demonstrated in practice</Text>
+                {strength.notes ? <Text style={styles.progressNotes}>{strength.notes}</Text> : null}
+                {strength.contexts.length ? <Text style={styles.progressCounts}>{strength.contexts.join(' · ')}</Text> : null}
+                <Text style={styles.progressNotes}>Last observed: {formatDate(strength.lastSeenAt)}</Text>
+              </View>)}
+          </View>
 
           {loadError && (
             <View style={styles.inlineErrorBanner} id="refresh_error_banner">
@@ -559,7 +590,7 @@ export default function ProgressScreen(props?: ProgressScreenProps) {
               {renderSectionTitle('Review')}
               {renderReviewStatus()}
 
-              {renderSectionTitle('Weaknesses')}
+              {renderSectionTitle('Areas being trained')}
               {renderWeaknesses()}
 
               {renderSectionTitle(
@@ -660,7 +691,7 @@ const styles = StyleSheet.create({
     paddingBottom: 40,
   },
   windowRow: {
-    flexDirection: 'row',
+    flexDirection: 'row', flexWrap: 'wrap',
     marginBottom: 14,
     gap: 8,
   },
@@ -714,7 +745,7 @@ const styles = StyleSheet.create({
     color: '#111827',
   },
   overviewLabel: {
-    fontSize: 10,
+    fontSize: 12,
     color: '#6B7280',
     marginTop: 2,
     fontWeight: '600',
@@ -722,7 +753,7 @@ const styles = StyleSheet.create({
   },
   allTimeNote: {
     marginTop: 6,
-    fontSize: 10,
+    fontSize: 12,
     color: '#9CA3AF',
     textAlign: 'center',
   },
@@ -743,7 +774,7 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   lexicalCount: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
     borderRadius: 6,
     paddingHorizontal: 8,
@@ -769,7 +800,7 @@ const styles = StyleSheet.create({
   },
   cardFootnote: {
     marginTop: 8,
-    fontSize: 10,
+    fontSize: 12,
     color: '#9CA3AF',
   },
   reviewDueLine: {
@@ -786,14 +817,14 @@ const styles = StyleSheet.create({
     marginTop: 10,
   },
   subListTitle: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
     color: '#6B7280',
     textTransform: 'uppercase',
     marginBottom: 4,
   },
   subRow: {
-    flexDirection: 'row',
+    flexDirection: 'row', flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingVertical: 4,
@@ -805,7 +836,7 @@ const styles = StyleSheet.create({
     marginRight: 8,
   },
   subRowMeta: {
-    fontSize: 11,
+    fontSize: 12,
     color: '#9CA3AF',
   },
   primaryButton: {
@@ -850,7 +881,7 @@ const styles = StyleSheet.create({
     opacity: 0.5,
   },
   groupBadgeText: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
     color: '#3730A3',
   },
@@ -860,7 +891,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
   },
   weaknessHeader: {
-    flexDirection: 'row',
+    flexDirection: 'row', flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'center',
   },
@@ -870,7 +901,7 @@ const styles = StyleSheet.create({
     color: '#111827',
   },
   weaknessStatus: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: '700',
     color: '#1E40AF',
     textTransform: 'uppercase',
@@ -882,12 +913,12 @@ const styles = StyleSheet.create({
   },
   weaknessMeta: {
     marginTop: 4,
-    fontSize: 11,
+    fontSize: 12,
     color: '#9CA3AF',
   },
   weaknessEvidence: {
     marginTop: 4,
-    fontSize: 11,
+    fontSize: 12,
     color: '#6B7280',
     fontStyle: 'italic',
   },
@@ -897,7 +928,7 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   activityRow: {
-    flexDirection: 'row',
+    flexDirection: 'row', flexWrap: 'wrap',
     alignItems: 'flex-start',
     paddingVertical: 6,
     borderBottomWidth: 1,
@@ -916,23 +947,23 @@ const styles = StyleSheet.create({
     color: '#111827',
   },
   activityDetail: {
-    fontSize: 11,
+    fontSize: 12,
     color: '#6B7280',
     marginTop: 1,
   },
   activityTime: {
-    fontSize: 10,
+    fontSize: 12,
     color: '#9CA3AF',
     marginLeft: 8,
   },
   trendRow: {
-    flexDirection: 'row',
+    flexDirection: 'row', flexWrap: 'wrap',
     alignItems: 'center',
     paddingVertical: 4,
   },
   trendLabel: {
     width: 64,
-    fontSize: 11,
+    fontSize: 12,
     color: '#6B7280',
     fontWeight: '600',
   },
@@ -950,7 +981,7 @@ const styles = StyleSheet.create({
   },
   trendValue: {
     width: 28,
-    fontSize: 11,
+    fontSize: 12,
     color: '#374151',
     fontWeight: '700',
     textAlign: 'right',
@@ -972,7 +1003,7 @@ const styles = StyleSheet.create({
   },
   progressNotes: {
     marginTop: 2,
-    fontSize: 11,
+    fontSize: 12,
     color: '#6B7280',
     fontStyle: 'italic',
   },
@@ -1003,7 +1034,7 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   refreshingRow: {
-    flexDirection: 'row',
+    flexDirection: 'row', flexWrap: 'wrap',
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 10,

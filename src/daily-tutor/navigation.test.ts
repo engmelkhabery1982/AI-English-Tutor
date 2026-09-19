@@ -353,6 +353,8 @@ describe('child routes match the REAL navigator hierarchy', () => {
       'ProfessionalEnglish',
       'Onboarding',
       'Reassessment',
+      'Pronunciation',
+      'Shadowing',
     ]);
   });
 });

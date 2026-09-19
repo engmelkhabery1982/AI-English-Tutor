@@ -1,3 +1,5 @@
+import ProviderSettingsLink from './components/ProviderSettingsLink';
+import TouchableOpacity from './components/LearnerButton';
 /**
  * src/screens/DeepSpeakingScreen.tsx
  *
@@ -47,7 +49,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
   View,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
@@ -234,9 +235,13 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
 
   const loadPlan = useCallback(
     async (token: number): Promise<void> => {
-      const service = serviceRef.current;
-      if (!service) return;
+      setPlanMessage(null);
+      updatePhase('loading');
       try {
+        if (!serviceRef.current) {
+          serviceRef.current = await (props?.loadService ?? createDefaultSpeakingService)();
+        }
+        const service = serviceRef.current;
         const result = await service.planPractice({
           ...(seed ? { seed } : {}),
           ...(preferredPracticeType ? { practiceType: preferredPracticeType } : {}),
@@ -252,18 +257,16 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
         setPlan(null);
         setPlanMessage(result.message);
         updatePhase('loading');
-      } catch (error) {
+      } catch {
         if (unmountedRef.current || restartTokenRef.current !== token) return;
         setPlan(null);
         setPlanMessage(
-          error instanceof Error
-            ? error.message
-            : 'Your speaking practice could not be prepared. Nothing was changed.',
+          'Your speaking practice could not be prepared. Nothing was changed.',
         );
         updatePhase('loading');
       }
     },
-    [preferredPracticeType, professionalScenario, seed, updatePhase],
+    [preferredPracticeType, professionalScenario, seed, updatePhase, props?.loadService],
   );
 
   useEffect(() => {
@@ -279,13 +282,11 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
         }
         serviceRef.current = service;
         await loadPlan(token);
-      } catch (error) {
+      } catch {
         if (!active || unmountedRef.current) return;
         setPlan(null);
         setPlanMessage(
-          error instanceof Error
-            ? error.message
-            : 'Speaking practice is unavailable right now.',
+          'Speaking practice is unavailable right now.',
         );
         updatePhase('loading');
       }
@@ -370,16 +371,14 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
         // Speak the REAL tutor turn. The microphone is never opened automatically.
         void coordinator.speakResponse(openingText);
       }
-    } catch (error) {
+    } catch {
       if (unmountedRef.current) return;
       // Starting failed: nothing is running, so the learner is returned to the
       // plan (with the honest reason) instead of an empty practice screen.
       setIsOpening(false);
       updatePhase('plan_overview');
       setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : 'The speaking practice could not be started. Please try again.',
+        'The speaking practice could not be started. Please try again.',
       );
     } finally {
       startingRef.current = false;
@@ -454,13 +453,11 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
         if (coordinator && tutorText.trim().length > 0 && !(status?.isMuted ?? false)) {
           void coordinator.speakResponse(tutorText);
         }
-      } catch (error) {
+      } catch {
         if (unmountedRef.current || turnTokenRef.current !== token) return;
         if (options?.restoreInput) setInputText(options.restoreInput);
         setErrorMessage(
-          error instanceof Error
-            ? error.message
-            : 'Your turn could not be completed. Please try again.',
+          'Your turn could not be completed. Please try again.',
         );
       } finally {
         if (turnTokenRef.current === token) {
@@ -590,12 +587,10 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
           itemsPracticed: completed.learnerTurns,
         });
       }
-    } catch (error) {
+    } catch {
       if (unmountedRef.current || restartTokenRef.current !== token) return;
       setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : 'Your practice could not be finished. Nothing was lost.',
+        'Your practice could not be finished. Nothing was lost.',
       );
       updatePhase('practicing');
     } finally {
@@ -680,7 +675,7 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
 
   if (phase === 'loading') {
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
         <Text style={styles.screenTitle}>Speaking practice</Text>
         {isLoadingPlan(planMessage) ? (
           <View style={styles.card}>
@@ -691,6 +686,7 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Speaking practice is not ready</Text>
             <Text style={styles.body}>{planMessage}</Text>
+            <ProviderSettingsLink />
             <TouchableOpacity
               style={styles.secondaryButton}
               onPress={() => {
@@ -708,7 +704,7 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
 
   if (phase === 'plan_overview' && plan) {
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
         <Text style={styles.screenTitle}>Speaking practice</Text>
 
         <View style={styles.card}>
@@ -811,8 +807,9 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
 
   if (phase === 'summary') {
     return (
-      <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
         <Text style={styles.screenTitle}>Practice summary</Text>
+        {summary?.isDemo ? <Text style={styles.demoText}>Demo Mode · Not real AI. These attempts are not learner evidence.</Text> : null}
 
         <View style={styles.card}>
           <View style={styles.cardHeader}>
@@ -903,7 +900,7 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
         {isOfflineDemo ? (
           <View style={styles.demoBox}>
             <Text style={styles.demoText}>
-              Offline demo tutor: replies are not real practice and nothing from this session is
+              Demo Mode · Not real AI. replies are not real practice and nothing from this session is
               saved.
             </Text>
           </View>
@@ -989,7 +986,7 @@ export default function DeepSpeakingScreen(props?: DeepSpeakingScreenProps) {
             </TouchableOpacity>
           </View>
 
-          <TextInput
+          <TextInput accessibilityLabel="Your reply in English"
             style={[styles.input, styles.inputMultiline]}
             value={inputText}
             onChangeText={setInputText}
@@ -1058,6 +1055,7 @@ const styles = StyleSheet.create({
   },
   cardHeader: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'center',
     justifyContent: 'space-between',
     marginBottom: 8,
@@ -1093,7 +1091,7 @@ const styles = StyleSheet.create({
     padding: 10,
     marginBottom: 8,
   },
-  turnRole: { fontSize: 11, fontWeight: '700', color: '#8e8e93', marginBottom: 2 },
+  turnRole: { fontSize: 12, fontWeight: '700', color: '#8e8e93', marginBottom: 2 },
   turnText: { fontSize: 14, color: '#1c1c1e' },
   transcriptLine: { fontSize: 13, color: '#4a4a4e', fontStyle: 'italic', marginTop: 4 },
   feedbackBox: {
@@ -1124,7 +1122,7 @@ const styles = StyleSheet.create({
   },
   micButtonDisabled: { opacity: 0.45 },
   micButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  controlRow: { flexDirection: 'row', gap: 8, marginTop: 10 },
+  controlRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 },
   controlButton: {
     flex: 1,
     borderWidth: 1,

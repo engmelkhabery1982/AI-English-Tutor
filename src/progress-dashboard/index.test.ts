@@ -244,6 +244,31 @@ describe('Progress Dashboard (real SQLite, injected repositories)', () => {
     vi.useRealTimers();
   });
 
+  it('UX: exposes only persisted strengths, without writing during presentation reads', async () => {
+    expect(await ctx.service.loadStrengths(ctx.learnerId)).toEqual([]);
+    const saved = await ctx.weaknesses.upsertStrength({
+      learnerId: ctx.learnerId, type: 'listening', referenceId: 'listening-success',
+      confidence: 0.7, firstSeenAt: NOW, lastSeenAt: NOW,
+      contexts: ['Understood the main idea'], notes: 'Successful listening answer',
+      evidence: [{ kind: 'observation', id: 'real-listening-answer', at: NOW }],
+    });
+    const before = await ctx.weaknesses.listStrengths(ctx.learnerId);
+    expect(await ctx.service.loadStrengths(ctx.learnerId)).toEqual([saved]);
+    expect(await ctx.weaknesses.listStrengths(ctx.learnerId)).toEqual(before);
+    expect(await ctx.service.loadStrengths('different-learner')).toEqual([]);
+  });
+
+  it('UX: strength read failures are not presented as an empty success list', async () => {
+    vi.spyOn(ctx.weaknesses, 'listStrengths').mockRejectedValueOnce(new Error('storage unavailable'));
+    await expect(ctx.service.loadStrengths(ctx.learnerId)).rejects.toThrow('storage unavailable');
+  });
+
+  it('UX: strength details use a bounded existing repository read', async () => {
+    const spy = vi.spyOn(ctx.weaknesses, 'listStrengths');
+    await ctx.service.loadStrengths(ctx.learnerId);
+    expect(spy).toHaveBeenCalledWith(ctx.learnerId, 20);
+  });
+
   // --- 1. NO LEARNER PROFILE ---
   it('1. reports no learner when no profile exists and never fabricates an id', async () => {
     const adapter = new SqlJsAdapter();

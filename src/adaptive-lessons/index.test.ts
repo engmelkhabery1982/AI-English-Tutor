@@ -2182,7 +2182,7 @@ describe('Adaptive lessons — architecture, composition and UI wiring', () => {
   });
 
   it('63. Home exposes the Today\'s Practice entry point and opens the lesson route', () => {
-    expect(homeScreenSrc).toContain("Today&apos;s Practice");
+    expect(homeScreenSrc).toContain('Daily Tutor');
     expect(homeScreenSrc).toContain("navigation.navigate('AdaptiveLesson')");
     expect(homeScreenSrc).toContain('useFocusEffect');
     expect(homeScreenSrc).toMatch(/no-profile|No profile yet/);
