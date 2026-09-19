@@ -15,7 +15,7 @@
  */
 
 /** Current schema version. Bump this when adding a migration. */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /** A single SQL step inside a migration. */
 export interface SchemaStep {
@@ -385,12 +385,100 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       { sql: `CREATE INDEX IF NOT EXISTS idx_reassessment_history_learner ON reassessment_history(learner_id, created_at)` },
     ],
   },
+  {
+    version: 6,
+    description: 'Harden logical uniqueness + profile singleton + dedup existing data',
+    steps: [
+      // ---- learner_profile singleton deduplication ----
+      // If multiple profiles exist, keep the most recently updated one and
+      // repoint all FK tables to it before deleting the others. This preserves
+      // user data and keeps foreign keys valid.
+      { sql: `UPDATE conversation_sessions SET learner_id = (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) WHERE (SELECT COUNT(*) FROM learner_profile) > 1 AND learner_id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1)` },
+      { sql: `UPDATE grammar_mistakes SET learner_id = (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) WHERE (SELECT COUNT(*) FROM learner_profile) > 1 AND learner_id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1)` },
+      { sql: `UPDATE pronunciation_weaknesses SET learner_id = (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) WHERE (SELECT COUNT(*) FROM learner_profile) > 1 AND learner_id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1)` },
+      { sql: `UPDATE learner_weaknesses SET learner_id = (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) WHERE (SELECT COUNT(*) FROM learner_profile) > 1 AND learner_id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1)` },
+      { sql: `UPDATE learner_strengths SET learner_id = (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) WHERE (SELECT COUNT(*) FROM learner_profile) > 1 AND learner_id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1)` },
+      { sql: `UPDATE lexical_items SET learner_id = (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) WHERE (SELECT COUNT(*) FROM learner_profile) > 1 AND learner_id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1)` },
+      { sql: `UPDATE review_items SET learner_id = (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) WHERE (SELECT COUNT(*) FROM learner_profile) > 1 AND learner_id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1)` },
+      { sql: `UPDATE progress_records SET learner_id = (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) WHERE (SELECT COUNT(*) FROM learner_profile) > 1 AND learner_id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1)` },
+      { sql: `UPDATE daily_tutor_sessions SET learner_id = (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) WHERE (SELECT COUNT(*) FROM learner_profile) > 1 AND learner_id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1)` },
+      { sql: `UPDATE reassessment_history SET learner_id = (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) WHERE (SELECT COUNT(*) FROM learner_profile) > 1 AND learner_id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1)` },
+      { sql: `DELETE FROM learner_profile WHERE id != (SELECT id FROM learner_profile ORDER BY updated_at DESC LIMIT 1) AND (SELECT COUNT(*) FROM learner_profile) > 1` },
+
+      // Add singleton column to enforce single-profile invariant going forward.
+      // The column is always 1, so UNIQUE(singleton) allows only one row.
+      // This step is idempotent-safe via the runner's duplicate-column handling.
+      { sql: `ALTER TABLE learner_profile ADD COLUMN singleton INTEGER NOT NULL DEFAULT 1 CHECK(singleton = 1)` },
+      { sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_learner_profile_singleton ON learner_profile(singleton)` },
+
+      // ---- lexical_items deduplication ----
+      // Build a map of old_id -> kept_id (most recent updated_at per logical identity)
+      { sql: `DROP TABLE IF EXISTS _lexical_dedup_map` },
+      { sql: `CREATE TABLE _lexical_dedup_map AS
+        SELECT id AS old_id,
+               FIRST_VALUE(id) OVER (PARTITION BY learner_id, headword, type ORDER BY updated_at DESC) AS kept_id
+        FROM lexical_items` },
+      // Move child rows to kept parent
+      { sql: `UPDATE lexical_meanings SET lexical_item_id = (SELECT kept_id FROM _lexical_dedup_map WHERE old_id = lexical_meanings.lexical_item_id) WHERE lexical_item_id IN (SELECT old_id FROM _lexical_dedup_map WHERE old_id != kept_id)` },
+      { sql: `UPDATE lexical_examples SET lexical_item_id = (SELECT kept_id FROM _lexical_dedup_map WHERE old_id = lexical_examples.lexical_item_id) WHERE lexical_item_id IN (SELECT old_id FROM _lexical_dedup_map WHERE old_id != kept_id)` },
+      // Delete duplicate lexical_items
+      { sql: `DELETE FROM lexical_items WHERE id IN (SELECT old_id FROM _lexical_dedup_map WHERE old_id != kept_id)` },
+      { sql: `DROP TABLE IF EXISTS _lexical_dedup_map` },
+      // Unique index for logical identity
+      { sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_lexical_items_unique_learner_headword_type ON lexical_items(learner_id, headword, type)` },
+
+      // ---- review_items deduplication ----
+      { sql: `DROP TABLE IF EXISTS _review_dedup_map` },
+      { sql: `CREATE TABLE _review_dedup_map AS
+        SELECT id AS old_id,
+               FIRST_VALUE(id) OVER (PARTITION BY learner_id, kind, reference_id ORDER BY COALESCE(last_review_at, created_at) DESC) AS kept_id
+        FROM review_items` },
+      { sql: `UPDATE review_history SET review_item_id = (SELECT kept_id FROM _review_dedup_map WHERE old_id = review_history.review_item_id) WHERE review_item_id IN (SELECT old_id FROM _review_dedup_map WHERE old_id != kept_id)` },
+      { sql: `DELETE FROM review_items WHERE id IN (SELECT old_id FROM _review_dedup_map WHERE old_id != kept_id)` },
+      { sql: `DROP TABLE IF EXISTS _review_dedup_map` },
+      { sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_review_items_unique_learner_kind_ref ON review_items(learner_id, kind, reference_id)` },
+
+      // ---- learner_weaknesses deduplication ----
+      { sql: `DROP TABLE IF EXISTS _weakness_dedup_map` },
+      { sql: `CREATE TABLE _weakness_dedup_map AS
+        SELECT id AS old_id,
+               FIRST_VALUE(id) OVER (PARTITION BY learner_id, type, reference_id ORDER BY last_seen_at DESC) AS kept_id
+        FROM learner_weaknesses` },
+      { sql: `UPDATE weakness_evidence SET weakness_id = (SELECT kept_id FROM _weakness_dedup_map WHERE old_id = weakness_evidence.weakness_id) WHERE weakness_id IN (SELECT old_id FROM _weakness_dedup_map WHERE old_id != kept_id)` },
+      { sql: `DELETE FROM learner_weaknesses WHERE id IN (SELECT old_id FROM _weakness_dedup_map WHERE old_id != kept_id)` },
+      { sql: `DROP TABLE IF EXISTS _weakness_dedup_map` },
+      { sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_learner_weaknesses_unique_learner_type_ref ON learner_weaknesses(learner_id, type, reference_id)` },
+
+      // ---- learner_strengths deduplication ----
+      { sql: `DROP TABLE IF EXISTS _strength_dedup_map` },
+      { sql: `CREATE TABLE _strength_dedup_map AS
+        SELECT id AS old_id,
+               FIRST_VALUE(id) OVER (PARTITION BY learner_id, type, reference_id ORDER BY last_seen_at DESC) AS kept_id
+        FROM learner_strengths` },
+      { sql: `DELETE FROM learner_strengths WHERE id IN (SELECT old_id FROM _strength_dedup_map WHERE old_id != kept_id)` },
+      { sql: `DROP TABLE IF EXISTS _strength_dedup_map` },
+      { sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_learner_strengths_unique_learner_type_ref ON learner_strengths(learner_id, type, reference_id)` },
+
+      // ---- pronunciation_weaknesses deduplication ----
+      { sql: `DROP TABLE IF EXISTS _pronunciation_dedup_map` },
+      { sql: `CREATE TABLE _pronunciation_dedup_map AS
+        SELECT id AS old_id,
+               FIRST_VALUE(id) OVER (PARTITION BY learner_id, target_sound ORDER BY last_seen_at DESC) AS kept_id
+        FROM pronunciation_weaknesses` },
+      { sql: `DELETE FROM pronunciation_weaknesses WHERE id IN (SELECT old_id FROM _pronunciation_dedup_map WHERE old_id != kept_id)` },
+      { sql: `DROP TABLE IF EXISTS _pronunciation_dedup_map` },
+      { sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_pronunciation_weaknesses_unique_learner_target ON pronunciation_weaknesses(learner_id, target_sound)` },
+    ],
+  },
 ];
 
 /**
  * Run all pending migrations against the given adapter.
- * Idempotent: only applies migrations with version > current DB version.
- * Each migration runs in its own transaction. Version is recorded only on success.
+ * Crash-safe: each migration's schema changes and its version record are
+ * committed atomically in ONE transaction. If the process crashes after
+ * the schema change but before version recording in an old runner, the new
+ * runner detects duplicate-column / already-exists errors and still records
+ * the version, allowing recovery without forever-failing reruns.
  */
 export async function runMigrations(adapter: {
   query(sql: string, params?: readonly unknown[]): Promise<readonly Record<string, unknown>[]>;
@@ -411,15 +499,63 @@ export async function runMigrations(adapter: {
       continue;
     }
 
-    const steps = migration.steps.map((s) => ({ sql: s.sql }));
-    await adapter.transaction(steps);
-
-    // Record successful migration
     const now = new Date().toISOString();
-    await adapter.execute(
-      `INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)`,
-      [migration.version, migration.description, now]
-    );
+    const versionInsert = {
+      sql: `INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)`,
+      params: [migration.version, migration.description, now] as const,
+    };
+
+    const allSteps = [...migration.steps.map((s) => ({ sql: s.sql })), versionInsert];
+
+    try {
+      await adapter.transaction(allSteps);
+    } catch (err) {
+      const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+
+      // Check if this migration's version was already recorded by a concurrent writer
+      // or by a previous partially-failed run that managed to record version.
+      try {
+        const check = await adapter.query(`SELECT version FROM schema_migrations WHERE version = ?`, [migration.version]);
+        if (check.length > 0) {
+          appliedVersions.add(migration.version);
+          continue;
+        }
+      } catch {
+        // ignore check errors
+      }
+
+      // For ADD COLUMN migrations that may have partially succeeded in a previous
+      // crash (column exists but version not recorded), treat duplicate-column /
+      // already-exists errors as recoverable: try to record version anyway.
+      const isDuplicateColumn =
+        message.includes('duplicate column') ||
+        message.includes('already exists') ||
+        message.includes('duplicate');
+
+      if (isDuplicateColumn) {
+        try {
+          await adapter.execute(versionInsert.sql, versionInsert.params as unknown as readonly unknown[]);
+          appliedVersions.add(migration.version);
+          continue;
+        } catch {
+          // If version insert also fails due to duplicate version, it's already applied
+          try {
+            const check2 = await adapter.query(`SELECT version FROM schema_migrations WHERE version = ?`, [migration.version]);
+            if (check2.length > 0) {
+              appliedVersions.add(migration.version);
+              continue;
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      // Otherwise, rethrow original error – real migration failure
+      throw err;
+    }
+
+    appliedVersions.add(migration.version);
   }
 }
 

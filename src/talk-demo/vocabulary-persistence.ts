@@ -3,6 +3,7 @@
  *
  * Bridge service between the Talk conversation flow and SQLite local vocabulary persistence.
  * Uses the existing SQLiteVocabularyRepository and SQLiteUserProfileRepository.
+ * Hardened to preserve SRS history on re-save.
  */
 
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
@@ -88,7 +89,6 @@ export function createVocabularyPersistenceService(
             resolvedLearnerId = profile.id;
           }
         } catch {
-          // No user profile exists: do NOT create a fake/fabricated profile.
           resolvedLearnerId = null;
         }
       }
@@ -128,6 +128,18 @@ export function createVocabularyPersistenceService(
       const { vocabRepo, learnerId } = deps;
 
       try {
+        // Exact identity lookup – never capped list – to preserve SRS history
+        if (vocabRepo.getByHeadword) {
+          try {
+            const existing = await vocabRepo.getByHeadword(learnerId, normalizedHeadword, vocab.type || 'word');
+            if (existing) {
+              return existing;
+            }
+          } catch {
+            // lookup failure is non-blocking
+          }
+        }
+
         const examples: UsageExample[] = vocab.example?.trim()
           ? [
               {
@@ -168,26 +180,35 @@ export function createVocabularyPersistenceService(
 
         const savedItem = await vocabRepo.upsert(itemInput);
 
-        // Schedule review item for this saved word
         if (savedItem && deps.adapter) {
           try {
             const reviewRepo = options?.reviewRepository ?? new SQLiteReviewRepository(deps.adapter);
             if (reviewRepo.upsert) {
-              await reviewRepo.upsert({
-                learnerId,
-                kind: 'vocabulary',
-                referenceId: savedItem.id,
-                prompt: `What word matches this definition: "${vocab.meaning?.trim() || normalizedHeadword}"?`,
-                expectedResponse: normalizedHeadword,
-                state: 'learning',
-                dueAt: new Date().toISOString(),
-                reviewCount: 0,
-                consecutiveCorrect: 0,
-                outcomeHistory: [],
-              });
+              const now = new Date().toISOString();
+              let shouldCreate = true;
+              if (reviewRepo.getByReference) {
+                try {
+                  const existingReview = await reviewRepo.getByReference(learnerId, 'vocabulary', savedItem.id);
+                  if (existingReview) shouldCreate = false;
+                } catch {}
+              }
+              if (shouldCreate) {
+                await reviewRepo.upsert({
+                  learnerId,
+                  kind: 'vocabulary',
+                  referenceId: savedItem.id,
+                  prompt: `What word matches this definition: "${vocab.meaning?.trim() || normalizedHeadword}"?`,
+                  expectedResponse: normalizedHeadword,
+                  state: 'learning',
+                  dueAt: now,
+                  reviewCount: 0,
+                  consecutiveCorrect: 0,
+                  outcomeHistory: [],
+                });
+              }
             }
           } catch {
-            // Review item scheduling is non-blocking
+            // non-blocking
           }
         }
 
