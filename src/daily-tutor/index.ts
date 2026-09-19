@@ -16,6 +16,7 @@
  * - No AI is used for planning: the daily plan is deterministic and local.
  */
 
+import { getAppDatabase } from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteConversationRepository,
@@ -31,6 +32,7 @@ import {
 } from '../data/local/sqlite/repositories';
 import { createLearnerModel } from '../learner-model';
 import type { AppRepositories } from '../repositories';
+import { createRecoverableSingleFlight } from '../shared/single-flight';
 import { DailyTutorService } from './service';
 
 export * from './types';
@@ -86,21 +88,17 @@ export function createDailyTutorService(
   });
 }
 
-// Default composition bootstrap. The dynamic Expo SQLite import and adapter
-// lifecycle live HERE — behind composition — never inside UI screens. The
-// promise is shared so Home and the Daily Tutor screen see ONE service (and
-// therefore one in-flight plan/session), exactly like the other engines.
-let defaultServicePromise: Promise<DailyTutorService> | null = null;
+// Default composition bootstrap — the canonical application database owns the
+// adapter lifecycle (see src/data/local/sqlite/app-database.ts). The service
+// instance is shared so Home and the Daily Tutor screen see ONE service (and
+// therefore one in-flight plan/session). A failed bootstrap is not cached, so
+// a later call retries.
+const defaultService = createRecoverableSingleFlight(async () => {
+  const { adapter } = await getAppDatabase();
+  return createDailyTutorService(adapter);
+});
 
-/** Compose the service on the default local database (reused across calls). */
+/** Compose the service on the canonical app database (reused across calls). */
 export function createDefaultDailyTutorService(): Promise<DailyTutorService> {
-  if (!defaultServicePromise) {
-    defaultServicePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
-      return createDailyTutorService(adapter);
-    })();
-  }
-  return defaultServicePromise;
+  return defaultService();
 }

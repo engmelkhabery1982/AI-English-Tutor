@@ -6,6 +6,7 @@
  * Hardened to preserve SRS history on re-save.
  */
 
+import { getAppDatabase } from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteReviewRepository,
@@ -32,23 +33,14 @@ export interface VocabularyPersistenceOptions {
   readonly learnerId?: string;
 }
 
-let defaultAdapterInstance: DatabaseAdapter | null = null;
-let defaultAdapterInitPromise: Promise<void> | null = null;
-
+/**
+ * The default database adapter is the CANONICAL application database adapter
+ * (see src/data/local/sqlite/app-database.ts) — this bridge never opens a
+ * second connection to the same file. A failed initialization is not cached by
+ * the owner, so a later call retries.
+ */
 async function getDefaultDatabaseAdapter(): Promise<DatabaseAdapter> {
-  if (!defaultAdapterInstance) {
-    const { ExpoSqliteAdapter } = await import(
-      '../data/local/sqlite/ExpoSqliteAdapter'
-    );
-    defaultAdapterInstance = new ExpoSqliteAdapter({
-      databaseName: 'ai_english_tutor.db',
-    });
-  }
-  if (!defaultAdapterInitPromise) {
-    defaultAdapterInitPromise = defaultAdapterInstance.init();
-  }
-  await defaultAdapterInitPromise;
-  return defaultAdapterInstance;
+  return (await getAppDatabase()).adapter;
 }
 
 /**

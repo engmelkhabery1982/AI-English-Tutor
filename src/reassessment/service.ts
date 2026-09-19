@@ -8,6 +8,7 @@
  * DOES NOT silently replace current level: level update requires explicit user acceptance.
  */
 
+import { getAppDatabase } from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteWeaknessRepository,
@@ -81,10 +82,10 @@ export function createReassessmentService(
 
   async function resolveDependencies() {
     if (!adapterInstance && !onboardingInstance) {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
-      adapterInstance = adapter;
+      // Precedence: an explicitly injected adapter/onboarding service first,
+      // then the CANONICAL application database owner (one shared adapter for
+      // every feature; never a second connection to the same file).
+      adapterInstance = (await getAppDatabase()).adapter;
     }
 
     if (!onboardingInstance && adapterInstance) {

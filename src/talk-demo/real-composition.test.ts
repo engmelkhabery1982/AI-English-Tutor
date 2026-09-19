@@ -243,12 +243,25 @@ describe('Talk — real persisted-learner composition', () => {
     expect(screenSource).toContain('loadDefaultComposition');
     expect(screenSource).not.toContain('createDemoLearnerModel');
 
-    // …and Talk owns its bootstrap on the SAME canonical database file as the
-    // other features (no second database, no second learner-model architecture).
+    // …and Talk composes through the ONE canonical application database owner
+    // (no second database, no second learner-model architecture, no
+    // feature-local adapter bootstrap).
     expect(talkSource).toContain('createDefaultTalkComposition');
-    expect(talkSource).toContain("databaseName: 'ai_english_tutor.db'");
+    expect(talkSource).toContain('getAppDatabase');
+    expect(talkSource).toContain('app-database');
     expect(talkSource).toContain("from '../learner-model'");
-    expect(adaptiveSource).toContain("databaseName: 'ai_english_tutor.db'");
+    expect(adaptiveSource).toContain('getAppDatabase');
+    expect(adaptiveSource).toContain('app-database');
+
+    // The database FILE is named in exactly one module — the canonical owner —
+    // so no feature can silently open a second connection to it.
+    const ownerSource = readFileSync(
+      join(__dirname, '..', 'data', 'local', 'sqlite', 'app-database.ts'),
+      'utf8',
+    );
+    expect(ownerSource).toContain("ai_english_tutor.db");
+    expect(talkSource).not.toContain('ai_english_tutor.db');
+    expect(adaptiveSource).not.toContain('ai_english_tutor.db');
 
     // The demo learner model remains reachable only as the explicit fallback
     // inside the composition module, never from the screen.

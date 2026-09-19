@@ -15,6 +15,7 @@ import {
   type ConversationSessionResult,
   type ConversationTurn,
 } from '../conversation-session';
+import { getAppDatabase } from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteConversationRepository,
@@ -59,6 +60,7 @@ import {
   type VoiceTurnPhase,
   type VoiceTurnView,
 } from '../voice';
+import { createRecoverableSingleFlight } from '../shared/single-flight';
 import { createDemoLearnerModel } from './demo-learner-model';
 import {
   createVocabularyPersistenceService,
@@ -449,27 +451,18 @@ export function createTalkComposition(adapter: DatabaseAdapter): TalkCoachingCom
   return { databaseAdapter: adapter, learnerModel };
 }
 
-// Default composition bootstrap. The dynamic Expo SQLite import and adapter
-// lifecycle live HERE — behind composition — never inside UI screens. This
-// follows the SAME pattern already used by the adaptive lessons, listening and
-// pronunciation modules, on the SAME canonical database file.
-let defaultCompositionPromise: Promise<TalkCoachingComposition> | null = null;
+// Default composition bootstrap. The canonical application database owns the
+// adapter lifecycle (see src/data/local/sqlite/app-database.ts) — the SAME
+// owner every other feature composition uses. A failed bootstrap is not
+// cached, so a later call retries.
+const defaultComposition = createRecoverableSingleFlight(async () => {
+  const { adapter } = await getAppDatabase();
+  return createTalkComposition(adapter);
+});
 
-/** Compose Talk's coaching context on the default app database (reused). */
+/** Compose Talk's coaching context on the canonical app database (reused). */
 export function createDefaultTalkComposition(): Promise<TalkCoachingComposition> {
-  if (!defaultCompositionPromise) {
-    defaultCompositionPromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
-      return createTalkComposition(adapter);
-    })().catch((error: unknown) => {
-      // Allow a later retry instead of caching a failed bootstrap forever.
-      defaultCompositionPromise = null;
-      throw error;
-    });
-  }
-  return defaultCompositionPromise;
+  return defaultComposition();
 }
 
 /**

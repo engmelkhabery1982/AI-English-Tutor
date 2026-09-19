@@ -18,6 +18,7 @@
  *   the service additionally collapses concurrent finalizations of the same id.
  */
 
+import { getAppDatabase } from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteConversationRepository,
@@ -325,11 +326,12 @@ function createConversationMemoryService(
   async function resolveDependencies(): Promise<ResolvedMemoryDependencies | null> {
     if (cachedDeps) return cachedDeps;
     try {
+      // Precedence: an explicitly injected adapter/repository first, then the
+      // canonical application database owner (never a feature-local second
+      // connection to the same file).
       let adapter = options?.databaseAdapter;
       if (!adapter && !options?.conversationRepository) {
-        const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-        adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-        await adapter.init();
+        adapter = (await getAppDatabase()).adapter;
       }
 
       const conversationRepo =

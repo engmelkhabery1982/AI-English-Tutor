@@ -21,6 +21,7 @@
  *   instance is what makes an unfinished lesson recoverable).
  */
 
+import { getAppDatabase } from '../data/local/sqlite/app-database';
 import type { DatabaseAdapter } from '../data/local/sqlite/DatabaseAdapter';
 import {
   SQLiteConversationRepository,
@@ -40,6 +41,7 @@ import type { AIProvider, ConversationFeedback } from '../providers/ai';
 import { createGeminiAIProvider } from '../providers/ai/gemini';
 import type { AppRepositories } from '../repositories';
 import { ReviewService } from '../review';
+import { createRecoverableSingleFlight } from '../shared/single-flight';
 import { getGeminiApiKey } from '../talk-demo';
 import { createLearningPersistenceService } from '../talk-demo/learning-persistence';
 import { AdaptiveLessonService } from './service';
@@ -147,21 +149,17 @@ export function createAdaptiveLessonService(
   });
 }
 
-// Default composition bootstrap. The dynamic Expo SQLite import and adapter
-// lifecycle live HERE — behind composition — never inside UI screens. The
-// promise is shared so Home and the lesson screen see ONE service instance
-// (and therefore one in-memory lesson).
-let defaultServicePromise: Promise<AdaptiveLessonService> | null = null;
+// Default composition bootstrap — the canonical application database owns the
+// adapter lifecycle (see src/data/local/sqlite/app-database.ts). The service
+// instance is shared so Home and the lesson screen see ONE service instance
+// (and therefore one in-memory lesson). A failed bootstrap is not cached, so a
+// later call retries.
+const defaultService = createRecoverableSingleFlight(async () => {
+  const { adapter } = await getAppDatabase();
+  return createAdaptiveLessonService(adapter);
+});
 
-/** Compose the engine on the default local database (reused across calls). */
+/** Compose the engine on the canonical app database (reused across calls). */
 export function createDefaultAdaptiveLessonService(): Promise<AdaptiveLessonService> {
-  if (!defaultServicePromise) {
-    defaultServicePromise = (async () => {
-      const { ExpoSqliteAdapter } = await import('../data/local/sqlite/ExpoSqliteAdapter');
-      const adapter = new ExpoSqliteAdapter({ databaseName: 'ai_english_tutor.db' });
-      await adapter.init();
-      return createAdaptiveLessonService(adapter);
-    })();
-  }
-  return defaultServicePromise;
+  return defaultService();
 }
