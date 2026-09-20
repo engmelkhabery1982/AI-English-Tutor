@@ -2216,7 +2216,17 @@ describe('Onboarding — integration with the rest of the app', () => {
       expect(pronunciationBranch).not.toContain('stopRecordingAndProcess');
       // …and passes the captured step token, not the token current at completion.
       expect(pronunciationBranch).toContain('stepToken');
-      expect(pronunciationBranch).toContain('recordPronunciation');
+      // The token reaches the pronunciation service through the shared absorption
+      // helper, so an explicit Retry takes the IDENTICAL transcription-only path.
+      expect(pronunciationBranch).toContain(
+        'absorbPronunciationTranscript(handle, result.transcript, stepToken)',
+      );
+      const pronunciationAbsorb = screen.slice(
+        screen.indexOf('const absorbPronunciationTranscript = useCallback'),
+        screen.indexOf('const absorbSpokenTurn = useCallback'),
+      );
+      expect(pronunciationAbsorb).toContain('recordPronunciation');
+      expect(pronunciationAbsorb).toContain('{ stepToken, transcriptFromVoice: true }');
       // The conversational branch is untouched.
       expect(screen).toContain('const outcome = await coordinator.stopRecordingAndProcess();');
     });
@@ -2686,12 +2696,19 @@ describe('Onboarding — integration with the rest of the app', () => {
         expect(screen).toContain(guard);
       }
 
-      // Typed answers hold the operation guard for their whole duration.
-      const typedIndex = screen.indexOf('const submitTextAnswer = useCallback');
+      // Typed answers hold the operation guard for their whole duration. The
+      // commit body now lives in the ONE typed-answer commit controller, which
+      // also captures the step identity/token at submission start.
+      const typedIndex = screen.indexOf('const answerController = useMemo');
+      expect(typedIndex).toBeGreaterThan(-1);
       const typedBlock = screen.slice(typedIndex, screen.indexOf('const continueStep = useCallback'));
       expect(typedBlock).toContain('diagnosticOperationInFlightRef.current = true;');
       expect(typedBlock).toContain('diagnosticOperationInFlightRef.current = false;');
-      expect(typedBlock).toContain('const stepToken = handle.session.getCurrentStepToken();');
+      expect(typedBlock).toContain('stepToken: handle.session.getCurrentStepToken()');
+      // The learner-facing entry points still exist and go through that controller.
+      expect(screen).toContain('const submitTextAnswer = useCallback');
+      expect(screen).toContain('await answerController.submit();');
+      expect(screen).toContain('await answerController.retry();');
 
       // Listening is guarded and re-entrancy protected with a captured token.
       const listeningIndex = screen.indexOf('const submitListeningAnswer = useCallback');
@@ -2707,7 +2724,16 @@ describe('Onboarding — integration with the rest of the app', () => {
       const releaseIndex = micBlock.indexOf('diagnosticOperationInFlightRef.current = false;');
       expect(pronounceIndex).toBeGreaterThan(-1);
       expect(releaseIndex).toBeGreaterThan(pronounceIndex); // guard spans the engine call too
-      expect(micBlock).toContain('await handle.speaking.observeCommittedHistory({ purpose });');
+      // Evidence absorption runs INSIDE the guarded region, through the shared
+      // helper that every explicit Retry also uses.
+      expect(micBlock).toContain('await absorbSpokenTurn(handle, purpose, stepToken, outcome);');
+      const spokenAbsorb = screen.slice(
+        screen.indexOf('const absorbSpokenTurn = useCallback'),
+        screen.indexOf('const pressMic = useCallback'),
+      );
+      expect(spokenAbsorb).toContain('await handle.speaking.observeCommittedHistory({ purpose });');
+      expect(spokenAbsorb).toContain('handle.session.recordSpeaking(');
+      expect(spokenAbsorb).toContain('handle.session.recordLanguageUse(');
     });
 
     it('88. after a completed operation navigation works again', async () => {

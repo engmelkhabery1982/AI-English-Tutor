@@ -78,8 +78,10 @@ import {
   type FluencyTaskKind,
 } from '../fluency';
 import {
+  classifyProviderFailure,
   createTalkVoiceCoordinator,
   describeVoiceTurn,
+  isConfigurationFailure,
   resolveTalkTurnControls,
   type AudioRecorderService,
   type SpeechToTextProvider,
@@ -154,6 +156,18 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
   const [summary, setSummary] = useState<FluencySummary | null>(null);
   const [loadMessage, setLoadMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  /**
+   * A task start that FAILED (Work Order 1, item 8). Instead of a silent jump back
+   * to the task list, the learner sees ONE classified, actionable sentence and an
+   * explicit Retry for the SAME task. `null` while nothing failed.
+   */
+  const [startFailure, setStartFailure] = useState<{
+    readonly taskId: string;
+    readonly taskTitle: string;
+    readonly message: string;
+    readonly needsConfiguration: boolean;
+    readonly retryAvailable: boolean;
+  } | null>(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [isPreparing, setIsPreparing] = useState<boolean>(false);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>(VOICE_IDLE_STATUS);
@@ -202,11 +216,21 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
           setTask(preselected);
         }
         updatePhase('task_pick');
-      } catch {
+      } catch (err: unknown) {
         if (!active || unmountedRef.current) return;
         setTasks([]);
+        const failure = classifyProviderFailure(
+          err instanceof Error ? { message: err.message } : null,
+          'practice',
+        );
+        // Raw provider detail is diagnostic only: it is never rendered.
+        if (failure.technical) console.error('Fluency practice could not be prepared:', failure.technical);
+        // A configuration problem says so (with the Settings link below); anything
+        // else keeps the honest "not ready" sentence.
         setLoadMessage(
-          'Fluency practice is unavailable right now.',
+          isConfigurationFailure(failure)
+            ? failure.message
+            : 'Fluency practice is unavailable right now.',
         );
         updatePhase('loading');
       }
@@ -235,6 +259,7 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
       if (startingRef.current) return;
       startingRef.current = true;
       setErrorMessage(null);
+      setStartFailure(null);
       setIsPreparing(true);
       setRepeatPrompt(null);
       setComparison(null);
@@ -288,13 +313,29 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
         if (openingText.trim().length > 0 && !coordinator.getStatus().isMuted) {
           void coordinator.speakResponse(openingText);
         }
-      } catch {
+      } catch (err: unknown) {
         if (unmountedRef.current || sessionTokenRef.current !== sessionToken) return;
         setIsPreparing(false);
-        updatePhase('task_pick');
-        setErrorMessage(
-          'This task could not be started. Please try again.',
+        // The task did NOT start: report the real, classified reason and keep an
+        // explicit Retry for the SAME task. Nothing is silently reset, no second
+        // session is created and no attempt is counted.
+        const failure = classifyProviderFailure(
+          err instanceof Error ? { message: err.message } : null,
+          'practice',
         );
+        // Raw provider detail is diagnostic only: it is never rendered.
+        if (failure.technical) console.error('Fluency task start failed:', failure.technical);
+        const startedTask = service.findTask(taskId);
+        setStartFailure({
+          taskId,
+          taskTitle: startedTask?.title ?? 'This task',
+          message: failure.message,
+          needsConfiguration: isConfigurationFailure(failure),
+          // A configuration problem is not fixed by retrying: point at Settings.
+          retryAvailable: failure.retryable,
+        });
+        setErrorMessage(null);
+        updatePhase('task_pick');
       } finally {
         startingRef.current = false;
       }
@@ -320,8 +361,21 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
       const service = serviceRef.current;
       const session = sessionRef.current;
       const coordinator = coordinatorRef.current;
-      if (!service || !session) return;
-      if (turnInFlightRef.current || phaseRef.current !== 'practicing') return;
+      if (!service || !session) {
+        // The practice session is gone: the learner's own words come back instead
+        // of disappearing, and they are told plainly what happened.
+        if (options?.restoreInput) setInputText(options.restoreInput);
+        setErrorMessage(
+          'This practice session is not running, so that answer was not sent. Nothing was counted.',
+        );
+        return;
+      }
+      if (turnInFlightRef.current || phaseRef.current !== 'practicing') {
+        // Another attempt is unresolved (or the practice is not active): refuse
+        // BEFORE anything is cleared, so no answer can be lost or duplicated.
+        if (options?.restoreInput) setInputText(options.restoreInput);
+        return;
+      }
 
       const token = (turnTokenRef.current += 1);
       const sessionToken = sessionTokenRef.current;
@@ -362,9 +416,13 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
         setCues(service.getCues());
 
         if (!result.ok) {
+          // The attempt was NOT counted: the learner keeps their own answer and
+          // reads ONE classified, learner-safe sentence.
           if (options?.restoreInput) setInputText(options.restoreInput);
           if (result.reason !== 'stale') {
-            setErrorMessage(result.errorMessage);
+            const failure = classifyProviderFailure(result.errorMessage ?? null, 'practice');
+            if (failure.technical) console.error('Fluency attempt failure:', failure.technical);
+            setErrorMessage(failure.message);
           }
           return;
         }
@@ -381,12 +439,15 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
           // is already final for this attempt).
           void coordinator.speakResponse(result.tutorReply).catch(() => undefined);
         }
-      } catch {
+      } catch (err: unknown) {
         if (unmountedRef.current || turnTokenRef.current !== token) return;
         if (options?.restoreInput) setInputText(options.restoreInput);
-        setErrorMessage(
-          'Your attempt could not be completed. Please try again.',
+        const failure = classifyProviderFailure(
+          err instanceof Error ? { message: err.message } : null,
+          'practice',
         );
+        if (failure.technical) console.error('Fluency attempt threw:', failure.technical);
+        setErrorMessage(failure.message);
       } finally {
         if (turnTokenRef.current === token) {
           turnInFlightRef.current = false;
@@ -421,6 +482,10 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
           return;
         }
         if (!voice.ok) {
+          // Already ONE classified learner-safe sentence; the recording itself is
+          // preserved by the coordinator, so the recovery action below can
+          // transcribe the SAME audio again instead of asking for a second take.
+          if (voice.technical) console.error('Fluency transcription failure:', voice.technical);
           setErrorMessage(
             voice.error || 'Your speech could not be transcribed. Please try again.',
           );
@@ -449,10 +514,70 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
     await coordinator.startRecording();
   }, [runAttempt]);
 
+  /**
+   * Explicit learner Retry of a PRESERVED RECORDING after a failed transcription:
+   * the same audio goes through the SAME transcription-only contract again (it can
+   * never become a counted attempt by itself), and a second failure stays honest.
+   */
+  const handleRetryTranscription = useCallback(async (): Promise<void> => {
+    const coordinator = coordinatorRef.current;
+    if (!coordinator || turnInFlightRef.current || startingRef.current) return;
+    if (phaseRef.current !== 'practicing') return;
+    const token = (turnTokenRef.current += 1);
+    const sessionToken = sessionTokenRef.current;
+    turnInFlightRef.current = true;
+    setIsSubmitting(true);
+    setErrorMessage(null);
+    try {
+      const voice = await coordinator.retryTranscription();
+      if (
+        unmountedRef.current ||
+        turnTokenRef.current !== token ||
+        sessionTokenRef.current !== sessionToken
+      ) {
+        return;
+      }
+      if (!voice.ok) {
+        if (voice.technical) console.error('Fluency transcription retry failure:', voice.technical);
+        setErrorMessage(
+          voice.error || 'Your speech could not be transcribed. Please try again.',
+        );
+        return;
+      }
+      const transcript = (voice.transcript ?? '').trim();
+      if (transcript.length === 0) {
+        setErrorMessage('No speech was recognized. Please try again, or type your answer.');
+        return;
+      }
+      turnInFlightRef.current = false;
+      setIsSubmitting(false);
+      await runAttempt(transcript);
+    } finally {
+      if (turnTokenRef.current === token) {
+        turnInFlightRef.current = false;
+        setIsSubmitting(false);
+      }
+    }
+  }, [runAttempt]);
+
   const handleSendTyped = useCallback(async (): Promise<void> => {
     const message = inputText.trim();
     if (message.length === 0) return;
-    if (turnInFlightRef.current || phaseRef.current !== 'practicing') return;
+    // Refuse BEFORE clearing: an answer typed while another attempt is unresolved
+    // (or while the practice is not active) stays in the composer instead of
+    // vanishing, which is how typed fluency answers used to be lost.
+    if (turnInFlightRef.current || startingRef.current) {
+      setErrorMessage(
+        'Your previous answer is still being processed. It is not lost — send this one when it finishes.',
+      );
+      return;
+    }
+    if (phaseRef.current !== 'practicing') {
+      setErrorMessage(
+        'This practice is not running, so that answer was not sent. Nothing was counted.',
+      );
+      return;
+    }
     setInputText('');
     await runAttempt(message, { restoreInput: message });
   }, [inputText, runAttempt]);
@@ -537,11 +662,14 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
       if (openingText.trim().length > 0 && !coordinator.getStatus().isMuted) {
         void coordinator.speakResponse(openingText);
       }
-    } catch {
+    } catch (err: unknown) {
       if (unmountedRef.current || sessionTokenRef.current !== sessionToken) return;
-      setErrorMessage(
-        'Could not prepare the transfer task. Please try again.',
+      const failure = classifyProviderFailure(
+        err instanceof Error ? { message: err.message } : null,
+        'practice',
       );
+      if (failure.technical) console.error('Fluency transfer start failed:', failure.technical);
+      setErrorMessage(failure.message);
     } finally {
       setIsPreparing(false);
       startingRef.current = false;
@@ -723,6 +851,36 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
           Repeat the same speaking task, sustain longer answers, and practise
           recovering when communication breaks down.
         </Text>
+        {/*
+          A start that failed is reported HERE, with the real classified reason and
+          an explicit Retry for the SAME task: the practice either starts or the
+          learner gets an actionable, recoverable failure — never a silent reset.
+        */}
+        {startFailure ? (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>{startFailure.taskTitle} did not start</Text>
+            <Text accessibilityRole="alert" style={styles.body}>
+              {startFailure.message}
+            </Text>
+            {startFailure.needsConfiguration ? <ProviderSettingsLink /> : null}
+            {startFailure.retryAvailable ? (
+              <TouchableOpacity
+                style={styles.primaryButton}
+                disabled={isPreparing}
+                onPress={() => void handleStartTask(startFailure.taskId)}
+                accessibilityRole="button"
+                accessibilityLabel="Retry starting this practice task"
+              >
+                <Text style={styles.primaryButtonText}>
+                  {isPreparing ? 'Starting…' : 'Retry'}
+                </Text>
+              </TouchableOpacity>
+            ) : null}
+            <Text style={styles.sourceNote}>
+              Nothing was counted and no practice session was left open.
+            </Text>
+          </View>
+        ) : null}
         {tasks.map((entry) => (
           <View key={entry.id} style={styles.card}>
             <View style={styles.cardHeader}>
@@ -1004,6 +1162,22 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
         </View>
 
         {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+        {/*
+          Voice recovery (Work Order 1, item 6): when a recording survived a failed
+          transcription, the SAME audio can be transcribed again — the learner never
+          has to speak twice and no transcript is invented.
+        */}
+        {voiceStatus.canRetryTranscription ? (
+          <TouchableOpacity
+            style={styles.secondaryButton}
+            disabled={isSubmitting || isPreparing}
+            onPress={() => void handleRetryTranscription()}
+            accessibilityRole="button"
+            accessibilityLabel="Transcribe my last recording again"
+          >
+            <Text style={styles.secondaryButtonText}>Try my last recording again</Text>
+          </TouchableOpacity>
+        ) : null}
 
         <TouchableOpacity style={styles.repeatButton} onPress={handleRepeat}>
           <Text style={styles.repeatButtonText}>Repeat this task</Text>

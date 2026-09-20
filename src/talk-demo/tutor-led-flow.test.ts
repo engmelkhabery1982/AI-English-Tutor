@@ -777,7 +777,17 @@ describe('Talk — tutor-led conversational flow', () => {
     expect(session.getHistory().filter((turn) => turn.role === 'assistant')).toHaveLength(0);
     expect(session.getHistory()).toEqual([]);
     expect(tts.getSpokenTexts()).toEqual([]);
-    expect(coordinator.getStatus().errorMessage).toBe('The tutor is unavailable right now.');
+    // The learner sees ONE classified, actionable sentence from the provider
+    // failure catalog; the raw provider text stays available for diagnostics only.
+    expect(coordinator.getStatus().errorMessage).toBe(
+      'The tutor service is busy right now. Your answer was not lost. Try again.',
+    );
+    expect(result.error).toBe(coordinator.getStatus().errorMessage);
+    expect(result.technical).toContain('The tutor is unavailable right now.');
+    expect(result.failure?.kind).toBe('service_busy');
+    // The failed turn preserved the learner's own transcript for an explicit Retry.
+    expect(coordinator.getStatus().pendingTranscript).toBe('Hello there.');
+    expect(coordinator.getStatus().canRetryPendingTurn).toBe(true);
   });
 
   it('12. a TTS failure preserves the successful conversation turn', async () => {
@@ -1199,6 +1209,10 @@ describe('Talk — tutor-led conversational flow', () => {
         'getHistory',
         'getLastFeedback',
         'getSavedVocabulary',
+        // Additive recovery probe (Work Order 1): lets a surface detect that the
+        // conversation it still shows was closed, instead of sending a turn that
+        // can only be discarded. It adds no second engine.
+        'isAbandoned',
         'isVocabularySaved',
         'openConversation',
         'saveVocabularyItem',

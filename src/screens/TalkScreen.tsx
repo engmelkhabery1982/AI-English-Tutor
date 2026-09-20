@@ -19,9 +19,17 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { countCommittedLearnerTurns } from '../conversation-session';
 import {
   finalizeConversationWithReview,
+  hasUnappliedTopicDraft,
+  isConversationReusable,
+  learnerMessageForFailure,
+  normalizeTopicDraft,
   replaceConversationWithMemory,
+  resolveConversationIdentity,
+  TALK_CONVERSATION_RESTARTED_MESSAGE,
+  TALK_CONVERSATION_RESTARTED_MIC_MESSAGE,
   createConversationMemoryRecorder,
   createConversationMemoryService,
   type ConversationMemoryService,
@@ -102,7 +110,15 @@ export function buildTutorOpeningMessage(topic: string): string {
 export default function TalkScreen(props?: TalkScreenProps) {
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
   const [mode, setMode] = useState<ConversationMode>('natural');
+  /**
+   * The topic DRAFT the learner is typing. It is deliberately NOT the identity of
+   * the composed conversation: a draft never replaces a conversation by itself
+   * (that per-keystroke replacement is what produced "this conversation was
+   * replaced before the turn finished").
+   */
   const [topic, setTopic] = useState<string>('');
+  /** The topic the ACTIVE conversation was really composed with. */
+  const [appliedTopic, setAppliedTopic] = useState<string>('');
   const [inputText, setInputText] = useState<string>('');
   const [history, setHistory] = useState<readonly ConversationTurn[]>([]);
   const [isSending, setIsSending] = useState<boolean>(false);
@@ -110,6 +126,12 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const [lastFeedback, setLastFeedback] = useState<ConversationFeedback | null>(null);
   const [savedWords, setSavedWords] = useState<Record<string, boolean>>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  /**
+   * The learner's OWN message of a typed turn that did NOT commit. Preserved so an
+   * explicit Retry resends exactly that text (never a re-typed guess) and so it can
+   * never be committed twice.
+   */
+  const [retryMessage, setRetryMessage] = useState<string | null>(null);
   /**
    * Resolved provider identity. `null` until the composition settles, so the
    * surface never claims a provider state it has not established yet.
@@ -154,6 +176,14 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const openingTokenRef = useRef<number>(0);
   /** Mode+topic identity of the conversation currently composed. */
   const conversationIdentityRef = useRef<string>('');
+  /**
+   * Committed learner turns observed when the current retryable message failed.
+   * A Retry verifies this first: a message that really committed is never sent
+   * again, so one tap can never produce two learner turns.
+   */
+  const retryBaselineRef = useRef<number>(0);
+  /** Synchronous in-flight guard for typed sends (a double tap cannot duplicate). */
+  const sendInFlightRef = useRef<boolean>(false);
   /** Resolved real coaching composition (persisted learner evidence). */
   const coachingRef = useRef<TalkCoachingResolution | null>(null);
   /** Guards concurrent session switches: only the newest one may install. */
@@ -320,7 +350,11 @@ export default function TalkScreen(props?: TalkScreenProps) {
       const switchToken = (switchTokenRef.current += 1);
       // Any tutor opening of the previous conversation is invalidated at once.
       openingTokenRef.current += 1;
-      conversationIdentityRef.current = `${targetMode}::${targetTopic.trim()}`;
+      // The composed identity AND the applied topic are set together, so the
+      // identity effect sees one stable identity for this conversation and never
+      // composes a second one for the same mode+topic.
+      conversationIdentityRef.current = `${targetMode}::${normalizeTopicDraft(targetTopic)}`;
+      setAppliedTopic(normalizeTopicDraft(targetTopic));
       setIsOpening(false);
       setIsSwitching(true);
       coordinatorIsSwitchingRef.current = true;
@@ -406,7 +440,9 @@ export default function TalkScreen(props?: TalkScreenProps) {
       setLastFeedback(null);
       setSavedWords({});
       setStreamingText(null);
-      setInputText('');
+      // The composer draft is deliberately PRESERVED across a replacement: an
+      // uncommitted message belongs to the learner, not to the old conversation,
+      // and clearing it here is how typed answers used to vanish.
       setErrorMessage(null);
       setPronunciationLines(null);
       setIsSending(false);
@@ -462,23 +498,67 @@ export default function TalkScreen(props?: TalkScreenProps) {
     }
   };
 
-  // Fresh conversation whenever the mode or the (empty-history) topic changes —
-  // the same rule as before, funnelled through startConversation so the previous
-  // voice work is always cancelled safely. The identity guard keeps a single
-  // composition per identity (no duplicate session/opening).
+  /**
+   * Composes a fresh conversation when — and ONLY when — the identity rules in
+   * src/talk-demo/conversation-identity.ts say so:
+   * - the typed topic is a DRAFT (`appliedTopic` is the composed one), so typing
+   *   can no longer replace a conversation per keystroke;
+   * - nothing is replaced while a learner/tutor turn, a switch or voice work is
+   *   unresolved, so an in-flight turn always keeps a stable session identity;
+   * - a live conversation (committed history) is replaced only explicitly.
+   * The composition itself stays the ONE existing atomic path (startConversation).
+   */
   useEffect(() => {
-    if (coachingSource === null) {
+    const voiceBusy =
+      voiceStatus.isProcessing === true ||
+      voiceStatus.state === 'recording' ||
+      voiceStatus.state === 'transcribing' ||
+      voiceStatus.state === 'sending' ||
+      voiceStatus.state === 'requesting_permission';
+    const decision = resolveConversationIdentity({
+      mode,
+      appliedTopic,
+      composedIdentity:
+        conversationIdentityRef.current.length > 0 ? conversationIdentityRef.current : null,
+      historyLength: history.length,
+      turnInFlight: isSending || isOpening || isSwitching || voiceBusy,
       // Still resolving the REAL persisted coaching context: composing now would
       // silently fall back to the demo learner model.
-      return;
+      coachingResolved: coachingSource !== null,
+    });
+    if (decision.action === 'compose') {
+      void startConversation(mode, appliedTopic);
     }
-    const identity = `${mode}::${topic.trim()}`;
-    if (history.length === 0 && conversationIdentityRef.current !== identity) {
-      void startConversation(mode, topic);
-    }
-  }, [mode, topic, history.length, coachingSource, startConversation]);
+  }, [
+    appliedTopic,
+    coachingSource,
+    history.length,
+    isOpening,
+    isSending,
+    isSwitching,
+    mode,
+    startConversation,
+    voiceStatus.isProcessing,
+    voiceStatus.state,
+  ]);
 
-  const topicEditable = history.length === 0 && !isSending && !isOpening;
+  const topicEditable = history.length === 0 && !isSending && !isOpening && !isSwitching;
+  /** True while the typed topic differs from the conversation it would start. */
+  const topicDraftPending =
+    topicEditable && hasUnappliedTopicDraft(topic, appliedTopic);
+
+  /**
+   * Explicit Apply: the learner decides when a typed topic becomes a conversation.
+   * This is the preferred path (draft topic + explicit Start/Apply) and the reason
+   * an in-flight turn is never replaced by typing.
+   */
+  const handleApplyTopic = () => {
+    const draft = normalizeTopicDraft(topic);
+    if (!hasUnappliedTopicDraft(draft, appliedTopic)) return;
+    if (isSending || isOpening || isSwitching) return; // never replace mid-turn
+    setAppliedTopic(draft);
+    void startConversation(mode, draft);
+  };
 
   // Tutor-led opening turn: obtained through the EXISTING conversation/AI path.
   // Only attempted when a REAL AI provider is answering; offline demo mode never
@@ -686,8 +766,23 @@ export default function TalkScreen(props?: TalkScreenProps) {
       return;
     }
     // No active conversation yet (still preparing or switching): nothing to do.
-    const session = sessionRef.current;
+    let session = sessionRef.current;
     if (!session || isSwitching) return;
+
+    // DEAD-SESSION RECOVERY: the conversation on screen may have been closed
+    // underneath this surface (the background policy abandons the active
+    // session). Recording into it could only produce a discarded turn, so a fresh
+    // conversation with the SAME identity is composed first and the learner is
+    // told plainly what happened — nothing is silently reset.
+    if (!isConversationReusable(session)) {
+      const recovered = await startConversation(mode, appliedTopic);
+      if (!recovered) {
+        setErrorMessage(TALK_CONVERSATION_RESTARTED_MIC_MESSAGE);
+        return;
+      }
+      session = recovered;
+      setErrorMessage(TALK_CONVERSATION_RESTARTED_MIC_MESSAGE);
+    }
     const coordinator = getOrCreateVoiceCoordinator(session, providerKind);
 
     if (voiceStatus.state === 'recording') {
@@ -716,7 +811,12 @@ export default function TalkScreen(props?: TalkScreenProps) {
       setStreamingText(null);
 
       if (!res.ok && res.error) {
+        // Already ONE classified learner-safe sentence; the raw provider detail
+        // stays in the logs and the preserved transcript/recording drives the
+        // recovery actions rendered below.
+        if (res.technical) console.error('Talk voice turn failure:', res.technical);
         setErrorMessage(res.error);
+        return;
       }
 
       // Analyze pronunciation once per spoken turn (never blocks the flow).
@@ -727,6 +827,88 @@ export default function TalkScreen(props?: TalkScreenProps) {
       // before the microphone opens.
       await coordinator.startRecording();
     }
+  };
+
+  /**
+   * Explicit learner Retry of a PRESERVED voice transcript (Work Order 1, item 6):
+   * the learner's own words are sent again without re-recording, through the SAME
+   * coordinator path, so the turn either commits exactly once or fails honestly
+   * again with the transcript still preserved.
+   */
+  const handleRetryVoiceTurn = async () => {
+    const coordinator = voiceCoordinatorRef.current;
+    const session = sessionRef.current;
+    if (!coordinator || !session || isSending || isSwitching || sendInFlightRef.current) return;
+    sendInFlightRef.current = true;
+    setIsSending(true);
+    setStreamingText('');
+    setErrorMessage(null);
+    try {
+      const res = await coordinator.retryPendingTurn((chunk: string) => {
+        setStreamingText((prev) => (prev ?? '') + chunk);
+      });
+      // A late result from a replaced session must never touch the new one.
+      if (sessionRef.current !== session) return;
+      setHistory(session.getHistory());
+      setLastFeedback(session.getLastFeedback());
+      if (!res.ok) {
+        if (res.technical) console.error('Talk voice retry failure:', res.technical);
+        if (res.error) setErrorMessage(res.error);
+        return;
+      }
+      await runPronunciationAnalysis();
+    } finally {
+      setIsSending(false);
+      setStreamingText(null);
+      sendInFlightRef.current = false;
+    }
+  };
+
+  /**
+   * Explicit learner Retry of a PRESERVED RECORDING after a failed transcription:
+   * the same audio is transcribed again, so the learner never has to speak twice,
+   * and nothing is fabricated when it fails again.
+   */
+  const handleRetryTranscription = async () => {
+    const coordinator = voiceCoordinatorRef.current;
+    const session = sessionRef.current;
+    if (!coordinator || !session || isSending || isSwitching || sendInFlightRef.current) return;
+    sendInFlightRef.current = true;
+    setIsSending(true);
+    setStreamingText('');
+    setErrorMessage(null);
+    try {
+      const res = await coordinator.retryTranscription((chunk: string) => {
+        setStreamingText((prev) => (prev ?? '') + chunk);
+      });
+      if (sessionRef.current !== session) return;
+      setHistory(session.getHistory());
+      setLastFeedback(session.getLastFeedback());
+      if (!res.ok) {
+        if (res.technical) console.error('Talk transcription retry failure:', res.technical);
+        if (res.error) setErrorMessage(res.error);
+        return;
+      }
+      await runPronunciationAnalysis();
+    } finally {
+      setIsSending(false);
+      setStreamingText(null);
+      sendInFlightRef.current = false;
+    }
+  };
+
+  /**
+   * "Type instead": the preserved transcript moves into the composer so the
+   * learner can review and edit it before sending. Taking it clears the
+   * coordinator's preserved turn, so the same utterance can never be sent twice.
+   */
+  const handleUseTranscriptAsText = () => {
+    const coordinator = voiceCoordinatorRef.current;
+    if (!coordinator) return;
+    const transcript = coordinator.takePendingTranscript();
+    if (!transcript) return;
+    setErrorMessage(null);
+    setInputText(transcript);
   };
 
   // Handle stop speaking
@@ -750,83 +932,182 @@ export default function TalkScreen(props?: TalkScreenProps) {
     }
   };
 
-  // Handle send message with streaming (typed)
-  const handleSendMessage = async () => {
-    const trimmedMessage = inputText.trim();
-    if (!trimmedMessage || isSending || !voiceStatus.canSendText) {
-      return;
-    }
-    if (providerKind === null || providerKind === 'unavailable') {
-      // No provider is configured (or not yet established): a message must not
-      // be sent into nothing.
-      return;
-    }
-
-    if (voiceCoordinatorRef.current) {
-      await voiceCoordinatorRef.current.stopSpeaking();
-    }
-
-    setIsSending(true);
-    setErrorMessage(null);
-    setInputText('');
-    setStreamingText('');
-
-    // Optimistically add user message to history
-    const userTurn: ConversationTurn = { role: 'user', content: trimmedMessage };
-    setHistory((prev) => [...prev, userTurn]);
-
-    const targetSession = sessionRef.current;
-    if (!targetSession || isSwitching) {
-      return;
-    }
-
-    try {
-      await ensureLearnerContext();
-      const session = targetSession;
-      // Never race the tutor opening: it must finish or be invalidated first.
-      if (isOpening) {
-        setInputText(trimmedMessage);
+  /**
+   * Sends ONE typed learner message through the EXISTING conversation session.
+   *
+   * Reliability contract (Work Order 1):
+   * - the composer is cleared only once the turn is really dispatched, and the
+   *   learner's EXACT text is restored on every path that does not commit it
+   *   (including the paths that used to return early and lose it);
+   * - a failure shows ONE classified learner-safe sentence — never a raw provider
+   *   payload, stack trace or quota object — and preserves the message so an
+   *   explicit Retry resends exactly that text;
+   * - a conversation that was closed underneath this surface is detected BEFORE
+   *   the turn starts and recovered with the SAME identity, so the learner no
+   *   longer reads "this conversation was replaced before the turn finished";
+   * - a repeated tap can never commit the same message twice (synchronous
+   *   in-flight guard, plus a committed-turn check before any replay).
+   */
+  const sendLearnerMessage = useCallback(
+    async (rawMessage: string): Promise<void> => {
+      const trimmedMessage = rawMessage.trim();
+      if (!trimmedMessage) return;
+      // Synchronous guards FIRST: nothing is mutated before them, so an early
+      // return can never leave the surface stuck in "sending" or lose the draft.
+      if (sendInFlightRef.current || isSending || isSwitching) return;
+      if (!voiceStatus.canSendText) return;
+      if (providerKind === null || providerKind === 'unavailable') {
+        // No provider is configured (or not yet established): a message must not
+        // be sent into nothing.
         return;
       }
-      const result = await session.send(
-        { userMessage: trimmedMessage },
-        (chunk: string) => {
-          if (sessionRef.current === session) {
-            setStreamingText((prev) => (prev ?? '') + chunk);
+
+      let session = sessionRef.current;
+      if (!session) return;
+
+      sendInFlightRef.current = true;
+      /** Calm notice kept when a closed conversation had to be replaced first. */
+      let restartNotice: string | null = null;
+      try {
+        // DEAD-SESSION RECOVERY: the conversation this surface still shows may
+        // have been closed underneath it (the background policy abandons the
+        // active session). A turn sent into it could only be discarded, so a
+        // fresh conversation with the SAME identity is composed first and the
+        // learner keeps their message.
+        if (!isConversationReusable(session)) {
+          const recovered = await startConversation(mode, appliedTopic);
+          if (!recovered) {
+            setInputText(trimmedMessage);
+            setErrorMessage(TALK_CONVERSATION_RESTARTED_MESSAGE);
+            return;
           }
+          session = recovered;
+          restartNotice = TALK_CONVERSATION_RESTARTED_MESSAGE;
+          setInputText(trimmedMessage);
         }
-      );
 
-      // Stale guard: a replaced session's result must not appear in the new one.
-      if (sessionRef.current !== session) {
-        return;
+        if (voiceCoordinatorRef.current) {
+          await voiceCoordinatorRef.current.stopSpeaking();
+        }
+
+        setIsSending(true);
+        setErrorMessage(null);
+        setInputText('');
+        setStreamingText('');
+        // Commit state observed BEFORE the turn: an explicit Retry verifies
+        // against it, so a message that really landed is never sent twice.
+        retryBaselineRef.current = countCommittedLearnerTurns(session);
+        setRetryMessage(null);
+
+        // Optimistically add user message to history
+        const userTurn: ConversationTurn = { role: 'user', content: trimmedMessage };
+        setHistory((prev) => [...prev, userTurn]);
+
+        await ensureLearnerContext();
+        // Never race the tutor opening: it must finish or be invalidated first.
+        if (isOpening) {
+          setInputText(trimmedMessage);
+          if (restartNotice) setErrorMessage(restartNotice);
+          return;
+        }
+
+        const result = await session.send(
+          { userMessage: trimmedMessage },
+          (chunk: string) => {
+            if (sessionRef.current === session) {
+              setStreamingText((prev) => (prev ?? '') + chunk);
+            }
+          }
+        );
+
+        // Stale guard: a replaced session's result must not appear in the new one.
+        // That turn never committed, so the learner's text comes back.
+        if (sessionRef.current !== session) {
+          setInputText(trimmedMessage);
+          setRetryMessage(null);
+          setErrorMessage(
+            result.ok ? restartNotice : learnerMessageForFailure(result.error, 'tutor'),
+          );
+          return;
+        }
+
+        setHistory(session.getHistory());
+        setLastFeedback(session.getLastFeedback());
+
+        if (!result.ok) {
+          // The turn was not accepted: nothing was added to the conversation, so
+          // the learner keeps their text, reads one safe sentence and gets an
+          // explicit Retry.
+          setHistory(session.getHistory());
+          setInputText(trimmedMessage);
+          setRetryMessage(trimmedMessage);
+          const learnerMessage = learnerMessageForFailure(result.error, 'tutor');
+          setErrorMessage(learnerMessage);
+          if (result.error?.message && result.error.message !== learnerMessage) {
+            // Raw provider detail is diagnostic only: it is never rendered.
+            console.error('Talk turn failure:', result.error.message);
+          }
+          return;
+        }
+
+        if (restartNotice) setErrorMessage(restartNotice);
+      } catch (err: unknown) {
+        const current = sessionRef.current;
+        if (current) {
+          setHistory(current.getHistory());
+        }
+        // An unexpected throw still preserves the learner's own message.
+        setInputText(trimmedMessage);
+        setRetryMessage(trimmedMessage);
+        const learnerMessage = learnerMessageForFailure(
+          err instanceof Error ? { message: err.message } : null,
+          'tutor',
+        );
+        setErrorMessage(learnerMessage);
+        if (err instanceof Error && err.message !== learnerMessage) {
+          console.error('Talk turn threw:', err.message);
+        }
+      } finally {
+        setIsSending(false);
+        setStreamingText(null);
+        sendInFlightRef.current = false;
       }
+    },
+    [
+      appliedTopic,
+      isOpening,
+      isSending,
+      isSwitching,
+      mode,
+      providerKind,
+      startConversation,
+      voiceStatus.canSendText,
+    ],
+  );
 
+  // Handle send message with streaming (typed)
+  const handleSendMessage = () => sendLearnerMessage(inputText);
+
+  /**
+   * Explicit learner Retry of a message that did NOT commit. It resends the
+   * learner's own preserved text through the SAME path, and first verifies the
+   * committed learner-turn count: a message that really landed is shown as
+   * committed instead of being sent a second time.
+   */
+  const handleRetryMessage = async () => {
+    const message = retryMessage;
+    if (!message || isSending || isSwitching || sendInFlightRef.current) return;
+    const session = sessionRef.current;
+    if (session && countCommittedLearnerTurns(session) > retryBaselineRef.current) {
+      // The turn really committed after all: report the truth, resend nothing.
       setHistory(session.getHistory());
       setLastFeedback(session.getLastFeedback());
-
-      if (!result.ok) {
-        // The turn was not accepted: nothing was added to the conversation, so
-        // the learner keeps their text and can retry.
-        setHistory(session.getHistory());
-        setInputText(trimmedMessage);
-        setErrorMessage(
-          result.error.message || 'The tutor returned an error. Please try again.'
-        );
-      }
-    } catch {
-      const message =
-        'An unexpected error occurred while sending.';
-      const session = sessionRef.current;
-      if (session) {
-        setHistory(session.getHistory());
-      }
-      setInputText(trimmedMessage);
-      setErrorMessage(message);
-    } finally {
-      setIsSending(false);
-      setStreamingText(null);
+      setRetryMessage(null);
+      setErrorMessage(null);
+      return;
     }
+    setRetryMessage(null);
+    await sendLearnerMessage(message);
   };
 
   reviewOpenRef.current = conversationReview !== null;
@@ -961,6 +1242,21 @@ export default function TalkScreen(props?: TalkScreenProps) {
           <Text style={styles.topicLockedHelperText}>
             Start a new chat to change the topic.
           </Text>
+        )}
+        {/*
+          A typed topic is a DRAFT: the learner applies it explicitly. This is what
+          stops per-keystroke conversation replacement (and the "conversation was
+          replaced before the turn finished" failure it caused).
+        */}
+        {topicDraftPending && (
+          <TouchableOpacity
+            style={styles.topicApplyButton}
+            onPress={handleApplyTopic}
+            accessibilityRole="button"
+            accessibilityLabel="Start the conversation with this topic"
+          >
+            <Text style={styles.topicApplyButtonText}>Start with this topic</Text>
+          </TouchableOpacity>
         )}
 
         {/*
@@ -1260,6 +1556,58 @@ export default function TalkScreen(props?: TalkScreenProps) {
         {errorMessage && (
           <View style={styles.errorContainer}>
             <Text style={styles.errorText}>{errorMessage}</Text>
+            {/*
+              Recovery is explicit and matches what really survived:
+              - a typed message that did not commit → Retry resends exactly it;
+              - a transcript that survived a failed tutor reply → send it again or
+                review it as text (never a fabricated transcript);
+              - a recording that survived a failed transcription → transcribe the
+                SAME audio again instead of speaking twice.
+            */}
+            {retryMessage ? (
+              <TouchableOpacity
+                style={styles.errorAction}
+                onPress={() => void handleRetryMessage()}
+                disabled={isSending || isSwitching}
+                accessibilityRole="button"
+                accessibilityLabel="Retry sending my message"
+              >
+                <Text style={styles.errorActionText}>Retry</Text>
+              </TouchableOpacity>
+            ) : null}
+            {voiceStatus.canRetryPendingTurn ? (
+              <View style={styles.errorActionRow}>
+                <TouchableOpacity
+                  style={styles.errorAction}
+                  onPress={() => void handleRetryVoiceTurn()}
+                  disabled={isSending || isSwitching}
+                  accessibilityRole="button"
+                  accessibilityLabel="Send my transcribed answer again"
+                >
+                  <Text style={styles.errorActionText}>Send it again</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.errorAction}
+                  onPress={handleUseTranscriptAsText}
+                  disabled={isSending || isSwitching}
+                  accessibilityRole="button"
+                  accessibilityLabel="Type my transcribed answer instead"
+                >
+                  <Text style={styles.errorActionText}>Type instead</Text>
+                </TouchableOpacity>
+              </View>
+            ) : null}
+            {voiceStatus.canRetryTranscription ? (
+              <TouchableOpacity
+                style={styles.errorAction}
+                onPress={() => void handleRetryTranscription()}
+                disabled={isSending || isSwitching}
+                accessibilityRole="button"
+                accessibilityLabel="Transcribe my last recording again"
+              >
+                <Text style={styles.errorActionText}>Try my last recording again</Text>
+              </TouchableOpacity>
+            ) : null}
           </View>
         )}
       </ScrollView>
@@ -1899,6 +2247,43 @@ const styles = StyleSheet.create({
   errorText: {
     fontSize: 13,
     color: '#B91C1C',
+  },
+  /** One explicit recovery action inside the failure notice. */
+  errorAction: {
+    marginTop: 8,
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#FCA5A5',
+  },
+  errorActionRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  errorActionText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#B91C1C',
+  },
+  /** Explicit "apply this drafted topic" action (no per-keystroke replacement). */
+  topicApplyButton: {
+    marginTop: 6,
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+  },
+  topicApplyButtonText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#374151',
   },
   composerContainer: {
     flexDirection: 'row',

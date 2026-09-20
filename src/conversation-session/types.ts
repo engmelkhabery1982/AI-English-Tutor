@@ -98,6 +98,15 @@ export interface ConversationSession {
    */
   abandon?(): void;
 
+  /**
+   * True once this session was replaced/closed. A surface that still shows this
+   * conversation must read it BEFORE starting a learner turn: sending into a
+   * closed session can only produce a discarded turn, so the honest recovery is
+   * to compose a fresh conversation instead of reporting a frightening error.
+   * Optional so existing sessions/providers stay compatible.
+   */
+  isAbandoned?(): boolean;
+
   sendStream?(
     input: ConversationSessionSendInput,
     onChunk: AIStreamCallback
