@@ -21,6 +21,7 @@ import type {
   ConversationMode,
   EvidenceRef,
   IsoDate,
+  LearnerPreferences,
   Uuid,
   WeaknessStatus,
 } from '../../shared/types';
@@ -36,6 +37,12 @@ export interface UserProfile {
   readonly currentLevel: CefrLevelInput;
   readonly learningGoals: readonly string[];
   readonly preferredModes: readonly ConversationMode[];
+  /**
+   * Work Order 2 — additive learner preferences (correction intensity) stored
+   * on the ONE existing profile row. Optional for rows written before the
+   * v7 migration; readers must fall back to the documented defaults.
+   */
+  readonly preferences?: LearnerPreferences;
   readonly createdAt: IsoDate;
   readonly updatedAt: IsoDate;
 }

@@ -42,6 +42,14 @@ export const CONVERSATION_OPENING_DISCARDED_MESSAGE =
 export const CONVERSATION_ABANDONED_MESSAGE =
   'This conversation was replaced before the turn finished, so the turn was discarded.';
 
+/**
+ * Honest message when a learner-assistance reply arrives after the learner
+ * already sent a real turn: the help is discarded, the learner's turn wins,
+ * and NOTHING is written into the conversation.
+ */
+export const CONVERSATION_ASSISTANCE_DISCARDED_MESSAGE =
+  'Your own answer arrived before the tutor help did, so the help was discarded.';
+
 export type {
   ConversationMode,
   ConversationTurn,
@@ -118,6 +126,12 @@ export function createConversationSession(
   let historyVersion = 0;
   /** True once the session was replaced/closed (late work must be discarded). */
   let abandoned = false;
+  /**
+   * Work Order 2 — session-local correction-mode override ("fewer corrections
+   * for now"). It affects ONLY prompt building for subsequent turns; nothing
+   * is persisted and the composed conversation identity never changes.
+   */
+  let modeOverride: ConversationMode | null = null;
 
   /** Discriminated refusal used for every abandoned-session case. */
   function abandonedResult(): ConversationSessionResult {
@@ -140,7 +154,7 @@ export function createConversationSession(
     if (abandoned) return abandonedResult();
 
     const requestInput: ConversationRequestInput = {
-      mode: sessionConfig.mode,
+      mode: modeOverride ?? sessionConfig.mode,
       ...(typeof sessionConfig.topic === 'string' && { topic: sessionConfig.topic }),
       ...(typeof sessionConfig.historyLimit === 'number' && {
         historyLimit: sessionConfig.historyLimit,
@@ -238,7 +252,7 @@ export function createConversationSession(
     const startedVersion = historyVersion;
 
     const requestInput: ConversationRequestInput = {
-      mode: sessionConfig.mode,
+      mode: modeOverride ?? sessionConfig.mode,
       ...(typeof sessionConfig.topic === 'string' && { topic: sessionConfig.topic }),
       ...(typeof sessionConfig.historyLimit === 'number' && {
         historyLimit: sessionConfig.historyLimit,
@@ -300,6 +314,109 @@ export function createConversationSession(
     };
   }
 
+  /**
+   * Work Order 2 — learner-assistance turn (hint / example / explain /
+   * "I don't know" / skip).
+   *
+   * The instruction is a HIDDEN tutor request, exactly like the opening
+   * instruction: it is never a learner turn, never feedback, and never
+   * persisted learning evidence. Only the tutor's reply is appended to the
+   * conversation so the flow continues naturally from the scaffold.
+   *
+   * Session-safety (Work Order 1 contract preserved):
+   * - an abandoned/replaced session never receives the reply;
+   * - if a real learner turn committed while the request was in flight, the
+   *   assistance is discarded (never inserted mid-turn);
+   * - the committed-LEARNER-turn count can never change through this path —
+   *   only assistant history grows;
+   * - `lastFeedback` is left exactly as it was, so correction/weakness
+   *   persistence can never see assistance text.
+   */
+  async function executeAssistance(
+    input: ConversationSessionSendInput,
+    onChunk?: AIStreamCallback
+  ): Promise<ConversationSessionResult> {
+    if (abandoned) return abandonedResult();
+
+    const instruction = input.userMessage.trim();
+    if (instruction.length === 0) {
+      return {
+        ok: false,
+        error: {
+          code: 'invalid_request',
+          message: 'The help request was empty. Nothing was added to the conversation.',
+          retryable: false,
+        },
+        history: cloneHistory(history),
+        feedback: null,
+      };
+    }
+
+    const startedVersion = historyVersion;
+
+    const requestInput: ConversationRequestInput = {
+      mode: modeOverride ?? sessionConfig.mode,
+      ...(typeof sessionConfig.topic === 'string' && { topic: sessionConfig.topic }),
+      ...(typeof sessionConfig.historyLimit === 'number' && {
+        historyLimit: sessionConfig.historyLimit,
+      }),
+      history: cloneHistory(history),
+      userMessage: instruction,
+    };
+
+    let result: ConversationExecutionResult;
+    if (onChunk && typeof orchestrator.executeStream === 'function') {
+      result = await orchestrator.executeStream(requestInput, onChunk);
+    } else {
+      result = await orchestrator.execute(requestInput);
+      if (result.ok && onChunk) {
+        onChunk(result.response.content);
+      }
+    }
+
+    if (!result.ok) {
+      // Honest failure, no fabricated help: the learner work stays exactly as it was.
+      return {
+        ok: false,
+        error: result.error,
+        history: cloneHistory(history),
+        feedback: null,
+      };
+    }
+
+    if (abandoned) {
+      // The session was replaced while the help was in flight.
+      return abandonedResult();
+    }
+
+    // A learner turn (or clear) landed while the help was in flight: the
+    // learner's real answer wins and the stale scaffold is discarded.
+    if (historyVersion !== startedVersion) {
+      return {
+        ok: false,
+        error: {
+          code: 'cancelled',
+          message: CONVERSATION_ASSISTANCE_DISCARDED_MESSAGE,
+          retryable: true,
+        },
+        history: cloneHistory(history),
+        feedback: null,
+      };
+    }
+
+    historyVersion += 1;
+    history.push({ role: 'assistant', content: result.response.content });
+
+    return {
+      ok: true,
+      // Feedback is stripped at the SOURCE: assistance replies can never be
+      // recorded as correction evidence by any surface, whoever consumes them.
+      response: { ...result.response, feedback: null },
+      history: cloneHistory(history),
+      feedback: null,
+    };
+  }
+
   return {
     async send(
       input: ConversationSessionSendInput,
@@ -313,6 +430,13 @@ export function createConversationSession(
       onChunk?: AIStreamCallback
     ): Promise<ConversationSessionResult> {
       return executeOpening(input, onChunk);
+    },
+
+    async requestAssistance(
+      input: ConversationSessionSendInput,
+      onChunk?: AIStreamCallback
+    ): Promise<ConversationSessionResult> {
+      return executeAssistance(input, onChunk);
     },
 
     async sendStream(
@@ -384,6 +508,13 @@ export function createConversationSession(
 
     isAbandoned(): boolean {
       return abandoned;
+    },
+
+    setModeOverride(mode: ConversationMode | null): void {
+      // Deliberately does NOT bump historyVersion and does NOT touch history:
+      // the override only changes how the NEXT request prompt is built, so it
+      // can never invalidate an in-flight turn or fake a new conversation.
+      modeOverride = mode;
     },
 
     getConfig(): ConversationSessionConfig {

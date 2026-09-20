@@ -65,6 +65,19 @@ export interface WorkspaceEntry {
   readonly createdAt: IsoDate;
   readonly updatedAt: IsoDate;
   readonly addedBy: string;
+  /**
+   * Work Order 2 — where the SAVE itself came from: the stored provenance
+   * (`source.saveSource`) when present, otherwise derived deterministically
+   * from `addedBy`. 'manual_learner' → "Saved by me", 'detected' →
+   * "Detected from practice". Derivation only — nothing is re-persisted here.
+   */
+  readonly saveSource: 'manual_learner' | 'detected_practice';
+  /** Origin feature of a learner save, when recorded (e.g. 'listening'). */
+  readonly saveOrigin: string | null;
+  /** True when the stored item is marked as containing generated text. */
+  readonly containsGeneratedText: boolean;
+  /** Usage context captured at save time, when present. */
+  readonly contextSentence: string | null;
   /** The full persisted domain item, for the details view. */
   readonly item: VocabularyItem | ExpressionItem;
 }

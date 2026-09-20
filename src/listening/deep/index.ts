@@ -19,4 +19,8 @@ export * from './generation';
 export * from './catalogue';
 export * from './planner';
 export * from './shadowing';
+// Work Order 2: learner-controlled shadowing assistance (reveal / meaning /
+// replay-friendly state). Pure presentation state — it can never create or
+// change practice evidence.
+export * from './shadowing-assist';
 export * from './evaluation';

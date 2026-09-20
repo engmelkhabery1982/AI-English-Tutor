@@ -122,6 +122,9 @@ function rowToUserProfile(row: SqlRow): UserProfile {
     currentLevel: row.current_level as UserProfile['currentLevel'],
     learningGoals: safeJsonParse(row.learning_goals, []),
     preferredModes: safeJsonParse(row.preferred_modes, []),
+    // Work Order 2: additive preferences JSON. Rows/tables created before v7
+    // have no column here and safely map to an empty preferences object.
+    preferences: safeJsonParse(row.preferences, {}),
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string,
   };
@@ -348,13 +351,14 @@ function buildProfileUpdate(
     currentLevel: 'current_level',
     learningGoals: 'learning_goals',
     preferredModes: 'preferred_modes',
+    preferences: 'preferences',
   };
 
   for (const [key, column] of Object.entries(fieldMap)) {
     const value = patch[key as keyof typeof patch];
     if (value !== undefined) {
       fields.push(`${column} = ?`);
-      if (key === 'learningGoals' || key === 'preferredModes') {
+      if (key === 'learningGoals' || key === 'preferredModes' || key === 'preferences') {
         params.push(JSON.stringify(value));
       } else {
         params.push(value as SqlParam);
@@ -404,55 +408,86 @@ export class SQLiteUserProfileRepository implements UserProfileRepository {
       const learningGoals = patch.learningGoals ?? [];
       const preferredModes = patch.preferredModes ?? [];
       const nativeLanguage = patch.nativeLanguage ?? null;
+      const preferences = JSON.stringify(patch.preferences ?? {});
 
-      try {
-        // Include singleton=1 for the unique single-profile invariant.
-        // If column doesn't exist yet (pre-v6 DB during migration), fallback without it.
-        try {
-          await this.adapter.execute(
-            `INSERT INTO learner_profile (
+      // Column variants, most-capable first. A pre-v6 DB has no singleton
+      // column and a pre-v7 DB has no preferences column; each INSERT below
+      // degrades past whichever is missing instead of failing the profile
+      // creation (the v6/v7 migration adds them later).
+      const insertVariants: readonly {
+        sql: string;
+        withPreferences: boolean;
+        withSingleton: boolean;
+      }[] = [
+        {
+          sql: `INSERT INTO learner_profile (
+              id, display_name, native_language, target_language,
+              target_level, current_level, learning_goals, preferred_modes,
+              preferences, created_at, updated_at, singleton
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+          withPreferences: true,
+          withSingleton: true,
+        },
+        {
+          sql: `INSERT INTO learner_profile (
               id, display_name, native_language, target_language,
               target_level, current_level, learning_goals, preferred_modes,
               created_at, updated_at, singleton
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
-            [
-              id,
-              displayName,
-              nativeLanguage,
-              targetLanguage,
-              targetLevel,
-              currentLevel,
-              JSON.stringify(learningGoals),
-              JSON.stringify(preferredModes),
-              now,
-              now,
-            ],
-          );
-        } catch (e) {
-          if (String((e as Error).message).toLowerCase().includes('no column') && String((e as Error).message).toLowerCase().includes('singleton')) {
-            await this.adapter.execute(
-              `INSERT INTO learner_profile (
-                id, display_name, native_language, target_language,
-                target_level, current_level, learning_goals, preferred_modes,
-                created_at, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              [
-                id,
-                displayName,
-                nativeLanguage,
-                targetLanguage,
-                targetLevel,
-                currentLevel,
-                JSON.stringify(learningGoals),
-                JSON.stringify(preferredModes),
-                now,
-                now,
-              ],
-            );
-          } else {
-            throw e;
+          withPreferences: false,
+          withSingleton: true,
+        },
+        {
+          sql: `INSERT INTO learner_profile (
+              id, display_name, native_language, target_language,
+              target_level, current_level, learning_goals, preferred_modes,
+              preferences, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          withPreferences: true,
+          withSingleton: false,
+        },
+        {
+          sql: `INSERT INTO learner_profile (
+              id, display_name, native_language, target_language,
+              target_level, current_level, learning_goals, preferred_modes,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          withPreferences: false,
+          withSingleton: false,
+        },
+      ];
+
+      const insertParamsFor = (variant: (typeof insertVariants)[number]): SqlParam[] =>
+        [
+          id,
+          displayName,
+          nativeLanguage,
+          targetLanguage,
+          targetLevel,
+          currentLevel,
+          JSON.stringify(learningGoals),
+          JSON.stringify(preferredModes),
+          ...(variant.withPreferences ? [preferences] : []),
+          now,
+          now,
+        ];
+
+      let degradedError: unknown = null;
+      try {
+        for (const variant of insertVariants) {
+          try {
+            await this.adapter.execute(variant.sql, insertParamsFor(variant));
+            degradedError = null;
+            break;
+          } catch (e) {
+            const msg = String((e as Error).message).toLowerCase();
+            const missingPreferences = msg.includes('no column') && msg.includes('preferences');
+            const missingSingleton = msg.includes('no column') && msg.includes('singleton');
+            degradedError = e;
+            if (!missingPreferences && !missingSingleton) throw e;
           }
         }
+        if (degradedError !== null) throw degradedError;
       } catch (err) {
         if (isUniqueViolation(err)) {
           // Race: another instance inserted first. Load existing and apply patch.

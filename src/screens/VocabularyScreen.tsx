@@ -1,4 +1,5 @@
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { describeSaveSource } from '../learner-agency';
 import SavedItemAudio from './components/SavedItemAudio';
 import TouchableOpacity from './components/LearnerButton';
 /**
@@ -775,16 +776,17 @@ export default function VocabularyScreen(props?: VocabularyScreenProps) {
               </View>
 
               <Text style={styles.detailMeta}>
-                Added {formatDate(selectedEntry.createdAt)} · Saved{' '}
-                {selectedEntry.addedBy === 'learner-created'
-                  ? 'by you'
-                  : selectedEntry.addedBy === 'ai-suggested'
-                    ? 'from conversation'
-                    : 'by the tutor'}
+                Added {formatDate(selectedEntry.createdAt)} ·{' '}
+                {describeSaveSource(selectedEntry.saveSource).label}
+                {selectedEntry.saveOrigin ? ` (${selectedEntry.saveOrigin.replace(/_/g, ' ')})` : ''}
+                {selectedEntry.containsGeneratedText ? ' · includes AI-generated text' : ''}
                 {selectedEntry.nextReviewAt
                   ? ` · Next review: ${formatDate(selectedEntry.nextReviewAt)}`
                   : ''}
               </Text>
+              {selectedEntry.contextSentence ? (
+                <Text style={styles.detailMeta}>In context: “{selectedEntry.contextSentence}”</Text>
+              ) : null}
 
               {pronunciationNotes.length > 0 && (
                 <View style={styles.pronunciationNotesBox}>

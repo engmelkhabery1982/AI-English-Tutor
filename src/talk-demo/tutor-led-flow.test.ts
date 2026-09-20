@@ -1218,6 +1218,13 @@ describe('Talk — tutor-led conversational flow', () => {
         'saveVocabularyItem',
         'send',
         'sendStream',
+        // Additive learner-agency methods (Work Order 2): help runs through
+        // the SAME session/engine (requestAssistance commits a tutor-only
+        // turn) and the temporary correction override only re-maps the mode of
+        // the next request. Both extend the ONE existing contract; neither is
+        // a second conversation engine, and neither can submit a learner answer.
+        'requestAssistance',
+        'setModeOverride',
       ].sort(),
     );
   });

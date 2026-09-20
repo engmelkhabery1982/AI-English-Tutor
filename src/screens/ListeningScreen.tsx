@@ -52,6 +52,7 @@ import {
 } from '../daily-tutor';
 import { TTSController } from '../voice/tts-controller';
 import { useVoiceAppStateGuard } from '../voice/use-app-state-guard';
+import { createSaveToReviewService } from '../learner-agency';
 
 export interface ListeningScreenProps {
   readonly initialPractice?: 'pronunciation' | 'shadowing';
@@ -394,6 +395,46 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
       }
     } catch {
       setErrorMessage('Saving failed. Please try again.');
+    }
+  };
+
+  /**
+   * Work Order 2 — always-available manual save of the revealed transcript
+   * sentence, valid after ANY result (a correct answer may still be worth
+   * keeping). Goes through the ONE reusable Save to Review service; it never
+   * changes review status, mastery or evidence.
+   */
+  const [reviewSaveNote, setReviewSaveNote] = useState<string | null>(null);
+  const [isSavingToReview, setIsSavingToReview] = useState<boolean>(false);
+  const reviewSaveServiceRef = React.useRef(createSaveToReviewService());
+
+  const handleSaveRevealedToReview = async (): Promise<void> => {
+    const sentence = (evaluation?.revealedTranscript ?? currentExercise?.speakText ?? '').trim();
+    if (sentence.length === 0 || isSavingToReview) return;
+    setIsSavingToReview(true);
+    setReviewSaveNote(null);
+    try {
+      const result = await reviewSaveServiceRef.current.save({
+        learnerId: '',
+        text: sentence,
+        itemType: 'sentence',
+        origin: 'listening',
+        originRef: currentExercise?.id,
+        contextSentence: sentence,
+      });
+      if (result.ok) {
+        setReviewSaveNote(
+          result.reason === 'already_saved'
+            ? 'Already in your Review list — nothing was duplicated.'
+            : 'Saved to Review. Saving does not count as practice.',
+        );
+      } else if (result.reason === 'no_profile') {
+        setReviewSaveNote('Saving needs a learning profile first.');
+      } else {
+        setReviewSaveNote('Could not save this time. Nothing was changed.');
+      }
+    } finally {
+      setIsSavingToReview(false);
     }
   };
 
@@ -745,6 +786,22 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
                 );
               })}
             </View>
+          ) : null}
+          <View style={styles.saveRow}>
+            <TouchableOpacity
+              style={[styles.saveChip, isSavingToReview && styles.saveChipDone]}
+              onPress={() => void handleSaveRevealedToReview()}
+              disabled={isSavingToReview}
+              accessibilityRole="button"
+              accessibilityLabel="Save this sentence to Review — allowed after any answer, correct or not"
+            >
+              <Text style={styles.saveChipText}>
+                {isSavingToReview ? 'Saving…' : '＋ Save sentence to Review'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+          {reviewSaveNote ? (
+            <Text style={styles.feedbackLine}>{reviewSaveNote}</Text>
           ) : null}
           <TouchableOpacity style={styles.nextButton} onPress={handleNext}>
             <Text style={styles.nextButtonText}>

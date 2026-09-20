@@ -1,5 +1,5 @@
 import TouchableOpacity from './components/LearnerButton';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   ScrollView,
@@ -19,6 +19,11 @@ import {
   type ProviderCredentialService,
   type ProviderDiagnosticResult,
 } from '../provider-config';
+import {
+  CORRECTION_INTENSITY_OPTIONS,
+  createCorrectionPreferencesService,
+} from '../learner-agency';
+import type { CorrectionIntensity } from '../learner-agency';
 
 /**
  * SettingsScreen
@@ -88,6 +93,51 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
   const refreshSnapshot = useCallback(() => {
     setSnapshot(service.snapshot());
   }, [service]);
+
+  /* ---------- Work Order 2 — correction intensity (stored in the existing
+     profile preferences architecture; no parallel preference system) ------- */
+  const preferencesService = useMemo(() => createCorrectionPreferencesService(), []);
+  const [intensity, setIntensity] = useState<CorrectionIntensity>('balanced');
+  const [intensityOrigin, setIntensityOrigin] = useState<string>('default');
+  const [intensityFeedback, setIntensityFeedback] = useState<string | null>(null);
+  const intensityMountedRef = useRef(true);
+
+  useEffect(() => {
+    intensityMountedRef.current = true;
+    void (async () => {
+      const loaded = await preferencesService.load();
+      if (!intensityMountedRef.current) return;
+      setIntensity(loaded.intensity);
+      setIntensityOrigin(loaded.origin);
+    })();
+    return () => {
+      intensityMountedRef.current = false;
+    };
+  }, [preferencesService]);
+
+  const handleSelectIntensity = useCallback(
+    async (key: CorrectionIntensity): Promise<void> => {
+      if (busy) return;
+      setBusy(true);
+      setIntensityFeedback(null);
+      const ok = await preferencesService.save(key);
+      if (!intensityMountedRef.current) return;
+      if (ok) {
+        setIntensity(key);
+        setIntensityOrigin('stored');
+        setIntensityFeedback('Saved. Your next conversation uses this intensity.');
+      } else {
+        setIntensityFeedback(
+          'Could not save this choice right now. Nothing was changed — try again.',
+        );
+      }
+      setBusy(false);
+    },
+    [busy, preferencesService],
+  );
+
+  const intensityChoice = CORRECTION_INTENSITY_OPTIONS.find((option) => option.key === intensity);
+  const intensityLabel = intensityChoice?.label ?? 'Balanced';
 
   const handleSave = useCallback(async () => {
     if (busy) return;
@@ -315,6 +365,46 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
           Real AI conversations and speech recognition need a configured provider and a connection.
           Demo mode uses simulated content, not real AI or evidence of your English ability.
         </Text>
+      </View>
+
+      {/* --------------------- correction intensity (WO2) ------------------ */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Correction intensity</Text>
+        <Text style={styles.body}>
+          How often the tutor corrects you in conversation practice. This is a
+          preference, not a judgment — your level and evidence never depend on it.
+        </Text>
+        <View style={styles.buttonRow}>
+          {CORRECTION_INTENSITY_OPTIONS.map((option) => {
+            const selected = intensity === option.key;
+            return (
+              <TouchableOpacity
+                key={option.key}
+                testID={`settings-intensity-${option.key}`}
+                style={[styles.secondaryButton, selected && styles.primaryButton]}
+                disabled={busy}
+                onPress={() => void handleSelectIntensity(option.key)}
+                accessibilityRole="button"
+                accessibilityState={{ selected }}
+                accessibilityLabel={`Correction intensity: ${option.label}`}
+              >
+                <Text style={[styles.secondaryButtonText, selected && styles.primaryButtonText]}>
+                  {option.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+        <Text style={styles.metaRow}>
+          Stored on this device: <Text style={styles.metaValue}>{intensityLabel}</Text>
+          {intensityOrigin === 'default' ? ' (not chosen yet)' : ''}
+        </Text>
+        <Text style={styles.note}>{intensityChoice?.description ?? ''}</Text>
+        {intensityFeedback ? (
+          <Text accessibilityRole="alert" style={styles.feedback}>
+            {intensityFeedback}
+          </Text>
+        ) : null}
       </View>
 
       {/* ------------------------ existing entry point --------------------- */}

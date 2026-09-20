@@ -6,7 +6,7 @@
  * integrity validation and the explicit (never automatic) reset primitive.
  *
  * REAL SQLite integration: every test drives a real SqlJsAdapter with the real
- * v6 schema and real migrations. Only the platform adapter boundary is
+ * v7 schema and real migrations. Only the platform adapter boundary is
  * replaced (through the owner's OWN injection seam), so the production adapter
  * lifecycle code is what runs.
  */
@@ -136,13 +136,13 @@ describe('canonical database owner: concurrent initialization', () => {
       expect(connection.lifecycleId).toBe(1);
     }
 
-    // The shared database is a real, migrated v6 database and migrations ran
+    // The shared database is a real, migrated v7 database and migrations ran
     // exactly once (the adapter's init is the only migration runner).
-    expect(await getSchemaVersion(inner)).toBe(6);
+    expect(await getSchemaVersion(inner)).toBe(7);
     const migrations = await inner.query(
       `SELECT version FROM schema_migrations ORDER BY version`,
     );
-    expect(migrations.map((row) => Number(row.version))).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(migrations.map((row) => Number(row.version))).toEqual([1, 2, 3, 4, 5, 6, 7]);
   });
 
   it('a successful initialization is reused by later requests', async () => {
@@ -361,7 +361,7 @@ describe('canonical database owner: close and reopen', () => {
 
     // The new lifecycle is fully usable on real SQLite.
     const version = await getSchemaVersion(secondInner);
-    expect(version).toBe(6);
+    expect(version).toBe(7);
     const repository = new SQLiteUserProfileRepository(reopened.adapter);
     const created2 = await repository.update({
       displayName: 'Second Lifecycle',
@@ -415,15 +415,15 @@ describe('canonical database owner: close and reopen', () => {
  * ------------------------------------------------------------------ */
 
 describe('canonical database owner: integrity validation', () => {
-  it('reports a healthy v6 database and refuses to inspect a closed one', async () => {
+  it('reports a healthy v7 database and refuses to inspect a closed one', async () => {
     const { adapter } = await seedRealDatabase();
     const owner = ownerFor(adapter);
     await owner.open();
 
     const health = await owner.validate();
     expect(health.ok).toBe(true);
-    expect(health.schemaVersion).toBe(6);
-    expect(health.expectedSchemaVersion).toBe(6);
+    expect(health.schemaVersion).toBe(7);
+    expect(health.expectedSchemaVersion).toBe(7);
     expect(health.missingTables).toEqual([]);
     expect(health.integrityCheck).toBe('ok');
     expect(health.issues).toEqual([]);
@@ -531,7 +531,7 @@ describe('canonical database owner: explicit local-data reset', () => {
     );
     expect(profileRows).toHaveLength(1);
     const version = await getSchemaVersion(inner);
-    expect(version).toBe(6);
+    expect(version).toBe(7);
   });
 
   it('deletes learner data only when explicitly confirmed, keeping the schema', async () => {
@@ -561,8 +561,8 @@ describe('canonical database owner: explicit local-data reset', () => {
       const rows = await inner.query(`SELECT COUNT(*) AS c FROM ${table}`);
       expect(Number(rows[0].c)).toBe(0);
     }
-    // The schema is preserved: still v6, still healthy, still migratable.
-    expect(await getSchemaVersion(inner)).toBe(6);
+    // The schema is preserved: still v7, still healthy, still migratable.
+    expect(await getSchemaVersion(inner)).toBe(7);
     const health = await owner.validate();
     expect(health.ok).toBe(true);
   });

@@ -18,7 +18,7 @@ import TouchableOpacity from '../components/LearnerButton';
  *   passage text is never shown before the learner answers.
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   StyleSheet,
@@ -39,19 +39,33 @@ import {
   activitySpokenText,
   beginPlayback,
   buildSpokenScript,
+  beginMeaningRequest,
+  closeMeaning,
+  curatedMeaning,
   deepAnswerSteps,
   finishPlayback,
   abortPlayback,
+  initialShadowingAssistState,
   isDiscourseActivity,
   isMultiSpeakerActivity,
+  meaningFailed,
+  meaningLoaded,
+  openMeaning,
   playShadowingChunk,
+  readableChunkFor,
+  resetAssistForActivity,
   resolveSpeakerVoiceCapability,
   resolveSpeechRateCapability,
   revealedTranscriptFor,
   speakerSummary,
   speechRateTTSOptions,
+  toggleTranscript,
   withSpeechRate,
 } from '../../listening';
+import {
+  createLearnerHelpService,
+  createSaveToReviewService,
+} from '../../learner-agency';
 import type {
   DeepListeningActivity,
   DeepPlaybackState,
@@ -131,6 +145,23 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [voicePending, setVoicePending] = useState(false);
   const [completed, setCompleted] = useState<boolean>(false);
+
+  /* ---------------------------------------------------------------- *
+   * Work Order 2 — learner-controlled shadowing assistance.
+   * Reveal / meaning / save are LOCAL presentation + one manual save call:
+   * they never touch ShadowingSession attempts, support progression or any
+   * evidence store. A reveal can never complete or fail an attempt.
+   * ---------------------------------------------------------------- */
+  const [assist, setAssist] = useState(initialShadowingAssistState);
+  const [isSavingChunk, setIsSavingChunk] = useState<boolean>(false);
+  const [chunkSaveNote, setChunkSaveNote] = useState<string | null>(null);
+  const meaningInFlightRef = useRef<boolean>(false);
+  const helpServiceRef = useRef<ReturnType<typeof createLearnerHelpService> | null>(null);
+  const getHelpService = () => {
+    if (!helpServiceRef.current) helpServiceRef.current = createLearnerHelpService();
+    return helpServiceRef.current;
+  };
+  const saveService = useMemo(() => createSaveToReviewService(), []);
 
   const ttsRef = useRef<TextToSpeechProvider | null>(props.ttsProvider ?? null);
   const capabilityRef = useRef<SpeechRateCapability>(resolveSpeechRateCapability(props.ttsProvider));
@@ -256,6 +287,12 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
   useEffect(() => {
     let active = true;
     const token = (shadowingTokenRef.current += 1);
+    // A new activity starts a FRESH assist state: an in-flight meaning request
+    // for the old activity is invalidated by the token bump above and its
+    // result can never be written onto the new activity's card.
+    setAssist(resetAssistForActivity());
+    setChunkSaveNote(null);
+    meaningInFlightRef.current = false;
 
     const oldController = controllerRef.current;
     controllerRef.current = null;
@@ -435,6 +472,110 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
     }
   };
 
+  /**
+   * Work Order 2 — Meaning / explanation. Uses the activity's OWN curated
+   * explanation when it has one; otherwise asks the tutor through the shared
+   * help service. A failure shows a friendly sentence and keeps everything the
+   * learner already has; reading the meaning never counts as performance.
+   */
+  const handleMeaning = async (): Promise<void> => {
+    if (!activity) return;
+    const curated = curatedMeaning({ explanation: activity.explanation });
+    if (curated !== null) {
+      setAssist((current) => meaningLoaded(openMeaning(current), curated, false));
+      return;
+    }
+    if (meaningInFlightRef.current) return;
+    if (assist.meaningVisible && assist.meaningStatus === 'ready') {
+      setAssist((current) => closeMeaning(current));
+      return;
+    }
+    meaningInFlightRef.current = true;
+    const token = shadowingTokenRef.current;
+    setAssist((current) => beginMeaningRequest(current));
+    try {
+      const help = getHelpService();
+      if (!help.providerAvailable) {
+        setAssist((current) =>
+          meaningFailed(
+            current,
+            'No AI tutor is configured, so this passage cannot be explained automatically. Nothing was invented.',
+          ),
+        );
+        return;
+      }
+      const result = await help.requestHelp({
+        action: 'explain',
+        topic: activity.contextTopic ?? null,
+        contextText:
+          activity.taskType === 'shadowing'
+            ? activity.chunk
+            : activity.taskType === 'connected_speech'
+            ? activity.items.map((item) => item.writtenForm).join(', ')
+            : undefined,
+        // Stale probe: leaving the activity discards the late answer.
+        checkStale: () => shadowingTokenRef.current !== token,
+      });
+      if (shadowingTokenRef.current !== token) return;
+      if (!result.ok) {
+        setAssist((current) => meaningFailed(current, result.errorMessage));
+        return;
+      }
+      setAssist((current) => meaningLoaded(current, result.text, true));
+    } catch {
+      if (shadowingTokenRef.current === token) {
+        setAssist((current) =>
+          meaningFailed(current, 'The explanation could not be fetched. Your practice is untouched.'),
+        );
+      }
+    } finally {
+      meaningInFlightRef.current = false;
+    }
+  };
+
+  const handleRetryMeaning = (): void => {
+    void handleMeaning();
+  };
+
+  /**
+   * Work Order 2 — save the CURRENT chunk (or a revealed transcript sentence)
+   * to Review. Manual, allowed in every state, and completely separate from
+   * attempts: saving changes no review status, mastery or evidence.
+   */
+  const handleSaveToReview = async (
+    text: string,
+    itemType: 'sentence' | 'word' | 'phrase' | 'collocation' | 'expression',
+  ): Promise<void> => {
+    if (!activity || isSavingChunk) return;
+    const clean = text.trim();
+    if (clean.length === 0) return;
+    setIsSavingChunk(true);
+    setChunkSaveNote(null);
+    try {
+      const result = await saveService.save({
+        learnerId: await service.resolveLearnerId().catch(() => null) ?? '',
+        text: clean,
+        itemType: itemType === 'expression' ? 'common_expression' : itemType,
+        origin: activity.taskType === 'shadowing' ? 'shadowing' : 'listening',
+        originRef: activity.id,
+        contextSentence: clean,
+      });
+      if (result.ok) {
+        setChunkSaveNote(
+          result.reason === 'already_saved'
+            ? 'Already in your Review list — nothing was duplicated.'
+            : 'Saved to Review. Listening and saving never count as a result.',
+        );
+      } else if (result.reason === 'no_profile') {
+        setChunkSaveNote('Saving needs a learning profile first.');
+      } else {
+        setChunkSaveNote('Could not save this time. Nothing was changed.');
+      }
+    } finally {
+      setIsSavingChunk(false);
+    }
+  };
+
   const handleNext = (): void => {
     setErrorMessage(null);
     setVoicePending(false);
@@ -513,9 +654,6 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
   const revealed = evaluation ? revealedTranscriptFor(activity) : null;
   const isChoice = Boolean(step?.options && step.options.length > 0);
   const speechRate = playback.speechRate;
-  const maskedChunk =
-    activity.taskType === 'shadowing' ? shadowing?.session.visibleChunk ?? null : null;
-
   return (
     // The owning screen provides the scrolling container (mobile-first, no
     // nested scroll views).
@@ -601,15 +739,106 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
           {!shadowing?.controller.voiceAvailable ? <View><ProviderSettingsLink /><Text accessibilityLiveRegion="polite">Recording needs a configured speech provider. Open Settings → AI provider. Listening alone does not create pronunciation evidence.</Text></View> : null}
           <Text style={styles.note}>Microphone permission lets us hear your repeat. No permission means no recording or spoken evidence.</Text>
           {/permission/i.test(errorMessage ?? '') ? <MicrophoneHelp /> : null}
-          {maskedChunk ? (
-            <View style={styles.transcriptBox}>
-              <Text style={styles.transcriptText}>{maskedChunk}</Text>
+          {(() => {
+            const readable = shadowing ? readableChunkFor(shadowing.session, assist) : null;
+            return readable ? (
+              <View style={styles.transcriptBox}>
+                <Text style={styles.transcriptText}>{readable}</Text>
+                {assist.transcriptRevealed && (
+                  <Text style={styles.note}>
+                    Revealed for you — this is assistance, not an attempt and not a result.
+                  </Text>
+                )}
+              </View>
+            ) : (
+              <Text style={styles.note}>
+                Listen first: the text is hidden for this level. You can listen as many times as you like,
+                or reveal the transcript below to understand it first.
+              </Text>
+            );
+          })()}
+          <View style={styles.playRow}>
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={() => setAssist((current) => toggleTranscript(current))}
+              accessibilityRole="button"
+              accessibilityLabel={assist.transcriptRevealed ? 'Hide the transcript again' : 'Reveal the transcript to read while practicing'}
+            >
+              <Text style={styles.secondaryButtonText}>
+                {assist.transcriptRevealed ? 'Hide transcript' : 'Reveal transcript'}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={() => void handleMeaning()}
+              disabled={assist.meaningStatus === 'loading'}
+              accessibilityRole="button"
+              accessibilityLabel="Show what this means"
+            >
+              <Text style={styles.secondaryButtonText}>
+                {assist.meaningStatus === 'loading' ? 'Explaining…' : 'Meaning'}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={() => void handlePlay()}
+              disabled={isPlaying || voicePending || isRecording}
+              accessibilityRole="button"
+              accessibilityLabel="Replay this chunk as often as you like"
+            >
+              <Text style={styles.secondaryButtonText}>↻ Replay</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={() =>
+                activity.taskType === 'shadowing'
+                  ? void handleSaveToReview(activity.chunk, 'sentence')
+                  : undefined
+              }
+              disabled={isSavingChunk || activity.taskType !== 'shadowing'}
+              accessibilityRole="button"
+              accessibilityLabel="Save this chunk to Review"
+            >
+              <Text style={styles.secondaryButtonText}>
+                {isSavingChunk ? 'Saving…' : '＋ Save to Review'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+          {chunkSaveNote ? <Text style={styles.note}>{chunkSaveNote}</Text> : null}
+          {assist.meaningVisible ? (
+            <View style={styles.feedbackCard}>
+              <Text style={styles.feedbackTitle}>
+                {assist.meaningIsGenerated ? 'Tutor explanation (generated, not a dictionary)' : 'What this means'}
+              </Text>
+              {assist.meaningStatus === 'loading' ? (
+                <Text style={styles.note}>The tutor is preparing a short explanation…</Text>
+              ) : null}
+              {assist.meaningText ? <Text style={styles.feedbackLine}>{assist.meaningText}</Text> : null}
+              {assist.meaningStatus === 'failed' && assist.meaningError ? (
+                <View>
+                  <Text accessibilityRole="alert" style={styles.errorText}>{assist.meaningError}</Text>
+                  {assist.canRetryMeaning ? (
+                    <TouchableOpacity
+                      style={styles.secondaryButton}
+                      onPress={handleRetryMeaning}
+                      accessibilityRole="button"
+                      accessibilityLabel="Try the explanation again"
+                    >
+                      <Text style={styles.secondaryButtonText}>Try again</Text>
+                    </TouchableOpacity>
+                  ) : null}
+                </View>
+              ) : null}
+              <TouchableOpacity
+                style={styles.secondaryButton}
+                onPress={() => setAssist((current) => closeMeaning(current))}
+                accessibilityRole="button"
+                accessibilityLabel="Close the meaning card"
+              >
+                <Text style={styles.secondaryButtonText}>Close</Text>
+              </TouchableOpacity>
             </View>
-          ) : (
-            <Text style={styles.note}>
-              Listen first: the text is hidden for this level. You can listen as many times as you like.
-            </Text>
-          )}
+          ) : null}
           <TouchableOpacity
             style={styles.primaryButton}
             onPress={() => void handleShadowingToggle()}
@@ -724,6 +953,20 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
                   {revealed ? (
                     <Text style={styles.transcriptText}>{revealed}</Text>
                   ) : null}
+                  {revealed ? (
+                    <TouchableOpacity
+                      style={styles.secondaryButton}
+                      onPress={() => void handleSaveToReview(revealed, 'sentence')}
+                      disabled={isSavingChunk}
+                      accessibilityRole="button"
+                      accessibilityLabel="Save a sentence from this transcript to Review"
+                    >
+                      <Text style={styles.secondaryButtonText}>
+                        {isSavingChunk ? 'Saving…' : '＋ Save to Review'}
+                      </Text>
+                    </TouchableOpacity>
+                  ) : null}
+                  {chunkSaveNote ? <Text style={styles.note}>{chunkSaveNote}</Text> : null}
                   <TouchableOpacity style={styles.nextButton} disabled={voicePending || isRecording || isPlaying} onPress={handleNext}>
                     <Text style={styles.nextButtonText}>
                       {stepIndex + 1 < steps.length

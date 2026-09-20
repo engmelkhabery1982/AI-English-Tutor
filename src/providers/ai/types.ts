@@ -29,16 +29,14 @@ export interface AIUsage {
 
 /**
  * Allowed vocabulary and expression categories matching domain models.
+ *
+ * Work Order 2: this is now a type ALIAS of the single domain union (which
+ * additionally allows 'sentence' for learner-saved complete sentences), so the
+ * provider layer can never drift from the stored lexical item types.
  */
-export type VocabularyCategory =
-  | 'word'
-  | 'phrase'
-  | 'phrasal_verb'
-  | 'idiom'
-  | 'common_expression'
-  | 'collocation'
-  | 'linking_expression'
-  | 'professional_expression';
+import type { VocabularyCategory as DomainVocabularyCategory } from '../../domain/shared/types';
+
+export type VocabularyCategory = DomainVocabularyCategory;
 
 /**
  * Structured correction feedback extracted from assistant response.

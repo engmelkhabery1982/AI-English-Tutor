@@ -1,4 +1,5 @@
 import { SafeAreaView } from 'react-native-safe-area-context';
+import type { VocabularyCategory } from '../domain/shared/types';
 import MicrophoneHelp from './components/MicrophoneHelp';
 import TouchableOpacity from './components/LearnerButton';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -20,6 +21,27 @@ import {
   View,
 } from 'react-native';
 import { countCommittedLearnerTurns } from '../conversation-session';
+import {
+  resolveSpeechRateCapability,
+  planSpeechRate,
+  speechRateTTSOptions,
+} from '../listening';
+import {
+  HELP_ACTION_DESCRIPTORS,
+  TEMPORARY_FEWER_CORRECTIONS,
+  buildHelpInstruction,
+  helpActionIsEvidenceSafe,
+  isProviderHelpAction,
+  resolveHelpControls,
+  resolveEffectiveConversationMode,
+  CORRECTION_INTENSITY_TO_MODE,
+  MODE_TO_CORRECTION_INTENSITY,
+  createSaveToReviewService,
+  createCorrectionPreferencesService,
+  type CorrectionIntensity,
+  type HelpActionId,
+  type SaveToReviewService,
+} from '../learner-agency';
 import {
   finalizeConversationWithReview,
   hasUnappliedTopicDraft,
@@ -65,9 +87,16 @@ import {
 /** Short pause before the tutor opens, so a topic being typed is not cut off. */
 const TUTOR_OPENING_DELAY_MS = 400;
 
+/**
+ * Correction-intensity chips (Work Order 2). The KEYS are the EXISTING
+ * ConversationMode values the engine already honors — only the learner-facing
+ * labels changed to the intensity wording. The selection persists through the
+ * existing profile preferences service; the temporary "fewer corrections for
+ * now" control is session-local and never touches these chips.
+ */
 const MODES: { readonly key: ConversationMode; readonly label: string }[] = [
-  { key: 'natural', label: 'Natural' },
-  { key: 'coach', label: 'Coach' },
+  { key: 'natural', label: 'Natural / light' },
+  { key: 'coach', label: 'Balanced' },
   { key: 'intensive', label: 'Intensive' },
 ];
 
@@ -167,6 +196,60 @@ export default function TalkScreen(props?: TalkScreenProps) {
 
   const [pronunciationLines, setPronunciationLines] = useState<readonly string[] | null>(null);
 
+  /* ---------------------------------------------------------------- *
+   * Work Order 2 — learner agency state.
+   * Help actions are SCREEN state + session-local: no help path may ever
+   * submit a learner turn, create evidence, or disturb the WO1 lifecycle.
+   * ---------------------------------------------------------------- */
+  /** The provider help reply currently shown in the help panel (streamed). */
+  const [helpText, setHelpText] = useState<string | null>(null);
+  /** The help action currently running (drives chip busy state). */
+  const [activeHelpAction, setActiveHelpAction] = useState<HelpActionId | null>(null);
+  /** Friendly, already-classified help failure text (never raw provider data). */
+  const [helpError, setHelpError] = useState<string | null>(null);
+  /** Action that can be safely retried after a help failure. */
+  const [helpRetryAction, setHelpRetryAction] = useState<HelpActionId | null>(null);
+  /** Honest notice shown with the help row (e.g. slower not supported). */
+  const [helpNote, setHelpNote] = useState<string | null>(null);
+  /** The TEMPORARY "fewer corrections for now" override (never persisted). */
+  const [fewerCorrectionsNow, setFewerCorrectionsNow] = useState<boolean>(false);
+  /** Explicit "change topic" mode: unlocks the topic draft for a new session. */
+  const [topicChangeOpen, setTopicChangeOpen] = useState<boolean>(false);
+  /** Items saved to review from this screen (presentation mirror). */
+  const [reviewSaves, setReviewSaves] = useState<Record<string, boolean>>({});
+  /** Friendly result line for save attempts (success or honest failure). */
+  const [reviewSaveNote, setReviewSaveNote] = useState<string | null>(null);
+  const [isSavingReview, setIsSavingReview] = useState<boolean>(false);
+
+  /** Synchronous double-tap guard for provider help requests. */
+  const helpInFlightRef = useRef<boolean>(false);
+  /** Invalidates late help replies when the conversation changes or unmounts. */
+  const helpTokenRef = useRef<number>(0);
+  const mountedRef = useRef<boolean>(true);
+  /** Persisted correction intensity (null while unresolved — never guessed). */
+  const correctionIntensityRef = useRef<CorrectionIntensity | null>(null);
+  const loadedPreferenceRef = useRef<boolean>(false);
+  /** Save to Review runs on the SAME adapter as the rest of the screen. */
+  const saveServiceRef = useRef<{
+    readonly adapter: DatabaseAdapter | null | undefined;
+    readonly service: SaveToReviewService;
+  } | null>(null);
+
+  const getSaveService = useCallback((): SaveToReviewService => {
+    const adapter = coachingRef.current?.databaseAdapter ?? props?.databaseAdapter;
+    const current = saveServiceRef.current;
+    if (current && current.adapter === adapter) return current.service;
+    const service = createSaveToReviewService({ databaseAdapter: adapter ?? undefined });
+    saveServiceRef.current = { adapter, service };
+    return service;
+  }, [props?.databaseAdapter]);
+
+  const getCorrectionPreferences = useCallback(() => {
+    return createCorrectionPreferencesService({
+      databaseAdapter: coachingRef.current?.databaseAdapter ?? props?.databaseAdapter,
+    });
+  }, [props?.databaseAdapter]);
+
   const sessionRef = useRef<ConversationSession | null>(null);
   const voiceCoordinatorRef = useRef<VoiceSessionCoordinator | null>(null);
   const providerInfoRef = useRef<TalkProviderInfo | null>(null);
@@ -222,6 +305,42 @@ export default function TalkScreen(props?: TalkScreenProps) {
     props?.pronunciationEngine ?? null,
   );
   const scrollViewRef = useRef<ScrollView | null>(null);
+
+  // Work Order 2 — unmount safety for help requests: late provider replies
+  // are dropped (the token invalidation + session identity check below), and
+  // nothing may write screen state into an unmounted surface.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      helpTokenRef.current += 1;
+      helpInFlightRef.current = false;
+    };
+  }, []);
+
+  /**
+   * Work Order 2 — load the persisted correction intensity ONCE when the real
+   * coaching composition settles. A stored choice only adopts itself while no
+   * conversation is running (a live conversation is never re-composed by a
+   * background preference read); the temporary override is never persisted.
+   */
+  useEffect(() => {
+    if (loadedPreferenceRef.current || coachingSource === null) return;
+    loadedPreferenceRef.current = true;
+    let active = true;
+    void (async () => {
+      const result = await getCorrectionPreferences().load();
+      if (!active) return;
+      correctionIntensityRef.current = result.intensity;
+      if (result.origin === 'stored') {
+        const target = CORRECTION_INTENSITY_TO_MODE[result.intensity];
+        setMode((prev) => (prev === target ? prev : target));
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [coachingSource, getCorrectionPreferences]);
 
   // Pronunciation analysis is secondary to the conversation: compose the
   // engine lazily and never let it break the talk flow.
@@ -448,6 +567,23 @@ export default function TalkScreen(props?: TalkScreenProps) {
       setIsSending(false);
       setIsSwitching(false);
       coordinatorIsSwitchingRef.current = false;
+      // Work Order 2: a replaced conversation also ends its help panel, its
+      // topic-change draft and its TEMPORARY correction override. The stored
+      // preference survives; the "for now" override never crosses a session.
+      helpTokenRef.current += 1;
+      helpInFlightRef.current = false;
+      setHelpText(null);
+      setActiveHelpAction(null);
+      setHelpError(null);
+      setHelpRetryAction(null);
+      setHelpNote(null);
+      setTopicChangeOpen(false);
+      setFewerCorrectionsNow(false);
+      setReviewSaves({});
+      setReviewSaveNote(null);
+      // Re-apply nothing: a fresh session starts on the real chip mode, and any
+      // in-flight help for the OLD session is invalidated by the token above.
+      bundle.session.setModeOverride?.(null);
       // Only now is the replacement session live: the tutor opening may run.
       setSessionEpoch((prev) => prev + 1);
 
@@ -542,7 +678,11 @@ export default function TalkScreen(props?: TalkScreenProps) {
     voiceStatus.state,
   ]);
 
-  const topicEditable = history.length === 0 && !isSending && !isOpening && !isSwitching;
+  // Work Order 2: "Change topic" explicitly unlocks the topic DRAFT mid-run —
+  // it still takes effect only through the one Apply path below (the Work
+  // Order 1 rule "a draft never replaces a conversation per keystroke" stays).
+  const topicEditable =
+    (history.length === 0 || topicChangeOpen) && !isSending && !isOpening && !isSwitching;
   /** True while the typed topic differs from the conversation it would start. */
   const topicDraftPending =
     topicEditable && hasUnappliedTopicDraft(topic, appliedTopic);
@@ -556,8 +696,14 @@ export default function TalkScreen(props?: TalkScreenProps) {
     const draft = normalizeTopicDraft(topic);
     if (!hasUnappliedTopicDraft(draft, appliedTopic)) return;
     if (isSending || isOpening || isSwitching) return; // never replace mid-turn
+    setTopicChangeOpen(false);
     setAppliedTopic(draft);
     void startConversation(mode, draft);
+  };
+
+  /** Cancel an opened topic change: the live conversation stays exactly as it is. */
+  const handleCancelTopicChange = () => {
+    setTopicChangeOpen(false);
   };
 
   // Tutor-led opening turn: obtained through the EXISTING conversation/AI path.
@@ -732,6 +878,22 @@ export default function TalkScreen(props?: TalkScreenProps) {
     setErrorMessage(null);
     setPronunciationLines(null);
     setHistory([]);
+    // A new conversation also ends the temporary override and any help panel.
+    setFewerCorrectionsNow(false);
+    helpTokenRef.current += 1;
+    helpInFlightRef.current = false;
+    setHelpText(null);
+    setHelpError(null);
+    setHelpRetryAction(null);
+    setHelpNote(null);
+    // Work Order 2 — the chip IS the persisted correction-intensity choice:
+    // store it through the existing profile preferences (best effort: a storage
+    // failure never blocks the conversation, and nothing here is invented).
+    const intensity = MODE_TO_CORRECTION_INTENSITY[newMode];
+    correctionIntensityRef.current = intensity;
+    void getCorrectionPreferences()
+      .save(intensity)
+      .catch(() => undefined);
   };
 
   // Handle New / Clear conversation: cancels active voice work, then starts a
@@ -744,7 +906,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
     void startConversation(mode, topic);
   };
 
-  // Handle save vocabulary item
+  // Handle save vocabulary item (existing session save path is preserved).
   const handleSaveVocabulary = async (vocab: ConversationFeedbackVocabulary) => {
     if (!sessionRef.current || !vocab.headword) return;
     const saved = await sessionRef.current.saveVocabularyItem(vocab);
@@ -752,6 +914,209 @@ export default function TalkScreen(props?: TalkScreenProps) {
       setSavedWords((prev) => ({ ...prev, [vocab.headword.toLowerCase()]: true }));
     }
   };
+
+  /**
+   * Work Order 2 — Save to Review for ANY language item from this surface.
+   * Independent of tutor-detected mistakes: a correctly-answered word can be
+   * saved, and saving only means "I want to learn/review this" (the reusable
+   * service enforces the no-evidence rules at its own boundary).
+   */
+  const handleSaveToReview = async (input: {
+    readonly text: string;
+    readonly itemType: VocabularyCategory;
+    readonly meaning?: string;
+    readonly example?: string;
+  }): Promise<void> => {
+    if (!input || input.text.trim().length === 0) return;
+    if (isSavingReview) return; // double-tap protection
+    setIsSavingReview(true);
+    setReviewSaveNote(null);
+    try {
+      const service = getSaveService();
+      const result = await service.save({
+        // Talk resolves the single learner profile inside the service.
+        learnerId: '',
+        text: input.text.trim(),
+        itemType: input.itemType,
+        origin: 'talk',
+        ...(input.meaning ? { selectedMeaning: input.meaning } : {}),
+        ...(input.example ? { example: input.example } : {}),
+        contextSentence: sessionRef.current?.getHistory().at(-1)?.content,
+        // Tutor wording on this surface is provider language: mark it.
+        meaningIsGenerated: true,
+      });
+      if (result.ok) {
+        const key = input.text.trim().toLowerCase();
+        setReviewSaves((prev) => ({ ...prev, [key]: true }));
+        setReviewSaveNote(
+          result.reason === 'already_saved'
+            ? 'Already in your Review list — nothing was duplicated.'
+            : result.reviewQueued
+            ? 'Saved to Review. It waits there for practice; it is not marked learned.'
+            : 'Saved. Review scheduling is unavailable right now, but the item is kept.',
+        );
+      } else if (result.reason === 'no_profile') {
+        setReviewSaveNote('Saving needs a learning profile. Set one up in Talk and try again.');
+      } else {
+        setReviewSaveNote('Could not save this right now. Nothing was changed — please try again.');
+      }
+    } finally {
+      setIsSavingReview(false);
+    }
+  };
+
+  /**
+   * Work Order 2 — the temporary "fewer corrections for now" control.
+   *
+   * It NEVER changes the composed conversation identity (no session is
+   * recreated mid-conversation) and NEVER persists: it only sets the live
+   * session's local mode override to the existing light-correction behavior
+   * for subsequent turns. Turning it off restores the chosen chip mode.
+   */
+  const handleToggleFewerCorrections = () => {
+    const next = !fewerCorrectionsNow;
+    setFewerCorrectionsNow(next);
+    const intensity =
+      correctionIntensityRef.current ?? MODE_TO_CORRECTION_INTENSITY[mode];
+    const effective = resolveEffectiveConversationMode(
+      intensity,
+      next ? TEMPORARY_FEWER_CORRECTIONS : null,
+    );
+    sessionRef.current?.setModeOverride?.(effective === mode ? null : effective);
+  };
+
+  /**
+   * Work Order 2 — learner help action over the conversation.
+   *
+   * Every provider-backed help goes through the session's assistance path:
+   * the hidden instruction never becomes a learner turn, the tutor's reply is
+   * appended as a tutor turn only, feedback/weakness persistence is never
+   * reached, and a reply that lands after the learner answered or after the
+   * conversation was replaced is DISCARDED, never applied.
+   */
+  const handleHelpAction = useCallback(
+    async (action: HelpActionId): Promise<void> => {
+      const session = sessionRef.current;
+      if (!session) return;
+      if (action === 'change_topic') {
+        setTopicChangeOpen(true);
+        return;
+      }
+      if (action === 'repeat') {
+        // Replay ONLY — never a new attempt.
+        if (voiceCoordinatorRef.current) {
+          await voiceCoordinatorRef.current.replayLastResponse();
+        }
+        return;
+      }
+      if (action === 'slower') {
+        const provider = voiceCoordinatorRef.current?.getPlaybackProvider();
+        const capability = resolveSpeechRateCapability(provider);
+        const plan = planSpeechRate('slower', capability);
+        setHelpNote(plan.rate === null ? plan.note : null);
+        if (voiceCoordinatorRef.current) {
+          await voiceCoordinatorRef.current.replayLastResponse(speechRateTTSOptions(plan));
+        }
+        return;
+      }
+      if (!isProviderHelpAction(action) || !helpActionIsEvidenceSafe(action)) return;
+      if (helpInFlightRef.current || isSending || isSwitching || isOpening) return;
+      if (providerKind === null || providerKind === 'unavailable') {
+        setHelpError(
+          'Help needs a configured tutor. Add a key in Settings — nothing scripted is invented in its place.',
+        );
+        return;
+      }
+
+      const boundSession = session;
+      // A conversation closed underneath this surface (background policy)
+      // cannot host help: the learner is told the truth instead of having a
+      // session silently regenerated by a help tap.
+      if (!isConversationReusable(boundSession)) {
+        setHelpNote(TALK_CONVERSATION_RESTARTED_MESSAGE);
+        return;
+      }
+      // Help NEVER falls back to `send`: sending the hidden instruction as a
+      // learner message would fabricate a learner turn. Without the
+      // assistance path, help is simply unavailable here.
+      if (typeof boundSession.requestAssistance !== 'function') {
+        setHelpNote('Help is unavailable for this conversation. Start a new chat to try again.');
+        return;
+      }
+
+      helpInFlightRef.current = true;
+      const token = (helpTokenRef.current += 1);
+      setActiveHelpAction(action);
+      setHelpError(null);
+      setHelpRetryAction(null);
+      setHelpNote(null);
+      setHelpText('');
+      try {
+        const result = await boundSession.requestAssistance!({
+          userMessage: buildHelpInstruction(action, appliedTopic || null),
+        });
+        // Stale guards: same token AND the same live session. A replaced
+        // conversation must never receive the late help.
+        if (
+          !mountedRef.current ||
+          helpTokenRef.current !== token ||
+          sessionRef.current !== boundSession
+        ) {
+          return;
+        }
+        if (!result.ok) {
+          setHelpText(null);
+          if (result.error.code === 'cancelled') {
+            // The learner's own turn won the race: say nothing, change nothing.
+            return;
+          }
+          const safe = learnerMessageForFailure(result.error, 'tutor');
+          setHelpError(safe);
+          if (result.error.retryable === true) setHelpRetryAction(action);
+          return;
+        }
+        // Keep the visible transcript aligned with the session (tutor-only add)
+        // and CLEAR any previous feedback card: help is not correction context.
+        setHistory(boundSession.getHistory());
+        setLastFeedback(null);
+        // The help reply now lives in the conversation as a tutor turn; close
+        // the panel's busy state instead of duplicating the same text.
+        setHelpText(null);
+      } catch (err: unknown) {
+        if (!mountedRef.current || helpTokenRef.current !== token) return;
+        const safe = learnerMessageForFailure(
+          err instanceof Error ? { message: err.message } : null,
+          'tutor',
+        );
+        setHelpText(null);
+        setHelpError(safe);
+        setHelpRetryAction(action);
+        if (err instanceof Error) console.error('Talk help action failed:', err.message);
+      } finally {
+        if (helpTokenRef.current === token) {
+          helpInFlightRef.current = false;
+          setActiveHelpAction((prev) => (prev === action ? null : prev));
+        }
+      }
+    },
+    [appliedTopic, isSending, isSwitching, isOpening, providerKind],
+  );
+
+  /** Retry uses the SAME one-shot rules; it cannot run twice at once. */
+  const handleRetryHelp = useCallback((): void => {
+    if (!helpRetryAction) return;
+    void handleHelpAction(helpRetryAction);
+  }, [handleHelpAction, helpRetryAction]);
+
+  const dismissHelpPanel = useCallback((): void => {
+    helpTokenRef.current += 1; // an in-flight help is dropped, not applied late
+    helpInFlightRef.current = false;
+    setHelpText(null);
+    setHelpError(null);
+    setHelpRetryAction(null);
+    setHelpNote(null);
+    setActiveHelpAction(null);
+  }, []);
 
   // Handle microphone press — the single primary action of a turn.
   const handleToggleRecording = async () => {
@@ -1147,6 +1512,24 @@ export default function TalkScreen(props?: TalkScreenProps) {
       : 'Real AI unavailable • Configuration required');
   const isSendDisabled = turnControls.sendDisabled || isProviderUnavailable;
 
+  // Work Order 2 — one place decides when help actions may run (pure, tested
+  // in src/learner-agency): never concurrently with a learner/tutor turn or a
+  // session switch, and never against a closed conversation.
+  const voiceBusyForHelp =
+    voiceStatus.isProcessing === true ||
+    voiceStatus.state === 'recording' ||
+    voiceStatus.state === 'transcribing' ||
+    voiceStatus.state === 'requesting_permission';
+  const hasLastTutorText = history.some((turn) => turn.role === 'assistant' && turn.content.trim().length > 0);
+  const helpControls = resolveHelpControls({
+    helpInFlight: activeHelpAction !== null,
+    turnInFlight: isSending || isOpening || voiceBusyForHelp,
+    isSwitching,
+    providerAvailable: providerKind === 'gemini' || providerKind === 'demo',
+    hasLastTutorText,
+    sessionActive: sessionRef.current !== null,
+  });
+
   // Learner-facing turn phase, derived from the EXISTING voice status model.
   const turnView = describeVoiceTurn(voiceStatus, isSending || isOpening);
   // Honest coaching status: personalization is claimed ONLY when the real
@@ -1255,9 +1638,69 @@ export default function TalkScreen(props?: TalkScreenProps) {
             accessibilityRole="button"
             accessibilityLabel="Start the conversation with this topic"
           >
-            <Text style={styles.topicApplyButtonText}>Start with this topic</Text>
+            <Text style={styles.topicApplyButtonText}>
+              {topicChangeOpen ? 'Start a new chat with this topic' : 'Start with this topic'}
+            </Text>
           </TouchableOpacity>
         )}
+        {topicChangeOpen && history.length > 0 && (
+          <TouchableOpacity
+            style={styles.topicApplyButton}
+            onPress={handleCancelTopicChange}
+            accessibilityRole="button"
+            accessibilityLabel="Keep the current conversation and close the topic change"
+          >
+            <Text style={styles.topicApplyButtonText}>Keep this conversation</Text>
+          </TouchableOpacity>
+        )}
+
+        {/*
+          Work Order 2 — learner agency row. REAL actions only:
+          provider-backed help goes through the conversation's non-committing
+          assistance path; Repeat/Slower are playback; Change topic opens the
+          explicit draft flow. None of them can submit a learner answer or
+          create evidence.
+        */}
+        <View style={styles.helpRow} testID="learner-help-row">
+          {HELP_ACTION_DESCRIPTORS.map((descriptor) => {
+            const isProvider = isProviderHelpAction(descriptor.id);
+            const disabled = descriptor.id === 'change_topic'
+              ? !helpControls.changeTopicEnabled
+              : descriptor.kind === 'playback'
+              ? !helpControls.playbackEnabled
+              : isProvider
+              ? !helpControls.providerActionsEnabled
+              : !helpControls.changeTopicEnabled;
+            const busy = activeHelpAction === descriptor.id;
+            return (
+              <TouchableOpacity
+                key={descriptor.id}
+                style={[styles.helpChip, disabled && styles.helpChipDisabled]}
+                onPress={() => void handleHelpAction(descriptor.id)}
+                disabled={disabled}
+                accessibilityRole="button"
+                accessibilityLabel={descriptor.accessibilityLabel}
+                accessibilityState={{ disabled, busy }}
+              >
+                <Text style={[styles.helpChipText, disabled && styles.helpChipTextDisabled]}>
+                  {busy ? '…' : descriptor.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+        {/* Temporary, session-only correction relief (never persisted). */}
+        <TouchableOpacity
+          style={[styles.fewerCorrectionsChip, fewerCorrectionsNow && styles.fewerCorrectionsChipActive]}
+          onPress={handleToggleFewerCorrections}
+          accessibilityRole="button"
+          accessibilityState={{ selected: fewerCorrectionsNow }}
+          accessibilityLabel="Fewer corrections for now (this conversation only)"
+        >
+          <Text style={styles.fewerCorrectionsText}>
+            {fewerCorrectionsNow ? '✓ Fewer corrections for now' : 'Fewer corrections for now'}
+          </Text>
+        </TouchableOpacity>
 
         {/*
           Provider honesty. Two distinct states, neither of which is ever
@@ -1396,6 +1839,44 @@ export default function TalkScreen(props?: TalkScreenProps) {
                       >
                         <Text style={styles.replayButtonText}>🔊 Replay</Text>
                       </TouchableOpacity>
+                      {/* Work Order 2 — honest slower replay (playback only,
+                          never an attempt; degrades with a visible note when
+                          the provider cannot change speed). */}
+                      <TouchableOpacity
+                        style={styles.replayButton}
+                        onPress={() => void handleHelpAction('slower')}
+                        accessibilityLabel="Replay the tutor message more slowly"
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.replayButtonText}>🐢 Slower</Text>
+                      </TouchableOpacity>
+                      {/* Work Order 2 — universal manual save of the tutor's
+                          example sentence, valid whatever the learner answered. */}
+                      <TouchableOpacity
+                        style={[
+                          styles.replayButton,
+                          reviewSaves[`bubble-${index}`] && styles.saveVocabButtonSaved,
+                        ]}
+                        onPress={() =>
+                          void (async () => {
+                            const sentences = turn.content
+                              .split(/(?<=[.!?])\s+/)
+                              .map((part) => part.trim())
+                              .filter((part) => part.length > 0);
+                            const first = sentences[0] ?? turn.content.trim();
+                            if (!first) return;
+                            await handleSaveToReview({ text: first, itemType: 'sentence' });
+                            setReviewSaves((prev) => ({ ...prev, [`bubble-${index}`]: true }));
+                          })()
+                        }
+                        disabled={isSavingReview}
+                        accessibilityLabel="Save this sentence to Review"
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.replayButtonText}>
+                          {reviewSaves[`bubble-${index}`] ? '✓ In Review' : '＋ Save to Review'}
+                        </Text>
+                      </TouchableOpacity>
                       {voiceStatus.isSpeaking && (
                         <TouchableOpacity
                           style={styles.replayStopButton}
@@ -1480,10 +1961,23 @@ export default function TalkScreen(props?: TalkScreenProps) {
                               savedWords[lastFeedback.vocabulary.headword.toLowerCase()] &&
                                 styles.saveVocabButtonSaved,
                             ]}
-                            onPress={() =>
-                              lastFeedback.vocabulary &&
-                              handleSaveVocabulary(lastFeedback.vocabulary)
-                            }
+                            onPress={() => {
+                              const vocab = lastFeedback.vocabulary;
+                              if (!vocab) return;
+                              // Work Order 2: the learner's tap is a MANUAL save
+                              // through the one reusable service (it marks
+                              // "Saved by me" and queues Review without touching
+                              // any mastery/evidence state). The existing
+                              // session-save path stays for in-memory mirroring.
+                              void handleSaveToReview({
+                                text: vocab.headword,
+                                itemType: vocab.type,
+                                meaning: vocab.meaning,
+                                example: vocab.example,
+                              });
+                              void handleSaveVocabulary(vocab);
+                            }}
+                            accessibilityLabel="Save this word to Review"
                             accessibilityRole="button"
                           >
                             <Text
@@ -1527,6 +2021,72 @@ export default function TalkScreen(props?: TalkScreenProps) {
               </View>
             );
           })
+        )}
+
+        {/* ---------------------------------------------------------- *
+         * Work Order 2 — learner help panel (evidence-free assistance).
+         * Busy state, honest failure sentence, learner-safe retry, and a
+         * visible dismiss. Nothing here can submit a learner answer.
+         * ---------------------------------------------------------- */}
+        {(activeHelpAction !== null || helpText !== null || helpError !== null || helpNote !== null) && (
+          <View style={styles.helpCard} testID="learner-help-panel" accessibilityLiveRegion="polite">
+            <Text style={styles.helpCardTitle}>
+              {activeHelpAction
+                ? 'Your tutor is helping…'
+                : helpError
+                ? 'Help did not arrive'
+                : helpNote
+                ? 'Playback note'
+                : 'Tutor help'}
+            </Text>
+            {helpText !== null && helpText.length === 0 && activeHelpAction !== null && (
+              <View style={styles.loadingContainer}>
+                <ActivityIndicator size="small" color="#2563EB" />
+                <Text style={styles.loadingText}>
+                  {activeHelpAction === 'dont_know'
+                    ? 'The tutor is preparing a small clue for you…'
+                    : activeHelpAction === 'skip'
+                    ? 'The tutor is preparing the next question…'
+                    : 'The tutor is preparing help…'}
+                </Text>
+              </View>
+            )}
+            {helpText !== null && helpText.length > 0 && (
+              <Text style={styles.helpCardText}>{helpText}</Text>
+            )}
+            {helpError !== null && (
+              <View>
+                <Text accessibilityRole="alert" style={styles.helpCardError}>
+                  {helpError}
+                </Text>
+                {helpRetryAction !== null && (
+                  <TouchableOpacity
+                    style={styles.helpCardAction}
+                    onPress={handleRetryHelp}
+                    accessibilityLabel="Ask the tutor for this help again"
+                    accessibilityRole="button"
+                  >
+                    <Text style={styles.helpCardActionText}>Try again</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            )}
+            {helpNote !== null && <Text style={styles.helpCardNote}>{helpNote}</Text>}
+            <TouchableOpacity
+              style={styles.helpCardDismiss}
+              onPress={dismissHelpPanel}
+              accessibilityLabel="Dismiss the help panel"
+              accessibilityRole="button"
+            >
+              <Text style={styles.helpCardDismissText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {reviewSaveNote !== null && (
+          <Text style={styles.reviewSaveNote} testID="review-save-note">
+            {reviewSaveNote}
+          </Text>
         )}
 
         {/* In-flight streaming message bubble */}
@@ -2533,5 +3093,107 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '600',
+  },
+  // Work Order 2 — minimal, functional controls (no visual redesign).
+  helpRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 8,
+  },
+  helpChip: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#CBD5E1',
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+  },
+  helpChipDisabled: {
+    opacity: 0.45,
+  },
+  helpChipText: {
+    fontSize: 12,
+    color: '#1F2937',
+    fontWeight: '600',
+  },
+  helpChipTextDisabled: {
+    color: '#6B7280',
+  },
+  fewerCorrectionsChip: {
+    alignSelf: 'flex-start',
+    marginTop: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    backgroundColor: '#F8FAFC',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  fewerCorrectionsChipActive: {
+    borderColor: '#2563EB',
+    backgroundColor: '#EFF6FF',
+  },
+  fewerCorrectionsText: {
+    fontSize: 12,
+    color: '#334155',
+  },
+  helpCard: {
+    marginVertical: 8,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+    backgroundColor: '#EFF6FF',
+    padding: 12,
+  },
+  helpCardTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#1D4ED8',
+    marginBottom: 6,
+  },
+  helpCardText: {
+    fontSize: 14,
+    color: '#1E3A8A',
+    lineHeight: 20,
+  },
+  helpCardError: {
+    fontSize: 14,
+    color: '#B91C1C',
+    lineHeight: 20,
+  },
+  helpCardNote: {
+    fontSize: 12,
+    color: '#475569',
+    marginTop: 4,
+  },
+  helpCardAction: {
+    marginTop: 8,
+    alignSelf: 'flex-start',
+    borderRadius: 8,
+    backgroundColor: '#2563EB',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  helpCardActionText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  helpCardDismiss: {
+    marginTop: 8,
+    alignSelf: 'flex-start',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  helpCardDismissText: {
+    fontSize: 12,
+    color: '#1D4ED8',
+    textDecorationLine: 'underline',
+  },
+  reviewSaveNote: {
+    fontSize: 12,
+    color: '#047857',
+    marginTop: 6,
   },
 });

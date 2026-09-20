@@ -15,7 +15,7 @@
  */
 
 /** Current schema version. Bump this when adding a migration. */
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 /** A single SQL step inside a migration. */
 export interface SchemaStep {
@@ -468,6 +468,17 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       { sql: `DELETE FROM pronunciation_weaknesses WHERE id IN (SELECT old_id FROM _pronunciation_dedup_map WHERE old_id != kept_id)` },
       { sql: `DROP TABLE IF EXISTS _pronunciation_dedup_map` },
       { sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_pronunciation_weaknesses_unique_learner_target ON pronunciation_weaknesses(learner_id, target_sound)` },
+    ],
+  },
+  {
+    version: 7,
+    description: 'Additive WP-2 learner-agency storage: persisted learner preferences on the profile',
+    steps: [
+      // Generic, additive preferences JSON for the ONE existing profile row.
+      // Work Order 2 stores the correction-intensity preference here; the
+      // manual-save marker for Save to Review rides inside the existing
+      // lexical_items.source JSON (no second vocabulary/review store).
+      { sql: `ALTER TABLE learner_profile ADD COLUMN preferences TEXT NOT NULL DEFAULT '{}'` },
     ],
   },
 ];
