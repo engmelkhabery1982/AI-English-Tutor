@@ -50,6 +50,12 @@ import {
 } from '../onboarding';
 import { countCommittedLearnerTurns } from '../conversation-session';
 import {
+  ASSESSMENT_PRE_GUIDANCE,
+  ASSESSMENT_SPEAKING_GUIDANCE,
+  ANSWER_ANYWAY_LABEL,
+  assessAnswerSubstance,
+} from '../learner-agency';
+import {
   createTalkVoiceCoordinator,
   type TalkProviderKind,
   type VoiceTurnOutcome,
@@ -115,6 +121,16 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
   const [turnError, setTurnError] = useState<string | null>(null);
   const [turns, setTurns] = useState<number>(0);
   const [pronunciationReady, setPronunciationReady] = useState<boolean>(false);
+  /**
+   * Work Order 2 — assessment RESPONSE COACHING (presentation-level only):
+   * when the learner tries to continue a speaking part too early, they are
+   * asked to expand FIRST, and may then explicitly "Continue anyway". This can
+   * never change the state machine's transitions, evidence counts or the
+   * assessment thresholds, and it never auto-fills or fabricates content.
+   */
+  const [coachingNudge, setCoachingNudge] = useState<string | null>(null);
+  const coachingOverrideRef = useRef<boolean>(false);
+  const coachingTurnsRef = useRef<number>(0);
   /**
    * The step a voice turn was started for. Captured when the microphone OPENS, so
    * a result that arrives after the flow moved on can never be recorded against
@@ -701,6 +717,52 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     }
   }, []);
 
+  /**
+   * Work Order 2 — coaching gate in front of `continueStep` for the speaking
+   * parts. It prompts for expansion ONCE per answer flow when the learner's
+   * latest turn is too short to carry much evidence; the learner can then
+   * explicitly continue anyway. Thresholds, evidence recording and the state
+   * machine itself are untouched — this wrapper never records anything.
+   */
+  const handleContinueWithCoaching = useCallback(async (): Promise<void> => {
+    const handle = handleRef.current;
+    if (handle && (stepId === 'speaking' || stepId === 'language_use') && !coachingOverrideRef.current) {
+      const history = handle.conversation.getHistory();
+      const learnerTurns = history.filter((turn) => turn.role === 'user').length;
+      if (learnerTurns > 0) {
+        const last = [...history].reverse().find((turn) => turn.role === 'user');
+        const nudge = assessAnswerSubstance(last?.content ?? '');
+        if (nudge !== null) {
+          setCoachingNudge(
+            `${nudge} Substantive answers give the check something real to work with — and nothing is invented if you stop here.`,
+          );
+          return;
+        }
+      }
+    }
+    setCoachingNudge(null);
+    await continueStep();
+  }, [continueStep, stepId]);
+
+  const handleCoachingContinueAnyway = useCallback(async (): Promise<void> => {
+    coachingOverrideRef.current = true;
+    setCoachingNudge(null);
+    await continueStep();
+  }, [continueStep]);
+
+  /**
+   * A new step or a newly committed answer restarts the coaching gate: the
+   * learner's LATEST wording is what gets evaluated next, and an override from
+   * an earlier gate never leaks into a later part of the flow.
+   */
+  useEffect(() => {
+    coachingOverrideRef.current = false;
+    if (coachingTurnsRef.current !== turns) {
+      coachingTurnsRef.current = turns;
+      setCoachingNudge(null);
+    }
+  }, [stepId, turns]);
+
   /** The listening task is planned when the step becomes current. */
   useEffect(() => {
     if (phase !== 'diagnostic' || stepId !== 'listening') return;
@@ -1047,7 +1109,11 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
   const renderSpeakingStep = () => (
     <View style={styles.card}>
       <Text style={styles.cardTitle}>{stepTitle}</Text>
+      <Text style={styles.muted} accessibilityLiveRegion="polite">
+        {ASSESSMENT_PRE_GUIDANCE}
+      </Text>
       <Text style={styles.body}>{SPEAKING_PROMPT}</Text>
+      <Text style={styles.muted}>{ASSESSMENT_SPEAKING_GUIDANCE}</Text>
       <Text style={styles.muted}>
         Tap the microphone and answer out loud, or type your answer below.
       </Text>
@@ -1092,7 +1158,19 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       </TouchableOpacity>
       {renderAnswerFailure()}
       <Text style={styles.muted}>Turns recorded: {turns}</Text>
-      <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void continueStep()}>
+      {coachingNudge ? (
+        <View style={styles.section}>
+          <Text accessibilityRole="alert" style={styles.body}>{coachingNudge}</Text>
+          <TouchableOpacity
+            style={styles.secondaryButton}
+            onPress={() => void handleCoachingContinueAnyway()}
+            accessibilityLabel="Finish this part with the answers given so far"
+          >
+            <Text style={styles.secondaryButtonText}>{ANSWER_ANYWAY_LABEL}</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+      <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void handleContinueWithCoaching()}>
         <Text style={styles.primaryButtonText}>Continue</Text>
       </TouchableOpacity>
     </View>
@@ -1181,7 +1259,19 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
           </Text>
         </TouchableOpacity>
         {renderAnswerFailure()}
-        <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void continueStep()}>
+        {coachingNudge ? (
+          <View style={styles.section}>
+            <Text accessibilityRole="alert" style={styles.body}>{coachingNudge}</Text>
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              onPress={() => void handleCoachingContinueAnyway()}
+              accessibilityLabel="Finish this part with the answers given so far"
+            >
+              <Text style={styles.secondaryButtonText}>{ANSWER_ANYWAY_LABEL}</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
+        <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void handleContinueWithCoaching()}>
           <Text style={styles.primaryButtonText}>Continue</Text>
         </TouchableOpacity>
       </View>

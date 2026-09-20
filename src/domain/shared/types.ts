@@ -165,7 +165,80 @@ export interface VocabularySource {
   readonly originTurnId?: Uuid;
   readonly addedBy: 'system' | 'ai-suggested' | 'learner-created';
   readonly addedAt: IsoDate;
+  /**
+   * Work Order 2 — universal Save to Review provenance.
+   *
+   * `saveSource` distinguishes A) an item the LEARNER explicitly saved
+   * ('manual_learner', "Saved by me") from B) an item detected automatically
+   * from practice/weakness evidence ('detected_practice'). The distinction is
+   * PERSISTED inside the existing lexical item `source` JSON — it never relies
+   * on a tutor-detected mistake, so a correctly-answered item can still be
+   * saved manually.
+   */
+  readonly saveSource?: SaveSource;
+  /** Which feature surface the item was saved from (origin of the save). */
+  readonly saveOrigin?: SavedItemOrigin;
+  /** Provenance reference (conversation id / turn id / exercise id) as text. */
+  readonly saveOriginRef?: string;
+  /** The sentence/context the learner saved the item from, EXACT source text. */
+  readonly contextSentence?: string;
+  /**
+   * True when any persisted meaning/example/explanation was AI-GENERATED for
+   * this save. Generated text is never silently presented as dictionary truth:
+   * surfaces must treat this flag as 'generated' provenance.
+   */
+  readonly containsGeneratedText?: boolean;
 }
+
+/** How a lexical item entered review: manual learner save vs detected practice. */
+export type SaveSource = 'manual_learner' | 'detected_practice';
+
+/** Feature surfaces a learner can save a language item from (Work Order 2). */
+export type SavedItemOrigin =
+  | 'talk'
+  | 'listening'
+  | 'shadowing'
+  | 'review_feedback'
+  | 'vocabulary'
+  | 'assessment'
+  | 'adaptive_lesson'
+  | 'daily_tutor'
+  | 'fluency'
+  | 'deep_speaking'
+  | 'professional_english';
+
+/**
+ * Work Order 2 — correction intensity.
+ *
+ * The learner-facing preference lives on the ONE existing profile row
+ * (`learner_profile.preferences` JSON). It maps onto the EXISTING
+ * ConversationMode — there is deliberately no parallel preference system:
+ * - 'natural'   ↔ 'natural' (Natural / light)
+ * - 'balanced'  ↔ 'coach'   (useful corrections, flow preserved)
+ * - 'intensive' ↔ 'intensive'
+ * The temporary "fewer corrections for now" override is SESSION-LOCAL: it is
+ * never persisted and only affects the current practice session.
+ */
+export type CorrectionIntensity = 'natural' | 'balanced' | 'intensive';
+
+/** Persisted learner preferences (additive JSON on the profile row). */
+export interface LearnerPreferences {
+  readonly correctionIntensity?: CorrectionIntensity;
+}
+
+/** The supported language-item categories a learner can save (Work Order 2). */
+export type VocabularyCategory =
+  | 'word'
+  | 'phrase'
+  | 'phrasal_verb'
+  | 'idiom'
+  | 'common_expression'
+  | 'collocation'
+  | 'linking_expression'
+  | 'professional_expression'
+  /** Work Order 2: a complete sentence the learner wants to keep and review. */
+  | 'sentence';
+
 
 /** Spaced-repetition scheduling fields (item-level convenience copy). */
 export interface ReviewSchedule {

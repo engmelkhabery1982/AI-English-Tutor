@@ -320,14 +320,26 @@ describe('SQLite schema migrations (sql.js)', () => {
   });
 
   describe('Migration version 2: expression metadata', () => {
-    it('CURRENT_SCHEMA_VERSION is 6 (v6 adds DB-backed logical uniqueness + singleton)', async () => {
-      // Previous assertion expected 5, which was correct before v6.
-      // v6 is additive and stronger: it adds UNIQUE constraints for
+    it('CURRENT_SCHEMA_VERSION is 7 (v7 adds the additive profile preferences column)', async () => {
+      // v6 is additive and stronger: UNIQUE constraints for
       // lexical_items(learner_id, headword, type), review_items,
       // weaknesses, strengths, pronunciation, plus singleton profile
-      // CHECK(id='singleton') and race-safe upserts. No data loss,
-      // only stricter integrity. So the correct current version is 6.
-      expect(CURRENT_SCHEMA_VERSION).toBe(6);
+      // CHECK and race-safe upserts.
+      // v7 is the Work Order 2 learner-agency addition: ONE additive
+      // `preferences TEXT NOT NULL DEFAULT '{}'` column on the existing
+      // learner_profile row (correction intensity). No data loss.
+      expect(CURRENT_SCHEMA_VERSION).toBe(7);
+    });
+
+    it('migration v7 exists and adds only the additive preferences column', async () => {
+      const v7 = SCHEMA_MIGRATIONS.find((m) => m.version === 7);
+      expect(v7).toBeDefined();
+      expect(v7!.steps).toHaveLength(1);
+      expect(v7!.steps[0].sql).toContain('ALTER TABLE learner_profile ADD COLUMN preferences TEXT NOT NULL DEFAULT');
+      // A preferences row survives a v1-style insert: the column has a default.
+      await createLearner();
+      const rows = await adapter.query(`SELECT preferences FROM learner_profile WHERE id = 'learner-1'`);
+      expect(rows[0].preferences).toBe('{}');
     });
 
     it('migration v2 exists with correct description', async () => {

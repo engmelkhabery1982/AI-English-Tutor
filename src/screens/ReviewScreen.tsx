@@ -46,6 +46,7 @@ import { resolveReviewProviders } from '../review/providers';
 import { readReviewLearnerProfile } from '../review/profile-guard';
 import { DEMO_REVIEW_NOTICE, selectReviewSessionCandidates } from '../review/demo-items';
 import { generateId } from '../shared/id';
+import { createSaveToReviewService } from '../learner-agency';
 
 // Demo practice cards live in the review package (`demo-items`) and are
 // reachable ONLY through explicit Demo Mode — never mixed into a real queue.
@@ -563,6 +564,57 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     }
   };
 
+  /**
+   * Work Order 2 — Save to Review from the answer feedback, available after
+   * ANY result including a CORRECT one. Saving here never re-schedules,
+   * re-scores or completes this review card: it only asks the ONE reusable
+   * service to keep this language item ("I want to learn/review this").
+   */
+  const [reviewSaveState, setReviewSaveState] = useState<{
+    readonly saving: boolean;
+    readonly note: string | null;
+    readonly savedKey: string | null;
+  }>({ saving: false, note: null, savedKey: null });
+  const saveToReviewRef = useRef<ReturnType<typeof createSaveToReviewService> | null>(null);
+  const getSaveToReview = () => {
+    if (!saveToReviewRef.current) {
+      saveToReviewRef.current = createSaveToReviewService({
+        databaseAdapter: dbAdapterRef.current ?? undefined,
+      });
+    }
+    return saveToReviewRef.current;
+  };
+
+  const handleSaveFromFeedback = async (candidate: ReviewItemCandidate | null): Promise<void> => {
+    if (!candidate || reviewSaveState.saving || isDemoMode) return;
+    const text = (evaluation?.suggestedCorrection ?? candidate.expectedAnswer ?? '').trim();
+    if (text.length === 0) return;
+    setReviewSaveState((prev) => ({ ...prev, saving: true, note: null }));
+    try {
+      const result = await getSaveToReview().save({
+        learnerId: candidate.learnerId,
+        text,
+        itemType: 'sentence',
+        origin: 'review_feedback',
+        originRef: candidate.id,
+        contextSentence: candidate.prompt,
+      });
+      setReviewSaveState({
+        saving: false,
+        savedKey: result.ok ? candidate.id : reviewSaveState.savedKey,
+        note: result.ok
+          ? result.reason === 'already_saved'
+            ? 'Already in your Review list — nothing was duplicated.'
+            : 'Saved to Review. This card keeps its own result — saving adds no evidence.'
+          : result.reason === 'no_profile'
+          ? 'Saving needs a learning profile first.'
+          : 'Could not save this time. Nothing was changed.',
+      });
+    } finally {
+      setReviewSaveState((prev) => (prev.saving ? { ...prev, saving: false } : prev));
+    }
+  };
+
   const handleNextItem = async () => {
     if (currentIndex + 1 < sessionCandidates.length) {
       // Item change: invalidate the finished item's voice work synchronously so
@@ -573,6 +625,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       setCurrentIndex((prev) => prev + 1);
       setUserAnswer('');
       setEvaluation(null);
+      // The next card starts with a clean manual-save state.
+      setReviewSaveState({ saving: false, note: null, savedKey: null });
     } else {
       // Session finished!
       try {
@@ -976,6 +1030,31 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
                 <View style={styles.explanationBox}>
                   <Text style={styles.explanationTitle}>Tutor Explanation:</Text>
                   <Text style={styles.explanationText}>{evaluation.explanation}</Text>
+                </View>
+              )}
+
+              {/* Work Order 2 — Save to Review works after ANY result, and a
+                  correct answer can be saved too. It never changes this card. */}
+              {!isDemoMode && (
+                <View style={styles.explanationBox}>
+                  <TouchableOpacity
+                    style={styles.nextButton}
+                    onPress={() => void handleSaveFromFeedback(sessionCandidates[currentIndex] ?? null)}
+                    disabled={reviewSaveState.saving || reviewSaveState.savedKey === sessionCandidates[currentIndex]?.id}
+                    accessibilityRole="button"
+                    accessibilityLabel="Save this phrasing to Review for extra practice"
+                  >
+                    <Text style={styles.nextButtonText}>
+                      {reviewSaveState.saving
+                        ? 'Saving…'
+                        : reviewSaveState.savedKey === sessionCandidates[currentIndex]?.id
+                        ? '✓ Saved to Review'
+                        : '＋ Save to Review'}
+                    </Text>
+                  </TouchableOpacity>
+                  {reviewSaveState.note ? (
+                    <Text style={styles.explanationText}>{reviewSaveState.note}</Text>
+                  ) : null}
                 </View>
               )}
 

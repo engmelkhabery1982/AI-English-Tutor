@@ -28,8 +28,8 @@ import type {
 export interface VocabularyItem {
   readonly id: Uuid;
   readonly learnerId: Uuid;
-  readonly headword: string; // e.g. "run"
-  readonly type: 'word' | 'phrase' | 'phrasal_verb' | 'idiom' | 'common_expression' | 'collocation' | 'linking_expression' | 'professional_expression';
+  readonly headword: string; // e.g. "run" (or the full sentence for type 'sentence')
+  readonly type: 'word' | 'phrase' | 'phrasal_verb' | 'idiom' | 'common_expression' | 'collocation' | 'linking_expression' | 'professional_expression' | 'sentence';
   readonly meanings: readonly Meaning[];
   readonly pronunciation?: PronunciationMetadata;
   readonly synonyms?: readonly string[];

@@ -28,6 +28,7 @@ import {
   type ReassessmentService,
 } from '../reassessment';
 import { createDefaultOnboardingService, type DiagnosticHandle } from '../onboarding';
+import { ASSESSMENT_PRE_GUIDANCE } from '../learner-agency';
 import { useNavigation, type NavigationProp, type ParamListBase } from '@react-navigation/native';
 import OnboardingScreen from './OnboardingScreen';
 
@@ -127,6 +128,9 @@ export default function ReassessmentScreen({
       <Text style={styles.headerTitle}>Check my English level again</Text>
 
       <Text style={styles.descriptionText}>After a period of practice, take another English assessment to compare what has changed. Your level changes only if you accept the suggested level.</Text>
+      {/* Work Order 2 — same pre-guidance as the first assessment: answer with
+          your own real examples; short answers are still valid, just weaker. */}
+      <Text style={styles.descriptionText}>{ASSESSMENT_PRE_GUIDANCE}</Text>
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Is it time to reassess?</Text>
         <Text style={styles.descriptionText}>

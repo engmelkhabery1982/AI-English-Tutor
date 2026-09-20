@@ -1139,11 +1139,18 @@ export class VoiceSessionCoordinator {
 
   /**
    * Speaks the assistant response text aloud.
+   *
+   * Work Order 2 (minimal, additive): an optional `rate` may be supplied to
+   * the EXISTING TTS provider for learner "slower/repeat" playback. It is
+   * passed straight through as a provider option — there is no second TTS
+   * path — and callers must only offer it when the provider really declares
+   * `supportsSpeechRate`. Playback never creates a learner attempt.
    */
   async speakResponse(
     text: string,
     session: ConversationSession = this.session,
     generation: number = this.generation,
+    options?: { readonly rate?: number },
   ): Promise<void> {
     // Never play tutor audio while the microphone is active: the recorder and
     // TTS must not run at the same time (barge-in always wins over playback).
@@ -1167,6 +1174,7 @@ export class VoiceSessionCoordinator {
 
     try {
       await this.ttsProvider.speak(text, {
+        ...(options?.rate !== undefined ? { rate: options.rate } : {}),
         onStart: () => {
           if (this.isCurrent(session, generation)) {
             this.state = 'speaking';
@@ -1193,6 +1201,16 @@ export class VoiceSessionCoordinator {
         this.notifyListeners();
       }
     }
+  }
+
+  /**
+   * Work Order 2 (read-only accessor): the SAME TTS provider this coordinator
+   * plays on. Surfaces use it ONLY to resolve honest playback capability
+   * (e.g. whether the provider really supports a speech-rate change). It is
+   * not a second playback path: playback stays owned by this coordinator.
+   */
+  getPlaybackProvider(): TextToSpeechProvider {
+    return this.ttsProvider;
   }
 
   /**
@@ -1225,8 +1243,13 @@ export class VoiceSessionCoordinator {
 
   /**
    * Replays the last tutor response aloud.
+   *
+   * Work Order 2: an optional `rate` supports the learner's "Slower" control
+   * through this SAME existing playback path (the caller only supplies it when
+   * the provider declares speech-rate capability). Replaying — at any speed —
+   * never creates a learner attempt or evidence.
    */
-  async replayLastResponse(): Promise<void> {
+  async replayLastResponse(options?: { readonly rate?: number }): Promise<void> {
     if (this.disposed) return;
     // Read from — and rebind to — the session that is active right now: a replay
     // must never re-speak the previous conversation's reply.
@@ -1238,7 +1261,7 @@ export class VoiceSessionCoordinator {
     }
 
     await this.stopSpeaking();
-    await this.speakResponse(lastAssistantTurn.content, session, generation);
+    await this.speakResponse(lastAssistantTurn.content, session, generation, options);
   }
 
   /**

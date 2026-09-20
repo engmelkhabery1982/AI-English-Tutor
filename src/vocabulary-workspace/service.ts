@@ -127,6 +127,14 @@ export function toWorkspaceEntry(
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     addedBy: item.source?.addedBy ?? 'system',
+    saveSource:
+      item.source?.saveSource === 'manual_learner' ||
+      (item.source?.saveSource === undefined && item.source?.addedBy === 'learner-created')
+        ? 'manual_learner'
+        : 'detected_practice',
+    saveOrigin: item.source?.saveOrigin ?? null,
+    containsGeneratedText: item.source?.containsGeneratedText === true,
+    contextSentence: item.source?.contextSentence ?? null,
     item,
   };
 }

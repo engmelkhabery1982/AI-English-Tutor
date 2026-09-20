@@ -107,6 +107,37 @@ export interface ConversationSession {
    */
   isAbandoned?(): boolean;
 
+  /**
+   * Work Order 2 — learner-assistance request.
+   *
+   * Runs a hidden instruction (hint / example / explain / "I don't know" /
+   * skip) through the SAME engine + orchestrator + provider path as a normal
+   * turn, but commits ONLY the tutor's reply:
+   * - the instruction is never stored as a learner turn;
+   * - no learner evidence is created (turn counts, feedback, weakness and
+   *   review persistence all stay untouched);
+   * - if any learner turn committed while the request was in flight, the late
+   *   assistance is DISCARDED instead of corrupting the conversation.
+   * Returns the same result shape as `send` so surfaces handle it with the
+   * same safe-retry rules. Optional so existing sessions stay compatible.
+   */
+  requestAssistance?(
+    input: ConversationSessionSendInput,
+    onChunk?: AIStreamCallback
+  ): Promise<ConversationSessionResult>;
+
+  /**
+   * Work Order 2 — a SESSION-LOCAL temporary correction-mode override.
+   *
+   * Used for "fewer corrections for now": it changes ONLY the mode the
+   * EXISTING engine uses to build the next request; it is never persisted,
+   * never changes the composed conversation identity, and passing `null`
+   * restores the session's real mode. When the session is replaced, the
+   * override disappears with it — exactly what "for now" means.
+   * Optional so existing sessions stay compatible.
+   */
+  setModeOverride?(mode: ConversationMode | null): void;
+
   sendStream?(
     input: ConversationSessionSendInput,
     onChunk: AIStreamCallback
