@@ -353,3 +353,10 @@ describe('provider failure classification — inputs, surfaces and retry policy'
     );
   });
 });
+
+// A classification can travel through safe-retry as a code without losing its policy.
+describe('classified failure round-trip', () => {
+  it.each(['rate_limited', 'service_busy', 'invalid_credentials', 'malformed_response'] as const)('preserves %s', kind => {
+    expect(classifyProviderFailure({ code: kind }).kind).toBe(kind);
+  });
+});

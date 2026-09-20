@@ -350,6 +350,11 @@ export interface SaveLanguageItemInput {
    * presented as authoritative dictionary truth.
    */
   readonly meaningIsGenerated?: boolean;
+  readonly originalText?: string;
+  readonly generatedBy?: string;
+  readonly selectedSenseId?: string;
+  readonly additionalExamples?: readonly string[];
+  readonly contextSource?: 'ai-generated' | 'learner-created' | 'curated' | 'manual';
 }
 
 /** Deterministic outcome of a save attempt. */

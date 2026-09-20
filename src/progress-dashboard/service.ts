@@ -1,3 +1,4 @@
+import { readPracticeActivity } from '../lessons/activity';
 /**
  * src/progress-dashboard/service.ts
  *
@@ -370,7 +371,7 @@ export class ProgressDashboardService {
         newWordsLearned: record.newWordsLearned ?? 0,
         weaknessesImproved: record.weaknessesImproved ?? 0,
         weaknessesWorsened: record.weaknessesWorsened ?? 0,
-        notes: record.notes,
+        notes: readPracticeActivity(record) ? `${readPracticeActivity(record)!.kind.replace('_', ' ')}: ${readPracticeActivity(record)!.action.replace('_', ' ')}. Counts reflect interaction only, not proficiency.` : record.notes,
       }));
 
     return {

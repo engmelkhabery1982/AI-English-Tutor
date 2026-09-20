@@ -270,6 +270,11 @@ const INPUT_PRESERVED_KINDS: readonly ProviderFailureKind[] = [
 
 /** Provider error codes (AIProviderErrorCode and friends) → failure kind. */
 const CODE_KINDS: Readonly<Record<string, ProviderFailureKind>> = {
+  // Classifications may pass through the shared safe-retry boundary again.
+  rate_limited: 'rate_limited',
+  service_busy: 'service_busy',
+  invalid_credentials: 'invalid_credentials',
+  malformed_response: 'malformed_response',
   rate_limit: 'rate_limited',
   ratelimit: 'rate_limited',
   quota: 'rate_limited',

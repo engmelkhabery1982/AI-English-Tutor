@@ -188,6 +188,9 @@ export interface VocabularySource {
    * surfaces must treat this flag as 'generated' provenance.
    */
   readonly containsGeneratedText?: boolean;
+  readonly originalText?: string;
+  readonly generatedBy?: string;
+  readonly selectedSenseId?: string;
 }
 
 /** How a lexical item entered review: manual learner save vs detected practice. */
@@ -195,6 +198,8 @@ export type SaveSource = 'manual_learner' | 'detected_practice';
 
 /** Feature surfaces a learner can save a language item from (Work Order 2). */
 export type SavedItemOrigin =
+  | 'inspector'
+  | 'reading'
   | 'talk'
   | 'listening'
   | 'shadowing'

@@ -30,6 +30,7 @@ describe('route tables (single source of truth)', () => {
       'Reassessment',
       'Pronunciation',
       'Shadowing',
+      'LearningTools',
     ]);
   });
 

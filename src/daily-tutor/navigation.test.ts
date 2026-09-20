@@ -355,6 +355,7 @@ describe('child routes match the REAL navigator hierarchy', () => {
       'Reassessment',
       'Pronunciation',
       'Shadowing',
+      'LearningTools',
     ]);
   });
 });

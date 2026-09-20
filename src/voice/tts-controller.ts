@@ -90,8 +90,11 @@ export class TTSController {
       if (this.generation === gen) {
         this.activeGen = null;
       }
-    } catch {
-      if (this.generation === gen) this.activeGen = null;
+    } catch (error) {
+      if (this.generation === gen) {
+        this.activeGen = null;
+        options?.onError?.(error instanceof Error ? error : new Error('Playback failed.'));
+      }
     }
   }
 

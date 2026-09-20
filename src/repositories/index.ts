@@ -334,7 +334,7 @@ export interface ExerciseRepository {
 }
 
 export interface ProgressRepository {
-  record(record: Omit<ProgressRecord, 'id'>): Promise<ProgressRecord>;
+  record(record: Omit<ProgressRecord, 'id'>, eventKey?: string): Promise<ProgressRecord>;
   list(learnerId: string, limit?: number): Promise<readonly ProgressRecord[]>;
   latest(learnerId: string): Promise<ProgressRecord | null>;
   /** Exact count of persisted progress records in an optional range. */

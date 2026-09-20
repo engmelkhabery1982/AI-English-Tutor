@@ -1,0 +1,22 @@
+import type { LessonLevel, StoryLesson } from './types';
+
+const starter = (level: LessonLevel, title: string, passage: string, question: string, options: string[], answer: string, item: string, meaning: string): StoryLesson => ({
+  id: `starter-${level}`, title, topic: title, level,
+  difficultyIntent: `${level} content practice — not an assessment of your level.`, passage,
+  provenance: { kind: 'curated' },
+  questions: [{ id: 'main', prompt: question, options, answer, explanation: `The passage says: ${answer}.` },
+    { id: 'detail', prompt: `In this passage, what does “${item}” mean?`, options: [meaning, 'The opposite of what was planned', 'A location mentioned in the story'], answer: meaning, explanation: `Here “${item}” means ${meaning.toLowerCase()}.` }],
+  language: [{ text: item, itemType: item.includes(' ') ? 'phrase' : 'word', meaning, context: passage }],
+});
+/** Small authored set; these are never advertised as offline AI or personalized content. */
+export const STARTER_LESSONS: readonly StoryLesson[] = [
+  starter('A1', 'At the market', 'Maya goes to the market on Saturday. She buys apples for her family. The shop is busy, so she waits. Then she walks home.', 'What does Maya buy?', ['Apples for her family', 'Bread for a friend', 'Flowers for her room'], 'Apples for her family', 'busy', 'Full of people or activity'),
+  starter('A2', 'A change of plan', 'Leo planned to cycle to the library, but it started raining. He decided to take the bus instead. At the library, he borrowed a book about gardens. He will try cycling again tomorrow.', 'How does Leo reach the library?', ['He takes the bus', 'He cycles', 'He walks'], 'He takes the bus', 'instead', 'In place of another choice'),
+  starter('B1', 'Sharing a garden', 'The neighbours wanted a greener street, so they set up a small shared garden. At first, nobody knew who would water it. They agreed on a weekly schedule, and each family took a turn. Within a month, the plants were growing well and the neighbours were talking more often.', 'What solved the watering problem?', ['A weekly schedule', 'Hiring a gardener', 'Moving the plants indoors'], 'A weekly schedule', 'set up', 'Organise or establish something'),
+  starter('B2', 'A flexible working week', 'A small company tested a flexible working week. Staff could choose when to start, provided that they attended the afternoon meeting. Although managers initially worried about coordination, the trial reduced delays because people planned their handovers more carefully. The company kept the policy but agreed to review it after three months.', 'Why were delays reduced?', ['People planned handovers more carefully', 'Meetings were cancelled', 'The company hired more managers'], 'People planned handovers more carefully', 'provided that', 'On the condition that'),
+  starter('C1', 'Repair rather than replace', 'The council considered subsidising a repair centre rather than expanding its waste collection service. Supporters argued that extending the life of household goods would address waste at its source. Critics questioned whether residents would use the centre consistently. To resolve the uncertainty, the council commissioned a limited pilot before committing to permanent funding.', 'How will the council resolve its uncertainty?', ['By commissioning a limited pilot', 'By immediately expanding waste collection', 'By banning new household goods'], 'By commissioning a limited pilot', 'at its source', 'Where a problem originates'),
+  starter('C2', 'The limits of a pilot', 'A successful transport pilot can be persuasive without being conclusive. Participants may be unusually motivated, while temporary subsidies obscure the costs of wider adoption. Rather than dismissing the findings, analysts should distinguish what the trial demonstrates from what remains contingent on scale. The strongest case for expansion therefore acknowledges uncertainty and specifies how it will be monitored.', 'What do the analysts recommend?', ['Distinguishing demonstrated findings from scale-dependent assumptions', 'Dismissing every pilot study', 'Expanding without monitoring'], 'Distinguishing demonstrated findings from scale-dependent assumptions', 'contingent on', 'Dependent on a particular condition'),
+];
+export function starterForLevel(level: string): StoryLesson {
+  return STARTER_LESSONS.find(lesson => lesson.level === level) ?? STARTER_LESSONS[0];
+}

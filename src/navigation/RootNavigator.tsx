@@ -1,3 +1,4 @@
+import LearningToolsScreen from '../screens/LearningToolsScreen';
 import React from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -151,6 +152,7 @@ const ROOT_SCREENS: readonly RootScreenDef[] = [
   },
   { name: 'Pronunciation', component: PronunciationScreen, options: { title: 'Pronunciation', headerBackTitle: 'Back' } },
   { name: 'Shadowing', component: ShadowingScreen, options: { title: 'Shadowing', headerBackTitle: 'Back' } },
+  { name: 'LearningTools', component: LearningToolsScreen, options: { title: 'Learning tools', headerBackTitle: 'Back' } },
 ];
 
 // Single-source-of-truth check: the rendered root screens must be EXACTLY

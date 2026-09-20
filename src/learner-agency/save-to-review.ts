@@ -127,6 +127,9 @@ function buildSource(input: SaveLanguageItemInput, now: IsoDate): VocabularySour
       ? { contextSentence: preserveExactText(input.contextSentence) }
       : {}),
     containsGeneratedText: input.meaningIsGenerated === true,
+    originalText: input.originalText,
+    generatedBy: input.generatedBy,
+    selectedSenseId: input.selectedSenseId,
   };
 }
 
@@ -148,10 +151,10 @@ function buildMeaning(input: SaveLanguageItemInput): Meaning {
   if (input.meaningIsGenerated === true) {
     usageNotes.push('Tutor-generated note for review — not a dictionary definition.');
   }
-  const examples = [input.example, input.contextSentence]
+  const examples = [input.example, ...(input.additionalExamples ?? []), input.contextSentence]
     .map((value) => (value ?? '').trim())
     .filter((value, index, all) => value.length > 0 && all.indexOf(value) === index)
-    .map((text) => ({ text, source: exampleSourceFor(input) }));
+    .map((text) => ({ text, source: text === input.contextSentence?.trim() && input.contextSource ? input.contextSource : exampleSourceFor(input) }));
 
   return {
     // An empty definition stays the exact text: never a fabricated meaning.

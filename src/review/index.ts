@@ -14,3 +14,5 @@ export * from './providers';
 export * from './demo-items';
 export * from './evidence-identity';
 export * from './voice-controller';
+export * from './active-modes';
+export * from './context-practice';

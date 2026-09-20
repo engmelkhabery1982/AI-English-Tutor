@@ -61,7 +61,7 @@ export * from './service';
  * Assemble the EXISTING repository facade on one adapter. Same shape the
  * other composition factories use — no new persistence layer, no new tables.
  */
-function createAppRepositories(adapter: DatabaseAdapter): AppRepositories {
+export function createAppRepositories(adapter: DatabaseAdapter): AppRepositories {
   return {
     profile: new SQLiteUserProfileRepository(adapter),
     conversations: new SQLiteConversationRepository(adapter),
@@ -170,3 +170,4 @@ const defaultService = createRecoverableSingleFlight(
 export function createDefaultAdaptiveLessonService(): Promise<AdaptiveLessonService> {
   return defaultService();
 }
+export * from './next-focus';

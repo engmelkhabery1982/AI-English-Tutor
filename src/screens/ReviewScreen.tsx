@@ -1,3 +1,5 @@
+import { TTSController } from '../voice/tts-controller';
+import { learnerMessageForFailure } from '../providers/failures';
 import MicrophoneHelp from './components/MicrophoneHelp';
 import TouchableOpacity from './components/LearnerButton';
 import React, { useCallback, useEffect, useState, useRef } from 'react';
@@ -134,6 +136,12 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     useCallback(() => {
       return () => {
         setDailyLaunch((current) => clearDailyTutorReturn(current));
+        playbackRef.current?.invalidate();
+        voiceRef.current?.reset();
+        sessionGenerationRef.current += 1;
+        submitInFlightRef.current = false;
+        setIsEvaluating(false);
+        setIsPlayingListening(false);
       };
     }, []),
   );
@@ -194,6 +202,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const ttsRef = useRef<TextToSpeechProvider | null>(props?.ttsProvider ?? null);
   const [isPlayingListening, setIsPlayingListening] = useState<boolean>(false);
+  const playbackRef = useRef<TTSController | null>(null);
+  const listeningPlayedRef = useRef<string | null>(null);
 
   const isRecording = voiceStatus.isRecording;
   const isTranscribing = voiceStatus.isTranscribing;
@@ -211,6 +221,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       // tears the shared recorder and playback down best-effort.
       voiceRef.current?.dispose();
       voiceRef.current = null;
+      void playbackRef.current?.dispose();
       void ttsRef.current?.stop().catch(() => undefined);
     };
   }, []);
@@ -347,10 +358,14 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
    * persisted by itself).
    */
   const handleToggleRecording = async () => {
+    const generation = sessionGenerationRef.current, index = currentIndexRef.current;
+    await playbackRef.current?.stop();
+    if (!mountedRef.current || generation !== sessionGenerationRef.current || index !== currentIndexRef.current) return;
+    setIsPlayingListening(false);
     const controller = voiceRef.current;
     if (!controller || controller.isDisposed) return;
     const status = await controller.toggleRecording();
-    if (!mountedRef.current) return;
+    if (!mountedRef.current || generation !== sessionGenerationRef.current || index !== currentIndexRef.current) return;
     setVoiceStatus(status);
     if (status.transcript) {
       setUserAnswer(status.transcript);
@@ -415,9 +430,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
       const limit = dailyOptions?.reviewLimit;
       const candidates = await reviewServiceRef.current.planSession(
         learnerId,
-        dailyOptions
-          ? { minItems: 1, maxItems: limit ?? 10, targetItems: limit ?? 10 }
-          : undefined,
+        { ...(dailyOptions ? { minItems: 1, maxItems: limit ?? 10, targetItems: limit ?? 10 } : {}),
+          activeModes: { audio: true, speech: voiceRef.current?.isAvailable === true, provider: true } },
       );
       const bounded = dailyOptions?.reviewKind
         ? candidates.filter((candidate) => candidate.kind === dailyOptions.reviewKind)
@@ -476,22 +490,40 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
    * Failure-safe: the exercise and the typed answer are never lost.
    */
   const handlePlayListeningItem = async (text: string) => {
+    if (voiceRef.current?.isRecording || voiceRef.current?.isBusy) return;
+    if (!ttsRef.current) ttsRef.current = createExpoTTSProvider();
+    if (!playbackRef.current) playbackRef.current = new TTSController(ttsRef.current);
+    const generation = sessionGenerationRef.current, index = currentIndexRef.current;
+    const current = () => mountedRef.current && generation === sessionGenerationRef.current && index === currentIndexRef.current;
+    playbackRef.current.invalidate();
+    await playbackRef.current.speak(text, {
+      onStart: () => { if (current()) { setIsPlayingListening(true); listeningPlayedRef.current = `${generation}:${index}`; } },
+      onDone: () => { if (current()) setIsPlayingListening(false); },
+      onError: error => { if (current()) { setIsPlayingListening(false); setSaveError(learnerMessageForFailure(error.message)); } },
+    });
+    if (current()) setIsPlayingListening(false);
+  };
+
+  /** Wiring only: domain services choose/construct the mode and retain the row identity. */
+  const handleActiveChange = async (work: (service: ReviewService) => Promise<ReviewItemCandidate>) => {
+    const generation = sessionGenerationRef.current, index = currentIndex;
+    const stale = () => !mountedRef.current || sessionGenerationRef.current !== generation || currentIndexRef.current !== index;
+    if (submitInFlightRef.current || !reviewServiceRef.current) return;
+    submitInFlightRef.current = true; setIsEvaluating(true); setSaveError(null);
     try {
-      if (!ttsRef.current) {
-        ttsRef.current = createExpoTTSProvider();
-      }
-      setIsPlayingListening(true);
-      await ttsRef.current.speak(text);
-      setIsPlayingListening(false);
-    } catch {
-      setIsPlayingListening(false);
-      setError('Audio playback failed. The item text is shown below — you can still answer.');
-    }
+      const changed = await work(reviewServiceRef.current);
+      if (!stale()) { setSessionCandidates(items => items.map((item, i) => i === index ? changed : item)); setUserAnswer(''); voiceRef.current?.reset(); listeningPlayedRef.current = null; playbackRef.current?.invalidate(); }
+    } catch (err) { if (!stale()) setSaveError(learnerMessageForFailure(err instanceof Error ? err.message : null)); }
+    finally { if (!stale()) { submitInFlightRef.current = false; setIsEvaluating(false); } }
   };
 
   const handleSubmitAnswer = async () => {
     const candidate = sessionCandidates[currentIndex];
-    if (!candidate || submitInFlightRef.current) return;
+    if (!candidate || !userAnswer.trim() || submitInFlightRef.current) return;
+    const activeEvidence = {
+      source: userAnswer === voiceRef.current?.userAnswer ? 'stt' as const : 'typed' as const,
+      playbackStarted: listeningPlayedRef.current === `${sessionGenerationRef.current}:${currentIndex}`,
+    };
 
     submitInFlightRef.current = true;
     setIsEvaluating(true);
@@ -515,7 +547,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
         // Explicit demo practice: local comparison only, nothing persisted.
         evalResult = evaluateDemoAnswerLocally(candidate, userAnswer);
       } else {
-        evalResult = await reviewServiceRef.current.evaluateAnswer(candidate, userAnswer);
+        evalResult = await reviewServiceRef.current.evaluateAnswer(candidate, userAnswer, undefined, activeEvidence);
         if (!isCurrentAttempt()) return;
 
         const profileRepo = new SQLiteUserProfileRepository(dbAdapterRef.current!);
@@ -530,7 +562,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
               userAnswer,
               evalResult,
               undefined,
-              { attemptId },
+              { attemptId, activeEvidence },
             );
           } catch (err) {
             console.error('Error saving review practice result:', err);
@@ -556,7 +588,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     } catch (err) {
       console.error('Error evaluating answer:', err);
       if (isCurrentAttempt()) {
-        setSaveError('That answer could not be graded. Nothing was recorded — please try again.');
+        setSaveError(`${learnerMessageForFailure(err instanceof Error ? err.message : null)} Nothing was recorded; your answer is kept.`);
       }
     } finally {
       setIsEvaluating(false);
@@ -587,14 +619,16 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
 
   const handleSaveFromFeedback = async (candidate: ReviewItemCandidate | null): Promise<void> => {
     if (!candidate || reviewSaveState.saving || isDemoMode) return;
-    const text = (evaluation?.suggestedCorrection ?? candidate.expectedAnswer ?? '').trim();
+    const text = (candidate.active?.lexicalText ?? evaluation?.suggestedCorrection ?? candidate.expectedAnswer ?? '').trim();
     if (text.length === 0) return;
     setReviewSaveState((prev) => ({ ...prev, saving: true, note: null }));
     try {
       const result = await getSaveToReview().save({
         learnerId: candidate.learnerId,
         text,
-        itemType: 'sentence',
+        itemType: candidate.active?.itemType ?? 'sentence',
+        selectedMeaning: candidate.active?.meaningDefinition,
+        meaningIsGenerated: candidate.active?.containsGeneratedText,
         origin: 'review_feedback',
         originRef: candidate.id,
         contextSentence: candidate.prompt,
@@ -616,6 +650,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
   };
 
   const handleNextItem = async () => {
+    playbackRef.current?.invalidate();
+    setIsPlayingListening(false);
     if (currentIndex + 1 < sessionCandidates.length) {
       // Item change: invalidate the finished item's voice work synchronously so
       // a late transcript can never enter the NEXT item.
@@ -674,6 +710,8 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
   };
 
   const handleExitSession = () => {
+    playbackRef.current?.invalidate();
+    setIsPlayingListening(false);
     // Synchronous invalidation BEFORE anything else: in-flight grading or
     // speech recognition from this session can neither land on the dashboard
     // nor persist as evidence after the learner left.
@@ -880,11 +918,11 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           </View>
 
           {/* Listening replay control (kind === 'listening'): existing TTS */}
-          {candidate.kind === 'listening' && (
+          {(candidate.kind === 'listening' || candidate.active?.audioText) && (
             <View style={styles.listeningPlayRow}>
               <TouchableOpacity
                 style={styles.listeningPlayButton}
-                onPress={() => handlePlayListeningItem(candidate.expectedAnswer)}
+                onPress={() => handlePlayListeningItem(candidate.active?.audioText ?? candidate.expectedAnswer)}
                 accessibilityLabel="Play listening item"
                 accessibilityRole="button"
               >
@@ -913,6 +951,19 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
             </View>
           )}
 
+          {!evaluation && candidate.active && <View>
+            <Text>Practice mode: {candidate.active.mode.replace(/_/g, ' ')}</Text>
+            {candidate.active.availableModes.map(mode => <TouchableOpacity key={mode} disabled={isEvaluating || isRecording || isTranscribing}
+              onPress={() => void handleActiveChange(service => service.changeMode(candidate, mode))}><Text>{mode.replace(/_/g, ' ')}</Text></TouchableOpacity>)}
+            <TouchableOpacity disabled={isEvaluating || isRecording || isTranscribing}
+              onPress={() => { const generation = sessionGenerationRef.current, index = currentIndex;
+                void handleActiveChange(service => service.varyContext(candidate, () => !mountedRef.current || sessionGenerationRef.current !== generation || currentIndexRef.current !== index));
+              }}><Text>Try a new context (provider-generated)</Text></TouchableOpacity>
+          </View>}
+          {candidate.active?.contextProvenance === 'ai-generated'  && <Text>Provider-generated practice context — not dictionary truth.</Text>}
+          {!evaluation && candidate.active?.choices?.map(choice => (
+            <TouchableOpacity key={choice} onPress={() => setUserAnswer(choice)}><Text>{choice}</Text></TouchableOpacity>
+          ))}
           {/* Answer Input Field (when not evaluated yet) */}
           {!evaluation ? (
             <View>
@@ -930,7 +981,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
                   autoCorrect={false}
                   autoCapitalize="none"
                   multiline={candidate.exerciseType === 'sentence_correction' || candidate.exerciseType === 'natural_phrasing'}
-                  editable={!isEvaluating && !isRecording && !isTranscribing}
+                  editable={!isEvaluating && !isRecording && !isTranscribing && candidate.active?.mode !== 'speak_sentence'}
                   id="answer_input_field"
                 />
                 <TouchableOpacity
