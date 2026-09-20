@@ -1,3 +1,4 @@
+import { activeReviewCandidate } from './active-modes';
 /**
  * src/review/planner.ts
  *
@@ -156,7 +157,7 @@ function vocabularyToCandidate(
 
   if (hasExample) {
     // Fill the gap exercise
-    const gapRegex = new RegExp(`\\b${item.headword}\\b`, 'gi');
+    const gapRegex = new RegExp(item.headword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
     const gappedSentence = example.text.replace(gapRegex, '_____');
 
     return {
@@ -342,6 +343,15 @@ export class ReviewPlanner {
 
     if (candidates.length === 0) {
       return [];
+    }
+
+    // Enrich even queued WO2 saves from their canonical lexical rows. Identity stays unchanged.
+    if (options?.activeModes) {
+      await Promise.all(candidates.map(async (candidate, index) => {
+        const repo = candidate.kind === 'vocabulary' ? this.repos.vocabulary : candidate.kind === 'expression' ? this.repos.expressions : null;
+        const item = repo ? await repo.get(candidate.referenceId) : null;
+        if (item) candidates[index] = activeReviewCandidate(candidate, item, options.activeModes!);
+      }));
     }
 
     // 4. Sort all candidates deterministically by priority score

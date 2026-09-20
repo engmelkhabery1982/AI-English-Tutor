@@ -1,3 +1,5 @@
+import { activeReviewCandidate, assertActiveReviewEvidence, type ActiveReviewEvidence, type ActiveReviewMode } from './active-modes';
+import { varyReviewContext } from './context-practice';
 /**
  * src/review/service.ts
  *
@@ -41,6 +43,7 @@ export interface ReviewPracticeOptions {
    * same item is a new attempt with new evidence.
    */
   readonly attemptId?: string;
+  readonly activeEvidence?: ActiveReviewEvidence;
 }
 
 export class ReviewService {
@@ -51,7 +54,7 @@ export class ReviewService {
 
   constructor(
     private readonly repos: AppRepositories,
-    aiProvider?: AIProvider,
+    private readonly aiProvider?: AIProvider,
   ) {
     this.planner = new ReviewPlanner(repos);
     this.evaluator = new ReviewEvaluator(aiProvider);
@@ -102,7 +105,19 @@ export class ReviewService {
     learnerId: string,
     options?: ReviewPlannerOptions,
   ): Promise<readonly ReviewItemCandidate[]> {
-    return this.planner.planSession(learnerId, options);
+    return this.planner.planSession(learnerId, options?.activeModes ? { ...options, activeModes: { ...options.activeModes, provider: Boolean(this.aiProvider), speech: options.activeModes.speech && Boolean(this.aiProvider) } } : options);
+  }
+
+  async changeMode(candidate: ReviewItemCandidate, mode: ActiveReviewMode): Promise<ReviewItemCandidate> {
+    if (!candidate.active?.availableModes.includes(mode)) throw new Error('That practice mode is unavailable for this item.');
+    const repo = candidate.kind === 'vocabulary' ? this.repos.vocabulary : candidate.kind === 'expression' ? this.repos.expressions : null;
+    const item = repo ? await repo.get(candidate.referenceId) : null;
+    if (!item) throw new Error('This saved language is no longer available.');
+    return activeReviewCandidate(candidate, item, { audio: candidate.active.availableModes.includes('listen_recognize'), speech: candidate.active.availableModes.includes('speak_sentence'), provider: Boolean(this.aiProvider) }, mode);
+  }
+
+  varyContext(candidate: ReviewItemCandidate, stale?: () => boolean): Promise<ReviewItemCandidate> {
+    return varyReviewContext(candidate, this.aiProvider, stale);
   }
 
   /**
@@ -111,9 +126,10 @@ export class ReviewService {
   async evaluateAnswer(
     candidate: ReviewItemCandidate,
     userAnswer: string,
-    coachingContext?: CoachingContext
+    coachingContext?: CoachingContext,
+    evidence?: ActiveReviewEvidence,
   ): Promise<EvaluationResult> {
-    return this.evaluator.evaluate(candidate, userAnswer, coachingContext);
+    return this.evaluator.evaluate(candidate, userAnswer, coachingContext, evidence);
   }
 
   /**
@@ -128,6 +144,8 @@ export class ReviewService {
     _latencyMs?: number,
     options?: ReviewPracticeOptions,
   ): Promise<void> {
+    if (!userAnswer.trim()) return;
+    assertActiveReviewEvidence(candidate, options?.activeEvidence);
     const now = nowIso();
 
     /**
@@ -218,7 +236,7 @@ export class ReviewService {
       await this.repos.review.markReviewed(
         reviewItem.id,
         evaluation.result,
-        evaluation.feedback,
+        candidate.active ? `${candidate.active.mode}; sense: ${candidate.active.meaningDefinition}; context (${candidate.active.contextProvenance ?? 'stored'}): ${candidate.contextSentence ?? '(audio/recall)'}; ${evaluation.feedback}` : evaluation.feedback,
         attemptKey,
       );
     }
@@ -268,7 +286,7 @@ export class ReviewService {
     if (candidate.kind === 'vocabulary') {
       const vocabItem = await this.repos.vocabulary.get(candidate.referenceId);
       if (vocabItem && vocabItem.meanings.length > 0) {
-        const updatedMeanings = vocabItem.meanings.map((m) => ({
+        const updatedMeanings = vocabItem.meanings.map((m, index) => candidate.active && (index !== candidate.active.meaningIndex || m.definition !== candidate.active.meaningDefinition || (m.review?.reviewCount ?? 0) > candidate.active.meaningReviewCount) ? m : ({
           ...m,
           review: {
             state: evaluation.result === 'correct' ? ('familiar' as const) : ('learning' as const),
@@ -286,7 +304,7 @@ export class ReviewService {
     } else if (candidate.kind === 'expression') {
       const exprItem = await this.repos.expressions.get(candidate.referenceId);
       if (exprItem && exprItem.meanings && exprItem.meanings.length > 0) {
-        const updatedMeanings = exprItem.meanings.map((m) => ({
+        const updatedMeanings = exprItem.meanings.map((m, index) => candidate.active && (index !== candidate.active.meaningIndex || m.definition !== candidate.active.meaningDefinition || (m.review?.reviewCount ?? 0) > candidate.active.meaningReviewCount) ? m : ({
           ...m,
           review: {
             state: evaluation.result === 'correct' ? ('familiar' as const) : ('learning' as const),

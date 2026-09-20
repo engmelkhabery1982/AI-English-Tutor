@@ -1,3 +1,4 @@
+import { evaluateActiveReview, type ActiveReviewEvidence } from './active-modes';
 /**
  * src/review/evaluator.ts
  *
@@ -345,7 +346,9 @@ export class ReviewEvaluator {
     candidate: ReviewItemCandidate,
     userAnswer: string,
     coachingContext?: CoachingContext,
+    evidence?: ActiveReviewEvidence,
   ): Promise<EvaluationResult> {
+    if (candidate.active) return evaluateActiveReview(candidate, userAnswer, this.aiProvider, evidence);
     if (
       candidate.exerciseType === 'vocabulary_recall' ||
       candidate.exerciseType === 'fill_the_gap'

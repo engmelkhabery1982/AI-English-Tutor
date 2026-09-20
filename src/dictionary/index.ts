@@ -9,3 +9,5 @@ export * from './prompts';
 export * from './sense-builder';
 export * from './examples';
 export * from './service';
+export * from './inspector';
+export * from './inspector-controller';

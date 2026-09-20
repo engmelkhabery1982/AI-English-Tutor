@@ -1,3 +1,4 @@
+import { deriveReviewEvidenceId } from '../../../review/evidence-identity';
 /**
  * src/data/local/sqlite/repositories.ts
  *
@@ -3530,9 +3531,10 @@ export class SQLiteProgressRepository implements ProgressRepository {
 
   async record(
     record: Omit<ProgressRecord, 'id'>,
+    eventKey?: string,
   ): Promise<ProgressRecord> {
     if (!record.learnerId || !isValidUuid(record.learnerId)) throw new Error('Invalid learnerId');
-    const id = generateId();
+    const id = eventKey ? deriveReviewEvidenceId(['progress', record.learnerId, eventKey]) : generateId();
     await this.adapter.execute(
       `INSERT INTO progress_records (
         id, learner_id, recorded_at, window_start, window_end,
@@ -3540,7 +3542,7 @@ export class SQLiteProgressRepository implements ProgressRepository {
         listening_score, speaking_score, fluency_score, confidence_score,
         pronunciation_score, grammar_score, vocabulary_score,
         new_words_learned, weaknesses_improved, weaknesses_worsened, notes
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
       [
         id,
         record.learnerId,

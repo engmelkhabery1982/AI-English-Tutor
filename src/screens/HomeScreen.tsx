@@ -276,6 +276,9 @@ export default function HomeScreen(props?: HomeScreenProps) {
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Practise and review</Text>
+        <TouchableOpacity style={styles.secondaryButton} onPress={() => navigation.navigate('LearningTools')} accessibilityLabel="Language inspector, stories and next practice">
+          <Text style={styles.secondaryButtonText}>Learning tools · Inspect, read, listen and read aloud</Text>
+        </TouchableOpacity>
         <TouchableOpacity style={styles.secondaryButton} onPress={() => navigation.navigate('Talk')}
           accessibilityLabel="Talk — open conversation" accessibilityHint="Speak or type to your tutor">
           <Text style={styles.secondaryButtonText}>Talk · Open conversation</Text>

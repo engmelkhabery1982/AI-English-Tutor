@@ -1,3 +1,5 @@
+import { runWithSafeRetry } from '../shared/safe-retry';
+import { learnerMessageForFailure } from '../providers/failures';
 /**
  * src/review/voice-controller.ts
  *
@@ -50,7 +52,7 @@ export interface ReviewVoiceControllerOptions {
 }
 
 function describeError(error: unknown, fallback: string): string {
-  return error instanceof Error && error.message ? error.message : fallback;
+  return learnerMessageForFailure(error instanceof Error && error.message ? error.message : fallback, 'speech');
 }
 
 export class ReviewVoiceController {
@@ -360,12 +362,20 @@ export class ReviewVoiceController {
         return this.getStatus();
       }
 
-      const sttRes = await this.stt.transcribe({
-        uri: result.uri,
-        base64: result.base64,
-        mimeType: result.mimeType,
-        durationMs: result.durationMs,
+      const sttOutcome = await runWithSafeRetry({
+        committed: () => this.isStale(generation),
+        surface: 'speech',
+        run: async () => {
+          if (this.isStale(generation)) return { ok: false as const, error: 'Request was replaced.', code: 'cancelled' as const };
+          try {
+            return await this.stt.transcribe({ uri: result.uri, base64: result.base64, mimeType: result.mimeType, durationMs: result.durationMs });
+          } catch (error) {
+            return { ok: false as const, error: error instanceof Error ? error.message : 'Speech recognition failed.' };
+          }
+        },
+        failureOf: value => value.ok ? null : value,
       });
+      const sttRes = sttOutcome.result;
 
       // A transcript that arrives after the attempt was invalidated (item
       // switch, leave, unmount) is discarded — it belongs to the old attempt.
@@ -391,7 +401,7 @@ export class ReviewVoiceController {
         this._state = 'error';
       } else {
         // Failed STT – no evidence
-        this._error = sttRes.error || 'Failed to transcribe speech.';
+        this._error = learnerMessageForFailure(sttRes, 'speech');
         this._state = 'error';
       }
     } catch (error) {

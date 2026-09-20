@@ -40,6 +40,7 @@ export const ROOT_STACK_ROUTES = [
   'Reassessment',
   'Pronunciation',
   'Shadowing',
+  'LearningTools',
 ] as const;
 
 export type RootStackRouteName = (typeof ROOT_STACK_ROUTES)[number];
@@ -101,6 +102,7 @@ export type RootStackParamList = {
   Reassessment: undefined;
   Pronunciation: undefined;
   Shadowing: undefined;
+  LearningTools: undefined;
 };
 
 /** The nested-navigation envelope returned by toMainTabRoute. */

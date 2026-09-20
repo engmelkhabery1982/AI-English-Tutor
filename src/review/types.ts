@@ -1,3 +1,4 @@
+import type { ActiveReviewSpec, ReviewCapabilities } from './active-modes';
 /**
  * src/review/types.ts
  *
@@ -9,6 +10,7 @@ import type { ReviewItem } from '../domain/models/learning';
 
 /** Supported interactive exercise types for review */
 export type ReviewExerciseType =
+  | 'active_language'
   | 'vocabulary_recall'
   | 'expression_use'
   | 'fill_the_gap'
@@ -59,6 +61,7 @@ export interface ReviewItemCandidate {
   readonly consecutiveCorrect: number;
   readonly reviewCount: number;
   readonly easeFactor?: number;
+  readonly active?: ActiveReviewSpec;
 }
 
 /** Status summary for the review dashboard */
@@ -98,6 +101,7 @@ export interface ReviewSessionSummary {
 
 /** Bounding constraints for review session planning */
 export interface ReviewPlannerOptions {
+  readonly activeModes?: ReviewCapabilities;
   readonly minItems?: number; // default 8
   readonly maxItems?: number; // default 12
   readonly targetItems?: number; // default 10

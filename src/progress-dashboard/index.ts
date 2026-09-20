@@ -87,3 +87,4 @@ const defaultService = createRecoverableSingleFlight(
 export function createDefaultProgressDashboardService(): Promise<ProgressDashboardService> {
   return defaultService();
 }
+export * from './next-focus-service';
