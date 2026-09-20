@@ -25,6 +25,7 @@ import { createOnboardingService, type OnboardingService } from './service';
 export type { ListeningExercise } from '../listening';
 
 export * from './types';
+export * from './answer-commit';
 export * from './assessment';
 export * from './session';
 export * from './speaking';

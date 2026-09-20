@@ -60,6 +60,17 @@ export type {
 };
 
 /**
+ * Counts the learner turns REALLY committed in a session.
+ *
+ * This is the single definition of "commit state" used by safe-retry decisions:
+ * a turn may only be replayed while this number is unchanged, and a surface may
+ * only clear preserved learner input after it grew (or after an explicit success).
+ */
+export function countCommittedLearnerTurns(session: ConversationSession): number {
+  return session.getHistory().filter((turn) => turn.role === 'user').length;
+}
+
+/**
  * Creates a defensive copy of a conversation history array and its turns.
  */
 function cloneHistory(turns: readonly ConversationTurn[]): ConversationTurn[] {
@@ -369,6 +380,10 @@ export function createConversationSession(
       abandoned = true;
       // Invalidate every in-flight turn/opening of this session.
       historyVersion += 1;
+    },
+
+    isAbandoned(): boolean {
+      return abandoned;
     },
 
     getConfig(): ConversationSessionConfig {

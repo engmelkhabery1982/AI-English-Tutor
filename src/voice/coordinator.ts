@@ -26,11 +26,19 @@
  *   microphone opens, so TTS and recording never run concurrently.
  */
 
-import type { ConversationSession, ConversationTurn } from '../conversation-session';
-import type { SpeechToTextProvider } from '../providers/stt';
+import {
+  countCommittedLearnerTurns,
+  type ConversationSession,
+  type ConversationSessionResult,
+  type ConversationTurn,
+} from '../conversation-session';
+import type { SpeechToTextProvider, STTResult } from '../providers/stt';
 import type { TextToSpeechProvider } from '../providers/tts';
+import { classifyProviderFailure, type ProviderFailure } from '../providers/failures';
+import { runWithSafeRetry } from '../shared/safe-retry';
 import type {
   AudioRecorderService,
+  AudioRecordingResult,
   VoiceState,
   VoiceStatus,
   VoiceStatusListener,
@@ -48,6 +56,32 @@ export const VOICE_DISPOSED_MESSAGE = 'This conversation was closed.';
 
 /** Message used when voice work is requested while the session is switching. */
 export const VOICE_SWITCHING_MESSAGE = 'The conversation is changing. Please try again.';
+
+/** Used when a retry is asked for but nothing recoverable survived. */
+/** A stop/retry arrived while nothing was recording: honest and learner-safe. */
+export const VOICE_NOTHING_TO_STOP_MESSAGE =
+  'Nothing is recording right now, so there was nothing to stop.';
+
+export const VOICE_NOTHING_TO_RETRY_MESSAGE =
+  'There is nothing to send again yet. Record your answer first.';
+
+/**
+ * The outcome of ONE spoken learner turn (or of a recovery retry).
+ *
+ * `error` is ALWAYS learner-safe: it comes from the ONE provider-failure
+ * classification path (src/providers/failures.ts), never from a raw provider
+ * payload. The raw detail is available in `technical` for logs/diagnostics only
+ * and must never be rendered.
+ */
+export interface VoiceTurnOutcome {
+  readonly ok: boolean;
+  readonly transcript?: string;
+  readonly error?: string;
+  /** Technical/log detail. NEVER show this to the learner. */
+  readonly technical?: string;
+  /** The classified failure, so callers can decide recovery (Retry / Type). */
+  readonly failure?: ProviderFailure;
+}
 
 /**
  * Learner-facing lifecycle of one conversational voice turn. Derived from — and
@@ -184,6 +218,28 @@ export class VoiceSessionCoordinator {
   private appStateSub: { remove: () => void } | null = null;
   private lastAppState: string = 'active';
   private lastAudioUri: string | null = null;
+  /**
+   * The learner's OWN transcript of a spoken turn that has NOT been committed
+   * because the tutor reply failed. Preserved so an explicit Retry sends the
+   * SAME turn (no re-recording) and so it can never be committed twice.
+   */
+  private pendingTurn: {
+    readonly transcript: string;
+    readonly session: ConversationSession;
+    readonly generation: number;
+  } | null = null;
+  /**
+   * A recording that survived a FAILED transcription. Preserved so the learner
+   * can transcribe it again instead of speaking a second time. `transcribeOnly`
+   * keeps the retry on the SAME contract as the original capture, so an
+   * evidence-only repeat can never become a conversation turn.
+   */
+  private recoverableRecording: {
+    readonly audio: AudioRecordingResult;
+    readonly session: ConversationSession;
+    readonly generation: number;
+    readonly transcribeOnly: boolean;
+  } | null = null;
 
   constructor(config: VoiceSessionCoordinatorConfig) {
     this.recorder = config.recorder;
@@ -257,6 +313,8 @@ export class VoiceSessionCoordinator {
     if (this.state === 'recording') {
       this.cancelRecording();
     }
+    // Preserved work belonged to the replaced session: it is never carried over.
+    this.invalidateRecoverableWork();
     this.session = newSession;
     this.recognizedTranscript = null;
     this.errorMessage = null;
@@ -292,6 +350,9 @@ export class VoiceSessionCoordinator {
     this.generation += 1;
     const generation = this.generation;
     this.switching = true;
+    // Recovery state of the OUTGOING conversation is invalidated synchronously:
+    // a preserved transcript/recording can never be replayed into the new one.
+    this.invalidateRecoverableWork();
     this.notifyListeners();
 
     // 2. The replaced session becomes non-writable at the exact start of the
@@ -380,6 +441,12 @@ export class VoiceSessionCoordinator {
       this.state !== 'recording' &&
       this.state !== 'transcribing';
 
+    // Recovery affordances: an explicit learner Retry is possible while nothing
+    // is in flight and the preserved work still belongs to the ACTIVE session.
+    const canRetry = !this.disposed && !this.switching && !this.processing;
+    const pendingTranscript = canRetry ? this.getPendingTranscript() : null;
+    const hasRecoverableRecording = canRetry && this.hasRecoverableRecording();
+
     return {
       state: this.state,
       elapsedSeconds: this.elapsedSeconds,
@@ -392,6 +459,9 @@ export class VoiceSessionCoordinator {
       canSendText,
       isProcessing: this.processing,
       isSwitching: this.switching,
+      pendingTranscript,
+      canRetryPendingTurn: pendingTranscript !== null,
+      canRetryTranscription: hasRecoverableRecording,
     };
   }
 
@@ -426,6 +496,11 @@ export class VoiceSessionCoordinator {
     ) {
       return false;
     }
+
+    // A NEW utterance supersedes any preserved recovery state: the learner chose
+    // to speak again, so the previous transcript/recording is dropped (with its
+    // temp file) and can never be sent a second time.
+    this.invalidateRecoverableWork();
 
     // Interruption ordering (barge-in): any tutor playback is stopped and
     // AWAITED first, so TTS and the microphone are never active at the same
@@ -506,17 +581,37 @@ export class VoiceSessionCoordinator {
   }
 
   /**
-   * Stops recording, transcribes audio with STT, and automatically submits transcript to ConversationSession.
+   * Stops recording, transcribes the audio with the EXISTING STT provider and
+   * submits the transcript to the ConversationSession this utterance belongs to.
+   *
+   * RECOVERY CONTRACT (one utterance, at most one committed turn)
+   * - Re-entrancy is refused BEFORE any await, so a double tap can never submit
+   *   the same utterance twice.
+   * - A TRANSIENT transcription failure (service busy / timeout / interrupted
+   *   connection) gets ONE short automatic retry on the SAME audio. STT commits
+   *   nothing, so replaying it can never duplicate a learner turn.
+   * - When transcription fails, the RECORDING is preserved: the learner retries
+   *   the transcription (`retryTranscription()`) instead of speaking again.
+   * - When transcription SUCCEEDS but the tutor reply fails, the TRANSCRIPT is
+   *   preserved (`getStatus().pendingTranscript`): the learner sends the SAME
+   *   turn again (`retryPendingTurn()`) or edits it as text
+   *   (`takePendingTranscript()`). Nothing is committed by a failed turn and no
+   *   evidence is created from it.
+   * - The tutor turn is replayed automatically ONLY while nothing was committed
+   *   and no reply content was streamed; otherwise recovery is an explicit
+   *   learner Retry, which re-verifies the commit state first.
+   * - Every learner-facing message goes through the ONE provider-failure path:
+   *   raw provider payloads stay in `technical` (logs only).
    */
   async stopRecordingAndProcess(
     onStreamChunk?: (chunk: string) => void
-  ): Promise<{ ok: boolean; transcript?: string; error?: string }> {
+  ): Promise<VoiceTurnOutcome> {
     if (this.disposed) return { ok: false, error: VOICE_DISPOSED_MESSAGE };
     if (this.switching) return { ok: false, error: VOICE_SWITCHING_MESSAGE };
     // One learner utterance = at most one submitted turn: this guard (plus the
     // immediate state change below) makes a re-entrant call impossible.
     if (this.processing || this.state !== 'recording') {
-      return { ok: false, error: 'Not currently recording.' };
+      return { ok: false, error: VOICE_NOTHING_TO_STOP_MESSAGE };
     }
 
     // Bind the whole operation to the session that is active right now.
@@ -534,129 +629,41 @@ export class VoiceSessionCoordinator {
     this.state = 'transcribing';
     this.notifyListeners();
 
-    let audio;
+    let audio: AudioRecordingResult;
     try {
       audio = await this.recorder.stopRecording();
       this.lastAudioUri = audio?.uri ?? null;
     } catch (err: unknown) {
       this.processing = false;
-      const message =
-        err instanceof Error ? err.message : 'Failed to stop audio recording.';
-      this.setStateIfCurrent(session, generation, 'error', message);
-      return { ok: false, error: message };
+      this.dropRecoverableRecording();
+      const failure = classifyProviderFailure(
+        err instanceof Error ? err.message : 'Failed to stop audio recording.',
+        'speech',
+      );
+      this.setStateIfCurrent(session, generation, 'error', failure.message);
+      return {
+        ok: false,
+        error: failure.message,
+        ...(failure.technical ? { technical: failure.technical } : {}),
+        failure,
+      };
     }
 
     if (!this.isCurrent(session, generation)) {
       // The session was replaced while the audio was being captured: the audio
       // belongs to the previous conversation, so it is not transcribed.
-      // Cleanup owned temp file – stale/disposed cleans owned
-      const toClean = this.lastAudioUri;
-      this.lastAudioUri = null;
-      void this.cleanupAudio(toClean);
+      this.dropRecoverableRecording();
       this.processing = false;
       return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
     }
 
-    // 1. Speech to Text
-    let sttResult;
-    try {
-      sttResult = await this.sttProvider.transcribe(audio);
-    } catch (err: unknown) {
-      const toClean = this.lastAudioUri;
-      this.lastAudioUri = null;
-      void this.cleanupAudio(toClean);
-      this.processing = false;
-      const message =
-        err instanceof Error ? err.message : 'Could not recognize speech. Please try speaking again.';
-      this.setStateIfCurrent(session, generation, 'error', message);
-      return { ok: false, error: message };
-    }
-
-    if (!this.isCurrent(session, generation)) {
-      // A late STT result must never be attached to the replacement session.
-      const toClean = this.lastAudioUri;
-      this.lastAudioUri = null;
-      void this.cleanupAudio(toClean);
-      this.processing = false;
-      return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
-    }
-
-    if (!sttResult.ok || !sttResult.transcript || sttResult.transcript.trim().length === 0) {
-      const toClean = this.lastAudioUri;
-      this.lastAudioUri = null;
-      void this.cleanupAudio(toClean);
-      this.processing = false;
-      const errorMsg =
-        sttResult.error || 'Could not recognize speech. Please try speaking again.';
-      this.setStateIfCurrent(session, generation, 'error', errorMsg);
-      // CRITICAL: ConversationSession history remains unchanged! Failed STT no evidence
-      return { ok: false, error: errorMsg };
-    }
-
-    // STT succeeded – file no longer needed by STT, cleanup after dependent pronunciation done.
-    // For conversational path, pronunciation happens later in TalkScreen, so we keep uri until after send?
-    // Actually STT consumer done, but pronunciation may still need transcript only, not file.
-    // So cleanup now is safe – file not needed by other consumer (transcript already extracted).
-    const audioUriForCleanup = this.lastAudioUri;
-    this.lastAudioUri = null;
-    void this.cleanupAudio(audioUriForCleanup);
-
-    const transcript = sttResult.transcript.trim();
-    this.recognizedTranscript = transcript;
-    this.state = 'sending';
-    this.notifyListeners();
-
-    // 2. Submit transcript to the session this utterance belongs to
-    try {
-      const sessionResult = await session.send({ userMessage: transcript }, onStreamChunk);
-
-      if (!this.isCurrent(session, generation)) {
-        this.processing = false;
-        return { ok: false, transcript, error: VOICE_SESSION_CHANGED_MESSAGE };
-      }
-
-      if (!sessionResult.ok) {
-        this.processing = false;
-        this.errorMessage = sessionResult.error?.message || 'Tutor response failed.';
-        this.state = 'error';
-        this.notifyListeners();
-        return { ok: false, transcript, error: this.errorMessage };
-      }
-
-      // 3. Play the learner-facing tutor reply via TTS if not muted.
-      // The conversational turn is now complete, so playback no longer counts as
-      // in-flight work: the learner can interrupt the tutor and speak (barge-in).
-      this.processing = false;
-
-      if (!this.isMuted) {
-        const history = session.getHistory();
-        const lastAssistantTurn = this.findLastAssistantTurn(history);
-        if (lastAssistantTurn && lastAssistantTurn.content.trim().length > 0) {
-          try {
-            await this.speakResponse(lastAssistantTurn.content, session, generation);
-          } catch {
-            // TTS failure must not roll back conversation or fail the conversational turn
-          }
-          return { ok: true, transcript };
-        }
-      }
-
-      if (this.isCurrent(session, generation)) {
-        this.state = 'idle';
-        this.notifyListeners();
-      }
-      return { ok: true, transcript };
-    } catch (err: unknown) {
-      this.processing = false;
-      const message =
-        err instanceof Error ? err.message : 'Error processing tutor response.';
-      if (this.isCurrent(session, generation)) {
-        this.errorMessage = message;
-        this.state = 'error';
-        this.notifyListeners();
-      }
-      return { ok: false, transcript, error: message };
-    }
+    return this.runSpokenTurn({
+      audio,
+      session,
+      generation,
+      transcribeOnly: false,
+      ...(onStreamChunk ? { onStreamChunk } : {}),
+    });
   }
 
   /**
@@ -672,19 +679,17 @@ export class VoiceSessionCoordinator {
    *
    * Lifecycle integrity is identical to the conversational path: one utterance
    * is transcribed at most once, a duplicate stop is refused, and a replaced or
-   * disposed session invalidates the late STT result.
+   * disposed session invalidates the late STT result. A failed transcription
+   * preserves the recording, and `retryTranscription()` repeats the SAME
+   * transcription-only contract (it can never turn into a conversation turn).
    */
-  async stopRecordingAndTranscribe(): Promise<{
-    ok: boolean;
-    transcript?: string;
-    error?: string;
-  }> {
+  async stopRecordingAndTranscribe(): Promise<VoiceTurnOutcome> {
     if (this.disposed) return { ok: false, error: VOICE_DISPOSED_MESSAGE };
     if (this.switching) return { ok: false, error: VOICE_SWITCHING_MESSAGE };
     // One utterance = at most one transcription: this guard (plus the immediate
     // state change below) makes a re-entrant/duplicate stop impossible.
     if (this.processing || this.state !== 'recording') {
-      return { ok: false, error: 'Not currently recording.' };
+      return { ok: false, error: VOICE_NOTHING_TO_STOP_MESSAGE };
     }
 
     // Bind the operation to the session that is active right now.
@@ -701,78 +706,421 @@ export class VoiceSessionCoordinator {
     this.state = 'transcribing';
     this.notifyListeners();
 
-    let audio;
+    let audio: AudioRecordingResult;
     try {
       audio = await this.recorder.stopRecording();
       this.lastAudioUri = audio?.uri ?? null;
     } catch (err: unknown) {
       this.processing = false;
-      const message = err instanceof Error ? err.message : 'Failed to stop audio recording.';
-      this.setStateIfCurrent(session, generation, 'error', message);
-      return { ok: false, error: message };
+      this.dropRecoverableRecording();
+      const failure = classifyProviderFailure(
+        err instanceof Error ? err.message : 'Failed to stop audio recording.',
+        'speech',
+      );
+      this.setStateIfCurrent(session, generation, 'error', failure.message);
+      return {
+        ok: false,
+        error: failure.message,
+        ...(failure.technical ? { technical: failure.technical } : {}),
+        failure,
+      };
     }
 
     if (!this.isCurrent(session, generation)) {
-      const toClean = this.lastAudioUri;
-      this.lastAudioUri = null;
-      void this.cleanupAudio(toClean);
+      this.dropRecoverableRecording();
       this.processing = false;
       return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
     }
 
-    let sttResult;
-    try {
-      sttResult = await this.sttProvider.transcribe(audio);
-    } catch (err: unknown) {
-      const toClean = this.lastAudioUri;
-      this.lastAudioUri = null;
-      void this.cleanupAudio(toClean);
-      this.processing = false;
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'Could not recognize speech. Please try speaking again.';
-      this.setStateIfCurrent(session, generation, 'error', message);
-      return { ok: false, error: message };
+    return this.runSpokenTurn({ audio, session, generation, transcribeOnly: true });
+  }
+
+  /**
+   * Retries the transcription of a PRESERVED recording after a failed STT call.
+   *
+   * The learner does not have to speak again: the same audio is transcribed once
+   * more through the SAME provider and the SAME lifecycle guards. A recording
+   * captured by the transcription-only path stays transcription-only, so this
+   * retry can never commit a conversation turn that the original did not.
+   */
+  async retryTranscription(onStreamChunk?: (chunk: string) => void): Promise<VoiceTurnOutcome> {
+    if (this.disposed) return { ok: false, error: VOICE_DISPOSED_MESSAGE };
+    if (this.switching) return { ok: false, error: VOICE_SWITCHING_MESSAGE };
+    if (this.processing) {
+      return { ok: false, error: 'Your previous answer is still being processed.' };
+    }
+    const recoverable = this.recoverableRecording;
+    if (!recoverable) {
+      return { ok: false, error: VOICE_NOTHING_TO_RETRY_MESSAGE };
+    }
+    if (!this.isCurrent(recoverable.session, recoverable.generation)) {
+      // The conversation moved on: the preserved audio belongs to a dead session.
+      this.dropRecoverableRecording();
+      return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
     }
 
+    this.processing = true;
+    this.errorMessage = null;
+    this.state = 'transcribing';
+    this.notifyListeners();
+
+    return this.runSpokenTurn({
+      audio: recoverable.audio,
+      session: recoverable.session,
+      generation: recoverable.generation,
+      transcribeOnly: recoverable.transcribeOnly,
+      ...(onStreamChunk ? { onStreamChunk } : {}),
+    });
+  }
+
+  /**
+   * Sends the PRESERVED transcript again after the tutor reply failed.
+   *
+   * Explicit learner Retry only — never automatic. It cannot duplicate a learner
+   * turn: when the transcript is already in the committed history (the previous
+   * attempt really did commit), the turn is reported as committed and nothing is
+   * sent again.
+   */
+  async retryPendingTurn(onStreamChunk?: (chunk: string) => void): Promise<VoiceTurnOutcome> {
+    if (this.disposed) return { ok: false, error: VOICE_DISPOSED_MESSAGE };
+    if (this.switching) return { ok: false, error: VOICE_SWITCHING_MESSAGE };
+    if (this.processing) {
+      return { ok: false, error: 'Your previous answer is still being processed.' };
+    }
+    const pending = this.pendingTurn;
+    if (!pending) {
+      return { ok: false, error: VOICE_NOTHING_TO_RETRY_MESSAGE };
+    }
+    if (!this.isCurrent(pending.session, pending.generation)) {
+      this.pendingTurn = null;
+      return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
+    }
+
+    // Commit-state verification: a turn that really committed is never replayed.
+    const alreadyCommitted = pending.session
+      .getHistory()
+      .some((turn) => turn.role === 'user' && turn.content === pending.transcript);
+    if (alreadyCommitted) {
+      this.pendingTurn = null;
+      this.processing = false;
+      this.errorMessage = null;
+      this.state = 'idle';
+      this.notifyListeners();
+      return { ok: true, transcript: pending.transcript };
+    }
+
+    this.processing = true;
+    this.errorMessage = null;
+    this.state = 'sending';
+    this.notifyListeners();
+
+    return this.submitTranscript({
+      transcript: pending.transcript,
+      session: pending.session,
+      generation: pending.generation,
+      ...(onStreamChunk ? { onStreamChunk } : {}),
+    });
+  }
+
+  /** The preserved transcript of an uncommitted spoken turn (or null). */
+  getPendingTranscript(): string | null {
+    const pending = this.pendingTurn;
+    if (!pending) return null;
+    if (!this.isCurrent(pending.session, pending.generation)) {
+      this.pendingTurn = null;
+      return null;
+    }
+    return pending.transcript;
+  }
+
+  /**
+   * Hands the preserved transcript to the learner as editable TEXT ("Type
+   * instead") and clears the pending voice turn, so the same utterance can never
+   * be sent twice (once as text, once as a voice retry).
+   */
+  takePendingTranscript(): string | null {
+    const transcript = this.getPendingTranscript();
+    this.pendingTurn = null;
+    if (this.state === 'error') {
+      this.state = 'idle';
+      this.notifyListeners();
+    }
+    return transcript;
+  }
+
+  /** Drops a preserved transcript (the learner moved on). */
+  clearPendingTurn(): void {
+    this.pendingTurn = null;
+    if (this.state === 'error' && !this.processing) {
+      this.state = 'idle';
+      this.notifyListeners();
+    }
+  }
+
+  /** True when a recording survived a failed transcription and can be retried. */
+  hasRecoverableRecording(): boolean {
+    const recoverable = this.recoverableRecording;
+    if (!recoverable) return false;
+    if (!this.isCurrent(recoverable.session, recoverable.generation)) {
+      this.dropRecoverableRecording();
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * STT (+ optional turn submission) for ONE recorded utterance. Shared by the
+   * first attempt and by `retryTranscription()`, so there is exactly ONE voice
+   * pipeline and one set of lifecycle guards.
+   */
+  private async runSpokenTurn(input: {
+    readonly audio: AudioRecordingResult;
+    readonly session: ConversationSession;
+    readonly generation: number;
+    readonly transcribeOnly: boolean;
+    readonly onStreamChunk?: (chunk: string) => void;
+  }): Promise<VoiceTurnOutcome> {
+    const { audio, session, generation } = input;
+
+    // 1. Speech to text. STT commits nothing, so ONE short automatic retry of a
+    //    transient failure is safe and cannot duplicate a learner turn.
+    const stt = await runWithSafeRetry<STTResult>({
+      surface: 'speech',
+      committed: () => false,
+      run: async () => {
+        if (!this.isCurrent(session, generation)) {
+          return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
+        }
+        try {
+          return await this.sttProvider.transcribe(audio);
+        } catch (err: unknown) {
+          return {
+            ok: false,
+            error:
+              err instanceof Error
+                ? err.message
+                : 'Could not recognize speech. Please try speaking again.',
+          };
+        }
+      },
+      failureOf: (result) => (result.ok ? null : { message: result.error ?? null }),
+    });
+
     if (!this.isCurrent(session, generation)) {
-      const toClean = this.lastAudioUri;
-      this.lastAudioUri = null;
-      void this.cleanupAudio(toClean);
+      // A late STT result must never be attached to the replacement session.
+      this.dropRecoverableRecording();
       this.processing = false;
       return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
     }
 
-    if (!sttResult.ok || !sttResult.transcript || sttResult.transcript.trim().length === 0) {
-      const toClean = this.lastAudioUri;
-      this.lastAudioUri = null;
-      void this.cleanupAudio(toClean);
+    const transcript = stt.result.ok ? (stt.result.transcript ?? '').trim() : '';
+
+    if (!stt.result.ok || transcript.length === 0) {
+      // FAILED / EMPTY TRANSCRIPTION: nothing was submitted anywhere, so no turn,
+      // no feedback and no evidence exist. The recording is PRESERVED so the
+      // learner can retry the transcription instead of speaking again.
+      this.recoverableRecording = {
+        audio,
+        session,
+        generation,
+        transcribeOnly: input.transcribeOnly,
+      };
+      this.lastAudioUri = audio?.uri ?? null;
       this.processing = false;
-      const errorMsg = sttResult.error || 'Could not recognize speech. Please try speaking again.';
-      this.setStateIfCurrent(session, generation, 'error', errorMsg);
-      // CRITICAL: no conversation turn, no feedback and no vocabulary — nothing
-      // was submitted anywhere. Failed/empty STT no evidence
-      return { ok: false, error: errorMsg };
+      const failure =
+        stt.failure ??
+        classifyProviderFailure(
+          'Could not recognize speech. Please try speaking again.',
+          'speech',
+        );
+      this.setStateIfCurrent(session, generation, 'error', failure.message);
+      return {
+        ok: false,
+        error: failure.message,
+        ...(failure.technical ? { technical: failure.technical } : {}),
+        failure,
+      };
     }
 
-    // STT succeeded – cleanup temp file after dependent pronunciation no longer needs file.
-    // Pronunciation uses transcript only, not file, so safe to cleanup now.
-    const uriToClean = this.lastAudioUri;
-    this.lastAudioUri = null;
-    void this.cleanupAudio(uriToClean);
+    // STT succeeded: no consumer needs the temp file any more (pronunciation
+    // works on the transcript text, not on the audio).
+    this.dropRecoverableRecording();
 
-    // STOP HERE (the whole point of this operation): return the real transcript
-    // to the caller. Nothing is submitted to the ConversationSession, nothing is
-    // spoken, and the coordinator returns to a calm idle state.
-    const transcript = sttResult.transcript.trim();
+    if (input.transcribeOnly) {
+      // STOP HERE (the whole point of this operation): return the real transcript
+      // to the caller. Nothing is submitted to the ConversationSession, nothing
+      // is spoken, and the coordinator returns to a calm idle state.
+      this.recognizedTranscript = transcript;
+      this.processing = false;
+      if (this.isCurrent(session, generation)) {
+        this.state = 'idle';
+        this.notifyListeners();
+      }
+      return { ok: true, transcript };
+    }
+
     this.recognizedTranscript = transcript;
+    this.state = 'sending';
+    this.notifyListeners();
+
+    // 2. Submit the transcript to the session this utterance belongs to. From
+    //    here the transcript is PRESERVED until the turn really commits.
+    this.pendingTurn = { transcript, session, generation };
+    return this.submitTranscript({
+      transcript,
+      session,
+      generation,
+      ...(input.onStreamChunk ? { onStreamChunk: input.onStreamChunk } : {}),
+    });
+  }
+
+  /**
+   * Submits ONE transcript to the session it belongs to. Shared by the first
+   * attempt and by an explicit learner retry of a preserved transcript, so the
+   * commit guards exist exactly once.
+   */
+  private async submitTranscript(input: {
+    readonly transcript: string;
+    readonly session: ConversationSession;
+    readonly generation: number;
+    readonly onStreamChunk?: (chunk: string) => void;
+  }): Promise<VoiceTurnOutcome> {
+    const { transcript, session, generation } = input;
+    const baselineLearnerTurns = countCommittedLearnerTurns(session);
+    let streamed = false;
+    const onChunk = input.onStreamChunk
+      ? (chunk: string) => {
+          streamed = true;
+          input.onStreamChunk?.(chunk);
+        }
+      : undefined;
+
+    const sent = await runWithSafeRetry<ConversationSessionResult>({
+      surface: 'tutor',
+      run: async (): Promise<ConversationSessionResult> => {
+        if (!this.isCurrent(session, generation)) {
+          return {
+            ok: false,
+            error: {
+              code: 'cancelled',
+              message: VOICE_SESSION_CHANGED_MESSAGE,
+              retryable: false,
+            },
+            history: session.getHistory(),
+          };
+        }
+        try {
+          return onChunk
+            ? await session.send({ userMessage: transcript }, onChunk)
+            : await session.send({ userMessage: transcript });
+        } catch (err: unknown) {
+          return {
+            ok: false,
+            error: {
+              code: 'unknown',
+              message:
+                err instanceof Error ? err.message : 'Error processing tutor response.',
+              retryable: true,
+            },
+            history: session.getHistory(),
+          };
+        }
+      },
+      failureOf: (result) =>
+        result.ok
+          ? null
+          : {
+              message: result.error?.message ?? null,
+              code: result.error?.code ?? null,
+              retryable: result.error?.retryable,
+            },
+      /**
+       * Commit-state verification: an automatic replay is refused as soon as a
+       * learner turn was committed or reply content was streamed. The state is
+       * then uncertain, and only an explicit learner Retry — which re-verifies
+       * the committed history — may proceed.
+       */
+      committed: () => streamed || countCommittedLearnerTurns(session) !== baselineLearnerTurns,
+    });
+
+    const result = sent.result;
+
+    if (!this.isCurrent(session, generation)) {
+      // The session was replaced while the tutor was answering: never commit and
+      // never keep the transcript for the replacement conversation.
+      this.pendingTurn = null;
+      this.processing = false;
+      return { ok: false, transcript, error: VOICE_SESSION_CHANGED_MESSAGE };
+    }
+
+    if (!result.ok) {
+      this.processing = false;
+      const failure =
+        sent.failure ?? classifyProviderFailure(result.error?.message ?? null, 'tutor');
+      // The transcript SURVIVES a failed tutor reply: the learner retries the
+      // SAME turn (or edits it as text) instead of recording again. Nothing was
+      // committed, so no evidence exists for this attempt.
+      this.pendingTurn = { transcript, session, generation };
+      this.errorMessage = failure.message;
+      this.state = 'error';
+      this.notifyListeners();
+      return {
+        ok: false,
+        transcript,
+        error: failure.message,
+        ...(failure.technical ? { technical: failure.technical } : {}),
+        failure,
+      };
+    }
+
+    // COMMITTED exactly once: the preserved transcript is no longer pending.
+    this.pendingTurn = null;
+    // The conversational turn is now complete, so playback no longer counts as
+    // in-flight work: the learner can interrupt the tutor and speak (barge-in).
     this.processing = false;
+
+    // 3. Play the learner-facing tutor reply via TTS if not muted.
+    if (!this.isMuted) {
+      const history = session.getHistory();
+      const lastAssistantTurn = this.findLastAssistantTurn(history);
+      if (lastAssistantTurn && lastAssistantTurn.content.trim().length > 0) {
+        try {
+          await this.speakResponse(lastAssistantTurn.content, session, generation);
+        } catch {
+          // TTS failure must not roll back conversation or fail the turn.
+        }
+        return { ok: true, transcript };
+      }
+    }
+
     if (this.isCurrent(session, generation)) {
       this.state = 'idle';
       this.notifyListeners();
     }
     return { ok: true, transcript };
+  }
+
+  /**
+   * Invalidates EVERY preserved recovery state (pending transcript + preserved
+   * recording). Preserved work belongs to exactly one session/generation, so it
+   * is dropped whenever the conversation changes or the coordinator is reset,
+   * backgrounded or disposed: it can never be replayed into another session.
+   */
+  private invalidateRecoverableWork(): void {
+    this.pendingTurn = null;
+    this.dropRecoverableRecording();
+  }
+
+  /**
+   * Drops the preserved recording (and its temp file). Called whenever the
+   * recoverable state stops being valid: a new utterance, a successful
+   * transcription, a session switch, a reset, backgrounding or disposal.
+   */
+  private dropRecoverableRecording(): void {
+    this.recoverableRecording = null;
+    const uri = this.lastAudioUri;
+    this.lastAudioUri = null;
+    if (uri) void this.cleanupAudio(uri);
   }
 
   /**
@@ -934,6 +1282,7 @@ export class VoiceSessionCoordinator {
     this.elapsedSeconds = 0;
     this.recognizedTranscript = null;
     this.errorMessage = null;
+    this.invalidateRecoverableWork();
     this.notifyListeners();
   }
 
@@ -953,6 +1302,11 @@ export class VoiceSessionCoordinator {
     // Synchronous invalidation FIRST
     this.generation += 1;
     this.session.abandon?.();
+    // Preserved recovery work belonged to the interrupted attempt: it is dropped
+    // instead of surviving into the next foreground turn (its temp file is
+    // cleaned by the owned-uri handling right below).
+    this.pendingTurn = null;
+    this.recoverableRecording = null;
     // Stop timer synchronously
     if (this.timerHandle) {
       clearInterval(this.timerHandle);
@@ -1040,6 +1394,9 @@ export class VoiceSessionCoordinator {
     }
     const ownedUri = this.lastAudioUri;
     this.lastAudioUri = null;
+    // Terminal: no preserved transcript or recording survives disposal.
+    this.pendingTurn = null;
+    this.recoverableRecording = null;
     if (ownedUri) {
       try {
         await this.cleanupAudio(ownedUri);

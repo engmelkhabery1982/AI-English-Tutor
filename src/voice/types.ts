@@ -50,6 +50,20 @@ export interface VoiceStatus {
    * session. No new voice work may start until the switch completes.
    */
   readonly isSwitching?: boolean;
+  /**
+   * The learner's OWN transcript that has not been committed into the
+   * conversation yet because the tutor reply failed. It is preserved so the
+   * learner can retry the SAME turn (or edit it as text) instead of recording
+   * again. Null when nothing is recoverable.
+   */
+  readonly pendingTranscript?: string | null;
+  /** True when a preserved transcript can be sent again (explicit learner Retry). */
+  readonly canRetryPendingTurn?: boolean;
+  /**
+   * True when the recording itself survived a failed transcription and can be
+   * transcribed again without asking the learner to speak a second time.
+   */
+  readonly canRetryTranscription?: boolean;
 }
 
 export type VoiceStatusListener = (status: VoiceStatus) => void;

@@ -63,14 +63,41 @@ import {
   createVoiceSessionCoordinator,
   describeVoiceTurn,
   VoiceSessionCoordinator,
+  VOICE_NOTHING_TO_RETRY_MESSAGE,
   type AudioRecorderService,
   type AudioRecordingResult,
   type VoiceState,
   type VoiceStatus,
   type VoiceStatusListener,
+  type VoiceTurnOutcome,
   type VoiceTurnPhase,
   type VoiceTurnView,
 } from '../voice';
+import {
+  classifyProviderFailure,
+  isConfigurationFailure,
+  isReplacementFailure,
+  isTransientProviderFailure,
+  learnerMessageForFailure,
+  PROVIDER_FAILURE_MESSAGES,
+  type ProviderFailure,
+  type ProviderFailureInput,
+  type ProviderFailureKind,
+  type ProviderFailureSurface,
+} from '../providers/failures';
+import { runWithSafeRetry, canLearnerRetry } from '../shared/safe-retry';
+import {
+  conversationIdentity,
+  hasUnappliedTopicDraft,
+  isConversationReusable,
+  normalizeTopicDraft,
+  resolveConversationIdentity,
+  TALK_CONVERSATION_RESTARTED_MESSAGE,
+  TALK_CONVERSATION_RESTARTED_MIC_MESSAGE,
+  type ConversationIdentityDecision,
+  type ConversationIdentityInput,
+  type ConversationIdentityReason,
+} from './conversation-identity';
 import { createRecoverableSingleFlight } from '../shared/single-flight';
 import { createDemoLearnerModel } from './demo-learner-model';
 import {
@@ -128,6 +155,48 @@ export {
   VoiceSessionCoordinator,
   sanitizeTextForTTS,
   describeVoiceTurn,
+  VOICE_NOTHING_TO_RETRY_MESSAGE,
+};
+/**
+ * THE ONE provider-failure path, re-exported for the surfaces that compose Talk
+ * (assessment, fluency practice, review). Learner-facing text must always come
+ * from here — never from a raw provider payload.
+ */
+export {
+  classifyProviderFailure,
+  learnerMessageForFailure,
+  isTransientProviderFailure,
+  isConfigurationFailure,
+  isReplacementFailure,
+  PROVIDER_FAILURE_MESSAGES,
+  runWithSafeRetry,
+  canLearnerRetry,
+};
+export type {
+  ProviderFailure,
+  ProviderFailureInput,
+  ProviderFailureKind,
+  ProviderFailureSurface,
+  VoiceTurnOutcome,
+};
+/**
+ * Conversation identity rules (Work Order 1, item 5): a typed topic is a DRAFT,
+ * identity is stable while a turn is in flight, and a live conversation is only
+ * replaced by an explicit learner action.
+ */
+export {
+  conversationIdentity,
+  hasUnappliedTopicDraft,
+  isConversationReusable,
+  normalizeTopicDraft,
+  resolveConversationIdentity,
+  TALK_CONVERSATION_RESTARTED_MESSAGE,
+  TALK_CONVERSATION_RESTARTED_MIC_MESSAGE,
+};
+export type {
+  ConversationIdentityDecision,
+  ConversationIdentityInput,
+  ConversationIdentityReason,
 };
 export type {
   SpeechToTextProvider,

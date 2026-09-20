@@ -129,8 +129,19 @@ describe('VoiceSessionCoordinator', () => {
     const result = await coordinator.stopRecordingAndProcess();
 
     expect(result.ok).toBe(false);
-    expect(result.error).toContain('Audio was not clear');
+    // The learner sees the ONE classified, learner-safe speech failure — never
+    // the raw provider text, which stays available for diagnostics only.
+    expect(result.error).toBe(
+      'I could not hear clear speech in that recording. Nothing was recorded. Try again, or type your answer.',
+    );
+    expect(result.technical).toContain('Audio was not clear');
+    expect(result.failure?.kind).toBe('unrecognized_speech');
     expect(coordinator.getStatus().state).toBe('error');
+    expect(coordinator.getStatus().errorMessage).toBe(result.error);
+    // The failed transcription produced NO transcript to preserve, but the
+    // RECORDING survived so the learner can retry without speaking again.
+    expect(coordinator.getStatus().pendingTranscript).toBeNull();
+    expect(coordinator.getStatus().canRetryTranscription).toBe(true);
 
     // History must NOT be touched
     expect(session.getHistory().length).toBe(0);
@@ -248,9 +259,20 @@ describe('VoiceSessionCoordinator', () => {
 
     expect(result.ok).toBe(false);
     expect(result.transcript).toBe('Testing error flow');
-    expect(result.error).toContain('AI Provider quota exceeded');
+    // The raw provider text never reaches the learner: the message comes from
+    // the ONE provider-failure catalog, and the raw detail stays diagnostic.
+    expect(result.error).not.toContain('quota');
+    expect(result.error).toBe(
+      'The tutor service is busy right now. Your answer was not lost. Try again.',
+    );
+    expect(result.technical).toContain('AI Provider quota exceeded');
     expect(coordinator.getStatus().state).toBe('error');
-    expect(coordinator.getStatus().errorMessage).toContain('AI Provider quota exceeded');
+    expect(coordinator.getStatus().errorMessage).toBe(result.error);
+    // The transcript SURVIVES the failed tutor reply: the learner retries the
+    // SAME turn instead of recording again, and nothing was committed.
+    expect(coordinator.getStatus().pendingTranscript).toBe('Testing error flow');
+    expect(coordinator.getStatus().canRetryPendingTurn).toBe(true);
+    expect(session.getHistory().length).toBe(0);
   });
 
   it('does not roll back conversation when TTS playback fails', async () => {

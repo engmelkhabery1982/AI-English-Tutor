@@ -30,11 +30,17 @@ import { useNavigation } from '@react-navigation/native';
 
 import type { CefrLevel, ConversationMode } from '../domain/shared/types';
 import {
+  ASSESSMENT_ANSWER_STEP_CHANGED_MESSAGE,
+  ASSESSMENT_SHORT_ANSWER_MESSAGE,
+  createAssessmentAnswerController,
   createDefaultOnboardingService,
   describeConfidence,
   describeEstimate,
   LEARNING_GOAL_OPTIONS,
   NATIVE_LANGUAGE_OPTIONS,
+  type AssessmentAnswerController,
+  type AssessmentAnswerPurpose,
+  type AssessmentAnswerState,
   type DiagnosticHandle,
   type DiagnosticResult,
   type DiagnosticStepId,
@@ -42,7 +48,12 @@ import {
   type OnboardingPrefill,
   type OnboardingService,
 } from '../onboarding';
-import { createTalkVoiceCoordinator, type TalkProviderKind } from '../talk-demo';
+import { countCommittedLearnerTurns } from '../conversation-session';
+import {
+  createTalkVoiceCoordinator,
+  type TalkProviderKind,
+  type VoiceTurnOutcome,
+} from '../talk-demo';
 import type { ReassessmentService, ReassessmentRecord, QualitativeChangeReport } from '../reassessment';
 import type { VoiceSessionCoordinator, VoiceStatus } from '../voice';
 
@@ -103,7 +114,6 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
   const [busy, setBusy] = useState<boolean>(false);
   const [turnError, setTurnError] = useState<string | null>(null);
   const [turns, setTurns] = useState<number>(0);
-  const [textAnswer, setTextAnswer] = useState<string>('');
   const [pronunciationReady, setPronunciationReady] = useState<boolean>(false);
   /**
    * The step a voice turn was started for. Captured when the microphone OPENS, so
@@ -278,6 +288,62 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     targetLevel,
   ]);
 
+  /**
+   * Absorbs a TRANSCRIPTION-ONLY pronunciation repeat: the real transcript is
+   * scored by the EXISTING pronunciation service and recorded against the captured
+   * step token only. A failed transcription records nothing — no fabricated sample.
+   */
+  const absorbPronunciationTranscript = useCallback(
+    async (handle: DiagnosticHandle, transcript: string, stepToken: number | null) => {
+      await serviceRef.current?.recordPronunciation(
+        handle,
+        transcript,
+        handle.pronunciationTask.sentence,
+        stepToken === null
+          ? { transcriptFromVoice: true }
+          : { stepToken, transcriptFromVoice: true },
+      );
+    },
+    [],
+  );
+
+  /**
+   * Absorbs a spoken CONVERSATION turn: evidence comes ONLY from what the
+   * conversation really committed (a failed turn contributes nothing) and is
+   * recorded against the step the turn STARTED in. Shared by the first attempt and
+   * by every explicit learner Retry, so a retry can never take a weaker path.
+   */
+  const absorbSpokenTurn = useCallback(
+    async (
+      handle: DiagnosticHandle,
+      purpose: AssessmentAnswerPurpose,
+      stepToken: number | null,
+      outcome: VoiceTurnOutcome,
+    ) => {
+      // AWAIT the absorption BEFORE reading the evidence snapshot: the committed
+      // voice turn must really be counted first.
+      await handle.speaking.observeCommittedHistory({ purpose });
+      if (!mountedRef.current) return;
+      const token = stepToken ?? handle.session.getCurrentStepToken();
+      const expectedStep = purpose === 'language_use' ? 'language_use' : 'speaking';
+      if (handle.session.getCurrentStepId() === expectedStep) {
+        if (purpose === 'language_use') {
+          handle.session.recordLanguageUse(handle.speaking.getLanguageUseEvidence(), token);
+        } else {
+          handle.session.recordSpeaking(handle.speaking.getSpeakingEvidence(), token);
+        }
+      }
+      if (!outcome.ok) {
+        // Already learner-safe and classified by the coordinator; the raw
+        // provider detail stays in the logs.
+        if (outcome.technical) console.error('Assessment voice turn failure:', outcome.technical);
+        setTurnError(outcome.error ?? 'That turn could not be completed. Nothing was recorded.');
+      }
+      setTurns(handle.conversation.getHistory().length);
+    },
+    [],
+  );
+
   /** Mic press — never auto-opens the microphone; the learner is in control. */
   const pressMic = useCallback(async () => {
     const coordinator = coordinatorRef.current;
@@ -308,36 +374,19 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
             const result = await coordinator.stopRecordingAndTranscribe();
             if (!mountedRef.current) return; // left the screen: discard the transcript
             if (!result.ok || !result.transcript) {
+              if (result.technical) console.error('Pronunciation transcription failure:', result.technical);
               setTurnError(result.error ?? 'That sentence could not be transcribed. Nothing was recorded.');
               return;
             }
-            await serviceRef.current?.recordPronunciation(
-              handle,
-              result.transcript,
-              handle.pronunciationTask.sentence,
-              stepToken === null
-                ? { transcriptFromVoice: true }
-                : { stepToken, transcriptFromVoice: true },
-            );
+            await absorbPronunciationTranscript(handle, result.transcript, stepToken);
           } else {
             // The EXISTING coordinator committed the turn through the EXISTING
             // session; the diagnostic only absorbs what was really committed,
-            // and records it against the step the turn was STARTED in.
+            // and records it against the step the turn was STARTED in. A failed
+            // turn preserves the recording/transcript for an explicit Retry.
             const outcome = await coordinator.stopRecordingAndProcess();
             if (!mountedRef.current) return;
-            // AWAIT the absorption BEFORE reading the evidence snapshot: the
-            // committed voice turn must really be counted first.
-            await handle.speaking.observeCommittedHistory({ purpose });
-            if (!mountedRef.current) return;
-            const token = stepToken ?? handle.session.getCurrentStepToken();
-            if (purpose === 'language_use') {
-              handle.session.recordLanguageUse(handle.speaking.getLanguageUseEvidence(), token);
-            } else {
-              handle.session.recordSpeaking(handle.speaking.getSpeakingEvidence(), token);
-            }
-            if (!outcome.ok) {
-              setTurnError(outcome.error ?? 'That turn could not be completed. Nothing was recorded.');
-            }
+            await absorbSpokenTurn(handle, purpose, stepToken, outcome);
           }
 
           setTurns(handle.conversation.getHistory().length);
@@ -359,52 +408,197 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
     } finally {
       micInFlightRef.current = false;
     }
-  }, []);
+  }, [absorbPronunciationTranscript, absorbSpokenTurn]);
+
+  /**
+   * The typed-answer commit controller (Work Order 1, bug #1). It OWNS the answer
+   * box, so:
+   * - the learner's text is cleared ONLY after the answer really committed;
+   * - a failure keeps the EXACT typed answer, shows one classified learner-safe
+   *   sentence and offers Retry (the learner may edit first);
+   * - a failed submission records no evidence and counts no committed turn;
+   * - a repeated tap can never commit twice (synchronous in-flight guard plus a
+   *   committed-turn verification before any replay).
+   * The commit itself still goes through the EXISTING service/session path.
+   */
+  const answerController = useMemo<AssessmentAnswerController>(
+    () =>
+      createAssessmentAnswerController({
+        captureStep: () => {
+          const handle = handleRef.current;
+          if (!handle) return null;
+          // The step AND its token are captured at submission start: a late
+          // answer can never become evidence for the next diagnostic step.
+          const id = handle.session.getCurrentStepId();
+          if (id !== 'speaking' && id !== 'language_use') return null;
+          return { stepId: id, stepToken: handle.session.getCurrentStepToken() };
+        },
+        currentPurpose: () =>
+          handleRef.current?.session.getCurrentStepId() === 'language_use'
+            ? 'language_use'
+            : 'speaking',
+        observeCommittedLearnerTurns: () => {
+          const handle = handleRef.current;
+          return handle ? countCommittedLearnerTurns(handle.conversation) : 0;
+        },
+        commit: async ({ answer, purpose, step }) => {
+          const handle = handleRef.current;
+          const service = serviceRef.current;
+          if (!handle || !service) {
+            return {
+              ok: false,
+              errorMessage:
+                'The assessment is not running, so that answer was not sent. Nothing was recorded.',
+            };
+          }
+          answerInFlightRef.current = true;
+          diagnosticOperationInFlightRef.current = true;
+          setBusy(true);
+          setTurnError(null);
+          try {
+            const onLanguageUse = purpose === 'language_use';
+            const learnerTurnsBefore = countCommittedLearnerTurns(handle.conversation);
+            // Text submission goes through the SERVICE (same existing session
+            // path), which awaits the committed turn and records its own evidence.
+            const outcome = onLanguageUse
+              ? await service.recordLanguageUseAnswer(handle, answer)
+              : await service.recordSpeakingAnswer(handle, answer);
+            if (!mountedRef.current) {
+              return { ok: false, errorMessage: 'That answer could not be sent.' };
+            }
+            if (!outcome.ok) {
+              // The turn really committed but produced no evidence yet (for
+              // example a very short answer). Honest and actionable — and never a
+              // reason to send the same answer a second time.
+              if (countCommittedLearnerTurns(handle.conversation) > learnerTurnsBefore) {
+                setTurnError(ASSESSMENT_SHORT_ANSWER_MESSAGE);
+                setTurns(handle.conversation.getHistory().length);
+                return { ok: true };
+              }
+              return { ok: false, errorMessage: outcome.errorMessage ?? null };
+            }
+            // Re-record evidence for the CAPTURED step only (the state machine
+            // refuses stale tokens anyway).
+            if (handle.session.getCurrentStepId() === step.stepId) {
+              if (onLanguageUse) {
+                handle.session.recordLanguageUse(
+                  handle.speaking.getLanguageUseEvidence(),
+                  step.stepToken,
+                );
+              } else {
+                handle.session.recordSpeaking(handle.speaking.getSpeakingEvidence(), step.stepToken);
+              }
+            } else {
+              setTurnError(ASSESSMENT_ANSWER_STEP_CHANGED_MESSAGE);
+            }
+            setTurns(handle.conversation.getHistory().length);
+            return { ok: true };
+          } finally {
+            answerInFlightRef.current = false;
+            diagnosticOperationInFlightRef.current = false;
+            setBusy(false);
+          }
+        },
+        onFailure: ({ failure }) => {
+          // Raw provider detail is diagnostic only: it never reaches the learner.
+          if (failure.technical) console.error('Assessment answer failure:', failure.technical);
+        },
+      }),
+    [],
+  );
+  const [answerState, setAnswerState] = useState<AssessmentAnswerState>(() =>
+    answerController.getState(),
+  );
+  useEffect(() => answerController.subscribe(setAnswerState), [answerController]);
 
   /** Manual text fallback — the SAME existing conversation path. */
   const submitTextAnswer = useCallback(async () => {
+    await answerController.submit();
+  }, [answerController]);
+
+  /** Explicit learner Retry of the preserved (possibly edited) typed answer. */
+  const retryTextAnswer = useCallback(async () => {
+    await answerController.retry();
+  }, [answerController]);
+
+  /**
+   * Explicit learner Retry of a PRESERVED transcript: the learner's own words are
+   * sent again without re-recording, and evidence is absorbed by the same path. A
+   * transcript that already committed is never sent twice (the coordinator
+   * verifies the committed history before replaying).
+   */
+  const retryPendingVoiceTurn = useCallback(async () => {
+    const coordinator = coordinatorRef.current;
     const handle = handleRef.current;
-    const service = serviceRef.current;
-    const answer = textAnswer.trim();
-    if (!handle || !service || !answer || answerInFlightRef.current) return;
-    answerInFlightRef.current = true;
+    if (!coordinator || !handle || micInFlightRef.current) return;
+    const purpose = pendingPurposeRef.current;
+    if (purpose === 'pronunciation') return; // a preserved transcript is a conversation turn only
+    micInFlightRef.current = true;
     diagnosticOperationInFlightRef.current = true;
     setBusy(true);
     setTurnError(null);
     try {
-      // The step AND its token are captured at submission start: a late answer
-      // can never become evidence for the next diagnostic step.
-      const stepId = handle.session.getCurrentStepId();
-      const stepToken = handle.session.getCurrentStepToken();
-      const onLanguageUse = stepId === 'language_use';
-
-      // Text submission goes through the SERVICE (same existing session path),
-      // which internally awaits the committed turn and records its own evidence.
-      const outcome = onLanguageUse
-        ? await service.recordLanguageUseAnswer(handle, answer)
-        : await service.recordSpeakingAnswer(handle, answer);
+      const outcome = await coordinator.retryPendingTurn();
       if (!mountedRef.current) return;
-      if (!outcome.ok) {
-        setTurnError(outcome.errorMessage ?? 'That answer could not be evaluated. Nothing was recorded.');
-      }
-      // The service recorded the evidence against the CURRENT step; if the flow
-      // somehow moved on, re-record only for the captured step and never for a
-      // different one (the state machine refuses stale tokens anyway).
-      if (handle.session.getCurrentStepId() !== stepId) {
-        setTurnError('That answer arrived after the step changed, so it was not recorded.');
-      } else if (onLanguageUse) {
-        handle.session.recordLanguageUse(handle.speaking.getLanguageUseEvidence(), stepToken);
-      } else {
-        handle.session.recordSpeaking(handle.speaking.getSpeakingEvidence(), stepToken);
-      }
-      setTextAnswer('');
-      setTurns(handle.conversation.getHistory().length);
+      await absorbSpokenTurn(handle, purpose, pendingStepTokenRef.current, outcome);
     } finally {
-      answerInFlightRef.current = false;
       diagnosticOperationInFlightRef.current = false;
+      micInFlightRef.current = false;
       setBusy(false);
     }
-  }, [textAnswer]);
+  }, [absorbSpokenTurn]);
+
+  /**
+   * Explicit learner Retry of a PRESERVED RECORDING after a failed transcription:
+   * the same audio is transcribed again on the SAME contract (transcription-only
+   * stays transcription-only), so a pronunciation repeat can never become a
+   * conversation turn and no transcript is fabricated.
+   */
+  const retryPreservedRecording = useCallback(async () => {
+    const coordinator = coordinatorRef.current;
+    const handle = handleRef.current;
+    if (!coordinator || !handle || micInFlightRef.current) return;
+    micInFlightRef.current = true;
+    diagnosticOperationInFlightRef.current = true;
+    setBusy(true);
+    setTurnError(null);
+    try {
+      const purpose = pendingPurposeRef.current;
+      const stepToken = pendingStepTokenRef.current;
+      const outcome = await coordinator.retryTranscription();
+      if (!mountedRef.current) return;
+      if (purpose === 'pronunciation') {
+        if (!outcome.ok || !outcome.transcript) {
+          if (outcome.technical) console.error('Pronunciation retry failure:', outcome.technical);
+          setTurnError(
+            outcome.error ?? 'That sentence could not be transcribed. Nothing was recorded.',
+          );
+          return;
+        }
+        await absorbPronunciationTranscript(handle, outcome.transcript, stepToken);
+        return;
+      }
+      await absorbSpokenTurn(handle, purpose, stepToken, outcome);
+    } finally {
+      diagnosticOperationInFlightRef.current = false;
+      micInFlightRef.current = false;
+      setBusy(false);
+    }
+  }, [absorbPronunciationTranscript, absorbSpokenTurn]);
+
+  /**
+   * "Type instead": the preserved transcript moves into the answer box so the
+   * learner can review and edit it before sending. Taking it clears the
+   * coordinator's preserved turn, so the same utterance can never be sent twice.
+   */
+  const useTranscriptAsText = useCallback(() => {
+    const coordinator = coordinatorRef.current;
+    if (!coordinator) return;
+    const transcript = coordinator.takePendingTranscript();
+    if (!transcript) return;
+    setTurnError(null);
+    answerController.setDraft(transcript);
+  }, [answerController]);
 
   /**
    * Continue to the next step. The state machine owns the transition; this
@@ -753,13 +947,101 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
   );
 
   // Presentation follows the existing coordinator; no independent voice lifecycle.
-  const assessmentInputBusy = busy || voiceStatus?.state === 'recording' ||
+  const assessmentInputBusy = busy || answerState.isSubmitting ||
+    voiceStatus?.state === 'recording' ||
     voiceStatus?.state === 'transcribing' || voiceStatus?.state === 'sending' ||
     voiceStatus?.state === 'requesting_permission';
   const assessmentMicLabel = voiceStatus?.state === 'recording' ? 'Stop recording'
     : busy ? 'Processing…'
     : voiceStatus?.state === 'requesting_permission' ? 'Waiting for microphone permission…'
     : voiceStatus?.canRecord ? (stepId === 'pronunciation' ? 'Repeat it' : 'Record answer') : 'Microphone unavailable';
+
+  /**
+   * ONE failure surface for the TYPED answer (Work Order 1, item 1): the exact
+   * answer stays in the box, the learner reads one classified learner-safe
+   * sentence, and Retry is explicit. Nothing here fabricates a result.
+   */
+  const renderAnswerFailure = () => {
+    if (answerState.phase !== 'failed' || !answerState.learnerMessage) return null;
+    return (
+      <View style={styles.recoveryBox}>
+        <Text style={styles.errorText}>{answerState.learnerMessage}</Text>
+        <Text style={styles.muted}>
+          Your answer is still in the box. You can edit it, then send it again.
+        </Text>
+        {answerState.retryAvailable ? (
+          <TouchableOpacity
+            style={styles.primaryButton}
+            disabled={assessmentInputBusy}
+            onPress={() => void retryTextAnswer()}
+            accessibilityLabel="Retry sending my typed answer"
+          >
+            <Text style={styles.primaryButtonText}>Retry</Text>
+          </TouchableOpacity>
+        ) : null}
+      </View>
+    );
+  };
+
+  /**
+   * ONE recovery surface for VOICE failures (Work Order 1, item 6): it offers only
+   * the actions that match what actually survived — resend the preserved
+   * transcript, review it as text, or transcribe the preserved recording again. It
+   * never invents a transcript, and `allowTypeInstead` keeps a transcription-only
+   * pronunciation repeat out of the typed-answer path.
+   */
+  const renderVoiceRecovery = (options: { readonly allowTypeInstead: boolean }) => {
+    const preservedTranscript =
+      voiceStatus?.canRetryPendingTurn === true ? (voiceStatus?.pendingTranscript ?? null) : null;
+    const canRetranscribe =
+      preservedTranscript === null && voiceStatus?.canRetryTranscription === true;
+    if (!preservedTranscript && !canRetranscribe) return null;
+    return (
+      <View style={styles.recoveryBox}>
+        {preservedTranscript ? (
+          <>
+            <Text style={styles.muted}>
+              Your answer was transcribed, but the tutor could not reply. Nothing was lost.
+            </Text>
+            <TouchableOpacity
+              style={styles.primaryButton}
+              disabled={assessmentInputBusy}
+              onPress={() => void retryPendingVoiceTurn()}
+              accessibilityLabel="Send my transcribed answer again"
+            >
+              <Text style={styles.primaryButtonText}>Send it again</Text>
+            </TouchableOpacity>
+            {options.allowTypeInstead ? (
+              <TouchableOpacity
+                style={styles.secondaryButton}
+                disabled={assessmentInputBusy}
+                onPress={() => useTranscriptAsText()}
+                accessibilityLabel="Review my transcribed answer as text"
+              >
+                <Text style={styles.secondaryButtonText}>Type instead</Text>
+              </TouchableOpacity>
+            ) : null}
+          </>
+        ) : null}
+        {canRetranscribe ? (
+          <>
+            <Text style={styles.muted}>
+              That recording could not be transcribed, so nothing was recorded. You can try the
+              same recording again instead of speaking twice.
+            </Text>
+            <TouchableOpacity
+              style={styles.secondaryButton}
+              disabled={assessmentInputBusy}
+              onPress={() => void retryPreservedRecording()}
+              accessibilityLabel="Transcribe my last recording again"
+            >
+              <Text style={styles.secondaryButtonText}>Try my last recording again</Text>
+            </TouchableOpacity>
+          </>
+        ) : null}
+      </View>
+    );
+  };
 
   // ── render helpers for the diagnostic steps
   const renderSpeakingStep = () => (
@@ -794,16 +1076,21 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       {voiceStatus?.errorMessage ? (
         <Text style={styles.errorText}>{voiceStatus.errorMessage}</Text>
       ) : null}
+      {renderVoiceRecovery({ allowTypeInstead: true })}
       <TextInput accessibilityLabel="Your typed assessment answer"
         style={styles.input}
         placeholder="Or type your answer"
-        value={textAnswer}
-        onChangeText={setTextAnswer}
+        value={answerState.draft}
+        onChangeText={answerController.setDraft}
         multiline
+        editable={!answerState.isSubmitting}
       />
-      <TouchableOpacity style={styles.secondaryButton} disabled={assessmentInputBusy || !textAnswer.trim()} onPress={() => void submitTextAnswer()}>
-        <Text style={styles.secondaryButtonText}>Send typed answer</Text>
+      <TouchableOpacity style={styles.secondaryButton} disabled={assessmentInputBusy || !answerState.draft.trim()} onPress={() => void submitTextAnswer()} accessibilityLabel="Send typed answer">
+        <Text style={styles.secondaryButtonText}>
+          {answerState.isSubmitting ? 'Sending…' : 'Send typed answer'}
+        </Text>
       </TouchableOpacity>
+      {renderAnswerFailure()}
       <Text style={styles.muted}>Turns recorded: {turns}</Text>
       <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void continueStep()}>
         <Text style={styles.primaryButtonText}>Continue</Text>
@@ -879,16 +1166,21 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
             </Text>
           </TouchableOpacity>
         </View>
+        {renderVoiceRecovery({ allowTypeInstead: true })}
         <TextInput accessibilityLabel="Your typed assessment answer"
           style={styles.input}
           placeholder="Or type your answer"
-          value={textAnswer}
-          onChangeText={setTextAnswer}
+          value={answerState.draft}
+          onChangeText={answerController.setDraft}
           multiline
+          editable={!answerState.isSubmitting}
         />
-        <TouchableOpacity style={styles.secondaryButton} disabled={assessmentInputBusy || !textAnswer.trim()} onPress={() => void submitTextAnswer()}>
-          <Text style={styles.secondaryButtonText}>Send typed answer</Text>
+        <TouchableOpacity style={styles.secondaryButton} disabled={assessmentInputBusy || !answerState.draft.trim()} onPress={() => void submitTextAnswer()} accessibilityLabel="Send typed answer">
+          <Text style={styles.secondaryButtonText}>
+            {answerState.isSubmitting ? 'Sending…' : 'Send typed answer'}
+          </Text>
         </TouchableOpacity>
+        {renderAnswerFailure()}
         <TouchableOpacity style={styles.primaryButton} disabled={assessmentInputBusy} onPress={() => void continueStep()}>
           <Text style={styles.primaryButtonText}>Continue</Text>
         </TouchableOpacity>
@@ -939,6 +1231,7 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         {voiceStatus?.errorMessage ? (
           <Text style={styles.errorText}>{voiceStatus.errorMessage}</Text>
         ) : null}
+        {renderVoiceRecovery({ allowTypeInstead: false })}
 
         {evidence ? (
           <View style={styles.section}>
@@ -1143,6 +1436,8 @@ const styles = StyleSheet.create({
   notice: { fontSize: 12, color: '#8a6d3b', marginBottom: 4 },
   savedLine: { fontSize: 13, color: '#0a7a3d', fontWeight: '600', marginTop: 8 },
   errorText: { fontSize: 13, color: '#b00020', marginBottom: 8 },
+  /** Groups a failure notice with its explicit recovery actions. */
+  recoveryBox: { marginTop: 4, marginBottom: 12, gap: 10 },
   input: {
     borderWidth: 1,
     borderColor: '#d7dbe3',
