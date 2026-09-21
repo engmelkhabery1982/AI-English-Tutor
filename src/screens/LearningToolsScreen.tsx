@@ -210,11 +210,15 @@ export default function LearningToolsScreen() {
                     );
                   })}
                 </View>
+                {/* Built-in starter lessons are authored content: they work
+                    WITHOUT AI and WITHOUT a profile (preview mode — nothing
+                    is saved until a learner profile exists). */}
                 <TouchableOpacity
                   style={styles.secondaryButton}
-                  disabled={!tools.profile || busy}
+                  disabled={busy}
                   onPress={() => { setLesson(starterForLevel(level)); setInspection(undefined); setFailure(null); }}
                   accessibilityRole="button"
+                  accessibilityLabel="Load built-in starter lesson (works without AI)"
                 >
                   <Text style={styles.secondaryButtonText}>Load built-in starter lesson</Text>
                 </TouchableOpacity>
@@ -248,8 +252,8 @@ export default function LearningToolsScreen() {
                 )}
               </View>
 
-              {lesson && tools.profile && (
-                <StoryPanel key={`${lesson.id}:${section}`} tools={tools} lesson={lesson} mode={section} inspect={setInspection} />
+              {lesson && (
+                <StoryPanel key={`${lesson.id}:${section}`} tools={tools} lesson={lesson} mode={section} inspect={setInspection} preview={!tools.profile} />
               )}
               {inspection && <InspectorPanel tools={tools} initial={inspection} />}
               </>

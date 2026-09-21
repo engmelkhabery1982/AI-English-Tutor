@@ -13,7 +13,8 @@ describe('WO3 reachable minimal UI contracts', () => {
   });
   it('reading/listening/read-aloud are wired to shared domain services rather than screen grading', () => {
     const panel = source('./learning/StoryPanel.tsx');
-    for (const text of ['tools.openLesson', 'tools.readAloud', 'session.answer', 'session.complete', 'session.saveLanguage', 'readAloud.compare', 'useFocusEffect', 'AppState', 'readAloud.dispose']) expect(panel).toContain(text);
+    // readAloud is nullable (preview mode without a profile), hence the ?. wiring.
+    for (const text of ['tools.openLesson', 'tools.readAloud', 'session.answer', 'session.complete', 'session.saveLanguage', 'readAloud.compare', 'useFocusEffect', 'AppState', 'readAloud?.dispose']) expect(panel).toContain(text);
     expect(panel).not.toContain('provider.generate(');
     expect(panel).not.toContain('markReviewed(');
   });

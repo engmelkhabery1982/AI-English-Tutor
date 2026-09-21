@@ -21,9 +21,24 @@ beforeEach(async () => {
 });
 afterEach(async () => { await adapter.close(); });
 describe('learning integration on existing SQLite contracts', () => {
-  it('first launch offers inspection without inventing a learner profile', async () => {
+  it('first launch offers inspection and preview lessons without inventing a learner profile', async () => {
     const empty = new SqlJsAdapter(':memory:'); await empty.init();
-    try { const tools = await createLearningTools(empty); expect(tools.profile).toBeNull(); expect(() => tools.openLesson(STARTER_LESSONS[0], 'reading', () => {})).toThrow('Create a learner profile'); }
+    try {
+      const tools = await createLearningTools(empty);
+      expect(tools.profile).toBeNull();
+      // Package 2 (G): a BUILT-IN lesson is playable without a profile
+      // (preview mode, no AI involved)…
+      const session = tools.openLesson(STARTER_LESSONS[0], 'reading', () => {});
+      const question = STARTER_LESSONS[0].questions[0];
+      expect(await session.answer(question.id, question.answer)).not.toBeNull();
+      session.dispose();
+      // …but NOTHING is persisted and no profile is invented.
+      const check = createAppRepositories(empty);
+      await expect(check.profile.get()).rejects.toBeTruthy();
+      expect(await check.progress.list('')).toHaveLength(0);
+      // Read-aloud records spoken evidence, so it still requires a profile.
+      expect(() => tools.readAloud(STARTER_LESSONS[0])).toThrow('Create a learner profile');
+    }
     finally { await empty.close(); }
   });
   it('inspection save round-trips original text, context, selected meaning and generated provenance; duplicates never reset review', async () => {

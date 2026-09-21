@@ -21,20 +21,22 @@ const MODE_LABELS: Record<LessonMode, string> = {
  * assistance markers and completion; ReadAloudPractice owns the existing
  * voice lifecycle + transcript comparison. This panel renders and delegates.
  */
-export default function StoryPanel({ tools, lesson, mode, inspect }: { tools: LearningTools; lesson: StoryLesson; mode: LessonMode; inspect: (input: InspectionInput) => void }) {
+export default function StoryPanel({ tools, lesson, mode, inspect, preview }: { tools: LearningTools; lesson: StoryLesson; mode: LessonMode; inspect: (input: InspectionInput) => void; preview?: boolean }) {
   const [, redraw] = useReducer(n => n + 1, 0);
   const session = useMemo(() => tools.openLesson(lesson, mode, redraw), [tools, lesson, mode]);
-  const readAloud = useMemo(() => tools.readAloud(lesson), [tools, lesson]);
+  // Read-aloud recording saves spoken evidence, so it needs a learner
+  // profile; the rest of a built-in lesson is fully playable in preview.
+  const readAloud = useMemo(() => (tools.profile ? tools.readAloud(lesson) : null), [tools, lesson]);
   const [selected, setSelected] = useState('');
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
   const [voiceBusy, setVoiceBusy] = useState(false);
   useEffect(() => {
-    const sub = AppState.addEventListener('change', state => { if (state !== 'active') { session.stop(); readAloud.reset(); redraw(); } });
-    return () => { session.dispose(); readAloud.dispose(); sub.remove(); };
+    const sub = AppState.addEventListener('change', state => { if (state !== 'active') { session.stop(); readAloud?.reset(); redraw(); } });
+    return () => { session.dispose(); readAloud?.dispose(); sub.remove(); };
   }, [session, readAloud]);
-  useFocusEffect(useCallback(() => () => { session.stop(); readAloud.reset(); }, [session, readAloud]));
-  const state = session.snapshot(), voice = readAloud.voice.getStatus();
+  useFocusEffect(useCallback(() => () => { session.stop(); readAloud?.reset(); }, [session, readAloud]));
+  const state = session.snapshot(), voice = readAloud?.voice.getStatus();
   const passageLabel = mode === 'listening' && !state.transcriptVisible ? 'Transcript (hidden)' : 'Passage';
   return (
     <View style={styles.root}>
@@ -126,10 +128,18 @@ export default function StoryPanel({ tools, lesson, mode, inspect }: { tools: Le
         </View>
       )}
 
+      {preview && (
+        <View style={styles.pendingBanner} accessibilityLiveRegion="polite">
+          <Text style={styles.pendingText}>
+            Preview mode — this built-in lesson works without AI. Nothing is saved yet: create a learner profile to save progress and answers.
+          </Text>
+        </View>
+      )}
+
       {mode === 'reading' && (
         <TouchableOpacity
           style={styles.primaryButton}
-          onPress={() => void session.expose().then(() => setNote('Reading interaction saved — not a comprehension result.')).catch(() => setNote('Could not save reading activity. Retry.'))}
+          onPress={() => void session.expose().then(() => setNote(preview ? 'Preview mode — reading activity is not saved. Create a learner profile to save it.' : 'Reading interaction saved — not a comprehension result.')).catch(() => setNote('Could not save reading activity. Retry.'))}
           accessibilityRole="button"
         >
           <Text style={styles.primaryButtonText}>I have read the passage</Text>
@@ -218,7 +228,7 @@ export default function StoryPanel({ tools, lesson, mode, inspect }: { tools: Le
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.controlButton, styles.controlOutline]}
-              onPress={() => void session.saveLanguage(index).then(result => setNote(result.ok ? result.duplicate ? 'Already saved; existing review unchanged.' : 'Saved for review, not learned.' : 'Could not save. Retry.'))}
+              onPress={() => void session.saveLanguage(index).then(result => setNote(result.ok ? result.duplicate ? 'Already saved; existing review unchanged.' : 'Saved for review, not learned.' : result.reason === 'no_profile' ? 'Create a learner profile to save items to Review.' : 'Could not save. Retry.'))}
               accessibilityRole="button"
               accessibilityLabel={`Save ${item.text} to Review`}
             >
@@ -248,7 +258,7 @@ export default function StoryPanel({ tools, lesson, mode, inspect }: { tools: Le
         </TouchableOpacity>
       </View>
 
-      {mode === 'reading' && (
+      {mode === 'reading' && (readAloud && voice ? (
         <View style={styles.card}>
           <Text style={styles.sectionLabel}>Read aloud</Text>
           <Text style={styles.limitationText}>{READ_ALOUD_LIMITATION}</Text>
@@ -286,7 +296,14 @@ export default function StoryPanel({ tools, lesson, mode, inspect }: { tools: Le
             <Text style={styles.ghostButtonText}>Retry read-aloud</Text>
           </TouchableOpacity>
         </View>
-      )}
+      ) : mode === 'reading' ? (
+        <View style={styles.card}>
+          <Text style={styles.sectionLabel}>Read aloud</Text>
+          <Text style={styles.metaText}>
+            Read-aloud practice records spoken evidence, so it needs a learner profile. Create one to record and compare your reading.
+          </Text>
+        </View>
+      ) : null)}
 
       {!!note && <Text style={styles.noteText} accessibilityLiveRegion="polite">{note}</Text>}
     </View>
