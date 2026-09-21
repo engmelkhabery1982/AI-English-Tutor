@@ -30,6 +30,7 @@ import type { ViewStyle } from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 
+import { theme } from './components/ui/theme';
 import {
   createDefaultProgressDashboardService,
   DEFAULT_WINDOW,
@@ -621,25 +622,26 @@ export default function ProgressScreen(props?: ProgressScreenProps) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F9FAFB',
+    backgroundColor: theme.colors.background,
   },
   header: {
-    paddingHorizontal: 20,
-    paddingTop: 16,
-    paddingBottom: 8,
-    backgroundColor: '#FFFFFF',
+    paddingHorizontal: theme.spacing.lg,
+    paddingTop: theme.spacing.lg,
+    paddingBottom: theme.spacing.sm,
+    backgroundColor: theme.colors.surface,
     borderBottomWidth: 1,
-    borderBottomColor: '#E5E7EB',
+    borderBottomColor: theme.colors.borderLight,
   },
   title: {
-    fontSize: 22,
+    fontSize: 24,
     fontWeight: '800',
-    color: '#111827',
+    color: theme.colors.textPrimary,
+    letterSpacing: -0.5,
   },
   subtitle: {
-    fontSize: 13,
-    color: '#6B7280',
-    marginTop: 2,
+    fontSize: 14,
+    color: theme.colors.textSecondary,
+    marginTop: 4,
   },
   loadingContainer: {
     flex: 1,
@@ -716,19 +718,22 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
   },
   sectionTitle: {
-    fontSize: 15,
+    fontSize: 13,
     fontWeight: '700',
-    color: '#111827',
+    color: theme.colors.textTertiary,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
     marginTop: 6,
     marginBottom: 8,
   },
   card: {
-    backgroundColor: '#FFFFFF',
+    backgroundColor: theme.colors.surface,
     borderWidth: 1,
-    borderColor: '#E5E7EB',
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 14,
+    borderColor: theme.colors.borderLight,
+    borderRadius: theme.radius.lg,
+    padding: theme.spacing.lg,
+    marginBottom: theme.spacing.md,
+    ...theme.shadows.card,
   },
   overviewGrid: {
     flexDirection: 'row',
@@ -841,10 +846,11 @@ const styles = StyleSheet.create({
   },
   primaryButton: {
     marginTop: 12,
-    backgroundColor: '#2563EB',
-    borderRadius: 10,
-    paddingVertical: 12,
+    backgroundColor: theme.colors.primary,
+    borderRadius: theme.radius.md,
+    paddingVertical: 14,
     alignItems: 'center',
+    ...theme.shadows.primary,
   },
   primaryButtonText: {
     color: '#FFFFFF',

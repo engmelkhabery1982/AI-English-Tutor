@@ -1010,7 +1010,7 @@ const styles = StyleSheet.create({
   body: { fontSize: 14, color: '#4B5563', lineHeight: 20, marginBottom: 12 },
   headerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   counter: { fontSize: 13, color: '#6B7280', fontWeight: '600' },
-  typeLabel: { fontSize: 13, color: '#1F4E9C', fontWeight: '700' },
+  typeLabel: { fontSize: 13, color: '#1D4ED8', fontWeight: '700' },
   note: { fontSize: 12, color: '#6B7280', marginTop: 4, marginBottom: 8 },
   speakerLine: { fontSize: 13, color: '#374151', fontWeight: '600', marginTop: 4 },
   playRow: { flexDirection: 'row', gap: 8, marginVertical: 10, flexWrap: 'wrap' },
@@ -1023,10 +1023,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#D1D5DB',
   },
-  pillActive: { backgroundColor: '#1F4E9C', borderColor: '#1F4E9C' },
+  pillActive: { backgroundColor: '#1D4ED8', borderColor: '#1D4ED8' },
   pillText: { color: '#374151', fontSize: 13 },
   pillTextActive: { color: '#FFFFFF', fontWeight: '600' },
-  sectionLabel: { fontSize: 13, color: '#1F4E9C', fontWeight: '700', marginTop: 12 },
+  sectionLabel: { fontSize: 13, color: '#1D4ED8', fontWeight: '700', marginTop: 12 },
   questionText: { fontSize: 15, color: '#1F2937', fontWeight: '600', marginBottom: 10, marginTop: 4 },
   optionsColumn: { gap: 8 },
   optionButton: {
@@ -1036,7 +1036,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#D1D5DB',
   },
-  optionSelected: { borderColor: '#1F4E9C', backgroundColor: '#EEF4FF' },
+  optionSelected: { borderColor: '#1D4ED8', backgroundColor: '#EFF6FF' },
   optionText: { fontSize: 14, color: '#1F2937' },
   answerInput: {
     backgroundColor: '#FFFFFF',
@@ -1051,7 +1051,7 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   primaryButton: {
-    backgroundColor: '#1F4E9C',
+    backgroundColor: '#1D4ED8',
     borderRadius: 12,
     paddingVertical: 12,
     paddingHorizontal: 20,
@@ -1061,14 +1061,14 @@ const styles = StyleSheet.create({
   buttonDisabled: { opacity: 0.5 },
   primaryButtonText: { color: '#FFFFFF', fontSize: 15, fontWeight: '700' },
   secondaryButton: {
-    backgroundColor: '#E5EDFB',
+    backgroundColor: '#DBEAFE',
     borderRadius: 12,
     paddingVertical: 12,
     paddingHorizontal: 16,
     alignItems: 'center',
     marginTop: 8,
   },
-  secondaryButtonText: { color: '#1F4E9C', fontWeight: '600', fontSize: 14 },
+  secondaryButtonText: { color: '#1D4ED8', fontWeight: '600', fontSize: 14 },
   transcriptBox: {
     backgroundColor: '#FFFFFF',
     borderRadius: 12,
@@ -1089,7 +1089,7 @@ const styles = StyleSheet.create({
   feedbackTitle: {
     fontSize: 16,
     fontWeight: '700',
-    color: '#1F4E9C',
+    color: '#1D4ED8',
     textTransform: 'capitalize',
     marginBottom: 8,
   },
@@ -1102,5 +1102,5 @@ const styles = StyleSheet.create({
     marginTop: 14,
   },
   nextButtonText: { color: '#FFFFFF', fontSize: 15, fontWeight: '700' },
-  errorText: { color: '#B91C1C', fontSize: 13, marginTop: 10, textAlign: 'center' },
+  errorText: { color: '#DC2626', fontSize: 13, marginTop: 10, textAlign: 'center' },
 });

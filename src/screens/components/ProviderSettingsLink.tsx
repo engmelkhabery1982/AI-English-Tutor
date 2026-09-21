@@ -7,6 +7,6 @@ export default function ProviderSettingsLink() {
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
   return <LearnerButton accessibilityLabel="Open AI provider settings"
     onPress={() => navigation.navigate('MainTabs', { screen: 'Settings' })}>
-    <Text style={{ color: '#0066CC', fontSize: 16 }}>Open AI provider settings</Text>
+    <Text style={{ color: '#2563EB', fontSize: 16 }}>Open AI provider settings</Text>
   </LearnerButton>;
 }

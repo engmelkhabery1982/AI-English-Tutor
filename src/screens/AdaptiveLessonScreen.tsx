@@ -937,7 +937,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
           value={answer}
           onChangeText={setAnswer}
           placeholder="Type your answer"
-          placeholderTextColor="#9a9a9e"
+          placeholderTextColor="#9CA3AF"
           editable={!itemFeedback}
           multiline
         />
@@ -976,7 +976,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
           value={answer}
           onChangeText={setAnswer}
           placeholder="Type what you hear, or tap to speak"
-          placeholderTextColor="#9a9a9e"
+          placeholderTextColor="#9CA3AF"
           editable={!itemFeedback}
           multiline
         />
@@ -1000,7 +1000,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
           value={answer}
           onChangeText={setAnswer}
           placeholder="Say it, then type or record what you said"
-          placeholderTextColor="#9a9a9e"
+          placeholderTextColor="#9CA3AF"
           editable={!itemFeedback}
           multiline
         />
@@ -1047,7 +1047,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
           value={answer}
           onChangeText={setAnswer}
           placeholder="Type your answer, or tap to speak"
-          placeholderTextColor="#9a9a9e"
+          placeholderTextColor="#9CA3AF"
           editable={!itemFeedback}
           multiline
         />
@@ -1272,7 +1272,7 @@ export default function AdaptiveLessonScreen(props?: AdaptiveLessonScreenProps) 
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#f5f7fa' },
+  container: { flex: 1, backgroundColor: '#F7F8FA' },
   content: { padding: 16, paddingBottom: 40, gap: 12 },
   loadingBox: { paddingVertical: 40, gap: 12, alignItems: 'center' },
   spinner: { marginTop: 12 },
@@ -1282,50 +1282,50 @@ const styles = StyleSheet.create({
     padding: 16,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: '#e6e9ef',
+    borderColor: '#E5E7EB',
   },
-  cardTitle: { fontSize: 18, fontWeight: '700', color: '#1c1c1e', marginBottom: 6 },
-  headline: { fontSize: 15, color: '#1c1c1e', marginBottom: 8 },
-  body: { fontSize: 14, color: '#3a3a3c', marginBottom: 6 },
-  sourceNote: { fontSize: 13, color: '#6b6b70', marginTop: 6 },
-  reason: { fontSize: 13, color: '#3a3a3c', marginTop: 8, fontStyle: 'italic' },
-  honestNote: { fontSize: 12, color: '#6b6b70', marginTop: 8 },
-  errorText: { fontSize: 13, color: '#b00020', marginBottom: 8 },
+  cardTitle: { fontSize: 18, fontWeight: '700', color: '#111827', marginBottom: 6 },
+  headline: { fontSize: 15, color: '#111827', marginBottom: 8 },
+  body: { fontSize: 14, color: '#374151', marginBottom: 6 },
+  sourceNote: { fontSize: 13, color: '#6B7280', marginTop: 6 },
+  reason: { fontSize: 13, color: '#374151', marginTop: 8, fontStyle: 'italic' },
+  honestNote: { fontSize: 12, color: '#6B7280', marginTop: 8 },
+  errorText: { fontSize: 13, color: '#DC2626', marginBottom: 8 },
   pillRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 4 },
   pill: {
-    backgroundColor: '#eef1f6',
+    backgroundColor: '#F3F4F6',
     borderRadius: 10,
     paddingHorizontal: 8,
     paddingVertical: 4,
     alignSelf: 'flex-start',
     marginTop: 6,
   },
-  pillPersonal: { backgroundColor: '#e3f2e6' },
-  pillGeneral: { backgroundColor: '#f1f1f4' },
-  pillText: { fontSize: 12, color: '#3a3a3c', fontWeight: '600' },
-  listLine: { fontSize: 14, color: '#3a3a3c', marginBottom: 4 },
+  pillPersonal: { backgroundColor: '#D1FAE5' },
+  pillGeneral: { backgroundColor: '#F3F4F6' },
+  pillText: { fontSize: 12, color: '#374151', fontWeight: '600' },
+  listLine: { fontSize: 14, color: '#374151', marginBottom: 4 },
   structureRow: { flexDirection: 'row', marginBottom: 10 },
-  structureIndex: { fontSize: 14, color: '#8e8e93', width: 22 },
+  structureIndex: { fontSize: 14, color: '#9CA3AF', width: 22 },
   structureBody: { flex: 1 },
-  structureTitle: { fontSize: 14, fontWeight: '600', color: '#1c1c1e' },
-  structureReason: { fontSize: 12, color: '#6b6b70', marginTop: 2 },
-  stepCounter: { fontSize: 12, color: '#8e8e93', marginBottom: 2 },
-  itemCounter: { fontSize: 12, color: '#8e8e93', marginBottom: 6 },
-  prompt: { fontSize: 15, color: '#1c1c1e', marginBottom: 8 },
-  context: { fontSize: 14, color: '#3a3a3c', marginBottom: 8 },
+  structureTitle: { fontSize: 14, fontWeight: '600', color: '#111827' },
+  structureReason: { fontSize: 12, color: '#6B7280', marginTop: 2 },
+  stepCounter: { fontSize: 12, color: '#9CA3AF', marginBottom: 2 },
+  itemCounter: { fontSize: 12, color: '#9CA3AF', marginBottom: 6 },
+  prompt: { fontSize: 15, color: '#111827', marginBottom: 8 },
+  context: { fontSize: 14, color: '#374151', marginBottom: 8 },
   input: {
     borderWidth: 1,
-    borderColor: '#d8dce3',
+    borderColor: '#D1D5DB',
     borderRadius: 10,
     padding: 10,
     fontSize: 15,
-    color: '#1c1c1e',
-    backgroundColor: '#fbfcfe',
+    color: '#111827',
+    backgroundColor: '#F9FAFB',
     minHeight: 44,
   },
   inputMultiline: { minHeight: 90, textAlignVertical: 'top' },
   primaryButton: {
-    backgroundColor: '#007AFF',
+    backgroundColor: '#2563EB',
     borderRadius: 12,
     paddingVertical: 13,
     alignItems: 'center',
@@ -1334,43 +1334,43 @@ const styles = StyleSheet.create({
   primaryButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
   secondaryButton: {
     borderWidth: 1,
-    borderColor: '#007AFF',
+    borderColor: '#2563EB',
     borderRadius: 10,
     paddingVertical: 9,
     alignItems: 'center',
     marginBottom: 8,
   },
-  secondaryButtonText: { color: '#007AFF', fontSize: 14, fontWeight: '600' },
+  secondaryButtonText: { color: '#2563EB', fontSize: 14, fontWeight: '600' },
   voiceButton: {
-    backgroundColor: '#0b6b3a',
+    backgroundColor: '#059669',
     borderRadius: 10,
     paddingVertical: 12,
     alignItems: 'center',
     marginBottom: 8,
   },
   voiceButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  voiceHint: { fontSize: 12, color: '#0b6b3a', marginBottom: 6 },
+  voiceHint: { fontSize: 12, color: '#059669', marginBottom: 6 },
   optionButton: {
     borderWidth: 1,
-    borderColor: '#d8dce3',
+    borderColor: '#D1D5DB',
     borderRadius: 10,
     paddingVertical: 10,
     paddingHorizontal: 12,
     marginBottom: 6,
-    backgroundColor: '#fbfcfe',
+    backgroundColor: '#F9FAFB',
   },
-  optionText: { fontSize: 14, color: '#1c1c1e' },
+  optionText: { fontSize: 14, color: '#111827' },
   linkButton: { alignItems: 'center', paddingVertical: 10, marginTop: 6 },
-  linkButtonText: { fontSize: 14, color: '#6b6b70', textDecorationLine: 'underline' },
+  linkButtonText: { fontSize: 14, color: '#6B7280', textDecorationLine: 'underline' },
   feedbackBox: {
-    backgroundColor: '#f3f7f4',
+    backgroundColor: '#ECFDF5',
     borderRadius: 10,
     padding: 12,
     marginTop: 10,
     borderWidth: 1,
-    borderColor: '#dce7df',
+    borderColor: '#D1FAE5',
   },
-  transcriptLine: { fontSize: 13, color: '#4a4a4e', marginBottom: 6, fontStyle: 'italic' },
-  feedbackLine: { fontSize: 14, color: '#1c1c1e', marginBottom: 4 },
-  feedbackDetail: { fontSize: 13, color: '#4a4a4e', marginTop: 4 },
+  transcriptLine: { fontSize: 13, color: '#4B5563', marginBottom: 6, fontStyle: 'italic' },
+  feedbackLine: { fontSize: 14, color: '#111827', marginBottom: 4 },
+  feedbackDetail: { fontSize: 13, color: '#4B5563', marginTop: 4 },
 });
