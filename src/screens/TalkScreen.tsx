@@ -230,6 +230,13 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const [fewerCorrectionsNow, setFewerCorrectionsNow] = useState<boolean>(false);
   /** Explicit "change topic" mode: unlocks the topic draft for a new session. */
   const [topicChangeOpen, setTopicChangeOpen] = useState<boolean>(false);
+  /**
+   * Package 3 — progressive disclosure. Conversation options (correction
+   * intensity + topic) and the help actions start COLLAPSED so the
+   * conversation and the mic/composer stay the strongest elements on screen.
+   */
+  const [optionsOpen, setOptionsOpen] = useState<boolean>(false);
+  const [helpOpen, setHelpOpen] = useState<boolean>(false);
   /** Items saved to review from this screen (presentation mirror). */
   const [reviewSaves, setReviewSaves] = useState<Record<string, boolean>>({});
   /** Friendly result line for save attempts (success or honest failure). */
@@ -1067,6 +1074,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
       if (!session) return;
       if (action === 'change_topic') {
         setTopicChangeOpen(true);
+        setOptionsOpen(true);
         return;
       }
       if (action === 'repeat') {
@@ -1692,141 +1700,186 @@ export default function TalkScreen(props?: TalkScreenProps) {
         </View>
       </View>
 
-      {/* Config Bar */}
+      {/*
+        Conversation controls — progressive disclosure (Package 3). Options
+        and help start COLLAPSED: the conversation and the mic/composer are
+        the strongest elements on screen, and nothing competes with them
+        until the learner opens a disclosure.
+      */}
       <View style={styles.configContainer}>
-        <View style={styles.modeSelector}>
-          {MODES.map((item) => {
-            const isActive = mode === item.key;
-            return (
-              <TouchableOpacity
-                key={item.key}
-                style={[styles.modeButton, isActive && styles.modeButtonActive]}
-                onPress={() => handleSelectMode(item.key)}
-                accessibilityRole="button"
-                accessibilityState={{ selected: isActive }}
-              >
-                <Text
-                  style={[
-                    styles.modeButtonText,
-                    isActive && styles.modeButtonTextActive,
-                  ]}
-                >
-                  {item.label}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
-
-        <TextInput accessibilityLabel="Conversation topic"
-          style={[styles.topicInput, !topicEditable && styles.topicInputLocked]}
-          placeholder="Optional topic (e.g. Travel, Job Interview)"
-          placeholderTextColor="#9CA3AF"
-          value={topic}
-          onChangeText={(text) => {
-            setTopic(text);
-          }}
-          editable={topicEditable}
-        />
-        {history.length > 0 && (
-          <Text style={styles.topicLockedHelperText}>
-            Start a new chat to change the topic.
-          </Text>
-        )}
-        {/*
-          A typed topic is a DRAFT: the learner applies it explicitly. This is what
-          stops per-keystroke conversation replacement (and the "conversation was
-          replaced before the turn finished" failure it caused).
-        */}
-        {topicDraftPending && (
+        <View style={[styles.disclosureRow, isProviderUnavailable && styles.controlsUnavailable]}>
           <TouchableOpacity
-            style={styles.topicApplyButton}
-            onPress={handleApplyTopic}
+            style={[styles.disclosureButton, optionsOpen && styles.disclosureButtonOpen]}
+            onPress={() => setOptionsOpen(open => !open)}
             accessibilityRole="button"
-            accessibilityLabel="Start the conversation with this topic"
+            accessibilityState={{ expanded: optionsOpen }}
+            accessibilityLabel="Conversation options"
+            testID="talk-options-disclosure"
           >
-            <Text style={styles.topicApplyButtonText}>
-              {topicChangeOpen ? 'Start a new chat with this topic' : 'Start with this topic'}
+            <Text style={styles.disclosureButtonText}>
+              {optionsOpen ? 'Conversation options ▲' : 'Conversation options ▼'}
             </Text>
           </TouchableOpacity>
-        )}
-        {topicChangeOpen && history.length > 0 && (
           <TouchableOpacity
-            style={styles.topicApplyButton}
-            onPress={handleCancelTopicChange}
+            style={[styles.disclosureButton, helpOpen && styles.disclosureButtonOpen]}
+            onPress={() => setHelpOpen(open => !open)}
             accessibilityRole="button"
-            accessibilityLabel="Keep the current conversation and close the topic change"
+            accessibilityState={{ expanded: helpOpen }}
+            accessibilityLabel="Need help?"
+            testID="talk-help-disclosure"
           >
-            <Text style={styles.topicApplyButtonText}>Keep this conversation</Text>
+            <Text style={styles.disclosureButtonText}>
+              {helpOpen ? 'Need help? ▲' : 'Need help? ▼'}
+            </Text>
           </TouchableOpacity>
-        )}
+        </View>
 
-        {/*
-          Work Order 2 — learner agency row. REAL actions only:
-          provider-backed help goes through the conversation's non-committing
-          assistance path; Repeat/Slower are playback; Change topic opens the
-          explicit draft flow. None of them can submit a learner answer or
-          create evidence.
-        */}
-        <View style={styles.helpRow} testID="learner-help-row">
-          {HELP_ACTION_DESCRIPTORS.map((descriptor) => {
-            const isProvider = isProviderHelpAction(descriptor.id);
-            const disabled = descriptor.id === 'change_topic'
-              ? !helpControls.changeTopicEnabled
-              : descriptor.kind === 'playback'
-              ? !helpControls.playbackEnabled
-              : isProvider
-              ? !helpControls.providerActionsEnabled
-              : !helpControls.changeTopicEnabled;
-            const busy = activeHelpAction === descriptor.id;
-            return (
+        {optionsOpen ? (
+          <View style={styles.disclosurePanel}>
+            <View style={styles.modeSelector}>
+              {MODES.map((item) => {
+                const isActive = mode === item.key;
+                return (
+                  <TouchableOpacity
+                    key={item.key}
+                    style={[styles.modeButton, isActive && styles.modeButtonActive]}
+                    onPress={() => handleSelectMode(item.key)}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: isActive }}
+                  >
+                    <Text
+                      style={[
+                        styles.modeButtonText,
+                        isActive && styles.modeButtonTextActive,
+                      ]}
+                    >
+                      {item.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            <TextInput accessibilityLabel="Conversation topic"
+              style={[styles.topicInput, !topicEditable && styles.topicInputLocked]}
+              placeholder="Optional topic (e.g. Travel, Job Interview)"
+              placeholderTextColor="#9CA3AF"
+              value={topic}
+              onChangeText={(text) => {
+                setTopic(text);
+              }}
+              editable={topicEditable}
+            />
+            {history.length > 0 && (
+              <Text style={styles.topicLockedHelperText}>
+                Start a new chat to change the topic.
+              </Text>
+            )}
+            {/*
+              A typed topic is a DRAFT: the learner applies it explicitly. This is what
+              stops per-keystroke conversation replacement (and the "conversation was
+              replaced before the turn finished" failure it caused).
+            */}
+            {topicDraftPending && (
               <TouchableOpacity
-                key={descriptor.id}
-                style={[styles.helpChip, disabled && styles.helpChipDisabled]}
-                onPress={() => void handleHelpAction(descriptor.id)}
-                disabled={disabled}
+                style={styles.topicApplyButton}
+                onPress={handleApplyTopic}
                 accessibilityRole="button"
-                accessibilityLabel={descriptor.accessibilityLabel}
-                accessibilityState={{ disabled, busy }}
+                accessibilityLabel="Start the conversation with this topic"
               >
-                <Text style={[styles.helpChipText, disabled && styles.helpChipTextDisabled]}>
-                  {busy ? '…' : descriptor.label}
+                <Text style={styles.topicApplyButtonText}>
+                  {topicChangeOpen ? 'Start a new chat with this topic' : 'Start with this topic'}
                 </Text>
               </TouchableOpacity>
-            );
-          })}
-        </View>
-        {/* Temporary, session-only correction relief (never persisted). */}
-        <TouchableOpacity
-          style={[styles.fewerCorrectionsChip, fewerCorrectionsNow && styles.fewerCorrectionsChipActive]}
-          onPress={handleToggleFewerCorrections}
-          accessibilityRole="button"
-          accessibilityState={{ selected: fewerCorrectionsNow }}
-          accessibilityLabel="Fewer corrections for now (this conversation only)"
-        >
-          <Text style={styles.fewerCorrectionsText}>
-            {fewerCorrectionsNow ? '✓ Fewer corrections for now' : 'Fewer corrections for now'}
-          </Text>
-        </TouchableOpacity>
+            )}
+            {topicChangeOpen && history.length > 0 && (
+              <TouchableOpacity
+                style={styles.topicApplyButton}
+                onPress={handleCancelTopicChange}
+                accessibilityRole="button"
+                accessibilityLabel="Keep the current conversation and close the topic change"
+              >
+                <Text style={styles.topicApplyButtonText}>Keep this conversation</Text>
+              </TouchableOpacity>
+            )}
+
+          </View>
+        ) : null}
+
+        {helpOpen ? (
+          <View style={styles.disclosurePanel}>
+            {/*
+              Work Order 2 — learner agency row. REAL actions only:
+              provider-backed help goes through the conversation's non-committing
+              assistance path; Repeat/Slower are playback; Change topic opens the
+              explicit draft flow. None of them can submit a learner answer or
+              create evidence.
+            */}
+            <View style={styles.helpRow} testID="learner-help-row">
+              {HELP_ACTION_DESCRIPTORS.map((descriptor) => {
+                const isProvider = isProviderHelpAction(descriptor.id);
+                const disabled = descriptor.id === 'change_topic'
+                  ? !helpControls.changeTopicEnabled
+                  : descriptor.kind === 'playback'
+                  ? !helpControls.playbackEnabled
+                  : isProvider
+                  ? !helpControls.providerActionsEnabled
+                  : !helpControls.changeTopicEnabled;
+                const busy = activeHelpAction === descriptor.id;
+                return (
+                  <TouchableOpacity
+                    key={descriptor.id}
+                    style={[styles.helpChip, disabled && styles.helpChipDisabled]}
+                    onPress={() => void handleHelpAction(descriptor.id)}
+                    disabled={disabled}
+                    accessibilityRole="button"
+                    accessibilityLabel={descriptor.accessibilityLabel}
+                    accessibilityState={{ disabled, busy }}
+                  >
+                    <Text style={[styles.helpChipText, disabled && styles.helpChipTextDisabled]}>
+                      {busy ? '…' : descriptor.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+            {/* Temporary, session-only correction relief (never persisted). */}
+            <TouchableOpacity
+              style={[styles.fewerCorrectionsChip, fewerCorrectionsNow && styles.fewerCorrectionsChipActive]}
+              onPress={handleToggleFewerCorrections}
+              accessibilityRole="button"
+              accessibilityState={{ selected: fewerCorrectionsNow }}
+              accessibilityLabel="Fewer corrections for now (this conversation only)"
+            >
+              <Text style={styles.fewerCorrectionsText}>
+                {fewerCorrectionsNow ? '✓ Fewer corrections for now' : 'Fewer corrections for now'}
+              </Text>
+            </TouchableOpacity>
+
+          </View>
+        ) : null}
 
         {/*
-          Provider honesty. Two distinct states, neither of which is ever
-          substituted for the other:
-          - no provider configured and Demo not chosen → configuration required,
-            with no tutor reply of any kind;
-          - explicit Demo Mode → the offline script, labelled as not real AI.
-          The notice stays visible for the whole conversation.
+          Provider honesty — BLOCKED state (Package 3). When real AI is not
+          configured, Talk says so prominently at the top with the
+          configuration CTA, instead of looking ready. Explicit Demo Mode and
+          the demo-learner notice below stay distinct, as before.
         */}
         {isProviderUnavailable && (
-          <View style={styles.offlineNotice}>
-            <Text style={styles.offlineNoticeText}>{TALK_CONFIGURATION_REQUIRED_MESSAGE}</Text>
+          <View style={styles.blockedCard} accessibilityRole="alert" accessibilityLiveRegion="assertive">
+            <Text style={styles.blockedCardTitle}>Talk needs a real AI provider</Text>
+            <Text style={styles.blockedCardText}>{TALK_CONFIGURATION_REQUIRED_MESSAGE}</Text>
+            <Text style={styles.blockedCardBody}>
+              The tutor cannot generate replies until a provider is configured, so the
+              conversation controls stay inactive — nothing scripted is substituted.
+            </Text>
             <TouchableOpacity
-              style={styles.offlineNoticeAction}
+              style={styles.blockedCardAction}
               onPress={() => navigation.navigate('Settings')}
               accessibilityRole="button"
-              accessibilityLabel="Open Settings to configure a provider"
+              accessibilityLabel="Configure provider in Settings"
             >
-              <Text style={styles.offlineNoticeActionText}>Open provider settings</Text>
+              <Text style={styles.blockedCardActionText}>Configure provider</Text>
             </TouchableOpacity>
           </View>
         )}
@@ -2656,6 +2709,78 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: '#E5E7EB',
     gap: 8,
+  },
+  disclosureRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  controlsUnavailable: {
+    opacity: 0.55,
+  },
+  disclosureButton: {
+    flex: 1,
+    minWidth: 150,
+    minHeight: 44,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 10,
+    borderWidth: 1.5,
+    borderColor: '#2563EB',
+    backgroundColor: '#FFFFFF',
+  },
+  disclosureButtonOpen: {
+    backgroundColor: '#EFF6FF',
+  },
+  disclosureButtonText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#2563EB',
+  },
+  disclosurePanel: {
+    gap: 8,
+    padding: 10,
+    borderRadius: 12,
+    backgroundColor: '#F9FAFB',
+    borderWidth: 1,
+    borderColor: '#F3F4F6',
+  },
+  blockedCard: {
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: '#F59E0B',
+    backgroundColor: '#FFFBEB',
+    padding: 16,
+    gap: 8,
+  },
+  blockedCardTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#92400E',
+  },
+  blockedCardText: {
+    fontSize: 14,
+    color: '#78350F',
+    lineHeight: 20,
+  },
+  blockedCardBody: {
+    fontSize: 13,
+    color: '#92400E',
+    lineHeight: 19,
+  },
+  blockedCardAction: {
+    marginTop: 4,
+    minHeight: 48,
+    borderRadius: 10,
+    backgroundColor: '#2563EB',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+  },
+  blockedCardActionText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '700',
   },
   modeSelector: {
     flexDirection: 'row',

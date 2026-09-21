@@ -65,3 +65,64 @@ describe('Home — one dominant primary CTA and core actions first', () => {
     expect(home.match(/testID=\{`home-skill-\$\{link.route\}`\}/g)).toHaveLength(2);
   });
 });
+
+const talk = read('TalkScreen.tsx');
+
+describe('Talk — voice-first hierarchy with progressive disclosure', () => {
+  it('keeps Conversation options collapsed by default', () => {
+    expect(talk).toContain('const [optionsOpen, setOptionsOpen] = useState<boolean>(false);');
+    // The options panel (mode selector + topic draft) renders only when open.
+    expect(talk).toContain('{optionsOpen ? (');
+    const panelAt = talk.indexOf('{optionsOpen ? (');
+    const selectorAt = talk.indexOf('<View style={styles.modeSelector}>');
+    const topicAt = talk.indexOf('accessibilityLabel="Conversation topic"');
+    expect(selectorAt).toBeGreaterThan(panelAt);
+    expect(topicAt).toBeGreaterThan(panelAt);
+    expect(talk).toContain('accessibilityLabel="Conversation options"');
+    expect(talk).toContain('testID="talk-options-disclosure"');
+  });
+
+  it('replaces the permanent help button row with ONE collapsed "Need help?" control', () => {
+    expect(talk).toContain('const [helpOpen, setHelpOpen] = useState<boolean>(false);');
+    expect(talk).toContain('{helpOpen ? (');
+    const panelAt = talk.indexOf('{helpOpen ? (');
+    // All help actions live inside the disclosure — the descriptor row and the
+    // temporary correction relief are rendered only when it is open.
+    const helpRowAt = talk.indexOf('HELP_ACTION_DESCRIPTORS.map');
+    const fewerAt = talk.indexOf('fewerCorrectionsChip');
+    expect(helpRowAt).toBeGreaterThan(panelAt);
+    expect(fewerAt).toBeGreaterThan(panelAt);
+    expect(talk).toContain('accessibilityLabel="Need help?"');
+    expect(talk).toContain('testID="talk-help-disclosure"');
+    // "Change topic" still reaches the topic draft in one step.
+    expect(talk).toContain('setTopicChangeOpen(true);\n        setOptionsOpen(true);');
+    expect(talk).toContain('setOptionsOpen(true);');
+  });
+
+  it('shows a prominent blocked-state card when real AI is unavailable', () => {
+    expect(talk).toContain('styles.blockedCard');
+    expect(talk).toContain('Talk needs a real AI provider');
+    expect(talk).toContain('Configure provider');
+    expect(talk).toContain('TALK_CONFIGURATION_REQUIRED_MESSAGE');
+    expect(talk).toContain('accessibilityRole="alert"');
+    // Provider-backed controls are visually de-emphasized, and the mic/send
+    // stay disabled (Package 1 contract preserved).
+    expect(talk).toContain('isProviderUnavailable && styles.controlsUnavailable');
+    expect(talk).toContain('disabled={turnControls.micDisabled || isProviderUnavailable}');
+  });
+
+  it('keeps the mic/composer as the strongest action area', () => {
+    // The composer is a direct child of the screen (outside the chat scroll),
+    // rendered after the conversation — unchanged Package 1 structure.
+    const chatAt = talk.indexOf('{/* Chat Area */}');
+    const composerAt = talk.indexOf('{/* Message Composer */}');
+    expect(chatAt).toBeGreaterThan(-1);
+    expect(composerAt).toBeGreaterThan(chatAt);
+    expect(talk).toContain('KeyboardAvoidingView');
+    expect(talk).toContain('styles.micButton');
+  });
+
+  it('announces the disclosure state to assistive tech', () => {
+    expect(talk.match(/accessibilityState=\{\{ expanded: (optionsOpen|helpOpen) \}\}/g)).toHaveLength(2);
+  });
+});
