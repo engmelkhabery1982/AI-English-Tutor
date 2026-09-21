@@ -958,6 +958,7 @@ export class VoiceSessionCoordinator {
     const stt = await runWithSafeRetry<STTResult>({
       surface: 'speech',
       committed: () => false,
+      diagnosticsType: 'stt',
       run: async () => {
         if (!this.isCurrent(session, generation)) {
           return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
@@ -1105,6 +1106,7 @@ export class VoiceSessionCoordinator {
     markVoiceTiming('provider_request_started');
     const sent = await runWithSafeRetry<ConversationSessionResult>({
       surface: 'tutor',
+      diagnosticsType: 'tutor_text',
       run: async (): Promise<ConversationSessionResult> => {
         if (!this.isCurrent(session, generation)) {
           return {

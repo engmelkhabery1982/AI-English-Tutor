@@ -22,6 +22,11 @@ import {
 } from '../index';
 import { FeedbackStreamFilter, parseFeedbackAndContent } from '../feedback';
 import {
+  beginRequestDiagnostics,
+  finishRequestDiagnostics,
+  type RequestDiagnosticsOutcome,
+} from '../../request-diagnostics';
+import {
   DEFAULT_GEMINI_MODEL,
   DEFAULT_GEMINI_TIMEOUT_MS,
   GEMINI_PROVIDER_ID,
@@ -70,6 +75,18 @@ function mapFinishReason(rawReason?: string): AIFinishReason | undefined {
 /**
  * Concrete implementation of the Gemini AIProvider.
  */
+/** Maps a provider result onto the INTERNAL diagnostics outcome. */
+function aiResultOutcome(result: AIProviderResult): RequestDiagnosticsOutcome {
+  if (!result.ok) {
+    return {
+      ok: false,
+      failureKind: result.error.code,
+      rateLimited: result.error.code === 'rate_limit',
+    };
+  }
+  return { ok: true, usage: result.response.usage ?? null };
+}
+
 class GeminiAIProvider implements AIProvider {
   readonly id = GEMINI_PROVIDER_ID;
   private readonly apiKey: string;
@@ -103,7 +120,18 @@ class GeminiAIProvider implements AIProvider {
         )
       );
     }
+    // INTERNAL dev/debug request counters only — never part of the request.
+    const diagnostics = beginRequestDiagnostics({
+      type: request.diagnosticsType ?? 'tutor_text',
+      providerId: this.id,
+      model: this.model,
+    });
+    const result = await this.performGenerate(request);
+    finishRequestDiagnostics(diagnostics, aiResultOutcome(result));
+    return result;
+  }
 
+  private async performGenerate(request: ConversationRequest): Promise<AIProviderResult> {
     const url = `${this.endpointBaseUrl}/models/${encodeURIComponent(this.model)}:generateContent`;
 
     const contents = request.messages.map((turn) => ({
@@ -231,7 +259,21 @@ class GeminiAIProvider implements AIProvider {
         )
       );
     }
+    // INTERNAL dev/debug request counters only — never part of the request.
+    const diagnostics = beginRequestDiagnostics({
+      type: request.diagnosticsType ?? 'tutor_text',
+      providerId: this.id,
+      model: this.model,
+    });
+    const result = await this.performGenerateStream(request, onChunk);
+    finishRequestDiagnostics(diagnostics, aiResultOutcome(result));
+    return result;
+  }
 
+  private async performGenerateStream(
+    request: ConversationRequest,
+    onChunk: AIStreamCallback
+  ): Promise<AIProviderResult> {
     const url = `${this.endpointBaseUrl}/models/${encodeURIComponent(this.model)}:streamGenerateContent?alt=sse`;
 
     const contents = request.messages.map((turn) => ({

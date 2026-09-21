@@ -29,6 +29,10 @@ import {
   type ProviderFailureInput,
   type ProviderFailureSurface,
 } from '../providers/failures';
+import {
+  noteAutomaticRetry,
+  type RequestDiagnosticsType,
+} from '../providers/request-diagnostics';
 
 /** Default maximum number of AUTOMATIC retries (one — never a loop). */
 export const DEFAULT_MAX_AUTOMATIC_RETRIES = 1;
@@ -67,6 +71,12 @@ export interface SafeRetryOptions<T> {
     readonly failure: ProviderFailure;
     readonly nextAttempt: number;
   }) => void;
+  /**
+   * INTERNAL dev/debug label: when set, the single automatic retry (if it
+   * happens) is counted per type in src/providers/request-diagnostics.
+   * Never changes retry behaviour itself.
+   */
+  readonly diagnosticsType?: RequestDiagnosticsType;
 }
 
 export interface SafeRetryOutcome<T> {
@@ -114,6 +124,7 @@ export async function runWithSafeRetry<T>(
     } else {
       automaticRetries = 1;
       attempts = 2;
+      if (options.diagnosticsType) noteAutomaticRetry(options.diagnosticsType);
       options.onAutomaticRetry?.({ failure, nextAttempt: 2 });
       if (delayMs > 0) await sleep(delayMs);
       result = await options.run({ index: 2, automatic: true });

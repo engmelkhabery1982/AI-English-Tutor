@@ -216,6 +216,9 @@ export function buildMaterialPrompt(request: ContentRequest): ConversationReques
     mode: 'coach',
     topic: 'Listening content generation',
     coachingContext: neutralCoachingContext(),
+    // INTERNAL dev/debug counter label only (this path serves listening
+    // exercise generation exclusively).
+    diagnosticsType: 'listening_generation',
   };
 }
 

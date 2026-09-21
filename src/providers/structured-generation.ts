@@ -16,6 +16,8 @@ export async function generateStructured<T>(
 ): Promise<GenerationResult<T>> {
   const outcome = await runWithSafeRetry<GenerationResult<T>>({
     committed: stale,
+    // INTERNAL dev/debug: attribute the (at most one) automatic retry.
+    ...(request.diagnosticsType ? { diagnosticsType: request.diagnosticsType } : {}),
     run: async () => {
       if (stale()) return { ok: false, failure: classifyProviderFailure({ code: 'cancelled', message: 'Request was replaced.' }) };
       if (!provider) return { ok: false, failure: classifyProviderFailure({ code: 'not_configured', message: 'Configure the AI provider in Settings. Your input is kept.', retryable: false }) };

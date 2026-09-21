@@ -365,6 +365,7 @@ export class ReviewVoiceController {
       const sttOutcome = await runWithSafeRetry({
         committed: () => this.isStale(generation),
         surface: 'speech',
+        diagnosticsType: 'stt',
         run: async () => {
           if (this.isStale(generation)) return { ok: false as const, error: 'Request was replaced.', code: 'cancelled' as const };
           try {

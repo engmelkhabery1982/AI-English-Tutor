@@ -6,6 +6,7 @@
 
 import type { ConversationMode } from '../domain/shared/types';
 import type { CoachingContext, LearnerModel } from '../learner-model';
+import type { RequestDiagnosticsType } from '../providers/request-diagnostics';
 
 export type ConversationRole = 'user' | 'assistant';
 
@@ -30,6 +31,13 @@ export interface ConversationRequest {
   readonly mode: ConversationMode;
   readonly topic: string | null;
   readonly coachingContext: CoachingContext;
+  /**
+   * Optional INTERNAL diagnostics label (dev/debug counters only — see
+   * src/providers/request-diagnostics). Never affects the request itself;
+   * providers that do not know it simply ignore it. Defaults to
+   * 'tutor_text' at the provider boundary.
+   */
+  readonly diagnosticsType?: RequestDiagnosticsType;
 }
 
 export interface ConversationEngine {

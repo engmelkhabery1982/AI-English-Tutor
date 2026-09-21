@@ -13,6 +13,7 @@
 import type * as ExpoSpeechModule from 'expo-speech';
 import { sanitizeTextForTTS } from './sanitizer';
 import type { TextToSpeechProvider, TTSOptions } from './types';
+import { beginRequestDiagnostics, finishRequestDiagnostics } from '../request-diagnostics';
 
 let speechModulePromise: Promise<typeof ExpoSpeechModule> | null = null;
 async function getSpeechModule(): Promise<typeof ExpoSpeechModule> {
@@ -72,6 +73,11 @@ export class ExpoTTSProvider implements TextToSpeechProvider {
 
     this.active = true;
 
+    // INTERNAL dev/debug counters only — local speech synthesis, no network,
+    // never any spoken content.
+    const diagnostics = beginRequestDiagnostics({ type: 'tts', providerId: this.id });
+    let diagnosticsFailure: string | null = null;
+
     return new Promise(async (resolve) => {
       let resolved = false;
       let watchdog: ReturnType<typeof setTimeout> | null = null;
@@ -81,6 +87,10 @@ export class ExpoTTSProvider implements TextToSpeechProvider {
           resolved = true;
           if (watchdog) clearTimeout(watchdog);
           this.active = false;
+          finishRequestDiagnostics(diagnostics, {
+            ok: diagnosticsFailure === null,
+            failureKind: diagnosticsFailure,
+          });
           resolve();
         }
       };
@@ -88,6 +98,7 @@ export class ExpoTTSProvider implements TextToSpeechProvider {
       // Bounded watchdog – avoids permanent pending promise if native callback never arrives
       watchdog = setTimeout(() => {
         // Do not invent fake completion – just resolve the promise and stop
+        diagnosticsFailure = 'timeout';
         try {
           this.stopInternal().catch(() => {});
         } finally {
@@ -118,11 +129,13 @@ export class ExpoTTSProvider implements TextToSpeechProvider {
             finish();
           },
           onError: (err: Error) => {
+            diagnosticsFailure = 'playback_error';
             if (this.generation === gen) options?.onError?.(err);
             finish();
           },
         });
       } catch (err: unknown) {
+        diagnosticsFailure = 'playback_error';
         const error = err instanceof Error ? err : new Error(String(err));
         if (this.generation === gen) options?.onError?.(error);
         finish();
