@@ -126,3 +126,26 @@ describe('Talk — voice-first hierarchy with progressive disclosure', () => {
     expect(talk.match(/accessibilityState=\{\{ expanded: (optionsOpen|helpOpen) \}\}/g)).toHaveLength(2);
   });
 });
+
+describe('Bottom navigation — full discoverable labels', () => {
+  const navigator = read('../navigation/RootNavigator.tsx');
+
+  it('shows full readable tab labels with meaningful icons (no single letters)', () => {
+    expect(navigator).toContain('tabBarShowLabel: true');
+    expect(navigator).toContain('const TAB_ICONS');
+    for (const label of ['Home', 'Talk', 'Review', 'Progress', 'Settings']) {
+      expect(navigator).toContain(`${label}: '`);
+    }
+    // The single-letter icon presentation is gone.
+    expect(navigator).not.toContain('route.name.charAt(0)');
+  });
+
+  it('keeps clear selected/unselected states and the hidden utility tabs', () => {
+    expect(navigator).toContain("tabBarActiveTintColor: '#2563EB'");
+    expect(navigator).toContain("tabBarInactiveTintColor: '#9CA3AF'");
+    expect(navigator).toContain('focused ? 1 : 0.65');
+    // Existing behavior preserved: Listening/Vocabulary stay off the bar.
+    expect(navigator).toContain("route.name === 'Listening' || route.name === 'Vocabulary' ? { display: 'none' }");
+    expect(navigator).toContain('MAIN_TAB_ROUTES.map');
+  });
+});
