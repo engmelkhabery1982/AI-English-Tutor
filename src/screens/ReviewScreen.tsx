@@ -12,6 +12,7 @@ import {
   View,
 } from 'react-native';
 import type { ViewStyle } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
 import type { ReviewService } from '../review/service';
@@ -103,6 +104,10 @@ export interface ReviewScreenProps {
  * existing Review planner is conditioned on.
  */
 export default function ReviewScreen(props?: ReviewScreenProps) {
+  // Top safe-area inset: the practice view's "Card N of M" progress area
+  // sits at the very top of the tab (no header), so it must clear the
+  // status bar / notch.
+  const insets = useSafeAreaInsets();
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
   const route = useRoute() as { readonly params?: { readonly dailyTutor?: DailyTutorReviewLaunch } };
 
@@ -883,9 +888,10 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
     const progressPercent = ((currentIndex + 1) / sessionCandidates.length) * 100;
 
     return (
+      <View style={styles.practiceRoot}>
       <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.practiceContainer}>
         {/* Progress Bar Header */}
-        <View style={styles.practiceHeader}>
+        <View style={[styles.practiceHeader, { paddingTop: insets.top }]}>
           <Text style={styles.practiceProgressText}>
             Card {currentIndex + 1} of {sessionCandidates.length}
           </Text>
@@ -1109,20 +1115,32 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
                 </View>
               )}
 
-              <TouchableOpacity
-                style={styles.nextButton}
-                onPress={handleNextItem}
-                accessibilityRole="button"
-                id="next_card_button"
-              >
-                <Text style={styles.nextButtonText}>
-                  {currentIndex + 1 < sessionCandidates.length ? 'Next Card →' : 'Finish Session'}
-                </Text>
-              </TouchableOpacity>
             </View>
           )}
         </View>
       </ScrollView>
+
+      {/* Sticky continuation bar: once feedback is shown, Next Card /
+          Finish Session stays reachable at the bottom — long feedback can
+          never bury the navigation below the fold. */}
+      {evaluation ? (
+        <View style={styles.continuationBar}>
+          <TouchableOpacity
+            style={styles.nextButton}
+            onPress={handleNextItem}
+            accessibilityRole="button"
+            accessibilityLabel={
+              currentIndex + 1 < sessionCandidates.length ? 'Next Card' : 'Finish Session'
+            }
+            id="next_card_button"
+          >
+            <Text style={styles.nextButtonText}>
+              {currentIndex + 1 < sessionCandidates.length ? 'Next Card →' : 'Finish Session'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+      </View>
     );
   }
 
@@ -1391,6 +1409,17 @@ const styles = StyleSheet.create({
     fontSize: 15,
     color: '#4B5563',
     marginTop: 12,
+  },
+  practiceRoot: {
+    flex: 1,
+  },
+  continuationBar: {
+    paddingHorizontal: 20,
+    paddingTop: 10,
+    paddingBottom: 16,
+    backgroundColor: '#FFFFFF',
+    borderTopWidth: 1,
+    borderTopColor: '#E5E7EB',
   },
   practiceHeader: {
     flexDirection: 'row',
