@@ -242,6 +242,40 @@ describe('Onboarding — reduced setup density, unchanged assessment logic', () 
   });
 });
 
+describe('Listening — clear setup sequence, no dead space', () => {
+  const listening = read('ListeningScreen.tsx');
+
+  it('removes the vertically-centered blank-space layout', () => {
+    // The setup screen is top-aligned now; the centered flexGrow container
+    // (which produced large unused areas) is no longer wired to it.
+    expect(listening).toContain('ref={setupScrollRef}');
+    expect(listening).toContain('contentContainerStyle={styles.setupContent}');
+    expect(listening).toContain('setupContent: { padding: 16, paddingBottom: 40 },');
+    const setupScrollAt = listening.indexOf('ref={setupScrollRef}');
+    expect(listening.indexOf('styles.centerContent', setupScrollAt)).toBe(-1);
+  });
+
+  it('makes the setup sequence explicit: mode → level → Start', () => {
+    const modeLabelAt = listening.indexOf('>Mode</Text>');
+    const levelLabelAt = listening.indexOf('>Level</Text>');
+    const startAt = listening.indexOf('testID="start_listening_button"');
+    expect(modeLabelAt).toBeGreaterThan(-1);
+    expect(levelLabelAt).toBeGreaterThan(modeLabelAt);
+    expect(startAt).toBeGreaterThan(levelLabelAt);
+    // The explanatory paragraph is secondary info under the Start action.
+    expect(listening.indexOf('Short listening exercises. Play the audio')).toBeGreaterThan(startAt);
+  });
+
+  it('preserves the Package 2 failure/start behavior', () => {
+    expect(listening).toContain('onLayout={(event) => { startAreaY.current');
+    expect(listening).toContain('accessibilityRole="alert"');
+    expect(listening).toContain('setupScrollRef.current?.scrollTo(');
+    expect(listening).toContain('No learner profile yet');
+    // CEFR/difficulty semantics untouched.
+    expect(listening).toContain("setDifficulty(level)");
+  });
+});
+
 describe('Bottom navigation — full discoverable labels', () => {
   const navigator = read('../navigation/RootNavigator.tsx');
 

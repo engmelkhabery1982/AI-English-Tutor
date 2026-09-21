@@ -532,8 +532,9 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
       );
     }
     return (
-      <ScrollView ref={setupScrollRef} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.centerContent}>
+      <ScrollView ref={setupScrollRef} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.setupContent}>
         <Text style={styles.title}>🎧 Listening</Text>
+        <Text style={styles.setupSectionLabel}>Mode</Text>
         {!dailyTutorRef ? (
           <View style={styles.modeRow}>
             <TouchableOpacity
@@ -576,11 +577,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
         </View> : null}
         {!serviceReady ? <Text accessibilityLiveRegion="polite">{errorMessage ?? 'Loading listening practice…'}</Text> : null}
         {!serviceReady && errorMessage ? <TouchableOpacity onPress={() => setLoadAttempt(n => n + 1)}><Text>Try again</Text></TouchableOpacity> : null}
-        <Text style={styles.subtitle}>
-          Short listening exercises. Play the audio, answer what you understood, and get
-          qualitative feedback — no scores, just real comprehension practice.
-        </Text>
-
+        <Text style={styles.setupSectionLabel}>Level</Text>
         <View style={styles.difficultyRow}>
           {DIFFICULTIES.map((level) => (
             <TouchableOpacity
@@ -629,6 +626,11 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
             )}
           </TouchableOpacity>
         </View>
+
+        <Text style={styles.subtitle}>
+          Short listening exercises. Play the audio, answer what you understood, and get
+          qualitative feedback — no scores, just real comprehension practice.
+        </Text>
       </ScrollView>
     );
   }
@@ -848,6 +850,8 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F7F8FA' },
   centerContent: { alignItems: 'center', justifyContent: 'center', padding: 24, flexGrow: 1 },
+  setupContent: { padding: 16, paddingBottom: 40 },
+  setupSectionLabel: { fontSize: 12, fontWeight: '700', color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8, marginTop: 4 },
   title: { fontSize: 28, fontWeight: '800', color: '#111827', letterSpacing: -0.5, marginBottom: 8 },
   subtitle: { fontSize: 14, color: '#6B7280', textAlign: 'center', lineHeight: 22, marginBottom: 20 },
   difficultyRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 20 },
