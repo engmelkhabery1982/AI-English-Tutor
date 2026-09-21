@@ -100,3 +100,21 @@ describe('Talk mic race — stale transition cannot install Conversation Review'
     );
   });
 });
+
+describe('Talk TTS recovery — learner-visible Replay wiring', () => {
+  it('shows the audio-only failure with a Replay action', () => {
+    expect(TALK).toContain('voiceStatus.audioPlaybackFailed');
+    expect(TALK).toContain("Audio didn't play");
+    expect(TALK).toContain('accessibilityLabel="Replay tutor audio"');
+    expect(TALK).toContain('onPress={handleReplayResponse}');
+  });
+
+  it('guards Replay taps synchronously against overlap', () => {
+    expect(TALK).toContain('if (!coordinator || replayInFlightRef.current) return;');
+    expect(TALK).toContain('replayInFlightRef.current = true;');
+    expect(TALK).toContain('replayInFlightRef.current = false;');
+    // Replay goes through the coordinator (no second playback path) and never
+    // regenerates a tutor turn.
+    expect(TALK).toContain('await coordinator.replayLastResponse();');
+  });
+});

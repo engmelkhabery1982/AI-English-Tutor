@@ -296,6 +296,8 @@ export default function TalkScreen(props?: TalkScreenProps) {
    * can never consume it.
    */
   const micIntentRef = useRef<MicIntentQueue>(new MicIntentQueue());
+  /** Synchronous single-flight guard for Replay taps (no overlapping playback). */
+  const replayInFlightRef = useRef<boolean>(false);
   /**
    * Conversation Learning Memory: the recorder owns the stable identity of the
    * ACTIVE conversation, so persistence is exactly-once regardless of rerenders.
@@ -1364,10 +1366,19 @@ export default function TalkScreen(props?: TalkScreenProps) {
     }
   };
 
-  // Handle replay response aloud
+  // Handle replay response aloud — the explicit recovery after an AUDIO-ONLY
+  // TTS failure. It replays the already-committed tutor response: no
+  // regeneration, no new tutor turn, no duplicated evidence, no history
+  // change. Rapid repeated taps are refused synchronously, and the coordinator
+  // additionally refuses while playback is already running.
   const handleReplayResponse = async () => {
-    if (voiceCoordinatorRef.current) {
-      await voiceCoordinatorRef.current.replayLastResponse();
+    const coordinator = voiceCoordinatorRef.current;
+    if (!coordinator || replayInFlightRef.current) return;
+    replayInFlightRef.current = true;
+    try {
+      await coordinator.replayLastResponse();
+    } finally {
+      replayInFlightRef.current = false;
     }
   };
 
@@ -2291,6 +2302,24 @@ export default function TalkScreen(props?: TalkScreenProps) {
         )}
       </View>
       <Text style={styles.turnHint}>{turnView.hint}</Text>
+      {/*
+        AUDIO-ONLY failure recovery: the tutor's committed text stays on
+        screen; only playback failed. Replay re-speaks the SAME response —
+        it never regenerates a turn or duplicates evidence.
+      */}
+      {voiceStatus.audioPlaybackFailed && (
+        <View style={styles.audioFailureRow}>
+          <Text style={styles.audioFailureText}>Audio didn't play</Text>
+          <TouchableOpacity
+            style={styles.audioReplayButton}
+            onPress={handleReplayResponse}
+            accessibilityRole="button"
+            accessibilityLabel="Replay tutor audio"
+          >
+            <Text style={styles.audioReplayButtonText}>Replay</Text>
+          </TouchableOpacity>
+        </View>
+      )}
       {/permission|microphone access/i.test(errorMessage ?? voiceStatus.errorMessage ?? '') ? <MicrophoneHelp /> : null}
       {voiceStatus.recognizedTranscript &&
         (voiceStatus.state === 'sending' ||
@@ -2509,6 +2538,36 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: '#6B7280',
     backgroundColor: '#FFFFFF',
+  },
+  audioFailureRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginHorizontal: 16,
+    marginBottom: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: '#FEF2F2',
+    borderWidth: 1,
+    borderColor: '#FECACA',
+  },
+  audioFailureText: {
+    fontSize: 13,
+    color: '#991B1B',
+    flex: 1,
+  },
+  audioReplayButton: {
+    marginLeft: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: '#2563EB',
+  },
+  audioReplayButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#FFFFFF',
   },
   header: {
     flexDirection: 'row',

@@ -64,6 +64,16 @@ export interface VoiceStatus {
    * transcribed again without asking the learner to speak a second time.
    */
   readonly canRetryTranscription?: boolean;
+  /**
+   * True when TTS playback of an ALREADY-COMMITTED tutor response failed for
+   * the CURRENT turn (audio-only failure: the tutor text is intact). Playback
+   * cancelled by an intentional stop, a session replacement or disposal is
+   * never reported as a failure. Drives the "Audio didn't play / Replay"
+   * recovery affordance.
+   */
+  readonly audioPlaybackFailed?: boolean;
+  /** True while the failed tutor audio can be replayed (no regeneration). */
+  readonly canReplayAudio?: boolean;
 }
 
 export type VoiceStatusListener = (status: VoiceStatus) => void;
