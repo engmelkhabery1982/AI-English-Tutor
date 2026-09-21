@@ -142,6 +142,10 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [replayCount, setReplayCount] = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // Start-failure visibility: measure the setup screen's Start area so a
+  // failure can be scrolled into view without manual scrolling.
+  const setupScrollRef = useRef<ScrollView | null>(null);
+  const startAreaY = useRef(0);
   const [difficulty, setDifficulty] = useState<ListeningDifficulty>('easy');
   const [savedItems, setSavedItems] = useState<readonly string[]>([]);
   const [sessionDone, setSessionDone] = useState<boolean>(false);
@@ -226,6 +230,19 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
       setIsStarting(false);
     }
   }, [difficulty, isStarting]);
+
+  // Start-failure visibility: keep the failure AND the Start action in the
+  // viewport — when a start fails on the setup screen, scroll the alert area
+  // into view instead of leaving the learner hunting for it. Selections
+  // (difficulty, mode, previous lesson) are intentionally untouched by any
+  // error path, so a retry after a recoverable failure starts unchanged.
+  useEffect(() => {
+    if (!errorMessage || session || sessionDone || mode !== 'short') return;
+    setupScrollRef.current?.scrollTo({
+      y: Math.max(0, startAreaY.current - 24),
+      animated: true,
+    });
+  }, [errorMessage, session, sessionDone, mode]);
 
   /**
    * A user-started session is NEVER the Daily Tutor workflow: clear any
@@ -515,7 +532,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
       );
     }
     return (
-      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.centerContent}>
+      <ScrollView ref={setupScrollRef} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.centerContent}>
         <Text style={styles.title}>🎧 Listening</Text>
         {!dailyTutorRef ? (
           <View style={styles.modeRow}>
@@ -585,22 +602,33 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
           ))}
         </View>
 
-        <TouchableOpacity
-          style={[styles.startButton, isStarting && styles.startButtonDisabled]}
-          onPress={handleStartSession}
-          disabled={isStarting || !serviceReady}
-          testID="start_listening_button"
-          accessibilityRole="button"
-          accessibilityLabel="Start listening practice"
-        >
-          {isStarting ? (
-            <ActivityIndicator color="#FFFFFF" />
-          ) : (
-            <Text style={styles.startButtonText}>Start practice</Text>
-          )}
-        </TouchableOpacity>
-
-        {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+        {/* Start area: a start failure renders IMMEDIATELY ABOVE the Start
+            button as an announced alert — adjacent to the action, in view. */}
+        <View onLayout={(event) => { startAreaY.current = event.nativeEvent.layout.y; }}>
+          {errorMessage ? (
+            <Text
+              style={styles.errorText}
+              accessibilityRole="alert"
+              accessibilityLiveRegion="assertive"
+            >
+              {errorMessage}
+            </Text>
+          ) : null}
+          <TouchableOpacity
+            style={[styles.startButton, isStarting && styles.startButtonDisabled]}
+            onPress={handleStartSession}
+            disabled={isStarting || !serviceReady}
+            testID="start_listening_button"
+            accessibilityRole="button"
+            accessibilityLabel="Start listening practice"
+          >
+            {isStarting ? (
+              <ActivityIndicator color="#FFFFFF" />
+            ) : (
+              <Text style={styles.startButtonText}>Start practice</Text>
+            )}
+          </TouchableOpacity>
+        </View>
       </ScrollView>
     );
   }
