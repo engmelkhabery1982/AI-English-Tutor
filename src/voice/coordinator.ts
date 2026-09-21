@@ -215,6 +215,13 @@ export class VoiceSessionCoordinator {
    * session that is on its way out.
    */
   private switching: boolean = false;
+  /**
+   * Synchronous single-flight guard for `startRecording()`: at most ONE
+   * recorder start operation may be active. Rapid repeated mic taps (before
+   * the state machine has visibly moved to `requesting_permission`) can never
+   * open two recorders or start two captures.
+   */
+  private startRequestInFlight: boolean = false;
   private appStateSub: { remove: () => void } | null = null;
   private lastAppState: string = 'active';
   private lastAudioUri: string | null = null;
@@ -485,6 +492,11 @@ export class VoiceSessionCoordinator {
     if (this.disposed) return false;
     // Never start new voice work while the conversation session is switching.
     if (this.switching) return false;
+    // At most ONE recorder start operation may be active. The state machine
+    // only moves to `requesting_permission` after the awaited barge-in stop
+    // below, so without this synchronous guard two rapid taps could both pass
+    // the state checks and open two recorders.
+    if (this.startRequestInFlight) return false;
     // Prevent starting if already recording, transcribing, or sending — and
     // never open the microphone while another voice operation is in flight.
     if (
@@ -496,7 +508,16 @@ export class VoiceSessionCoordinator {
     ) {
       return false;
     }
+    this.startRequestInFlight = true;
+    try {
+      return await this.performStartRecording();
+    } finally {
+      this.startRequestInFlight = false;
+    }
+  }
 
+  /** The actual recorder-open lifecycle. Only ever entered via startRecording(). */
+  private async performStartRecording(): Promise<boolean> {
     // A NEW utterance supersedes any preserved recovery state: the learner chose
     // to speak again, so the previous transcript/recording is dropped (with its
     // temp file) and can never be sent a second time.

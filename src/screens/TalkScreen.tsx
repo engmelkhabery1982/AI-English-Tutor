@@ -21,6 +21,7 @@ import {
   View,
 } from 'react-native';
 import { countCommittedLearnerTurns } from '../conversation-session';
+import { MicIntentQueue } from '../voice/mic-intent';
 import {
   resolveSpeechRateCapability,
   planSpeechRate,
@@ -86,6 +87,14 @@ import {
 
 /** Short pause before the tutor opens, so a topic being typed is not cut off. */
 const TUTOR_OPENING_DELAY_MS = 400;
+
+/**
+ * Shown when the learner taps the microphone while a conversation/session
+ * transition is running. The tap is NOT lost: exactly one mic intent is queued
+ * and executes as soon as the new conversation is installed.
+ */
+export const TALK_MIC_QUEUED_MESSAGE =
+  'Just a moment — recording will start as soon as your conversation is ready.';
 
 /**
  * Correction-intensity chips (Work Order 2). The KEYS are the EXISTING
@@ -274,6 +283,20 @@ export default function TalkScreen(props?: TalkScreenProps) {
   /** Mirror of `isSwitching` for async callbacks that must not re-enter. */
   const coordinatorIsSwitchingRef = useRef<boolean>(false);
   /**
+   * Synchronous guard for the mic handler: at most ONE mic action (start or
+   * stop) may be in flight, so rapid repeated taps can never open two recorders
+   * or submit one utterance twice from the screen side.
+   */
+  const micActionInFlightRef = useRef<boolean>(false);
+  /**
+   * ONE queued mic intent for the session-transition race: a tap that arrives
+   * while a transition is running is kept here (bound to that transition's
+   * switch token) and executed when — and ONLY when — that same transition
+   * installs its new session. A newer transition clears it; a stale transition
+   * can never consume it.
+   */
+  const micIntentRef = useRef<MicIntentQueue>(new MicIntentQueue());
+  /**
    * Conversation Learning Memory: the recorder owns the stable identity of the
    * ACTIVE conversation, so persistence is exactly-once regardless of rerenders.
    */
@@ -453,6 +476,24 @@ export default function TalkScreen(props?: TalkScreenProps) {
   );
 
   /**
+   * The ONE mic-open action, shared by a direct tap and by the execution of a
+   * mic intent queued during a session transition. Callers own their own
+   * re-entry guards; the coordinator itself enforces every lifecycle rule (at
+   * most one recorder start, no start while switching, barge-in ordering).
+   */
+  const startRecordingTurn = useCallback(
+    async (session: ConversationSession, kind: TalkProviderKind): Promise<void> => {
+      if (kind === 'unavailable') return;
+      const coordinator = getOrCreateVoiceCoordinator(session, kind);
+      setErrorMessage(null);
+      // Barge-in: the coordinator stops and awaits tutor playback internally
+      // before the microphone opens.
+      await coordinator.startRecording();
+    },
+    [getOrCreateVoiceCoordinator],
+  );
+
+  /**
    * Starts a NEW conversation identity: cancels any active voice work (recording
    * / in-flight STT or AI work / playback), builds the session stack for the
    * requested mode+topic, and resets all conversation state.
@@ -469,6 +510,10 @@ export default function TalkScreen(props?: TalkScreenProps) {
       const switchToken = (switchTokenRef.current += 1);
       // Any tutor opening of the previous conversation is invalidated at once.
       openingTokenRef.current += 1;
+      // A mic intent queued for an EARLIER transition belonged to that
+      // transition: this newer one owns the surface now, and the learner's
+      // queued tap must never start a recording on a session they moved past.
+      micIntentRef.current.clear();
       // The composed identity AND the applied topic are set together, so the
       // identity effect sees one stable identity for this conversation and never
       // composes a second one for the same mode+topic.
@@ -530,20 +575,26 @@ export default function TalkScreen(props?: TalkScreenProps) {
       });
       if (!outcome.installed) {
         // Superseded (or the screen was disposed): the newer operation owns the
-        // coordinator and will settle the switch state itself.
+        // coordinator and will settle the switch state itself. Nothing is
+        // installed here — no session UI, no Conversation Review — and a queued
+        // mic intent can never execute into a session that was not activated.
+        micIntentRef.current.clear();
         return null;
       }
+
+      // SWITCH-TOKEN REVALIDATION runs BEFORE anything is installed. A
+      // superseded transition must never open the Conversation Review, replace
+      // the current session UI, or consume a mic intent: the newer switch owns
+      // the switch flag and will clear it when it settles.
+      if (switchToken !== switchTokenRef.current) {
+        return null;
+      }
+
       if (!coordinator) {
         getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
       }
       if (outcome.review && outcome.review.hasEvidence) {
         setConversationReview(outcome.review);
-      }
-
-      // A newer switch superseded this one: install nothing. The newer switch
-      // owns the switch flag and will clear it when it settles.
-      if (switchToken !== switchTokenRef.current) {
-        return null;
       }
 
       sessionRef.current = bundle.session;
@@ -587,9 +638,17 @@ export default function TalkScreen(props?: TalkScreenProps) {
       // Only now is the replacement session live: the tutor opening may run.
       setSessionEpoch((prev) => prev + 1);
 
+      // A mic tap that arrived DURING this transition executes now, on the
+      // freshly installed session: one intent, one execution. `consume()`
+      // only matches THIS switch's token, so a superseded transition can never
+      // execute it and a newer transition has already cleared it.
+      if (micIntentRef.current.consume(switchToken)) {
+        void startRecordingTurn(bundle.session, bundle.providerKind);
+      }
+
       return bundle.session;
     },
-    [endConversation, getOrCreateVoiceCoordinator],
+    [endConversation, getOrCreateVoiceCoordinator, startRecordingTurn],
   );
 
   /**
@@ -1120,6 +1179,22 @@ export default function TalkScreen(props?: TalkScreenProps) {
 
   // Handle microphone press — the single primary action of a turn.
   const handleToggleRecording = async () => {
+    // Rapid-tap protection: at most ONE mic action (start or stop) at a time,
+    // so repeated taps can never open two recorders or submit one utterance
+    // twice from the screen side.
+    if (micActionInFlightRef.current) return;
+    // SYNCHRONOUS transition guard. `coordinatorIsSwitchingRef` is the
+    // authoritative mirror of `isSwitching`, set and cleared inside the same
+    // synchronous steps of startConversation — unlike the React state it can
+    // never be stale inside this handler. A tap during an active transition
+    // queues exactly ONE mic intent (bound to that transition's switch token)
+    // which executes when the transition installs its new session; it is never
+    // lost, never doubled, and never run against the outgoing session.
+    if (coordinatorIsSwitchingRef.current) {
+      micIntentRef.current.queue(switchTokenRef.current);
+      setErrorMessage(TALK_MIC_QUEUED_MESSAGE);
+      return;
+    }
     if (isOpening || isSending) {
       // The tutor is opening the conversation / composing a reply: nothing to
       // record yet. The learner stays in control once the turn completes.
@@ -1130,67 +1205,73 @@ export default function TalkScreen(props?: TalkScreenProps) {
       // no turn may start, and no reply can exist.
       return;
     }
-    // No active conversation yet (still preparing or switching): nothing to do.
+    // No active conversation yet (still preparing): nothing to do.
     let session = sessionRef.current;
-    if (!session || isSwitching) return;
+    if (!session) return;
 
-    // DEAD-SESSION RECOVERY: the conversation on screen may have been closed
-    // underneath this surface (the background policy abandons the active
-    // session). Recording into it could only produce a discarded turn, so a fresh
-    // conversation with the SAME identity is composed first and the learner is
-    // told plainly what happened — nothing is silently reset.
-    if (!isConversationReusable(session)) {
-      const recovered = await startConversation(mode, appliedTopic);
-      if (!recovered) {
+    micActionInFlightRef.current = true;
+    try {
+      // DEAD-SESSION RECOVERY: the conversation on screen may have been closed
+      // underneath this surface (the background policy abandons the active
+      // session). Recording into it could only produce a discarded turn, so a fresh
+      // conversation with the SAME identity is composed first and the learner is
+      // told plainly what happened — nothing is silently reset.
+      if (!isConversationReusable(session)) {
+        const recovered = await startConversation(mode, appliedTopic);
+        if (!recovered) {
+          setErrorMessage(TALK_CONVERSATION_RESTARTED_MIC_MESSAGE);
+          return;
+        }
+        session = recovered;
         setErrorMessage(TALK_CONVERSATION_RESTARTED_MIC_MESSAGE);
-        return;
       }
-      session = recovered;
-      setErrorMessage(TALK_CONVERSATION_RESTARTED_MIC_MESSAGE);
-    }
-    const coordinator = getOrCreateVoiceCoordinator(session, providerKind);
+      const coordinator = getOrCreateVoiceCoordinator(session, providerKind);
+      // The branch decision reads the coordinator's LIVE status, not the
+      // possibly-stale React mirror: after any await above, only the
+      // coordinator knows whether a recording is really active.
+      const status = coordinator.getStatus();
 
-    if (voiceStatus.state === 'recording') {
-      setIsSending(true);
-      setStreamingText('');
-      setErrorMessage(null);
+      if (status.state === 'recording') {
+        setIsSending(true);
+        setStreamingText('');
+        setErrorMessage(null);
 
-      // One utterance = at most one submitted turn: the coordinator guards this
-      // internally as well, so a double tap cannot send the audio twice.
-      await ensureLearnerContext();
-      const res = await coordinator.stopRecordingAndProcess((chunk: string) => {
-        setStreamingText((prev) => (prev ?? '') + chunk);
-      });
+        // One utterance = at most one submitted turn: the coordinator guards this
+        // internally as well, so a double tap cannot send the audio twice.
+        await ensureLearnerContext();
+        const res = await coordinator.stopRecordingAndProcess((chunk: string) => {
+          setStreamingText((prev) => (prev ?? '') + chunk);
+        });
 
-      // A late result from a session that has since been replaced must never
-      // touch the replacement conversation.
-      if (sessionRef.current !== session) {
+        // A late result from a session that has since been replaced must never
+        // touch the replacement conversation.
+        if (sessionRef.current !== session) {
+          setIsSending(false);
+          setStreamingText(null);
+          return;
+        }
+
+        setHistory(session.getHistory());
+        setLastFeedback(session.getLastFeedback());
         setIsSending(false);
         setStreamingText(null);
-        return;
+
+        if (!res.ok && res.error) {
+          // Already ONE classified learner-safe sentence; the raw provider detail
+          // stays in the logs and the preserved transcript/recording drives the
+          // recovery actions rendered below.
+          if (res.technical) console.error('Talk voice turn failure:', res.technical);
+          setErrorMessage(res.error);
+          return;
+        }
+
+        // Analyze pronunciation once per spoken turn (never blocks the flow).
+        await runPronunciationAnalysis();
+      } else if (status.canRecord) {
+        await startRecordingTurn(session, providerKind);
       }
-
-      setHistory(session.getHistory());
-      setLastFeedback(session.getLastFeedback());
-      setIsSending(false);
-      setStreamingText(null);
-
-      if (!res.ok && res.error) {
-        // Already ONE classified learner-safe sentence; the raw provider detail
-        // stays in the logs and the preserved transcript/recording drives the
-        // recovery actions rendered below.
-        if (res.technical) console.error('Talk voice turn failure:', res.technical);
-        setErrorMessage(res.error);
-        return;
-      }
-
-      // Analyze pronunciation once per spoken turn (never blocks the flow).
-      await runPronunciationAnalysis();
-    } else if (voiceStatus.canRecord) {
-      setErrorMessage(null);
-      // Barge-in: the coordinator stops and awaits tutor playback internally
-      // before the microphone opens.
-      await coordinator.startRecording();
+    } finally {
+      micActionInFlightRef.current = false;
     }
   };
 
