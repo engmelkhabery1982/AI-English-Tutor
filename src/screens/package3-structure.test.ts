@@ -161,13 +161,38 @@ describe('Review — deduplicated empty/summary states', () => {
 describe('Settings — grouped sections with progressive disclosure', () => {
   const settings = read('SettingsScreen.tsx');
 
-  it('groups the long screen into clear sections', () => {
+  it('groups the screen into the five required learner-facing sections, in order', () => {
     const providerAt = settings.indexOf('<SectionHeader title="AI provider" />');
-    const learningAt = settings.indexOf('<SectionHeader title="Learning" />');
-    const infoAt = settings.indexOf('<SectionHeader title="App info" />');
+    const voiceAt = settings.indexOf('<SectionHeader title="Voice & audio" />');
+    const prefsAt = settings.indexOf('<SectionHeader title="Learning Preferences" />');
+    const correctionsAt = settings.indexOf('<SectionHeader title="Corrections" />');
+    const infoAt = settings.indexOf('<SectionHeader title="Data / App Info" />');
+    // AI Provider → Voice & Audio → Learning Preferences → Corrections →
+    // Data / App Info
     expect(providerAt).toBeGreaterThan(-1);
-    expect(learningAt).toBeGreaterThan(providerAt);
-    expect(infoAt).toBeGreaterThan(learningAt);
+    expect(voiceAt).toBeGreaterThan(providerAt);
+    expect(prefsAt).toBeGreaterThan(voiceAt);
+    expect(correctionsAt).toBeGreaterThan(prefsAt);
+    expect(infoAt).toBeGreaterThan(correctionsAt);
+    // Correction intensity is its own group; the profile/assessment entry
+    // point lives under Learning Preferences.
+    const intensityAt = settings.indexOf('<Text style={styles.cardTitle}>Correction intensity</Text>');
+    expect(intensityAt).toBeGreaterThan(correctionsAt);
+    const profileAt = settings.indexOf('Learning profile & assessment');
+    expect(profileAt).toBeGreaterThan(prefsAt);
+    expect(profileAt).toBeLessThan(correctionsAt);
+  });
+
+  it('Voice & Audio is honest — guidance only, no invented global setting', () => {
+    expect(settings).toContain('Microphone & playback');
+    expect(settings).toContain('const [voiceInfoOpen, setVoiceInfoOpen] = useState<boolean>(false);');
+    expect(settings).toContain('accessibilityState={{ expanded: voiceInfoOpen }}');
+    expect(settings).toContain('There is no global voice or audio preference in this app yet');
+    // It points to the EXISTING per-practice controls and adds no new store
+    // or fake preference service.
+    expect(settings).toContain('Repeat / Slower help actions');
+    expect(settings).not.toContain('voiceSettingsService');
+    expect(settings).not.toContain('globalSpeechRate');
   });
 
   it('collapses secondary explanation while critical provider controls stay visible', () => {

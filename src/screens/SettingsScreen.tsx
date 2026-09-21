@@ -85,6 +85,7 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
    */
   const [keyDetailsOpen, setKeyDetailsOpen] = useState<boolean>(false);
   const [aboutDetailsOpen, setAboutDetailsOpen] = useState<boolean>(false);
+  const [voiceInfoOpen, setVoiceInfoOpen] = useState<boolean>(false);
   const [busy, setBusy] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [diagnostic, setDiagnostic] = useState<ProviderDiagnosticResult | null>(null);
@@ -391,7 +392,63 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
         </Text>
       </View>
 
-      <SectionHeader title="Learning" />
+      <SectionHeader title="Voice & audio" />
+
+      {/*
+        The app has NO global voice/audio preference yet — and none is
+        invented here. This group honestly points the learner to the
+        EXISTING per-practice voice controls, collapsed by default.
+      */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Microphone & playback</Text>
+        <Text style={styles.body}>
+          Voice and audio controls live with each practice, right where you use them:
+          the voice playback toggle and microphone in Talk, audio replay in Listening,
+          and the Repeat / Slower help actions during a conversation.
+        </Text>
+        <TouchableOpacity
+          style={styles.detailsToggle}
+          onPress={() => setVoiceInfoOpen(open => !open)}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: voiceInfoOpen }}
+          accessibilityLabel="Voice and audio details"
+        >
+          <Text style={styles.detailsToggleText}>
+            {voiceInfoOpen ? 'How voice works here ▲' : 'How voice works here ▼'}
+          </Text>
+        </TouchableOpacity>
+        {voiceInfoOpen ? (
+          <Text style={styles.note}>
+            There is no global voice or audio preference in this app yet — nothing is
+            switched on for you, and microphone access is requested per recording.
+            Audio replay is a listening aid, not evidence of practice.
+          </Text>
+        ) : null}
+      </View>
+
+      <SectionHeader title="Learning Preferences" />
+
+      {/* ------------------------ existing entry point --------------------- */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Learning profile & assessment</Text>
+        <Text style={styles.body}>New here? Set your goals and take your first English assessment.</Text>
+        <TouchableOpacity
+          testID="settings-assess"
+          style={styles.primaryButton}
+          onPress={() => navigation.navigate('Onboarding')}
+        >
+          <Text style={styles.primaryButtonText}>Assess my English</Text>
+        </TouchableOpacity>
+        <Text style={styles.note}>
+          Set up or update your learning goals. An assessment suggests a level; you choose whether to use it.
+        </Text>
+        <TouchableOpacity testID="settings-reassess" style={styles.secondaryButton}
+          onPress={() => navigation.navigate('Reassessment')} accessibilityHint="Compare a new English assessment with your previous learning">
+          <Text style={styles.secondaryButtonText}>Check my English level again</Text>
+        </TouchableOpacity>
+        <Text style={styles.note}>After some practice, reassess to see what has changed. Your working level does not change continuously or without your acceptance.</Text>
+      </View>
+      <SectionHeader title="Corrections" />
 
       {/* --------------------- correction intensity (WO2) ------------------ */}
       <View style={styles.card}>
@@ -433,27 +490,7 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
         ) : null}
       </View>
 
-      {/* ------------------------ existing entry point --------------------- */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Learning profile & assessment</Text>
-        <Text style={styles.body}>New here? Set your goals and take your first English assessment.</Text>
-        <TouchableOpacity
-          testID="settings-assess"
-          style={styles.primaryButton}
-          onPress={() => navigation.navigate('Onboarding')}
-        >
-          <Text style={styles.primaryButtonText}>Assess my English</Text>
-        </TouchableOpacity>
-        <Text style={styles.note}>
-          Set up or update your learning goals. An assessment suggests a level; you choose whether to use it.
-        </Text>
-        <TouchableOpacity testID="settings-reassess" style={styles.secondaryButton}
-          onPress={() => navigation.navigate('Reassessment')} accessibilityHint="Compare a new English assessment with your previous learning">
-          <Text style={styles.secondaryButtonText}>Check my English level again</Text>
-        </TouchableOpacity>
-        <Text style={styles.note}>After some practice, reassess to see what has changed. Your working level does not change continuously or without your acceptance.</Text>
-      </View>
-      <SectionHeader title="App info" />
+      <SectionHeader title="Data / App Info" />
 
       <View style={styles.card}>
         <Text style={styles.cardTitle}>About & privacy</Text>
