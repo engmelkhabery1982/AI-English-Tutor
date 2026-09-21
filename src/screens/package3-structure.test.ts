@@ -199,6 +199,49 @@ describe('Settings — grouped sections with progressive disclosure', () => {
   });
 });
 
+describe('Onboarding — reduced setup density, unchanged assessment logic', () => {
+  const onboarding = read('OnboardingScreen.tsx');
+
+  it('breaks the profile form into numbered step cards', () => {
+    expect(onboarding).toContain('1 · About you');
+    expect(onboarding).toContain('2 · Your goals');
+    expect(onboarding).toContain('3 · Practice preferences');
+    const aboutAt = onboarding.indexOf('1 · About you');
+    const goalsAt = onboarding.indexOf('2 · Your goals');
+    const practiceAt = onboarding.indexOf('3 · Practice preferences');
+    expect(goalsAt).toBeGreaterThan(aboutAt);
+    expect(practiceAt).toBeGreaterThan(goalsAt);
+  });
+
+  it('keeps the primary action visible without scrolling the form', () => {
+    // The start button lives in a persistent footer outside the ScrollView,
+    // rendered for the whole profile phase.
+    expect(onboarding).toContain('styles.profileFooter');
+    expect(onboarding).toContain("phase === 'profile' ? (");
+    expect(onboarding).toContain('testID="onboarding-start-assessment"');
+    expect(onboarding).toContain('Start the assessment');
+    const scrollEnd = onboarding.lastIndexOf('</ScrollView>');
+    expect(onboarding.indexOf('styles.profileFooter')).toBeGreaterThan(scrollEnd);
+  });
+
+  it('preserves every assessment input and safeguard', () => {
+    // All choice groups are still rendered with the same state bindings.
+    for (const required of [
+      'NATIVE_LANGUAGE_OPTIONS.map',
+      'TARGET_LEVELS.map',
+      'LEARNING_GOAL_OPTIONS.map',
+      'PRACTICE_MODES.map',
+      'onPress={() => void startDiagnostic()}',
+      'createAssessmentAnswerController',
+    ]) {
+      expect(onboarding, required).toContain(required);
+    }
+    // Diagnostic safeguards untouched (step token / committed-history pins).
+    expect(onboarding).toContain('stepToken: handle.session.getCurrentStepToken()');
+    expect(onboarding).toContain('countCommittedLearnerTurns(handle.conversation)');
+  });
+});
+
 describe('Bottom navigation — full discoverable labels', () => {
   const navigator = read('../navigation/RootNavigator.tsx');
 
