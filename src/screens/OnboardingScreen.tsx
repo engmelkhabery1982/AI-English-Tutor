@@ -1376,17 +1376,23 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
   };
 
   const renderProfile = () => (
-    <View style={styles.card}>
-      <Text style={styles.cardTitle}>Set up your learning plan</Text>
-      <Text style={styles.body}>
-        A few questions, then a short English assessment. Your existing profile is kept.
-      </Text>
-      {prefill?.hasExistingData ? (
-        <Text style={styles.muted}>
-          Prefilled from your profile — change only what you want to change.
+    <>
+      {/*
+        Package 3 (G) — the profile form is broken into numbered step cards
+        instead of one overwhelming block; the primary action stays visible
+        in a persistent footer (below), not buried under 13+ choices.
+        All fields, options and business logic are unchanged.
+      */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>1 · About you</Text>
+        <Text style={styles.body}>
+          A few questions, then a short English assessment. Your existing profile is kept.
         </Text>
-      ) : null}
-
+        {prefill?.hasExistingData ? (
+          <Text style={styles.muted}>
+            Prefilled from your profile — change only what you want to change.
+          </Text>
+        ) : null}
       <Text style={styles.sectionTitle}>Your name</Text>
       <TextInput accessibilityLabel="Your name"
         style={styles.input}
@@ -1409,6 +1415,10 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         ))}
       </View>
 
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>2 · Your goals</Text>
       <Text style={styles.sectionTitle}>Target level</Text>
       <View style={styles.chipRow}>
         {TARGET_LEVELS.map((level) => (
@@ -1437,6 +1447,10 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         ))}
       </View>
 
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>3 · Practice preferences</Text>
       <Text style={styles.sectionTitle}>How do you like to practise?</Text>
       <View style={styles.chipRow}>
         {PRACTICE_MODES.map((mode) => (
@@ -1451,17 +1465,12 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
         ))}
       </View>
 
-      <TouchableOpacity style={styles.primaryButton} disabled={busy} onPress={() => void startDiagnostic()}>
-        <Text style={styles.primaryButtonText}>Start the assessment</Text>
-      </TouchableOpacity>
-      <Text style={styles.muted}>
-        Your learning preferences are saved when you start the assessment. Your current working
-        level changes only if you accept the estimate at the end.
-      </Text>
-    </View>
+      </View>
+    </>
   );
 
   return (
+    <View style={styles.screenRoot}>
     <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.content}>
       <Text style={styles.title}>Assess my English</Text>
       <Text style={styles.subtitle}>
@@ -1500,11 +1509,35 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
 
       {phase === 'result' && result ? renderResult(result) : null}
     </ScrollView>
+
+    {/* Persistent primary action — visible without scrolling the form. */}
+    {phase === 'profile' ? (
+      <View style={styles.profileFooter}>
+        <TouchableOpacity style={styles.primaryButton} disabled={busy} onPress={() => void startDiagnostic()} testID="onboarding-start-assessment">
+          <Text style={styles.primaryButtonText}>Start the assessment</Text>
+        </TouchableOpacity>
+        <Text style={styles.muted}>
+          Your learning preferences are saved when you start the assessment. Your current
+          working level changes only if you accept the estimate at the end.
+        </Text>
+      </View>
+    ) : null}
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F7F8FA' },
+  screenRoot: { flex: 1, backgroundColor: '#F7F8FA' },
+  profileFooter: {
+    backgroundColor: '#FFFFFF',
+    borderTopWidth: 1,
+    borderTopColor: '#E5E7EB',
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 16,
+    gap: 8,
+  },
   content: { padding: 16, paddingBottom: 32 },
   title: { fontSize: 24, fontWeight: '800', color: '#111827', letterSpacing: -0.5, marginBottom: 4 },
   subtitle: { fontSize: 14, color: '#6B7280', marginBottom: 16 },

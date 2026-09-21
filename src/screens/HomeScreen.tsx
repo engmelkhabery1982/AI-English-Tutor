@@ -169,7 +169,7 @@ export default function HomeScreen(props?: HomeScreenProps) {
         {today.focusLines.length > 0 ? (
           <View style={styles.section}>
             <Text style={styles.label}>Focus</Text>
-            {today.focusLines.slice(0, 4).map((line) => (
+            {today.focusLines.slice(0, 2).map((line) => (
               <Text key={line} style={styles.listLine}>
                 {line}
               </Text>
@@ -177,17 +177,9 @@ export default function HomeScreen(props?: HomeScreenProps) {
           </View>
         ) : null}
 
-        <View style={styles.section}>
-          <Text style={styles.label}>Planned structure</Text>
-          {today.structureLines.map((line) => (
-            <Text key={line} style={styles.listLine}>
-              {line}
-            </Text>
-          ))}
-          <Text style={styles.sizeNote}>
-            {today.sizeLabel === 'short' ? 'Short lesson' : 'Standard lesson'} · {today.stepCount} steps
-          </Text>
-        </View>
+        <Text style={styles.sizeNote}>
+          {today.sizeLabel === 'short' ? 'Short lesson' : 'Standard lesson'} · {today.stepCount} steps
+        </Text>
 
         <TouchableOpacity style={styles.secondaryButton} onPress={openLesson}>
           <Text style={styles.secondaryButtonText}>
@@ -223,14 +215,27 @@ export default function HomeScreen(props?: HomeScreenProps) {
     >
       <AppHeader title="AI English Tutor" subtitle="Your daily practice, tailored to you" />
 
-      {dailyLoading && !dailyCard ? (
+      {/*
+        1. TOP PRIMARY AREA — exactly ONE dominant CTA answering "what should
+        I do now?". Profile not ready → set up/assess (nothing else competes);
+        profile ready → the real next activity from the Daily Tutor.
+      */}
+      {prefill && !prefill.isComplete ? (
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Set up your learning plan</Text>
+          <Text style={styles.body}>
+            Choose your goals and take a short English assessment so your tutor can adapt.
+          </Text>
+          <TouchableOpacity style={styles.setupPrimaryButton} onPress={openOnboarding} testID="home-primary-cta">
+            <Text style={styles.primaryButtonText}>Assess my English</Text>
+          </TouchableOpacity>
+        </View>
+      ) : dailyLoading && !dailyCard ? (
         <View style={styles.loadingRow}>
           <ActivityIndicator size="small" color={theme.colors.primary} />
           <Text style={styles.loadingText}>Preparing your daily practice…</Text>
         </View>
-      ) : null}
-
-      {dailyCard ? (
+      ) : dailyCard ? (
         <View style={styles.card}>
           <View style={styles.cardHeader}>
             <Text style={styles.cardTitle}>Daily Tutor</Text>
@@ -240,13 +245,11 @@ export default function HomeScreen(props?: HomeScreenProps) {
           <Text style={styles.body}>
             {dailyCard.progressLabel} · built from your own practice history
           </Text>
-          <TouchableOpacity style={styles.primaryButton} onPress={openDailyTutor}>
+          <TouchableOpacity style={styles.primaryButton} onPress={openDailyTutor} testID="home-primary-cta">
             <Text style={styles.primaryButtonText}>{dailyCard.buttonLabel}</Text>
           </TouchableOpacity>
         </View>
-      ) : null}
-
-      {!dailyCard && dailyUnavailable ? (
+      ) : dailyUnavailable ? (
         <View style={styles.card}>
           <View style={styles.cardHeader}>
             <Text style={styles.cardTitle}>Daily Tutor</Text>
@@ -259,18 +262,7 @@ export default function HomeScreen(props?: HomeScreenProps) {
         </View>
       ) : null}
 
-      {prefill && !prefill.isComplete ? (
-        <View style={styles.onboardingCard}>
-          <Text style={styles.cardTitle}>Set up your learning plan</Text>
-          <Text style={styles.body}>
-            Choose your goals and take a short English assessment so your tutor can adapt.
-          </Text>
-          <TouchableOpacity style={styles.secondaryButton} onPress={openOnboarding}>
-            <Text style={styles.secondaryButtonText}>Assess my English</Text>
-          </TouchableOpacity>
-        </View>
-      ) : null}
-
+      {/* 2. CORE PRACTICE — the daily actions, immediately visible. */}
       <SectionHeader title="Practice" subtitle="Practise and review · Choose a skill to focus on" />
 
       <PracticeCard
@@ -294,30 +286,10 @@ export default function HomeScreen(props?: HomeScreenProps) {
         icon="🔁"
         testID="home-review-card"
       />
-      <PracticeCard
-        title="Learning tools"
-        description="Inspect text, read stories, and read aloud"
-        onPress={() => navigation.navigate('LearningTools')}
-        icon="🛠️"
-        testID="home-learning-tools-card"
-      />
 
-      {PRACTICE_LINKS.length > 0 ? (
-        <>
-          <SectionHeader title="More skills" />
-          {PRACTICE_LINKS.map((link) => (
-            <PracticeCard
-              key={link.route}
-              title={link.title}
-              description={link.description}
-              onPress={() => navigation.navigate(link.route)}
-              testID={`home-skill-${link.route}`}
-            />
-          ))}
-        </>
-      ) : null}
-
-      <SectionHeader title="Adaptive lesson" subtitle="Built from your real practice history" />
+      {/* 3. NEXT FOCUS — ONE concise evidence-based recommendation. The
+          adaptive lesson appears ONLY here (no duplicated prominence). */}
+      <SectionHeader title="Next focus" subtitle="Built from your real practice history" />
 
       {isLoading ? (
         <View style={styles.loadingRow}>
@@ -346,6 +318,40 @@ export default function HomeScreen(props?: HomeScreenProps) {
           onAction={() => void loadPractice()}
         />
       ) : null}
+
+      {/* 4. LEARNING TOOLS — secondary entries. */}
+      <SectionHeader title="Learning tools" />
+
+      <PracticeCard
+        title="Learning tools"
+        description="Dictionary & Translate, reading stories, and read aloud"
+        onPress={() => navigation.navigate('LearningTools')}
+        icon="🛠️"
+        testID="home-learning-tools-card"
+      />
+      {PRACTICE_LINKS.filter((link) => link.route === 'Vocabulary').map((link) => (
+        <PracticeCard
+          key={link.route}
+          title={link.title}
+          description={link.description}
+          onPress={() => navigation.navigate(link.route)}
+          testID={`home-skill-${link.route}`}
+        />
+      ))}
+
+      {/* 5. MORE SKILLS — secondary/specialized entries, lower priority. */}
+      <SectionHeader title="More skills" />
+      {PRACTICE_LINKS.map((link) =>
+        link.route === 'Vocabulary' ? null : (
+          <PracticeCard
+            key={link.route}
+            title={link.title}
+            description={link.description}
+            onPress={() => navigation.navigate(link.route)}
+            testID={`home-skill-${link.route}`}
+          />
+        ),
+      )}
     </ScrollView>
   );
 }
@@ -374,6 +380,14 @@ const styles = StyleSheet.create({
     marginBottom: theme.spacing.md,
     borderWidth: 1,
     borderColor: theme.colors.primaryLight,
+  },
+  setupPrimaryButton: {
+    marginTop: theme.spacing.sm,
+    backgroundColor: theme.colors.primary,
+    borderRadius: theme.radius.md,
+    paddingVertical: 14,
+    alignItems: 'center',
+    ...theme.shadows.primary,
   },
   cardHeader: {
     flexDirection: 'row',

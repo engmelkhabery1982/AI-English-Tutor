@@ -86,6 +86,22 @@ const TAB_COMPONENTS: Record<MainTabRouteName, React.ComponentType<{}>> = {
   Settings: SettingsScreen,
 };
 
+/**
+ * Meaningful tab icons using the app's existing emoji idiom (the same
+ * vocabulary PracticeCards use). Single-letter abbreviations hurt
+ * discoverability, so every tab shows a real icon AND its full readable
+ * label (Home / Talk / Review / Progress / Settings).
+ */
+const TAB_ICONS: Record<string, string> = {
+  Home: '🏠',
+  Talk: '💬',
+  Review: '🔁',
+  Progress: '📈',
+  Settings: '⚙️',
+  Listening: '🎧',
+  Vocabulary: '📚',
+};
+
 /** The existing bottom-tab layout: tab names AND order come from ./routes. */
 function MainTabs() {
   return (
@@ -93,8 +109,16 @@ function MainTabs() {
       screenOptions={({ route }) => ({
         tabBarItemStyle: route.name === 'Listening' || route.name === 'Vocabulary' ? { display: 'none' } : undefined,
         tabBarButton: route.name === 'Listening' || route.name === 'Vocabulary' ? () => null : undefined,
-        tabBarLabelStyle: { fontSize: 12 },
-        tabBarIcon: () => <Text>{route.name.charAt(0)}</Text>,
+        tabBarShowLabel: true,
+        tabBarLabelStyle: { fontSize: 12, fontWeight: '600' },
+        tabBarIcon: ({ focused }) => (
+          <Text
+            style={{ fontSize: 20, opacity: focused ? 1 : 0.65 }}
+            accessibilityLabel={`${route.name} tab icon`}
+          >
+            {TAB_ICONS[route.name] ?? '•'}
+          </Text>
+        ),
         tabBarActiveTintColor: '#2563EB',
         tabBarInactiveTintColor: '#9CA3AF',
       })}

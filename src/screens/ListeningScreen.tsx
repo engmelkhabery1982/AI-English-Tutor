@@ -142,6 +142,10 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [replayCount, setReplayCount] = useState<number>(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // Start-failure visibility: measure the setup screen's Start area so a
+  // failure can be scrolled into view without manual scrolling.
+  const setupScrollRef = useRef<ScrollView | null>(null);
+  const startAreaY = useRef(0);
   const [difficulty, setDifficulty] = useState<ListeningDifficulty>('easy');
   const [savedItems, setSavedItems] = useState<readonly string[]>([]);
   const [sessionDone, setSessionDone] = useState<boolean>(false);
@@ -226,6 +230,19 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
       setIsStarting(false);
     }
   }, [difficulty, isStarting]);
+
+  // Start-failure visibility: keep the failure AND the Start action in the
+  // viewport — when a start fails on the setup screen, scroll the alert area
+  // into view instead of leaving the learner hunting for it. Selections
+  // (difficulty, mode, previous lesson) are intentionally untouched by any
+  // error path, so a retry after a recoverable failure starts unchanged.
+  useEffect(() => {
+    if (!errorMessage || session || sessionDone || mode !== 'short') return;
+    setupScrollRef.current?.scrollTo({
+      y: Math.max(0, startAreaY.current - 24),
+      animated: true,
+    });
+  }, [errorMessage, session, sessionDone, mode]);
 
   /**
    * A user-started session is NEVER the Daily Tutor workflow: clear any
@@ -502,6 +519,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
               service={serviceRef.current}
               shadowingOnly={Boolean(props?.initialPractice)}
               onExit={() => props?.initialPractice ? navigation.goBack() : setMode('short')}
+              onInspectText={(prefill) => navigation.navigate('LearningTools', { inspect: prefill })}
               {...(props?.ttsProvider ? { ttsProvider: props.ttsProvider } : {})}
               {...(props?.recorder ? { recorder: props.recorder } : {})}
               {...(props?.stt ? { stt: props.stt } : {})}
@@ -514,8 +532,9 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
       );
     }
     return (
-      <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.centerContent}>
+      <ScrollView ref={setupScrollRef} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets style={styles.container} contentContainerStyle={styles.setupContent}>
         <Text style={styles.title}>🎧 Listening</Text>
+        <Text style={styles.setupSectionLabel}>Mode</Text>
         {!dailyTutorRef ? (
           <View style={styles.modeRow}>
             <TouchableOpacity
@@ -558,11 +577,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
         </View> : null}
         {!serviceReady ? <Text accessibilityLiveRegion="polite">{errorMessage ?? 'Loading listening practice…'}</Text> : null}
         {!serviceReady && errorMessage ? <TouchableOpacity onPress={() => setLoadAttempt(n => n + 1)}><Text>Try again</Text></TouchableOpacity> : null}
-        <Text style={styles.subtitle}>
-          Short listening exercises. Play the audio, answer what you understood, and get
-          qualitative feedback — no scores, just real comprehension practice.
-        </Text>
-
+        <Text style={styles.setupSectionLabel}>Level</Text>
         <View style={styles.difficultyRow}>
           {DIFFICULTIES.map((level) => (
             <TouchableOpacity
@@ -584,22 +599,38 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
           ))}
         </View>
 
-        <TouchableOpacity
-          style={[styles.startButton, isStarting && styles.startButtonDisabled]}
-          onPress={handleStartSession}
-          disabled={isStarting || !serviceReady}
-          testID="start_listening_button"
-          accessibilityRole="button"
-          accessibilityLabel="Start listening practice"
-        >
-          {isStarting ? (
-            <ActivityIndicator color="#FFFFFF" />
-          ) : (
-            <Text style={styles.startButtonText}>Start practice</Text>
-          )}
-        </TouchableOpacity>
+        {/* Start area: a start failure renders IMMEDIATELY ABOVE the Start
+            button as an announced alert — adjacent to the action, in view. */}
+        <View onLayout={(event) => { startAreaY.current = event.nativeEvent.layout.y; }}>
+          {errorMessage ? (
+            <Text
+              style={styles.errorText}
+              accessibilityRole="alert"
+              accessibilityLiveRegion="assertive"
+            >
+              {errorMessage}
+            </Text>
+          ) : null}
+          <TouchableOpacity
+            style={[styles.startButton, isStarting && styles.startButtonDisabled]}
+            onPress={handleStartSession}
+            disabled={isStarting || !serviceReady}
+            testID="start_listening_button"
+            accessibilityRole="button"
+            accessibilityLabel="Start listening practice"
+          >
+            {isStarting ? (
+              <ActivityIndicator color="#FFFFFF" />
+            ) : (
+              <Text style={styles.startButtonText}>Start practice</Text>
+            )}
+          </TouchableOpacity>
+        </View>
 
-        {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+        <Text style={styles.subtitle}>
+          Short listening exercises. Play the audio, answer what you understood, and get
+          qualitative feedback — no scores, just real comprehension practice.
+        </Text>
       </ScrollView>
     );
   }
@@ -819,6 +850,8 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F7F8FA' },
   centerContent: { alignItems: 'center', justifyContent: 'center', padding: 24, flexGrow: 1 },
+  setupContent: { padding: 16, paddingBottom: 40 },
+  setupSectionLabel: { fontSize: 12, fontWeight: '700', color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8, marginTop: 4 },
   title: { fontSize: 28, fontWeight: '800', color: '#111827', letterSpacing: -0.5, marginBottom: 8 },
   subtitle: { fontSize: 14, color: '#6B7280', textAlign: 'center', lineHeight: 22, marginBottom: 20 },
   difficultyRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 20 },

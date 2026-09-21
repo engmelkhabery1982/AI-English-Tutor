@@ -7,6 +7,23 @@
 
 import { DEFAULT_GEMINI_MODEL, DEFAULT_GEMINI_TIMEOUT_MS } from '../ai/gemini/types';
 import type { SpeechToTextProvider, STTAudioInput, STTResult } from './types';
+import { classifyProviderFailure } from '../failures';
+import {
+  beginRequestDiagnostics,
+  finishRequestDiagnostics,
+  type RequestDiagnosticsOutcome,
+} from '../request-diagnostics';
+
+/** Maps an STT result onto the INTERNAL diagnostics outcome. */
+function sttResultOutcome(result: STTResult): RequestDiagnosticsOutcome {
+  if (result.ok) return { ok: true };
+  const failure = classifyProviderFailure(result.error ?? 'Transcription failed.');
+  return {
+    ok: false,
+    failureKind: failure.kind,
+    rateLimited: failure.kind === 'rate_limited',
+  };
+}
 
 export interface GeminiSTTProviderConfig {
   readonly apiKey: string;
@@ -135,7 +152,20 @@ export class GeminiSTTProvider implements SpeechToTextProvider {
       };
     }
 
-    const mimeType = input.mimeType || 'audio/m4a';
+    // INTERNAL dev/debug counters — counted only for the real provider
+    // request (local audio validation failures are not provider requests).
+    const diagnostics = beginRequestDiagnostics({
+      type: 'stt',
+      providerId: this.id,
+      model: this.model,
+    });
+    const result = await this.performTranscribe(base64Audio, input.mimeType || 'audio/m4a');
+    finishRequestDiagnostics(diagnostics, sttResultOutcome(result));
+    return result;
+  }
+
+  /** The actual network transcription. Never throws; maps errors to results. */
+  private async performTranscribe(base64Audio: string, mimeType: string): Promise<STTResult> {
     const requestBody = {
       contents: [
         {

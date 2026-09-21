@@ -14,8 +14,8 @@ import TouchableOpacity from './components/LearnerButton';
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { useFocusEffect, useNavigation } from '@react-navigation/native';
-import type { NavigationProp } from '@react-navigation/native';
+import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
+import type { NavigationProp, RouteProp } from '@react-navigation/native';
 import type { RootStackParamList } from '../navigation/routes';
 import { createLearningTools, type LearningTools } from '../lessons/composition';
 import { STARTER_LESSONS, starterForLevel } from '../lessons/catalogue';
@@ -38,6 +38,9 @@ const LOAD_ERROR =
 
 export default function LearningToolsScreen() {
   const navigation = useNavigation<NavigationProp<RootStackParamList>>();
+  const route = useRoute<RouteProp<RootStackParamList, 'LearningTools'>>();
+  /** Contextual prefill from another surface (story / transcript / Talk text). */
+  const inspectParam = route.params?.inspect;
   const [tools, setTools] = useState<LearningTools | null>(null);
   const [error, setError] = useState('');
   const [section, setSection] = useState<'inspector' | LessonMode>('inspector');
@@ -89,6 +92,19 @@ export default function LearningToolsScreen() {
     setSection(key as 'inspector' | LessonMode);
     setLesson(null); setInspection(undefined); setFailure(null);
   };
+  /**
+   * Consume a contextual Dictionary & Translate prefill exactly once: open the
+   * dictionary section with the learner's selected text already filled in.
+   * Nothing is looked up automatically — the learner confirms the action, so
+   * navigation alone never fires a provider request.
+   */
+  useEffect(() => {
+    if (!inspectParam) return;
+    setSection('inspector');
+    setLesson(null);
+    setInspection({ ...inspectParam, contextSource: 'manual' });
+    navigation.setParams({ inspect: undefined });
+  }, [inspectParam, navigation]);
   return (
     <ScrollView
       keyboardShouldPersistTaps="handled"
@@ -96,7 +112,7 @@ export default function LearningToolsScreen() {
       style={styles.container}
       contentContainerStyle={styles.content}
     >
-      <AppHeader title="Learning tools" subtitle="Inspect language, read and listen to stories, and read aloud" />
+      <AppHeader title="Learning tools" subtitle="Dictionary & Translate · Listening · Reading — look up a word, phrase, expression, or sentence in context" />
 
       {loading ? (
         <LoadingState message="Preparing your learning tools…" />
@@ -154,10 +170,12 @@ export default function LearningToolsScreen() {
             </View>
           )}
 
-          <SectionHeader title="Work area" subtitle="Built-in stories work without AI; generated content and inspection require your configured provider." />
+          <SectionHeader title="Choose a tool" subtitle="Dictionary & Translate · Listening · Reading. Built-in stories work without AI; lookups and generated lessons use your configured provider (provider-generated explanations, not authoritative dictionary truth)." />
           <SegmentedControl
             options={[
-              { key: 'inspector', label: 'Inspector' },
+              // Learner-facing name is "Dictionary & Translate"; the internal
+              // section key stays 'inspector' (the domain module is unchanged).
+              { key: 'inspector', label: 'Dictionary & Translate' },
               { key: 'listening', label: 'Listening' },
               { key: 'reading', label: 'Reading' },
             ]}
@@ -167,7 +185,7 @@ export default function LearningToolsScreen() {
 
           <View style={styles.sectionBody}>
             {section === 'inspector' ? (
-              <InspectorPanel tools={tools} />
+              <InspectorPanel tools={tools} initial={inspection} />
             ) : (
               <>
               <View style={styles.card}>
@@ -192,11 +210,15 @@ export default function LearningToolsScreen() {
                     );
                   })}
                 </View>
+                {/* Built-in starter lessons are authored content: they work
+                    WITHOUT AI and WITHOUT a profile (preview mode — nothing
+                    is saved until a learner profile exists). */}
                 <TouchableOpacity
                   style={styles.secondaryButton}
-                  disabled={!tools.profile || busy}
+                  disabled={busy}
                   onPress={() => { setLesson(starterForLevel(level)); setInspection(undefined); setFailure(null); }}
                   accessibilityRole="button"
+                  accessibilityLabel="Load built-in starter lesson (works without AI)"
                 >
                   <Text style={styles.secondaryButtonText}>Load built-in starter lesson</Text>
                 </TouchableOpacity>
@@ -230,8 +252,8 @@ export default function LearningToolsScreen() {
                 )}
               </View>
 
-              {lesson && tools.profile && (
-                <StoryPanel key={`${lesson.id}:${section}`} tools={tools} lesson={lesson} mode={section} inspect={setInspection} />
+              {lesson && (
+                <StoryPanel key={`${lesson.id}:${section}`} tools={tools} lesson={lesson} mode={section} inspect={setInspection} preview={!tools.profile} />
               )}
               {inspection && <InspectorPanel tools={tools} initial={inspection} />}
               </>

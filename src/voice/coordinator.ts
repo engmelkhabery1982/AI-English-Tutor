@@ -36,6 +36,7 @@ import type { SpeechToTextProvider, STTResult } from '../providers/stt';
 import type { TextToSpeechProvider } from '../providers/tts';
 import { classifyProviderFailure, type ProviderFailure } from '../providers/failures';
 import { runWithSafeRetry } from '../shared/safe-retry';
+import { markVoiceTiming } from './timings';
 import type {
   AudioRecorderService,
   AudioRecordingResult,
@@ -61,6 +62,12 @@ export const VOICE_SWITCHING_MESSAGE = 'The conversation is changing. Please try
 /** A stop/retry arrived while nothing was recording: honest and learner-safe. */
 export const VOICE_NOTHING_TO_STOP_MESSAGE =
   'Nothing is recording right now, so there was nothing to stop.';
+
+/**
+ * The FINAL submission boundary refused a transcript that contained no speech.
+ * Nothing was committed, no evidence exists, and the learner simply tries again.
+ */
+export const VOICE_EMPTY_TRANSCRIPT_MESSAGE = "I didn't catch any speech. Try again.";
 
 export const VOICE_NOTHING_TO_RETRY_MESSAGE =
   'There is nothing to send again yet. Record your answer first.';
@@ -215,6 +222,28 @@ export class VoiceSessionCoordinator {
    * session that is on its way out.
    */
   private switching: boolean = false;
+  /**
+   * Synchronous single-flight guard for `startRecording()`: at most ONE
+   * recorder start operation may be active. Rapid repeated mic taps (before
+   * the state machine has visibly moved to `requesting_permission`) can never
+   * open two recorders or start two captures.
+   */
+  private startRequestInFlight: boolean = false;
+  /**
+   * AUDIO-ONLY failure of the CURRENT turn's TTS playback. The tutor text is
+   * already committed and stays committed; this flag only drives the
+   * learner-visible "Audio didn't play / Replay" recovery. Cancellations
+   * caused by intentional teardown (stop, session replacement, background,
+   * disposal) never set it.
+   */
+  private audioPlaybackFailed: boolean = false;
+  /**
+   * True while an intentional playback stop is running, so the provider's
+   * cancellation callback cannot be misreported as a playback failure.
+   */
+  private ttsStopRequested: boolean = false;
+  /** Synchronous single-flight guard for `replayLastResponse()` (rapid taps). */
+  private replayInFlight: boolean = false;
   private appStateSub: { remove: () => void } | null = null;
   private lastAppState: string = 'active';
   private lastAudioUri: string | null = null;
@@ -318,6 +347,7 @@ export class VoiceSessionCoordinator {
     this.session = newSession;
     this.recognizedTranscript = null;
     this.errorMessage = null;
+    this.audioPlaybackFailed = false;
     this.state = 'idle';
     this.notifyListeners();
   }
@@ -377,6 +407,7 @@ export class VoiceSessionCoordinator {
     this.elapsedSeconds = 0;
     this.recognizedTranscript = null;
     this.errorMessage = null;
+    this.audioPlaybackFailed = false;
     this.state = 'idle';
     this.notifyListeners();
     return newSession;
@@ -462,6 +493,11 @@ export class VoiceSessionCoordinator {
       pendingTranscript,
       canRetryPendingTurn: pendingTranscript !== null,
       canRetryTranscription: hasRecoverableRecording,
+      audioPlaybackFailed: this.audioPlaybackFailed,
+      // Replay is possible while the failed audio belongs to the ACTIVE
+      // session and nothing else is in flight.
+      canReplayAudio:
+        this.audioPlaybackFailed && !this.disposed && !this.switching && !this.processing,
     };
   }
 
@@ -485,6 +521,11 @@ export class VoiceSessionCoordinator {
     if (this.disposed) return false;
     // Never start new voice work while the conversation session is switching.
     if (this.switching) return false;
+    // At most ONE recorder start operation may be active. The state machine
+    // only moves to `requesting_permission` after the awaited barge-in stop
+    // below, so without this synchronous guard two rapid taps could both pass
+    // the state checks and open two recorders.
+    if (this.startRequestInFlight) return false;
     // Prevent starting if already recording, transcribing, or sending — and
     // never open the microphone while another voice operation is in flight.
     if (
@@ -496,7 +537,17 @@ export class VoiceSessionCoordinator {
     ) {
       return false;
     }
+    this.startRequestInFlight = true;
+    try {
+      return await this.performStartRecording();
+    } finally {
+      this.startRequestInFlight = false;
+    }
+  }
 
+  /** The actual recorder-open lifecycle. Only ever entered via startRecording(). */
+  private async performStartRecording(): Promise<boolean> {
+    markVoiceTiming('recorder_start_requested');
     // A NEW utterance supersedes any preserved recovery state: the learner chose
     // to speak again, so the previous transcript/recording is dropped (with its
     // temp file) and can never be sent a second time.
@@ -512,6 +563,9 @@ export class VoiceSessionCoordinator {
 
     this.errorMessage = null;
     this.recognizedTranscript = null;
+    // A new utterance supersedes a failed tutor-audio playback: the learner
+    // moved on, so the Replay affordance no longer applies.
+    this.audioPlaybackFailed = false;
     this.state = 'requesting_permission';
     this.notifyListeners();
 
@@ -543,6 +597,7 @@ export class VoiceSessionCoordinator {
       }
       this.state = 'recording';
       this.elapsedSeconds = 0;
+      markVoiceTiming('recorder_active');
 
       if (this.timerHandle) {
         clearInterval(this.timerHandle);
@@ -604,7 +659,18 @@ export class VoiceSessionCoordinator {
    *   raw provider payloads stay in `technical` (logs only).
    */
   async stopRecordingAndProcess(
-    onStreamChunk?: (chunk: string) => void
+    onStreamChunk?: (chunk: string) => void,
+    options?: {
+      /**
+       * Optional pre-submission preparation (e.g. refreshing the persisted
+       * learner context). It runs AFTER recorder finalization and STT have
+       * been STARTED — the recorder is never kept capturing while this work
+       * runs — but it is awaited BEFORE `session.send()`, so the dependent
+       * order recorder-stop → STT → provider submission is preserved exactly.
+       * Best effort: a failure here never fails the turn.
+       */
+      readonly beforeSubmit?: () => void | Promise<void>;
+    },
   ): Promise<VoiceTurnOutcome> {
     if (this.disposed) return { ok: false, error: VOICE_DISPOSED_MESSAGE };
     if (this.switching) return { ok: false, error: VOICE_SWITCHING_MESSAGE };
@@ -613,6 +679,7 @@ export class VoiceSessionCoordinator {
     if (this.processing || this.state !== 'recording') {
       return { ok: false, error: VOICE_NOTHING_TO_STOP_MESSAGE };
     }
+    markVoiceTiming('stop_requested');
 
     // Bind the whole operation to the session that is active right now.
     const session = this.session;
@@ -633,6 +700,7 @@ export class VoiceSessionCoordinator {
     try {
       audio = await this.recorder.stopRecording();
       this.lastAudioUri = audio?.uri ?? null;
+      markVoiceTiming('recorder_stopped');
     } catch (err: unknown) {
       this.processing = false;
       this.dropRecoverableRecording();
@@ -663,6 +731,7 @@ export class VoiceSessionCoordinator {
       generation,
       transcribeOnly: false,
       ...(onStreamChunk ? { onStreamChunk } : {}),
+      ...(options?.beforeSubmit ? { beforeSubmit: options.beforeSubmit } : {}),
     });
   }
 
@@ -879,14 +948,17 @@ export class VoiceSessionCoordinator {
     readonly generation: number;
     readonly transcribeOnly: boolean;
     readonly onStreamChunk?: (chunk: string) => void;
+    readonly beforeSubmit?: () => void | Promise<void>;
   }): Promise<VoiceTurnOutcome> {
     const { audio, session, generation } = input;
 
     // 1. Speech to text. STT commits nothing, so ONE short automatic retry of a
     //    transient failure is safe and cannot duplicate a learner turn.
+    markVoiceTiming('stt_started');
     const stt = await runWithSafeRetry<STTResult>({
       surface: 'speech',
       committed: () => false,
+      diagnosticsType: 'stt',
       run: async () => {
         if (!this.isCurrent(session, generation)) {
           return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
@@ -905,6 +977,7 @@ export class VoiceSessionCoordinator {
       },
       failureOf: (result) => (result.ok ? null : { message: result.error ?? null }),
     });
+    markVoiceTiming('stt_completed');
 
     if (!this.isCurrent(session, generation)) {
       // A late STT result must never be attached to the replacement session.
@@ -959,6 +1032,24 @@ export class VoiceSessionCoordinator {
       return { ok: true, transcript };
     }
 
+    // Caller-provided pre-submission preparation (e.g. the persisted learner
+    // context refresh) is awaited HERE — after recorder finalization and STT,
+    // immediately before provider submission — so it overlaps with the
+    // recorder stop and STT instead of delaying them, while the dependent
+    // order recorder-stop → STT → submission stays exact. Best effort: it can
+    // never fail the turn.
+    if (input.beforeSubmit) {
+      try {
+        await input.beforeSubmit();
+      } catch {
+        // Context preparation is best-effort; the turn proceeds regardless.
+      }
+      if (!this.isCurrent(session, generation)) {
+        this.processing = false;
+        return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
+      }
+    }
+
     this.recognizedTranscript = transcript;
     this.state = 'sending';
     this.notifyListeners();
@@ -985,18 +1076,37 @@ export class VoiceSessionCoordinator {
     readonly generation: number;
     readonly onStreamChunk?: (chunk: string) => void;
   }): Promise<VoiceTurnOutcome> {
-    const { transcript, session, generation } = input;
+    const { session, generation } = input;
+
+    // FINAL TRANSCRIPT GUARD (defense in depth): this is the last point before
+    // `session.send()`, so EVERY coordinator path that can commit a learner
+    // voice turn (first spoken turn, transcription retry, explicit pending-turn
+    // retry) passes through it. A missing, empty or whitespace-only transcript
+    // must never create a user message ("You said: \"\""), never create
+    // evidence, never trigger tutor inference and never advance the turn.
+    const normalized = typeof input.transcript === 'string' ? input.transcript.trim() : '';
+    if (normalized.length === 0) {
+      this.pendingTurn = null;
+      this.processing = false;
+      this.setStateIfCurrent(session, generation, 'error', VOICE_EMPTY_TRANSCRIPT_MESSAGE);
+      return { ok: false, error: VOICE_EMPTY_TRANSCRIPT_MESSAGE };
+    }
+    const transcript = normalized;
+
     const baselineLearnerTurns = countCommittedLearnerTurns(session);
     let streamed = false;
     const onChunk = input.onStreamChunk
       ? (chunk: string) => {
+          if (!streamed) markVoiceTiming('first_tutor_chunk');
           streamed = true;
           input.onStreamChunk?.(chunk);
         }
       : undefined;
 
+    markVoiceTiming('provider_request_started');
     const sent = await runWithSafeRetry<ConversationSessionResult>({
       surface: 'tutor',
+      diagnosticsType: 'tutor_text',
       run: async (): Promise<ConversationSessionResult> => {
         if (!this.isCurrent(session, generation)) {
           return {
@@ -1074,6 +1184,7 @@ export class VoiceSessionCoordinator {
     }
 
     // COMMITTED exactly once: the preserved transcript is no longer pending.
+    markVoiceTiming('tutor_response_completed');
     this.pendingTurn = null;
     // The conversational turn is now complete, so playback no longer counts as
     // in-flight work: the learner can interrupt the tutor and speak (barge-in).
@@ -1172,35 +1283,58 @@ export class VoiceSessionCoordinator {
 
     if (!this.setStateIfCurrent(session, generation, 'speaking')) return;
 
+    // A NEW playback attempt for the current turn replaces any previous
+    // audio-failure state, and any older intentional-stop flag is no longer
+    // meaningful for this attempt.
+    this.audioPlaybackFailed = false;
+    this.ttsStopRequested = false;
+    markVoiceTiming('tts_requested');
+
     try {
       await this.ttsProvider.speak(text, {
         ...(options?.rate !== undefined ? { rate: options.rate } : {}),
         onStart: () => {
+          markVoiceTiming('tts_playback_started');
           if (this.isCurrent(session, generation)) {
             this.state = 'speaking';
             this.notifyListeners();
           }
         },
         onDone: () => {
+          markVoiceTiming('tts_completed');
           if (this.isCurrent(session, generation) && this.state === 'speaking') {
             this.state = 'idle';
             this.notifyListeners();
           }
         },
         onError: () => {
-          if (this.isCurrent(session, generation) && this.state === 'speaking') {
-            this.state = 'idle';
-            this.notifyListeners();
-          }
+          this.handlePlaybackFailure(session, generation);
         },
       });
     } catch {
       // TTS failure must NOT roll back the conversation
-      if (this.isCurrent(session, generation) && this.state === 'speaking') {
-        this.state = 'idle';
-        this.notifyListeners();
-      }
+      this.handlePlaybackFailure(session, generation);
     }
+  }
+
+  /**
+   * AUDIO-ONLY failure handling for tutor playback.
+   *
+   * The committed tutor text is never touched. The failure becomes
+   * learner-visible (Replay affordance) ONLY when it belongs to the CURRENT
+   * turn of the ACTIVE session: a cancellation caused by an intentional stop,
+   * a session replacement, a reset, backgrounding or disposal is stale by
+   * definition (isCurrent() is false or `ttsStopRequested` is set) and must
+   * never show a misleading failure for an obsolete turn.
+   */
+  private handlePlaybackFailure(session: ConversationSession, generation: number): void {
+    markVoiceTiming('tts_failed');
+    if (!this.isCurrent(session, generation) || this.state !== 'speaking') return;
+    this.state = 'idle';
+    if (!this.ttsStopRequested) {
+      this.audioPlaybackFailed = true;
+    }
+    this.notifyListeners();
   }
 
   /**
@@ -1218,9 +1352,12 @@ export class VoiceSessionCoordinator {
    */
   /**
    * Stops playback WITHOUT touching lifecycle state. Used by session switches so
-   * old playback cleanup can never write into the new session's state.
+   * old playback cleanup can never write into the new session's state. Marks the
+   * stop as INTENTIONAL so the provider's cancellation callback can never be
+   * misreported as a playback failure.
    */
   private async stopPlayback(): Promise<void> {
+    this.ttsStopRequested = true;
     try {
       await this.ttsProvider.stop();
     } catch {
@@ -1235,8 +1372,13 @@ export class VoiceSessionCoordinator {
     if (this.disposed || this.switching || this.generation !== generation) {
       return;
     }
+    // An intentional learner stop is not an audio failure.
+    const wasFailed = this.audioPlaybackFailed;
+    this.audioPlaybackFailed = false;
     if (this.state === 'speaking') {
       this.state = 'idle';
+      this.notifyListeners();
+    } else if (wasFailed) {
       this.notifyListeners();
     }
   }
@@ -1251,6 +1393,10 @@ export class VoiceSessionCoordinator {
    */
   async replayLastResponse(options?: { readonly rate?: number }): Promise<void> {
     if (this.disposed) return;
+    // Rapid repeated Replay taps must not start overlapping playback: at most
+    // ONE replay operation may be active, and a tap while playback is already
+    // running changes nothing.
+    if (this.replayInFlight || this.state === 'speaking') return;
     // Read from — and rebind to — the session that is active right now: a replay
     // must never re-speak the previous conversation's reply.
     const session = this.session;
@@ -1260,8 +1406,16 @@ export class VoiceSessionCoordinator {
       return;
     }
 
-    await this.stopSpeaking();
-    await this.speakResponse(lastAssistantTurn.content, session, generation, options);
+    this.replayInFlight = true;
+    try {
+      await this.stopSpeaking();
+      // The session was replaced while the previous playback was stopping: a
+      // stale replay must never speak into (or mutate) the replacement.
+      if (!this.isCurrent(session, generation)) return;
+      await this.speakResponse(lastAssistantTurn.content, session, generation, options);
+    } finally {
+      this.replayInFlight = false;
+    }
   }
 
   /**
@@ -1305,6 +1459,7 @@ export class VoiceSessionCoordinator {
     this.elapsedSeconds = 0;
     this.recognizedTranscript = null;
     this.errorMessage = null;
+    this.audioPlaybackFailed = false;
     this.invalidateRecoverableWork();
     this.notifyListeners();
   }
@@ -1366,6 +1521,7 @@ export class VoiceSessionCoordinator {
     // Keep recognizedTranscript? No – clear to avoid stale transcript populating new task
     this.recognizedTranscript = null;
     this.errorMessage = null;
+    this.audioPlaybackFailed = false;
     this.notifyListeners();
   }
 
@@ -1438,6 +1594,7 @@ export class VoiceSessionCoordinator {
     this.elapsedSeconds = 0;
     this.recognizedTranscript = null;
     this.errorMessage = null;
+    this.audioPlaybackFailed = false;
     this.notifyListeners();
   }
 }

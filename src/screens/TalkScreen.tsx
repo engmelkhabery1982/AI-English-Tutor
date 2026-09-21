@@ -1,6 +1,8 @@
 import { SafeAreaView } from 'react-native-safe-area-context';
 import type { VocabularyCategory } from '../domain/shared/types';
 import MicrophoneHelp from './components/MicrophoneHelp';
+import InspectableText from './components/InspectableText';
+import { useTargetLanguage } from './components/use-target-language';
 import TouchableOpacity from './components/LearnerButton';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
@@ -21,6 +23,8 @@ import {
   View,
 } from 'react-native';
 import { countCommittedLearnerTurns } from '../conversation-session';
+import { MicIntentQueue } from '../voice/mic-intent';
+import { markVoiceTiming } from '../voice/timings';
 import {
   resolveSpeechRateCapability,
   planSpeechRate,
@@ -88,6 +92,14 @@ import {
 const TUTOR_OPENING_DELAY_MS = 400;
 
 /**
+ * Shown when the learner taps the microphone while a conversation/session
+ * transition is running. The tap is NOT lost: exactly one mic intent is queued
+ * and executes as soon as the new conversation is installed.
+ */
+export const TALK_MIC_QUEUED_MESSAGE =
+  'Just a moment — recording will start as soon as your conversation is ready.';
+
+/**
  * Correction-intensity chips (Work Order 2). The KEYS are the EXISTING
  * ConversationMode values the engine already honors — only the learner-facing
  * labels changed to the intensity wording. The selection persists through the
@@ -138,6 +150,9 @@ export function buildTutorOpeningMessage(topic: string): string {
 
 export default function TalkScreen(props?: TalkScreenProps) {
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
+  // Translation target for contextual inspection: the learner profile's
+  // native language when available, otherwise the existing app default.
+  const inspectionTargetLanguage = useTargetLanguage();
   const [mode, setMode] = useState<ConversationMode>('natural');
   /**
    * The topic DRAFT the learner is typing. It is deliberately NOT the identity of
@@ -215,6 +230,13 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const [fewerCorrectionsNow, setFewerCorrectionsNow] = useState<boolean>(false);
   /** Explicit "change topic" mode: unlocks the topic draft for a new session. */
   const [topicChangeOpen, setTopicChangeOpen] = useState<boolean>(false);
+  /**
+   * Package 3 — progressive disclosure. Conversation options (correction
+   * intensity + topic) and the help actions start COLLAPSED so the
+   * conversation and the mic/composer stay the strongest elements on screen.
+   */
+  const [optionsOpen, setOptionsOpen] = useState<boolean>(false);
+  const [helpOpen, setHelpOpen] = useState<boolean>(false);
   /** Items saved to review from this screen (presentation mirror). */
   const [reviewSaves, setReviewSaves] = useState<Record<string, boolean>>({});
   /** Friendly result line for save attempts (success or honest failure). */
@@ -273,6 +295,22 @@ export default function TalkScreen(props?: TalkScreenProps) {
   const switchTokenRef = useRef<number>(0);
   /** Mirror of `isSwitching` for async callbacks that must not re-enter. */
   const coordinatorIsSwitchingRef = useRef<boolean>(false);
+  /**
+   * Synchronous guard for the mic handler: at most ONE mic action (start or
+   * stop) may be in flight, so rapid repeated taps can never open two recorders
+   * or submit one utterance twice from the screen side.
+   */
+  const micActionInFlightRef = useRef<boolean>(false);
+  /**
+   * ONE queued mic intent for the session-transition race: a tap that arrives
+   * while a transition is running is kept here (bound to that transition's
+   * switch token) and executed when — and ONLY when — that same transition
+   * installs its new session. A newer transition clears it; a stale transition
+   * can never consume it.
+   */
+  const micIntentRef = useRef<MicIntentQueue>(new MicIntentQueue());
+  /** Synchronous single-flight guard for Replay taps (no overlapping playback). */
+  const replayInFlightRef = useRef<boolean>(false);
   /**
    * Conversation Learning Memory: the recorder owns the stable identity of the
    * ACTIVE conversation, so persistence is exactly-once regardless of rerenders.
@@ -453,6 +491,24 @@ export default function TalkScreen(props?: TalkScreenProps) {
   );
 
   /**
+   * The ONE mic-open action, shared by a direct tap and by the execution of a
+   * mic intent queued during a session transition. Callers own their own
+   * re-entry guards; the coordinator itself enforces every lifecycle rule (at
+   * most one recorder start, no start while switching, barge-in ordering).
+   */
+  const startRecordingTurn = useCallback(
+    async (session: ConversationSession, kind: TalkProviderKind): Promise<void> => {
+      if (kind === 'unavailable') return;
+      const coordinator = getOrCreateVoiceCoordinator(session, kind);
+      setErrorMessage(null);
+      // Barge-in: the coordinator stops and awaits tutor playback internally
+      // before the microphone opens.
+      await coordinator.startRecording();
+    },
+    [getOrCreateVoiceCoordinator],
+  );
+
+  /**
    * Starts a NEW conversation identity: cancels any active voice work (recording
    * / in-flight STT or AI work / playback), builds the session stack for the
    * requested mode+topic, and resets all conversation state.
@@ -469,6 +525,10 @@ export default function TalkScreen(props?: TalkScreenProps) {
       const switchToken = (switchTokenRef.current += 1);
       // Any tutor opening of the previous conversation is invalidated at once.
       openingTokenRef.current += 1;
+      // A mic intent queued for an EARLIER transition belonged to that
+      // transition: this newer one owns the surface now, and the learner's
+      // queued tap must never start a recording on a session they moved past.
+      micIntentRef.current.clear();
       // The composed identity AND the applied topic are set together, so the
       // identity effect sees one stable identity for this conversation and never
       // composes a second one for the same mode+topic.
@@ -530,20 +590,26 @@ export default function TalkScreen(props?: TalkScreenProps) {
       });
       if (!outcome.installed) {
         // Superseded (or the screen was disposed): the newer operation owns the
-        // coordinator and will settle the switch state itself.
+        // coordinator and will settle the switch state itself. Nothing is
+        // installed here — no session UI, no Conversation Review — and a queued
+        // mic intent can never execute into a session that was not activated.
+        micIntentRef.current.clear();
         return null;
       }
+
+      // SWITCH-TOKEN REVALIDATION runs BEFORE anything is installed. A
+      // superseded transition must never open the Conversation Review, replace
+      // the current session UI, or consume a mic intent: the newer switch owns
+      // the switch flag and will clear it when it settles.
+      if (switchToken !== switchTokenRef.current) {
+        return null;
+      }
+
       if (!coordinator) {
         getOrCreateVoiceCoordinator(bundle.session, bundle.providerKind);
       }
       if (outcome.review && outcome.review.hasEvidence) {
         setConversationReview(outcome.review);
-      }
-
-      // A newer switch superseded this one: install nothing. The newer switch
-      // owns the switch flag and will clear it when it settles.
-      if (switchToken !== switchTokenRef.current) {
-        return null;
       }
 
       sessionRef.current = bundle.session;
@@ -587,9 +653,17 @@ export default function TalkScreen(props?: TalkScreenProps) {
       // Only now is the replacement session live: the tutor opening may run.
       setSessionEpoch((prev) => prev + 1);
 
+      // A mic tap that arrived DURING this transition executes now, on the
+      // freshly installed session: one intent, one execution. `consume()`
+      // only matches THIS switch's token, so a superseded transition can never
+      // execute it and a newer transition has already cleared it.
+      if (micIntentRef.current.consume(switchToken)) {
+        void startRecordingTurn(bundle.session, bundle.providerKind);
+      }
+
       return bundle.session;
     },
-    [endConversation, getOrCreateVoiceCoordinator],
+    [endConversation, getOrCreateVoiceCoordinator, startRecordingTurn],
   );
 
   /**
@@ -1000,6 +1074,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
       if (!session) return;
       if (action === 'change_topic') {
         setTopicChangeOpen(true);
+        setOptionsOpen(true);
         return;
       }
       if (action === 'repeat') {
@@ -1120,6 +1195,23 @@ export default function TalkScreen(props?: TalkScreenProps) {
 
   // Handle microphone press — the single primary action of a turn.
   const handleToggleRecording = async () => {
+    markVoiceTiming('mic_tap');
+    // Rapid-tap protection: at most ONE mic action (start or stop) at a time,
+    // so repeated taps can never open two recorders or submit one utterance
+    // twice from the screen side.
+    if (micActionInFlightRef.current) return;
+    // SYNCHRONOUS transition guard. `coordinatorIsSwitchingRef` is the
+    // authoritative mirror of `isSwitching`, set and cleared inside the same
+    // synchronous steps of startConversation — unlike the React state it can
+    // never be stale inside this handler. A tap during an active transition
+    // queues exactly ONE mic intent (bound to that transition's switch token)
+    // which executes when the transition installs its new session; it is never
+    // lost, never doubled, and never run against the outgoing session.
+    if (coordinatorIsSwitchingRef.current) {
+      micIntentRef.current.queue(switchTokenRef.current);
+      setErrorMessage(TALK_MIC_QUEUED_MESSAGE);
+      return;
+    }
     if (isOpening || isSending) {
       // The tutor is opening the conversation / composing a reply: nothing to
       // record yet. The learner stays in control once the turn completes.
@@ -1130,67 +1222,81 @@ export default function TalkScreen(props?: TalkScreenProps) {
       // no turn may start, and no reply can exist.
       return;
     }
-    // No active conversation yet (still preparing or switching): nothing to do.
+    // No active conversation yet (still preparing): nothing to do.
     let session = sessionRef.current;
-    if (!session || isSwitching) return;
+    if (!session) return;
 
-    // DEAD-SESSION RECOVERY: the conversation on screen may have been closed
-    // underneath this surface (the background policy abandons the active
-    // session). Recording into it could only produce a discarded turn, so a fresh
-    // conversation with the SAME identity is composed first and the learner is
-    // told plainly what happened — nothing is silently reset.
-    if (!isConversationReusable(session)) {
-      const recovered = await startConversation(mode, appliedTopic);
-      if (!recovered) {
+    micActionInFlightRef.current = true;
+    try {
+      // DEAD-SESSION RECOVERY: the conversation on screen may have been closed
+      // underneath this surface (the background policy abandons the active
+      // session). Recording into it could only produce a discarded turn, so a fresh
+      // conversation with the SAME identity is composed first and the learner is
+      // told plainly what happened — nothing is silently reset.
+      if (!isConversationReusable(session)) {
+        const recovered = await startConversation(mode, appliedTopic);
+        if (!recovered) {
+          setErrorMessage(TALK_CONVERSATION_RESTARTED_MIC_MESSAGE);
+          return;
+        }
+        session = recovered;
         setErrorMessage(TALK_CONVERSATION_RESTARTED_MIC_MESSAGE);
-        return;
       }
-      session = recovered;
-      setErrorMessage(TALK_CONVERSATION_RESTARTED_MIC_MESSAGE);
-    }
-    const coordinator = getOrCreateVoiceCoordinator(session, providerKind);
+      const coordinator = getOrCreateVoiceCoordinator(session, providerKind);
+      // The branch decision reads the coordinator's LIVE status, not the
+      // possibly-stale React mirror: after any await above, only the
+      // coordinator knows whether a recording is really active.
+      const status = coordinator.getStatus();
 
-    if (voiceStatus.state === 'recording') {
-      setIsSending(true);
-      setStreamingText('');
-      setErrorMessage(null);
+      if (status.state === 'recording') {
+        setIsSending(true);
+        setStreamingText('');
+        setErrorMessage(null);
 
-      // One utterance = at most one submitted turn: the coordinator guards this
-      // internally as well, so a double tap cannot send the audio twice.
-      await ensureLearnerContext();
-      const res = await coordinator.stopRecordingAndProcess((chunk: string) => {
-        setStreamingText((prev) => (prev ?? '') + chunk);
-      });
+        // One utterance = at most one submitted turn: the coordinator guards this
+        // internally as well, so a double tap cannot send the audio twice.
+        //
+        // LATENCY: recorder finalization starts IMMEDIATELY. The learner-context
+        // refresh overlaps with the recorder stop + STT and is awaited by the
+        // coordinator only right before provider submission (`beforeSubmit`),
+        // so the dependent order recorder-stop → STT → submission is preserved
+        // without keeping the microphone open during context preparation.
+        const res = await coordinator.stopRecordingAndProcess(
+          (chunk: string) => {
+            setStreamingText((prev) => (prev ?? '') + chunk);
+          },
+          { beforeSubmit: () => ensureLearnerContext() },
+        );
 
-      // A late result from a session that has since been replaced must never
-      // touch the replacement conversation.
-      if (sessionRef.current !== session) {
+        // A late result from a session that has since been replaced must never
+        // touch the replacement conversation.
+        if (sessionRef.current !== session) {
+          setIsSending(false);
+          setStreamingText(null);
+          return;
+        }
+
+        setHistory(session.getHistory());
+        setLastFeedback(session.getLastFeedback());
         setIsSending(false);
         setStreamingText(null);
-        return;
+
+        if (!res.ok && res.error) {
+          // Already ONE classified learner-safe sentence; the raw provider detail
+          // stays in the logs and the preserved transcript/recording drives the
+          // recovery actions rendered below.
+          if (res.technical) console.error('Talk voice turn failure:', res.technical);
+          setErrorMessage(res.error);
+          return;
+        }
+
+        // Analyze pronunciation once per spoken turn (never blocks the flow).
+        await runPronunciationAnalysis();
+      } else if (status.canRecord) {
+        await startRecordingTurn(session, providerKind);
       }
-
-      setHistory(session.getHistory());
-      setLastFeedback(session.getLastFeedback());
-      setIsSending(false);
-      setStreamingText(null);
-
-      if (!res.ok && res.error) {
-        // Already ONE classified learner-safe sentence; the raw provider detail
-        // stays in the logs and the preserved transcript/recording drives the
-        // recovery actions rendered below.
-        if (res.technical) console.error('Talk voice turn failure:', res.technical);
-        setErrorMessage(res.error);
-        return;
-      }
-
-      // Analyze pronunciation once per spoken turn (never blocks the flow).
-      await runPronunciationAnalysis();
-    } else if (voiceStatus.canRecord) {
-      setErrorMessage(null);
-      // Barge-in: the coordinator stops and awaits tutor playback internally
-      // before the microphone opens.
-      await coordinator.startRecording();
+    } finally {
+      micActionInFlightRef.current = false;
     }
   };
 
@@ -1283,10 +1389,19 @@ export default function TalkScreen(props?: TalkScreenProps) {
     }
   };
 
-  // Handle replay response aloud
+  // Handle replay response aloud — the explicit recovery after an AUDIO-ONLY
+  // TTS failure. It replays the already-committed tutor response: no
+  // regeneration, no new tutor turn, no duplicated evidence, no history
+  // change. Rapid repeated taps are refused synchronously, and the coordinator
+  // additionally refuses while playback is already running.
   const handleReplayResponse = async () => {
-    if (voiceCoordinatorRef.current) {
-      await voiceCoordinatorRef.current.replayLastResponse();
+    const coordinator = voiceCoordinatorRef.current;
+    if (!coordinator || replayInFlightRef.current) return;
+    replayInFlightRef.current = true;
+    try {
+      await coordinator.replayLastResponse();
+    } finally {
+      replayInFlightRef.current = false;
     }
   };
 
@@ -1585,141 +1700,186 @@ export default function TalkScreen(props?: TalkScreenProps) {
         </View>
       </View>
 
-      {/* Config Bar */}
+      {/*
+        Conversation controls — progressive disclosure (Package 3). Options
+        and help start COLLAPSED: the conversation and the mic/composer are
+        the strongest elements on screen, and nothing competes with them
+        until the learner opens a disclosure.
+      */}
       <View style={styles.configContainer}>
-        <View style={styles.modeSelector}>
-          {MODES.map((item) => {
-            const isActive = mode === item.key;
-            return (
-              <TouchableOpacity
-                key={item.key}
-                style={[styles.modeButton, isActive && styles.modeButtonActive]}
-                onPress={() => handleSelectMode(item.key)}
-                accessibilityRole="button"
-                accessibilityState={{ selected: isActive }}
-              >
-                <Text
-                  style={[
-                    styles.modeButtonText,
-                    isActive && styles.modeButtonTextActive,
-                  ]}
-                >
-                  {item.label}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
-
-        <TextInput accessibilityLabel="Conversation topic"
-          style={[styles.topicInput, !topicEditable && styles.topicInputLocked]}
-          placeholder="Optional topic (e.g. Travel, Job Interview)"
-          placeholderTextColor="#9CA3AF"
-          value={topic}
-          onChangeText={(text) => {
-            setTopic(text);
-          }}
-          editable={topicEditable}
-        />
-        {history.length > 0 && (
-          <Text style={styles.topicLockedHelperText}>
-            Start a new chat to change the topic.
-          </Text>
-        )}
-        {/*
-          A typed topic is a DRAFT: the learner applies it explicitly. This is what
-          stops per-keystroke conversation replacement (and the "conversation was
-          replaced before the turn finished" failure it caused).
-        */}
-        {topicDraftPending && (
+        <View style={[styles.disclosureRow, isProviderUnavailable && styles.controlsUnavailable]}>
           <TouchableOpacity
-            style={styles.topicApplyButton}
-            onPress={handleApplyTopic}
+            style={[styles.disclosureButton, optionsOpen && styles.disclosureButtonOpen]}
+            onPress={() => setOptionsOpen(open => !open)}
             accessibilityRole="button"
-            accessibilityLabel="Start the conversation with this topic"
+            accessibilityState={{ expanded: optionsOpen }}
+            accessibilityLabel="Conversation options"
+            testID="talk-options-disclosure"
           >
-            <Text style={styles.topicApplyButtonText}>
-              {topicChangeOpen ? 'Start a new chat with this topic' : 'Start with this topic'}
+            <Text style={styles.disclosureButtonText}>
+              {optionsOpen ? 'Conversation options ▲' : 'Conversation options ▼'}
             </Text>
           </TouchableOpacity>
-        )}
-        {topicChangeOpen && history.length > 0 && (
           <TouchableOpacity
-            style={styles.topicApplyButton}
-            onPress={handleCancelTopicChange}
+            style={[styles.disclosureButton, helpOpen && styles.disclosureButtonOpen]}
+            onPress={() => setHelpOpen(open => !open)}
             accessibilityRole="button"
-            accessibilityLabel="Keep the current conversation and close the topic change"
+            accessibilityState={{ expanded: helpOpen }}
+            accessibilityLabel="Need help?"
+            testID="talk-help-disclosure"
           >
-            <Text style={styles.topicApplyButtonText}>Keep this conversation</Text>
+            <Text style={styles.disclosureButtonText}>
+              {helpOpen ? 'Need help? ▲' : 'Need help? ▼'}
+            </Text>
           </TouchableOpacity>
-        )}
+        </View>
 
-        {/*
-          Work Order 2 — learner agency row. REAL actions only:
-          provider-backed help goes through the conversation's non-committing
-          assistance path; Repeat/Slower are playback; Change topic opens the
-          explicit draft flow. None of them can submit a learner answer or
-          create evidence.
-        */}
-        <View style={styles.helpRow} testID="learner-help-row">
-          {HELP_ACTION_DESCRIPTORS.map((descriptor) => {
-            const isProvider = isProviderHelpAction(descriptor.id);
-            const disabled = descriptor.id === 'change_topic'
-              ? !helpControls.changeTopicEnabled
-              : descriptor.kind === 'playback'
-              ? !helpControls.playbackEnabled
-              : isProvider
-              ? !helpControls.providerActionsEnabled
-              : !helpControls.changeTopicEnabled;
-            const busy = activeHelpAction === descriptor.id;
-            return (
+        {optionsOpen ? (
+          <View style={styles.disclosurePanel}>
+            <View style={styles.modeSelector}>
+              {MODES.map((item) => {
+                const isActive = mode === item.key;
+                return (
+                  <TouchableOpacity
+                    key={item.key}
+                    style={[styles.modeButton, isActive && styles.modeButtonActive]}
+                    onPress={() => handleSelectMode(item.key)}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: isActive }}
+                  >
+                    <Text
+                      style={[
+                        styles.modeButtonText,
+                        isActive && styles.modeButtonTextActive,
+                      ]}
+                    >
+                      {item.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            <TextInput accessibilityLabel="Conversation topic"
+              style={[styles.topicInput, !topicEditable && styles.topicInputLocked]}
+              placeholder="Optional topic (e.g. Travel, Job Interview)"
+              placeholderTextColor="#9CA3AF"
+              value={topic}
+              onChangeText={(text) => {
+                setTopic(text);
+              }}
+              editable={topicEditable}
+            />
+            {history.length > 0 && (
+              <Text style={styles.topicLockedHelperText}>
+                Start a new chat to change the topic.
+              </Text>
+            )}
+            {/*
+              A typed topic is a DRAFT: the learner applies it explicitly. This is what
+              stops per-keystroke conversation replacement (and the "conversation was
+              replaced before the turn finished" failure it caused).
+            */}
+            {topicDraftPending && (
               <TouchableOpacity
-                key={descriptor.id}
-                style={[styles.helpChip, disabled && styles.helpChipDisabled]}
-                onPress={() => void handleHelpAction(descriptor.id)}
-                disabled={disabled}
+                style={styles.topicApplyButton}
+                onPress={handleApplyTopic}
                 accessibilityRole="button"
-                accessibilityLabel={descriptor.accessibilityLabel}
-                accessibilityState={{ disabled, busy }}
+                accessibilityLabel="Start the conversation with this topic"
               >
-                <Text style={[styles.helpChipText, disabled && styles.helpChipTextDisabled]}>
-                  {busy ? '…' : descriptor.label}
+                <Text style={styles.topicApplyButtonText}>
+                  {topicChangeOpen ? 'Start a new chat with this topic' : 'Start with this topic'}
                 </Text>
               </TouchableOpacity>
-            );
-          })}
-        </View>
-        {/* Temporary, session-only correction relief (never persisted). */}
-        <TouchableOpacity
-          style={[styles.fewerCorrectionsChip, fewerCorrectionsNow && styles.fewerCorrectionsChipActive]}
-          onPress={handleToggleFewerCorrections}
-          accessibilityRole="button"
-          accessibilityState={{ selected: fewerCorrectionsNow }}
-          accessibilityLabel="Fewer corrections for now (this conversation only)"
-        >
-          <Text style={styles.fewerCorrectionsText}>
-            {fewerCorrectionsNow ? '✓ Fewer corrections for now' : 'Fewer corrections for now'}
-          </Text>
-        </TouchableOpacity>
+            )}
+            {topicChangeOpen && history.length > 0 && (
+              <TouchableOpacity
+                style={styles.topicApplyButton}
+                onPress={handleCancelTopicChange}
+                accessibilityRole="button"
+                accessibilityLabel="Keep the current conversation and close the topic change"
+              >
+                <Text style={styles.topicApplyButtonText}>Keep this conversation</Text>
+              </TouchableOpacity>
+            )}
+
+          </View>
+        ) : null}
+
+        {helpOpen ? (
+          <View style={styles.disclosurePanel}>
+            {/*
+              Work Order 2 — learner agency row. REAL actions only:
+              provider-backed help goes through the conversation's non-committing
+              assistance path; Repeat/Slower are playback; Change topic opens the
+              explicit draft flow. None of them can submit a learner answer or
+              create evidence.
+            */}
+            <View style={styles.helpRow} testID="learner-help-row">
+              {HELP_ACTION_DESCRIPTORS.map((descriptor) => {
+                const isProvider = isProviderHelpAction(descriptor.id);
+                const disabled = descriptor.id === 'change_topic'
+                  ? !helpControls.changeTopicEnabled
+                  : descriptor.kind === 'playback'
+                  ? !helpControls.playbackEnabled
+                  : isProvider
+                  ? !helpControls.providerActionsEnabled
+                  : !helpControls.changeTopicEnabled;
+                const busy = activeHelpAction === descriptor.id;
+                return (
+                  <TouchableOpacity
+                    key={descriptor.id}
+                    style={[styles.helpChip, disabled && styles.helpChipDisabled]}
+                    onPress={() => void handleHelpAction(descriptor.id)}
+                    disabled={disabled}
+                    accessibilityRole="button"
+                    accessibilityLabel={descriptor.accessibilityLabel}
+                    accessibilityState={{ disabled, busy }}
+                  >
+                    <Text style={[styles.helpChipText, disabled && styles.helpChipTextDisabled]}>
+                      {busy ? '…' : descriptor.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+            {/* Temporary, session-only correction relief (never persisted). */}
+            <TouchableOpacity
+              style={[styles.fewerCorrectionsChip, fewerCorrectionsNow && styles.fewerCorrectionsChipActive]}
+              onPress={handleToggleFewerCorrections}
+              accessibilityRole="button"
+              accessibilityState={{ selected: fewerCorrectionsNow }}
+              accessibilityLabel="Fewer corrections for now (this conversation only)"
+            >
+              <Text style={styles.fewerCorrectionsText}>
+                {fewerCorrectionsNow ? '✓ Fewer corrections for now' : 'Fewer corrections for now'}
+              </Text>
+            </TouchableOpacity>
+
+          </View>
+        ) : null}
 
         {/*
-          Provider honesty. Two distinct states, neither of which is ever
-          substituted for the other:
-          - no provider configured and Demo not chosen → configuration required,
-            with no tutor reply of any kind;
-          - explicit Demo Mode → the offline script, labelled as not real AI.
-          The notice stays visible for the whole conversation.
+          Provider honesty — BLOCKED state (Package 3). When real AI is not
+          configured, Talk says so prominently at the top with the
+          configuration CTA, instead of looking ready. Explicit Demo Mode and
+          the demo-learner notice below stay distinct, as before.
         */}
         {isProviderUnavailable && (
-          <View style={styles.offlineNotice}>
-            <Text style={styles.offlineNoticeText}>{TALK_CONFIGURATION_REQUIRED_MESSAGE}</Text>
+          <View style={styles.blockedCard} accessibilityRole="alert" accessibilityLiveRegion="assertive">
+            <Text style={styles.blockedCardTitle}>Talk needs a real AI provider</Text>
+            <Text style={styles.blockedCardText}>{TALK_CONFIGURATION_REQUIRED_MESSAGE}</Text>
+            <Text style={styles.blockedCardBody}>
+              The tutor cannot generate replies until a provider is configured, so the
+              conversation controls stay inactive — nothing scripted is substituted.
+            </Text>
             <TouchableOpacity
-              style={styles.offlineNoticeAction}
+              style={styles.blockedCardAction}
               onPress={() => navigation.navigate('Settings')}
               accessibilityRole="button"
-              accessibilityLabel="Open Settings to configure a provider"
+              accessibilityLabel="Configure provider in Settings"
             >
-              <Text style={styles.offlineNoticeActionText}>Open provider settings</Text>
+              <Text style={styles.blockedCardActionText}>Configure provider</Text>
             </TouchableOpacity>
           </View>
         )}
@@ -1820,14 +1980,24 @@ export default function TalkScreen(props?: TalkScreenProps) {
                       isUser ? styles.userBubble : styles.assistantBubble,
                     ]}
                   >
-                    <Text
-                      style={[
+                    {/*
+                      Contextual inspection (Package 2): tap any word in the
+                      conversation to open Dictionary & Translate prefilled
+                      with the exact word, its sentence and this message.
+                      Read-only — it never submits a turn or evidence.
+                    */}
+                    <InspectableText
+                      text={turn.content}
+                      textStyle={[
                         styles.messageText,
                         isUser ? styles.userMessageText : styles.assistantMessageText,
                       ]}
-                    >
-                      {turn.content}
-                    </Text>
+                      targetLanguage={inspectionTargetLanguage}
+                      accessibilityLabel={`${isUser ? 'Your' : 'Tutor'} message — tap any word to look it up`}
+                      onInspect={(prefill) => {
+                        navigation.navigate('LearningTools', { inspect: prefill });
+                      }}
+                    />
                   </View>
                   {isLastAssistant && (
                     <View style={styles.assistantVoiceActions}>
@@ -2210,6 +2380,24 @@ export default function TalkScreen(props?: TalkScreenProps) {
         )}
       </View>
       <Text style={styles.turnHint}>{turnView.hint}</Text>
+      {/*
+        AUDIO-ONLY failure recovery: the tutor's committed text stays on
+        screen; only playback failed. Replay re-speaks the SAME response —
+        it never regenerates a turn or duplicates evidence.
+      */}
+      {voiceStatus.audioPlaybackFailed && (
+        <View style={styles.audioFailureRow}>
+          <Text style={styles.audioFailureText}>Audio didn't play</Text>
+          <TouchableOpacity
+            style={styles.audioReplayButton}
+            onPress={handleReplayResponse}
+            accessibilityRole="button"
+            accessibilityLabel="Replay tutor audio"
+          >
+            <Text style={styles.audioReplayButtonText}>Replay</Text>
+          </TouchableOpacity>
+        </View>
+      )}
       {/permission|microphone access/i.test(errorMessage ?? voiceStatus.errorMessage ?? '') ? <MicrophoneHelp /> : null}
       {voiceStatus.recognizedTranscript &&
         (voiceStatus.state === 'sending' ||
@@ -2429,6 +2617,36 @@ const styles = StyleSheet.create({
     color: '#6B7280',
     backgroundColor: '#FFFFFF',
   },
+  audioFailureRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginHorizontal: 16,
+    marginBottom: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: '#FEF2F2',
+    borderWidth: 1,
+    borderColor: '#FECACA',
+  },
+  audioFailureText: {
+    fontSize: 13,
+    color: '#991B1B',
+    flex: 1,
+  },
+  audioReplayButton: {
+    marginLeft: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: '#2563EB',
+  },
+  audioReplayButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#FFFFFF',
+  },
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -2491,6 +2709,78 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: '#E5E7EB',
     gap: 8,
+  },
+  disclosureRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  controlsUnavailable: {
+    opacity: 0.55,
+  },
+  disclosureButton: {
+    flex: 1,
+    minWidth: 150,
+    minHeight: 44,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderRadius: 10,
+    borderWidth: 1.5,
+    borderColor: '#2563EB',
+    backgroundColor: '#FFFFFF',
+  },
+  disclosureButtonOpen: {
+    backgroundColor: '#EFF6FF',
+  },
+  disclosureButtonText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#2563EB',
+  },
+  disclosurePanel: {
+    gap: 8,
+    padding: 10,
+    borderRadius: 12,
+    backgroundColor: '#F9FAFB',
+    borderWidth: 1,
+    borderColor: '#F3F4F6',
+  },
+  blockedCard: {
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: '#F59E0B',
+    backgroundColor: '#FFFBEB',
+    padding: 16,
+    gap: 8,
+  },
+  blockedCardTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#92400E',
+  },
+  blockedCardText: {
+    fontSize: 14,
+    color: '#78350F',
+    lineHeight: 20,
+  },
+  blockedCardBody: {
+    fontSize: 13,
+    color: '#92400E',
+    lineHeight: 19,
+  },
+  blockedCardAction: {
+    marginTop: 4,
+    minHeight: 48,
+    borderRadius: 10,
+    backgroundColor: '#2563EB',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 16,
+  },
+  blockedCardActionText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '700',
   },
   modeSelector: {
     flexDirection: 'row',

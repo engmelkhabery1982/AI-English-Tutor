@@ -52,6 +52,7 @@ Return only JSON: {"meanings":[{"id":"sense-1","meaning":"English meaning","tran
 Give 1-4 COMMON meanings where relevant, never invent rare senses. 2-3 genuinely different example contexts per meaning. 1-3 alternatives. Do not claim authoritative dictionary truth.`,
         messages: [{ role: 'user', content: JSON.stringify(input) }], mode: 'coach', topic: 'Language inspection',
         coachingContext: createNeutralDictionaryCoachingContext(),
+        diagnosticsType: 'dictionary',
       }, value => {
         const obj = object(value);
         const meanings = array(obj.meanings, 1, 4).map(raw => {

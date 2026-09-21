@@ -16,6 +16,7 @@ export async function generateStoryLesson(provider: AIProvider | undefined, inpu
 Give 2-4 unambiguous questions, vary the position of correct answers, 1-5 contextual language items. No scores or learner claims.`,
     messages: [{ role: 'user', content: JSON.stringify(input) }], mode: 'coach', topic: input.topic,
     coachingContext: createNeutralDictionaryCoachingContext(),
+    diagnosticsType: 'lesson_generation',
   }, value => {
     const o = object(value), passage = text(o.passage, 5000);
     const questions = array(o.questions, 2, 4).map(raw => {

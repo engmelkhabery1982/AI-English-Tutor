@@ -12,94 +12,126 @@ import type { LearningTools } from '../../lessons/composition';
 const TYPES: readonly InspectionType[] = ['word','phrase','idiom','collocation','expression','sentence','short_text'];
 
 /**
- * Language inspector panel — meaning / translate / rephrase for one selected item.
- * Visual redesign only: the InspectorController owns input retention,
- * single-flight inspection, retry policy and invalidation. Saving uses the
- * existing WO2 save service via `tools.save` ("I want to review this").
+ * Dictionary & Translate panel — meaning / translate / rephrase for one
+ * selected word, phrase, idiom, expression, sentence or short text.
+ *
+ * Learner-facing name: "Dictionary & Translate" (the internal domain remains
+ * the language inspector). Visual hierarchy only: the InspectorController
+ * still owns input retention, single-flight inspection, retry policy and
+ * invalidation, and saving still uses the existing WO2 save service via
+ * `tools.save` ("I want to review this"). No capability was removed — the
+ * full original text, item type and target language live behind "More
+ * options" (progressive disclosure).
  */
 export default function InspectorPanel({ tools, initial }: { tools: LearningTools; initial?: InspectionInput }) {
   const [, redraw] = useReducer(n => n + 1, 0);
   const controller = useMemo(() => new InspectorController(() => tools.provider, initial ?? { originalText: '', selectedText: '', itemType: 'word', targetLanguage: tools.profile?.nativeLanguage ?? 'Arabic' }, redraw), [tools, initial]);
   const [saveNote, setSaveNote] = useState('');
   const [saving, setSaving] = useState(false);
+  const [moreOptionsOpen, setMoreOptionsOpen] = useState(false);
   useEffect(() => () => controller.dispose(), [controller]);
   useFocusEffect(useCallback(() => () => controller.cancel(), [controller]));
   const state = controller.snapshot(), input = state.input;
   const edit = (patch: Partial<InspectionInput>) => { controller.edit({ ...input, ...patch }); setSaveNote(''); };
+  /**
+   * Primary action. When the learner only typed/pasted the item itself (no
+   * separate passage), the item becomes its own source passage — the selected
+   * text itself is NEVER rewritten.
+   */
+  const lookup = () => {
+    if (!input.selectedText.trim() || state.status === 'loading') return;
+    if (!input.originalText.trim()) controller.edit({ ...input, originalText: input.selectedText });
+    void controller.inspect();
+  };
   return (
     <View style={styles.root}>
-      <SectionHeader title="Language inspector" subtitle="Paste up to 4,000 characters. Select a word, phrase, expression, sentence, or the whole short text." />
+      <SectionHeader title="Dictionary & Translate" subtitle="Look up a word, phrase, expression, or sentence in context. Explanations are provider-generated — not authoritative dictionary truth." />
 
       <View style={styles.card}>
-        <Text style={styles.fieldLabel}>Original text</Text>
-        <TextInput
-          accessibilityLabel="Original text"
-          placeholder="Paste original text"
-          value={input.originalText}
-          multiline
-          maxLength={4000}
-          onChangeText={originalText => edit({ originalText, selectedText: originalText })}
-          style={[styles.input, styles.inputMultiline]}
-          placeholderTextColor={theme.colors.textTertiary}
-        />
-
-        <Text style={styles.fieldLabel}>Selected language</Text>
+        <Text style={styles.fieldLabel}>Word, phrase, or sentence</Text>
         <TextInput
           accessibilityLabel="Selected language"
-          placeholder="Selected item from the original text"
+          placeholder="What do you want to understand? e.g. break the ice"
           value={input.selectedText}
           onChangeText={selectedText => edit({ selectedText })}
           style={styles.input}
           placeholderTextColor={theme.colors.textTertiary}
         />
 
-        <Text style={styles.fieldLabel}>Item type</Text>
-        <View style={styles.chipRow}>
-          {TYPES.map(itemType => {
-            const active = input.itemType === itemType;
-            return (
-              <TouchableOpacity
-                key={itemType}
-                style={[styles.chip, active && styles.chipActive]}
-                onPress={() => edit({ itemType })}
-                accessibilityRole="button"
-                accessibilityState={{ selected: active }}
-              >
-                <Text style={[styles.chipText, active && styles.chipTextActive]}>{itemType.replace('_', ' ')}</Text>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
-
-        <Text style={styles.fieldLabel}>Source context (optional)</Text>
+        <Text style={styles.fieldLabel}>Where did you see it? (optional)</Text>
         <TextInput
           accessibilityLabel="Source context"
-          placeholder="Optional sentence/context"
+          placeholder="The sentence or situation it appeared in"
           value={input.context ?? ''}
           multiline
           maxLength={4000}
           onChangeText={context => edit({ context })}
-          style={[styles.input, styles.inputMultiline]}
-          placeholderTextColor={theme.colors.textTertiary}
-        />
-
-        <Text style={styles.fieldLabel}>Translation language</Text>
-        <TextInput
-          accessibilityLabel="Translation language"
-          value={input.targetLanguage}
-          onChangeText={targetLanguage => edit({ targetLanguage })}
-          style={styles.input}
+          style={[styles.input, styles.inputContext]}
           placeholderTextColor={theme.colors.textTertiary}
         />
 
         <TouchableOpacity
           style={styles.primaryButton}
-          disabled={state.status === 'loading' || !input.originalText.trim()}
-          onPress={() => void controller.inspect()}
+          disabled={state.status === 'loading' || !input.selectedText.trim()}
+          onPress={lookup}
           accessibilityRole="button"
+          accessibilityLabel="Look up and translate the selected text"
         >
-          <Text style={styles.primaryButtonText}>{state.status === 'loading' ? 'Inspecting…' : 'Inspect / Translate / Rephrase'}</Text>
+          <Text style={styles.primaryButtonText}>{state.status === 'loading' ? 'Looking up…' : 'Look up / Translate'}</Text>
         </TouchableOpacity>
+
+        <TouchableOpacity
+          style={styles.moreOptionsToggle}
+          onPress={() => setMoreOptionsOpen(open => !open)}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: moreOptionsOpen }}
+          accessibilityLabel="More lookup options"
+        >
+          <Text style={styles.moreOptionsToggleText}>{moreOptionsOpen ? '▾ Hide more options' : '▸ More options (passage, item type, language)'}</Text>
+        </TouchableOpacity>
+
+        {moreOptionsOpen && (
+          <View>
+            <Text style={styles.fieldLabel}>Original text (full passage)</Text>
+            <TextInput
+              accessibilityLabel="Original text"
+              placeholder="Paste the full original text (up to 4,000 characters)"
+              value={input.originalText}
+              multiline
+              maxLength={4000}
+              onChangeText={originalText => edit({ originalText, selectedText: originalText })}
+              style={[styles.input, styles.inputMultiline]}
+              placeholderTextColor={theme.colors.textTertiary}
+            />
+
+            <Text style={styles.fieldLabel}>Item type</Text>
+            <View style={styles.chipRow}>
+              {TYPES.map(itemType => {
+                const active = input.itemType === itemType;
+                return (
+                  <TouchableOpacity
+                    key={itemType}
+                    style={[styles.chip, active && styles.chipActive]}
+                    onPress={() => edit({ itemType })}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: active }}
+                  >
+                    <Text style={[styles.chipText, active && styles.chipTextActive]}>{itemType.replace('_', ' ')}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            <Text style={styles.fieldLabel}>Translation language</Text>
+            <TextInput
+              accessibilityLabel="Translation language"
+              value={input.targetLanguage}
+              onChangeText={targetLanguage => edit({ targetLanguage })}
+              style={styles.input}
+              placeholderTextColor={theme.colors.textTertiary}
+            />
+          </View>
+        )}
 
         {state.failure && (
           <Text style={styles.alertText} accessibilityRole="alert">
@@ -115,7 +147,7 @@ export default function InspectorPanel({ tools, initial }: { tools: LearningTool
 
       {state.result && (
         <View style={styles.resultRoot}>
-          <SectionHeader title="Inspection result" />
+          <SectionHeader title="Meaning & translation" />
           <View style={styles.card}>
             <Text style={styles.provenance}>
               Provider-generated explanation · {state.result.provenance.providerId} · Not authoritative dictionary truth
@@ -208,6 +240,20 @@ const styles = StyleSheet.create({
   inputMultiline: {
     minHeight: 88,
     textAlignVertical: 'top',
+  },
+  inputContext: {
+    minHeight: 56,
+    textAlignVertical: 'top',
+  },
+  moreOptionsToggle: {
+    paddingVertical: 12,
+    minHeight: 44,
+    justifyContent: 'center',
+  },
+  moreOptionsToggleText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: theme.colors.primary,
   },
   chipRow: {
     flexDirection: 'row',
