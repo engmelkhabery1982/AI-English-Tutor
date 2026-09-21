@@ -276,6 +276,54 @@ describe('Listening — clear setup sequence, no dead space', () => {
   });
 });
 
+describe('Learning Tools — three clear top-level areas (Package 2 preserved)', () => {
+  const tools = read('LearningToolsScreen.tsx');
+
+  it('keeps Dictionary & Translate / Listening / Reading as the first-level structure', () => {
+    expect(tools).toContain("{ key: 'inspector', label: 'Dictionary & Translate' }");
+    expect(tools).toContain("{ key: 'listening', label: 'Listening' }");
+    expect(tools).toContain("{ key: 'reading', label: 'Reading' }");
+    expect(tools).toContain('<SegmentedControl');
+    expect(tools).toContain('Choose a tool');
+    // The panels behind the areas are unchanged.
+    expect(tools).toContain('<InspectorPanel tools={tools} initial={inspection} />');
+    expect(tools).toContain('<StoryPanel');
+  });
+
+  it('keeps contextual inspection wired from Talk and listening transcripts', () => {
+    expect(talk).toContain('<InspectableText');
+    expect(talk).toContain("navigation.navigate('LearningTools', { inspect: prefill })");
+    const panel = read('listening/DeepListeningPanel.tsx');
+    expect(panel).toContain('<InspectableText');
+    expect(panel.match(/targetLanguage=\{inspectionTargetLanguage\}/g)).toHaveLength(2);
+    expect(read('ListeningScreen.tsx')).toContain(
+      "onInspectText={(prefill) => navigation.navigate('LearningTools', { inspect: prefill })}",
+    );
+    expect(read('learning/StoryPanel.tsx')).toContain('<InspectableText');
+  });
+
+  it('introduces no fake gamification or fake metric copy', () => {
+    for (const file of [
+      'HomeScreen.tsx',
+      'TalkScreen.tsx',
+      'ReviewScreen.tsx',
+      'SettingsScreen.tsx',
+      'OnboardingScreen.tsx',
+      'ListeningScreen.tsx',
+      'LearningToolsScreen.tsx',
+      '../navigation/RootNavigator.tsx',
+    ]) {
+      // Scan learner-facing code only — comments that DOCUMENT the absence of
+      // gamification (e.g. "No … XP or streaks") are the opposite of a violation.
+      const code = read(file)
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/^\s*\/\/.*$/gm, '')
+        .replace(/\{\/\*[\s\S]*?\*\/\}/g, '');
+      expect(code, file).not.toMatch(/\bXP\b|streaks?|leaderboard|achievement points|daily points/i);
+    }
+  });
+});
+
 describe('Bottom navigation — full discoverable labels', () => {
   const navigator = read('../navigation/RootNavigator.tsx');
 

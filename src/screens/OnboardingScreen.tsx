@@ -1385,6 +1385,14 @@ export default function OnboardingScreen(props?: OnboardingScreenProps) {
       */}
       <View style={styles.card}>
         <Text style={styles.cardTitle}>1 · About you</Text>
+        <Text style={styles.body}>
+          A few questions, then a short English assessment. Your existing profile is kept.
+        </Text>
+        {prefill?.hasExistingData ? (
+          <Text style={styles.muted}>
+            Prefilled from your profile — change only what you want to change.
+          </Text>
+        ) : null}
       <Text style={styles.sectionTitle}>Your name</Text>
       <TextInput accessibilityLabel="Your name"
         style={styles.input}

@@ -170,7 +170,7 @@ export default function LearningToolsScreen() {
             </View>
           )}
 
-          <SectionHeader title="Work area" subtitle="Built-in stories work without AI. Dictionary & Translate lookups and generated lessons use your configured provider (provider-generated explanations, not authoritative dictionary truth)." />
+          <SectionHeader title="Choose a tool" subtitle="Dictionary & Translate · Listening · Reading. Built-in stories work without AI; lookups and generated lessons use your configured provider (provider-generated explanations, not authoritative dictionary truth)." />
           <SegmentedControl
             options={[
               // Learner-facing name is "Dictionary & Translate"; the internal
