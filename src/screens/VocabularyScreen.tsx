@@ -923,7 +923,7 @@ const styles = StyleSheet.create({
   },
   retryButton: {
     backgroundColor: '#2563EB',
-    borderRadius: 10,
+    borderRadius: 12,
     paddingHorizontal: 24,
     paddingVertical: 10,
   },
@@ -962,7 +962,7 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     minWidth: 60,
     backgroundColor: '#F3F4F6',
-    borderRadius: 10,
+    borderRadius: 12,
     paddingVertical: 8,
     paddingHorizontal: 6,
     alignItems: 'center',
@@ -1006,7 +1006,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#ECFDF5',
     borderWidth: 1,
     borderColor: '#A7F3D0',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 12,
   },
   caughtUpText: {
@@ -1020,7 +1020,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FEF2F2',
     borderWidth: 1,
     borderColor: '#FECACA',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 12,
   },
   actionErrorText: {
@@ -1033,7 +1033,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderWidth: 1,
     borderColor: '#D1D5DB',
-    borderRadius: 10,
+    borderRadius: 12,
     paddingHorizontal: 10,
   },
   searchInput: {
@@ -1238,7 +1238,7 @@ const styles = StyleSheet.create({
   },
   pronunciationNotesBox: {
     backgroundColor: '#EFF6FF',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 10,
     marginTop: 10,
   },
@@ -1250,7 +1250,7 @@ const styles = StyleSheet.create({
   },
   addMeaningBlock: {
     backgroundColor: '#FFFDF2',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 10,
     borderWidth: 1,
     borderColor: '#FDE68A',
@@ -1394,7 +1394,7 @@ const styles = StyleSheet.create({
   },
   editActionButton: {
     flex: 1,
-    borderRadius: 10,
+    borderRadius: 12,
     paddingVertical: 10,
     alignItems: 'center',
   },
@@ -1419,7 +1419,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderWidth: 1,
     borderColor: '#FECACA',
-    borderRadius: 10,
+    borderRadius: 12,
     paddingVertical: 12,
     alignItems: 'center',
   },

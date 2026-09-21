@@ -2615,7 +2615,7 @@ const styles = StyleSheet.create({
     marginHorizontal: 4,
   },
   bubble: {
-    borderRadius: 14,
+    borderRadius: 16,
     paddingHorizontal: 14,
     paddingVertical: 10,
   },
@@ -3101,7 +3101,7 @@ const styles = StyleSheet.create({
   reviewButton: {
     marginTop: 8,
     backgroundColor: '#2563EB',
-    borderRadius: 10,
+    borderRadius: 12,
     paddingVertical: 12,
     alignItems: 'center',
   },

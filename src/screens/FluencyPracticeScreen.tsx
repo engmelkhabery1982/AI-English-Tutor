@@ -1245,20 +1245,20 @@ const styles = StyleSheet.create({
   repeatLine: { fontSize: 14, fontStyle: 'italic', color: '#065F46', marginTop: 6 },
   pill: {
     backgroundColor: '#F3F4F6',
-    borderRadius: 10,
+    borderRadius: 12,
     paddingHorizontal: 8,
     paddingVertical: 4,
   },
   pillText: { fontSize: 12, color: '#374151', fontWeight: '600' },
   userTurn: {
     backgroundColor: '#EFF6FF',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 10,
     marginBottom: 8,
   },
   tutorTurn: {
     backgroundColor: '#f7f8fa',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 10,
     marginBottom: 8,
   },
@@ -1267,7 +1267,7 @@ const styles = StyleSheet.create({
   transcriptLine: { fontSize: 13, color: '#4B5563', fontStyle: 'italic', marginTop: 4 },
   feedbackBox: {
     backgroundColor: '#ECFDF5',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 12,
     marginBottom: 12,
     borderWidth: 1,
@@ -1277,7 +1277,7 @@ const styles = StyleSheet.create({
   feedbackDetail: { fontSize: 13, color: '#4B5563', marginTop: 2 },
   repairBox: {
     backgroundColor: '#EFF6FF',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 12,
     marginBottom: 12,
     borderWidth: 1,
@@ -1286,7 +1286,7 @@ const styles = StyleSheet.create({
   repairLabel: { fontSize: 13, color: '#1E40AF', marginBottom: 4 },
   demoBox: {
     backgroundColor: '#FEF3C7',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 12,
     marginBottom: 12,
     borderWidth: 1,

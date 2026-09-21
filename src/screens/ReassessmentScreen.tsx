@@ -251,7 +251,7 @@ const styles = StyleSheet.create({
     marginTop: 12,
     padding: 12,
     backgroundColor: '#F3F4F6',
-    borderRadius: 10,
+    borderRadius: 12,
   },
   disabledText: {
     fontSize: 14,

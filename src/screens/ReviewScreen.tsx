@@ -1465,7 +1465,7 @@ const styles = StyleSheet.create({
   },
   listeningPlayButton: {
     backgroundColor: '#059669',
-    borderRadius: 10,
+    borderRadius: 12,
     paddingVertical: 10,
     paddingHorizontal: 16,
     alignItems: 'center',
@@ -1533,7 +1533,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderWidth: 1,
     borderColor: '#D1D5DB',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 12,
     fontSize: 15,
     color: '#111827',
@@ -1542,7 +1542,7 @@ const styles = StyleSheet.create({
   submitButton: {
     backgroundColor: '#2563EB',
     paddingVertical: 12,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1559,7 +1559,7 @@ const styles = StyleSheet.create({
     gap: 16,
   },
   evalResultBanner: {
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 14,
   },
   evalResultBanner_correct: { backgroundColor: '#ECFDF5' },
@@ -1616,7 +1616,7 @@ const styles = StyleSheet.create({
   nextButton: {
     backgroundColor: '#111827',
     paddingVertical: 12,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: 'center',
   },
   nextButtonText: {

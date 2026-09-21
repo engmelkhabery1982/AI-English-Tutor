@@ -828,7 +828,7 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
     paddingHorizontal: 12,
     paddingVertical: 8,
-    borderRadius: 14,
+    borderRadius: 16,
     backgroundColor: '#DBEAFE',
     marginBottom: 8,
   },
@@ -878,7 +878,7 @@ const styles = StyleSheet.create({
   },
   stopButton: {
     backgroundColor: '#FEE2E2',
-    borderRadius: 10,
+    borderRadius: 12,
     paddingVertical: 12,
     paddingHorizontal: 16,
   },
@@ -949,7 +949,7 @@ const styles = StyleSheet.create({
   saveItemLabel: { fontSize: 13, color: '#1F2937', fontWeight: '600', flexShrink: 1 },
   saveChip: {
     backgroundColor: '#EFF6FF',
-    borderRadius: 10,
+    borderRadius: 12,
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderWidth: 1,
