@@ -1,6 +1,7 @@
 import { SafeAreaView } from 'react-native-safe-area-context';
 import type { VocabularyCategory } from '../domain/shared/types';
 import MicrophoneHelp from './components/MicrophoneHelp';
+import InspectableText from './components/InspectableText';
 import TouchableOpacity from './components/LearnerButton';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
@@ -1922,14 +1923,24 @@ export default function TalkScreen(props?: TalkScreenProps) {
                       isUser ? styles.userBubble : styles.assistantBubble,
                     ]}
                   >
-                    <Text
-                      style={[
+                    {/*
+                      Contextual inspection (Package 2): tap any word in the
+                      conversation to open Dictionary & Translate prefilled
+                      with the exact word, its sentence and this message.
+                      Read-only — it never submits a turn or evidence.
+                    */}
+                    <InspectableText
+                      text={turn.content}
+                      textStyle={[
                         styles.messageText,
                         isUser ? styles.userMessageText : styles.assistantMessageText,
                       ]}
-                    >
-                      {turn.content}
-                    </Text>
+                      targetLanguage="Arabic"
+                      accessibilityLabel={`${isUser ? 'Your' : 'Tutor'} message — tap any word to look it up`}
+                      onInspect={(prefill) => {
+                        navigation.navigate('LearningTools', { inspect: prefill });
+                      }}
+                    />
                   </View>
                   {isLastAssistant && (
                     <View style={styles.assistantVoiceActions}>

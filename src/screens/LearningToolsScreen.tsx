@@ -14,8 +14,8 @@ import TouchableOpacity from './components/LearnerButton';
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { useFocusEffect, useNavigation } from '@react-navigation/native';
-import type { NavigationProp } from '@react-navigation/native';
+import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
+import type { NavigationProp, RouteProp } from '@react-navigation/native';
 import type { RootStackParamList } from '../navigation/routes';
 import { createLearningTools, type LearningTools } from '../lessons/composition';
 import { STARTER_LESSONS, starterForLevel } from '../lessons/catalogue';
@@ -38,6 +38,9 @@ const LOAD_ERROR =
 
 export default function LearningToolsScreen() {
   const navigation = useNavigation<NavigationProp<RootStackParamList>>();
+  const route = useRoute<RouteProp<RootStackParamList, 'LearningTools'>>();
+  /** Contextual prefill from another surface (story / transcript / Talk text). */
+  const inspectParam = route.params?.inspect;
   const [tools, setTools] = useState<LearningTools | null>(null);
   const [error, setError] = useState('');
   const [section, setSection] = useState<'inspector' | LessonMode>('inspector');
@@ -89,6 +92,19 @@ export default function LearningToolsScreen() {
     setSection(key as 'inspector' | LessonMode);
     setLesson(null); setInspection(undefined); setFailure(null);
   };
+  /**
+   * Consume a contextual Dictionary & Translate prefill exactly once: open the
+   * dictionary section with the learner's selected text already filled in.
+   * Nothing is looked up automatically — the learner confirms the action, so
+   * navigation alone never fires a provider request.
+   */
+  useEffect(() => {
+    if (!inspectParam) return;
+    setSection('inspector');
+    setLesson(null);
+    setInspection({ ...inspectParam, contextSource: 'manual' });
+    navigation.setParams({ inspect: undefined });
+  }, [inspectParam, navigation]);
   return (
     <ScrollView
       keyboardShouldPersistTaps="handled"
@@ -169,7 +185,7 @@ export default function LearningToolsScreen() {
 
           <View style={styles.sectionBody}>
             {section === 'inspector' ? (
-              <InspectorPanel tools={tools} />
+              <InspectorPanel tools={tools} initial={inspection} />
             ) : (
               <>
               <View style={styles.card}>

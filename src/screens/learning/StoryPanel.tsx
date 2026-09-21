@@ -2,6 +2,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import React, { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
 import { AppState, StyleSheet, Text, TextInput, View } from 'react-native';
 import TouchableOpacity from '../components/LearnerButton';
+import InspectableText from '../components/InspectableText';
 import { theme } from '../components/ui/theme';
 import { Pill } from '../components/ui/Pill';
 import type { LearningTools } from '../../lessons/composition';
@@ -100,7 +101,28 @@ export default function StoryPanel({ tools, lesson, mode, inspect }: { tools: Le
       {state.transcriptVisible && (
         <View style={styles.card}>
           <Text style={styles.sectionLabel}>{passageLabel}</Text>
-          <Text style={styles.passageText} selectable>{lesson.passage}</Text>
+          {/*
+            Contextual inspection (Package 2): tap any word (or take the whole
+            sentence) to open Dictionary & Translate prefilled with the exact
+            selected text, its sentence and this passage. The session marks the
+            lookup as assistance, exactly like the existing Inspect action.
+          */}
+          <InspectableText
+            text={lesson.passage}
+            textStyle={styles.passageText}
+            targetLanguage={tools.profile?.nativeLanguage ?? 'Arabic'}
+            sourceRef={lesson.id}
+            accessibilityLabel={`${passageLabel} — tap any word to look it up`}
+            onInspect={sel => {
+              const target = tools.profile?.nativeLanguage ?? 'Arabic';
+              const base = session.inspection(sel.selectedText, target);
+              inspect({
+                ...base,
+                context: sel.context,
+                itemType: base.itemType === 'phrase' ? sel.itemType : base.itemType,
+              });
+            }}
+          />
         </View>
       )}
 

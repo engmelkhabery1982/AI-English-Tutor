@@ -15,6 +15,12 @@ const read = (file: string): string => readFileSync(join(__dirname, file), 'utf8
 
 const TOOLS = read('LearningToolsScreen.tsx');
 const PANEL = read('learning/InspectorPanel.tsx');
+const STORY = read('learning/StoryPanel.tsx');
+const TALK = read('TalkScreen.tsx');
+const DEEP = read('listening/DeepListeningPanel.tsx');
+const LISTENING = read('ListeningScreen.tsx');
+const COMPONENT = read('components/InspectableText.tsx');
+const ROUTES = read('../navigation/routes.ts');
 
 describe('Learning Tools communicates Dictionary & Translate', () => {
   it('names the tab "Dictionary & Translate" (not the internal term "Inspector")', () => {
@@ -87,5 +93,52 @@ describe('Dictionary & Translate panel — clear hierarchy, no lost capability',
     expect(PANEL).toContain('Save this meaning to Review');
     expect(PANEL).toContain('Already saved. The existing meaning and review schedule were kept.');
     expect(PANEL).toContain('Saved to Review — not marked learned.');
+  });
+});
+
+describe('contextual inspection from content (one shared pattern)', () => {
+  it('the shared component taps words and confirms through an explicit action row', () => {
+    // No fake native selection: tap regions + explicit confirm action.
+    expect(COMPONENT).toContain('onPress={');
+    expect(COMPONENT).toContain('Meaning / Translate');
+    expect(COMPONENT).toContain('Whole sentence');
+    expect(COMPONENT).toContain('accessibilityRole="button"');
+    expect(COMPONENT).toContain('buildInspectionPrefill');
+    // The action fires exactly one prefill per confirm.
+    expect(COMPONENT).toContain('onInspect(');
+  });
+
+  it('story passages (reading + listening transcript) are inspectable in context', () => {
+    expect(STORY).toContain('<InspectableText');
+    expect(STORY).toContain('session.inspection(sel.selectedText, target)');
+    expect(STORY).toContain('context: sel.context');
+  });
+
+  it('Talk conversation messages are inspectable and route to Dictionary & Translate', () => {
+    expect(TALK).toContain('<InspectableText');
+    expect(TALK).toContain("navigation.navigate('LearningTools', { inspect: prefill })");
+  });
+
+  it('the deep listening transcript exposes the same entry point', () => {
+    expect(DEEP).toContain('readonly onInspectText?: (prefill: InspectionPrefillParam) => void;');
+    expect(DEEP).toContain('onInspect={props.onInspectText}');
+    expect(LISTENING).toContain(
+      "onInspectText={(prefill) => navigation.navigate('LearningTools', { inspect: prefill })}",
+    );
+  });
+
+  it('Learning Tools consumes the prefill exactly once and never auto-runs a lookup', () => {
+    expect(TOOLS).toContain('const inspectParam = route.params?.inspect;');
+    expect(TOOLS).toContain("setInspection({ ...inspectParam, contextSource: 'manual' });");
+    expect(TOOLS).toContain('navigation.setParams({ inspect: undefined });');
+    // The panel is opened prefilled; the learner confirms the lookup.
+    expect(TOOLS).toContain('<InspectorPanel tools={tools} initial={inspection} />');
+    expect(TOOLS).not.toContain('controller.inspect()');
+  });
+
+  it('the prefill param is typed on the existing route (no navigator redesign)', () => {
+    expect(ROUTES).toContain(
+      'LearningTools: { readonly inspect?: InspectionPrefillParam } | undefined;',
+    );
   });
 });

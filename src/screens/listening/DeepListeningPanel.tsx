@@ -1,6 +1,8 @@
 import ProviderSettingsLink from '../components/ProviderSettingsLink';
 import { useVoiceAppStateGuard } from '../../voice/use-app-state-guard';
 import MicrophoneHelp from '../components/MicrophoneHelp';
+import InspectableText from '../components/InspectableText';
+import type { InspectionPrefillParam } from '../components/inspectable-text';
 import TouchableOpacity from '../components/LearnerButton';
 /**
  * src/screens/listening/DeepListeningPanel.tsx
@@ -82,6 +84,11 @@ export interface DeepListeningPanelProps {
   readonly recorder?: AudioRecorderService;
   readonly stt?: SpeechToTextProvider;
   readonly onExit?: () => void;
+  /**
+   * Contextual Dictionary & Translate entry point for revealed transcripts
+   * (Package 2). Read-only: inspecting never counts as an attempt.
+   */
+  readonly onInspectText?: (prefill: InspectionPrefillParam) => void;
 }
 
 const ACTIVITY_LABELS: Record<DeepListeningActivity['taskType'], string> = {
@@ -743,7 +750,17 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
             const readable = shadowing ? readableChunkFor(shadowing.session, assist) : null;
             return readable ? (
               <View style={styles.transcriptBox}>
-                <Text style={styles.transcriptText}>{readable}</Text>
+                {props.onInspectText ? (
+                  <InspectableText
+                    text={readable}
+                    textStyle={styles.transcriptText}
+                    targetLanguage="Arabic"
+                    accessibilityLabel="Transcript — tap any word to look it up"
+                    onInspect={props.onInspectText}
+                  />
+                ) : (
+                  <Text style={styles.transcriptText}>{readable}</Text>
+                )}
                 {assist.transcriptRevealed && (
                   <Text style={styles.note}>
                     Revealed for you — this is assistance, not an attempt and not a result.
@@ -951,7 +968,17 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
                     </Text>
                   ))}
                   {revealed ? (
-                    <Text style={styles.transcriptText}>{revealed}</Text>
+                    props.onInspectText ? (
+                      <InspectableText
+                        text={revealed}
+                        textStyle={styles.transcriptText}
+                        targetLanguage="Arabic"
+                        accessibilityLabel="Revealed transcript — tap any word to look it up"
+                        onInspect={props.onInspectText}
+                      />
+                    ) : (
+                      <Text style={styles.transcriptText}>{revealed}</Text>
+                    )
                   ) : null}
                   {revealed ? (
                     <TouchableOpacity

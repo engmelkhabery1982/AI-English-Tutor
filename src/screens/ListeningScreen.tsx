@@ -502,6 +502,7 @@ export default function ListeningScreen(props?: ListeningScreenProps) {
               service={serviceRef.current}
               shadowingOnly={Boolean(props?.initialPractice)}
               onExit={() => props?.initialPractice ? navigation.goBack() : setMode('short')}
+              onInspectText={(prefill) => navigation.navigate('LearningTools', { inspect: prefill })}
               {...(props?.ttsProvider ? { ttsProvider: props.ttsProvider } : {})}
               {...(props?.recorder ? { recorder: props.recorder } : {})}
               {...(props?.stt ? { stt: props.stt } : {})}

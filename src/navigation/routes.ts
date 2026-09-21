@@ -27,6 +27,7 @@ import type { NavigatorScreenParams } from '@react-navigation/native';
 
 import type { SpeakingPracticeSeed, SpeakingPracticeType, SpeakingProfessionalScenario } from '../deep-speaking';
 import type { DailyTutorActivityRef, DailyTutorReviewLaunch } from '../daily-tutor/types';
+import type { InspectionPrefillParam } from '../screens/components/inspectable-text';
 
 /** Root stack route names, in navigator order (RootNavigator renders these). */
 export const ROOT_STACK_ROUTES = [
@@ -102,7 +103,12 @@ export type RootStackParamList = {
   Reassessment: undefined;
   Pronunciation: undefined;
   Shadowing: undefined;
-  LearningTools: undefined;
+  /**
+   * `inspect` carries a contextual Dictionary & Translate prefill when the
+   * learner inspected language from another surface (story, listening
+   * transcript, Talk message). Plain serializable data only.
+   */
+  LearningTools: { readonly inspect?: InspectionPrefillParam } | undefined;
 };
 
 /** The nested-navigation envelope returned by toMainTabRoute. */
