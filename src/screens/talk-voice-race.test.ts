@@ -118,3 +118,20 @@ describe('Talk TTS recovery — learner-visible Replay wiring', () => {
     expect(TALK).toContain('await coordinator.replayLastResponse();');
   });
 });
+
+describe('Talk latency — recorder stop is never delayed by learner-context work', () => {
+  it('hands learner-context preparation to the coordinator as beforeSubmit', () => {
+    const stopBranch = micHandlerBody.slice(
+      micHandlerBody.indexOf("if (status.state === 'recording') {"),
+    );
+    expect(stopBranch).toContain('{ beforeSubmit: () => ensureLearnerContext() }');
+    // The old blocking order (await context, THEN stop the recorder) is gone.
+    expect(stopBranch).not.toMatch(
+      /await ensureLearnerContext\(\);\s*const res = await coordinator\.stopRecordingAndProcess/,
+    );
+  });
+
+  it('marks the mic tap for the internal timing diagnostics', () => {
+    expect(micHandlerBody).toContain("markVoiceTiming('mic_tap');");
+  });
+});

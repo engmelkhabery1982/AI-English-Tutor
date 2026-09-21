@@ -22,6 +22,7 @@ import {
 } from 'react-native';
 import { countCommittedLearnerTurns } from '../conversation-session';
 import { MicIntentQueue } from '../voice/mic-intent';
+import { markVoiceTiming } from '../voice/timings';
 import {
   resolveSpeechRateCapability,
   planSpeechRate,
@@ -1181,6 +1182,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
 
   // Handle microphone press — the single primary action of a turn.
   const handleToggleRecording = async () => {
+    markVoiceTiming('mic_tap');
     // Rapid-tap protection: at most ONE mic action (start or stop) at a time,
     // so repeated taps can never open two recorders or submit one utterance
     // twice from the screen side.
@@ -1240,10 +1242,18 @@ export default function TalkScreen(props?: TalkScreenProps) {
 
         // One utterance = at most one submitted turn: the coordinator guards this
         // internally as well, so a double tap cannot send the audio twice.
-        await ensureLearnerContext();
-        const res = await coordinator.stopRecordingAndProcess((chunk: string) => {
-          setStreamingText((prev) => (prev ?? '') + chunk);
-        });
+        //
+        // LATENCY: recorder finalization starts IMMEDIATELY. The learner-context
+        // refresh overlaps with the recorder stop + STT and is awaited by the
+        // coordinator only right before provider submission (`beforeSubmit`),
+        // so the dependent order recorder-stop → STT → submission is preserved
+        // without keeping the microphone open during context preparation.
+        const res = await coordinator.stopRecordingAndProcess(
+          (chunk: string) => {
+            setStreamingText((prev) => (prev ?? '') + chunk);
+          },
+          { beforeSubmit: () => ensureLearnerContext() },
+        );
 
         // A late result from a session that has since been replaced must never
         // touch the replacement conversation.

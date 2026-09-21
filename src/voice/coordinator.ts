@@ -36,6 +36,7 @@ import type { SpeechToTextProvider, STTResult } from '../providers/stt';
 import type { TextToSpeechProvider } from '../providers/tts';
 import { classifyProviderFailure, type ProviderFailure } from '../providers/failures';
 import { runWithSafeRetry } from '../shared/safe-retry';
+import { markVoiceTiming } from './timings';
 import type {
   AudioRecorderService,
   AudioRecordingResult,
@@ -546,6 +547,7 @@ export class VoiceSessionCoordinator {
 
   /** The actual recorder-open lifecycle. Only ever entered via startRecording(). */
   private async performStartRecording(): Promise<boolean> {
+    markVoiceTiming('recorder_start_requested');
     // A NEW utterance supersedes any preserved recovery state: the learner chose
     // to speak again, so the previous transcript/recording is dropped (with its
     // temp file) and can never be sent a second time.
@@ -595,6 +597,7 @@ export class VoiceSessionCoordinator {
       }
       this.state = 'recording';
       this.elapsedSeconds = 0;
+      markVoiceTiming('recorder_active');
 
       if (this.timerHandle) {
         clearInterval(this.timerHandle);
@@ -656,7 +659,18 @@ export class VoiceSessionCoordinator {
    *   raw provider payloads stay in `technical` (logs only).
    */
   async stopRecordingAndProcess(
-    onStreamChunk?: (chunk: string) => void
+    onStreamChunk?: (chunk: string) => void,
+    options?: {
+      /**
+       * Optional pre-submission preparation (e.g. refreshing the persisted
+       * learner context). It runs AFTER recorder finalization and STT have
+       * been STARTED — the recorder is never kept capturing while this work
+       * runs — but it is awaited BEFORE `session.send()`, so the dependent
+       * order recorder-stop → STT → provider submission is preserved exactly.
+       * Best effort: a failure here never fails the turn.
+       */
+      readonly beforeSubmit?: () => void | Promise<void>;
+    },
   ): Promise<VoiceTurnOutcome> {
     if (this.disposed) return { ok: false, error: VOICE_DISPOSED_MESSAGE };
     if (this.switching) return { ok: false, error: VOICE_SWITCHING_MESSAGE };
@@ -665,6 +679,7 @@ export class VoiceSessionCoordinator {
     if (this.processing || this.state !== 'recording') {
       return { ok: false, error: VOICE_NOTHING_TO_STOP_MESSAGE };
     }
+    markVoiceTiming('stop_requested');
 
     // Bind the whole operation to the session that is active right now.
     const session = this.session;
@@ -685,6 +700,7 @@ export class VoiceSessionCoordinator {
     try {
       audio = await this.recorder.stopRecording();
       this.lastAudioUri = audio?.uri ?? null;
+      markVoiceTiming('recorder_stopped');
     } catch (err: unknown) {
       this.processing = false;
       this.dropRecoverableRecording();
@@ -715,6 +731,7 @@ export class VoiceSessionCoordinator {
       generation,
       transcribeOnly: false,
       ...(onStreamChunk ? { onStreamChunk } : {}),
+      ...(options?.beforeSubmit ? { beforeSubmit: options.beforeSubmit } : {}),
     });
   }
 
@@ -931,11 +948,13 @@ export class VoiceSessionCoordinator {
     readonly generation: number;
     readonly transcribeOnly: boolean;
     readonly onStreamChunk?: (chunk: string) => void;
+    readonly beforeSubmit?: () => void | Promise<void>;
   }): Promise<VoiceTurnOutcome> {
     const { audio, session, generation } = input;
 
     // 1. Speech to text. STT commits nothing, so ONE short automatic retry of a
     //    transient failure is safe and cannot duplicate a learner turn.
+    markVoiceTiming('stt_started');
     const stt = await runWithSafeRetry<STTResult>({
       surface: 'speech',
       committed: () => false,
@@ -957,6 +976,7 @@ export class VoiceSessionCoordinator {
       },
       failureOf: (result) => (result.ok ? null : { message: result.error ?? null }),
     });
+    markVoiceTiming('stt_completed');
 
     if (!this.isCurrent(session, generation)) {
       // A late STT result must never be attached to the replacement session.
@@ -1011,6 +1031,24 @@ export class VoiceSessionCoordinator {
       return { ok: true, transcript };
     }
 
+    // Caller-provided pre-submission preparation (e.g. the persisted learner
+    // context refresh) is awaited HERE — after recorder finalization and STT,
+    // immediately before provider submission — so it overlaps with the
+    // recorder stop and STT instead of delaying them, while the dependent
+    // order recorder-stop → STT → submission stays exact. Best effort: it can
+    // never fail the turn.
+    if (input.beforeSubmit) {
+      try {
+        await input.beforeSubmit();
+      } catch {
+        // Context preparation is best-effort; the turn proceeds regardless.
+      }
+      if (!this.isCurrent(session, generation)) {
+        this.processing = false;
+        return { ok: false, error: VOICE_SESSION_CHANGED_MESSAGE };
+      }
+    }
+
     this.recognizedTranscript = transcript;
     this.state = 'sending';
     this.notifyListeners();
@@ -1058,11 +1096,13 @@ export class VoiceSessionCoordinator {
     let streamed = false;
     const onChunk = input.onStreamChunk
       ? (chunk: string) => {
+          if (!streamed) markVoiceTiming('first_tutor_chunk');
           streamed = true;
           input.onStreamChunk?.(chunk);
         }
       : undefined;
 
+    markVoiceTiming('provider_request_started');
     const sent = await runWithSafeRetry<ConversationSessionResult>({
       surface: 'tutor',
       run: async (): Promise<ConversationSessionResult> => {
@@ -1142,6 +1182,7 @@ export class VoiceSessionCoordinator {
     }
 
     // COMMITTED exactly once: the preserved transcript is no longer pending.
+    markVoiceTiming('tutor_response_completed');
     this.pendingTurn = null;
     // The conversational turn is now complete, so playback no longer counts as
     // in-flight work: the learner can interrupt the tutor and speak (barge-in).
@@ -1245,17 +1286,20 @@ export class VoiceSessionCoordinator {
     // meaningful for this attempt.
     this.audioPlaybackFailed = false;
     this.ttsStopRequested = false;
+    markVoiceTiming('tts_requested');
 
     try {
       await this.ttsProvider.speak(text, {
         ...(options?.rate !== undefined ? { rate: options.rate } : {}),
         onStart: () => {
+          markVoiceTiming('tts_playback_started');
           if (this.isCurrent(session, generation)) {
             this.state = 'speaking';
             this.notifyListeners();
           }
         },
         onDone: () => {
+          markVoiceTiming('tts_completed');
           if (this.isCurrent(session, generation) && this.state === 'speaking') {
             this.state = 'idle';
             this.notifyListeners();
@@ -1282,6 +1326,7 @@ export class VoiceSessionCoordinator {
    * never show a misleading failure for an obsolete turn.
    */
   private handlePlaybackFailure(session: ConversationSession, generation: number): void {
+    markVoiceTiming('tts_failed');
     if (!this.isCurrent(session, generation) || this.state !== 'speaking') return;
     this.state = 'idle';
     if (!this.ttsStopRequested) {
