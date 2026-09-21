@@ -1145,7 +1145,7 @@ export default function FluencyPracticeScreen(props?: FluencyPracticeScreenProps
             value={inputText}
             onChangeText={setInputText}
             placeholder="Or type your answer"
-            placeholderTextColor="#9a9a9e"
+            placeholderTextColor="#9CA3AF"
             editable={!isSubmitting && !isPreparing}
             multiline
           />
@@ -1244,14 +1244,14 @@ const styles = StyleSheet.create({
   progressLine: { fontSize: 14, fontWeight: '600', color: '#059669', marginTop: 4 },
   repeatLine: { fontSize: 14, fontStyle: 'italic', color: '#065F46', marginTop: 6 },
   pill: {
-    backgroundColor: '#eef1f6',
+    backgroundColor: '#F3F4F6',
     borderRadius: 10,
     paddingHorizontal: 8,
     paddingVertical: 4,
   },
-  pillText: { fontSize: 12, color: '#3a3a3c', fontWeight: '600' },
+  pillText: { fontSize: 12, color: '#374151', fontWeight: '600' },
   userTurn: {
-    backgroundColor: '#eef4ff',
+    backgroundColor: '#EFF6FF',
     borderRadius: 10,
     padding: 10,
     marginBottom: 8,
@@ -1262,37 +1262,37 @@ const styles = StyleSheet.create({
     padding: 10,
     marginBottom: 8,
   },
-  turnRole: { fontSize: 12, fontWeight: '700', color: '#8e8e93', marginBottom: 2 },
-  turnText: { fontSize: 14, color: '#1c1c1e' },
-  transcriptLine: { fontSize: 13, color: '#4a4a4e', fontStyle: 'italic', marginTop: 4 },
+  turnRole: { fontSize: 12, fontWeight: '700', color: '#9CA3AF', marginBottom: 2 },
+  turnText: { fontSize: 14, color: '#111827' },
+  transcriptLine: { fontSize: 13, color: '#4B5563', fontStyle: 'italic', marginTop: 4 },
   feedbackBox: {
-    backgroundColor: '#f3f7f4',
+    backgroundColor: '#ECFDF5',
     borderRadius: 10,
     padding: 12,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: '#dce7df',
+    borderColor: '#D1FAE5',
   },
-  feedbackLine: { fontSize: 14, color: '#1c1c1e', marginBottom: 4 },
-  feedbackDetail: { fontSize: 13, color: '#4a4a4e', marginTop: 2 },
+  feedbackLine: { fontSize: 14, color: '#111827', marginBottom: 4 },
+  feedbackDetail: { fontSize: 13, color: '#4B5563', marginTop: 2 },
   repairBox: {
-    backgroundColor: '#eef4ff',
+    backgroundColor: '#EFF6FF',
     borderRadius: 10,
     padding: 12,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: '#c9d8f5',
+    borderColor: '#DBEAFE',
   },
-  repairLabel: { fontSize: 13, color: '#1c3f7a', marginBottom: 4 },
+  repairLabel: { fontSize: 13, color: '#1E40AF', marginBottom: 4 },
   demoBox: {
-    backgroundColor: '#fff8e6',
+    backgroundColor: '#FEF3C7',
     borderRadius: 10,
     padding: 12,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: '#f0e2bf',
+    borderColor: '#FDE68A',
   },
-  demoText: { fontSize: 13, color: '#7a5b00' },
+  demoText: { fontSize: 13, color: '#92400E' },
   micButton: {
     backgroundColor: '#059669',
     borderRadius: 12,

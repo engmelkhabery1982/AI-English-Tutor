@@ -2420,7 +2420,7 @@ const styles = StyleSheet.create({
     color: '#DC2626',
   },
   turnStatusLabelError: {
-    color: '#B91C1C',
+    color: '#DC2626',
   },
   turnHint: {
     paddingHorizontal: 16,
@@ -2645,8 +2645,8 @@ const styles = StyleSheet.create({
     color: '#1F2937',
   },
   pronunciationContainer: {
-    backgroundColor: '#EEF4FF',
-    borderColor: '#C9DAF8',
+    backgroundColor: '#EFF6FF',
+    borderColor: '#DBEAFE',
     borderWidth: 1,
     borderRadius: 12,
     padding: 10,
@@ -2655,12 +2655,12 @@ const styles = StyleSheet.create({
   pronunciationTitle: {
     fontSize: 12,
     fontWeight: '600',
-    color: '#1F4E9C',
+    color: '#1D4ED8',
     marginBottom: 4,
   },
   pronunciationLine: {
     fontSize: 13,
-    color: '#2C3E50',
+    color: '#1F2937',
     lineHeight: 18,
   },
   feedbackContainer: {
@@ -2822,7 +2822,7 @@ const styles = StyleSheet.create({
   },
   errorText: {
     fontSize: 13,
-    color: '#B91C1C',
+    color: '#DC2626',
   },
   /** One explicit recovery action inside the failure notice. */
   errorAction: {
@@ -2843,7 +2843,7 @@ const styles = StyleSheet.create({
   errorActionText: {
     fontSize: 12,
     fontWeight: '600',
-    color: '#B91C1C',
+    color: '#DC2626',
   },
   /** Explicit "apply this drafted topic" action (no per-keystroke replacement). */
   topicApplyButton: {
@@ -3014,7 +3014,7 @@ const styles = StyleSheet.create({
   },
   micButtonRecording: {
     backgroundColor: '#DC2626',
-    borderColor: '#B91C1C',
+    borderColor: '#DC2626',
   },
   micButtonTranscribing: {
     backgroundColor: '#2563EB',
@@ -3175,7 +3175,7 @@ const styles = StyleSheet.create({
   },
   helpCardError: {
     fontSize: 14,
-    color: '#B91C1C',
+    color: '#DC2626',
     lineHeight: 20,
   },
   helpCardNote: {

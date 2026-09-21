@@ -917,7 +917,7 @@ const styles = StyleSheet.create({
   },
   errorText: {
     fontSize: 14,
-    color: '#B91C1C',
+    color: '#DC2626',
     textAlign: 'center',
     marginBottom: 16,
   },
@@ -1024,7 +1024,7 @@ const styles = StyleSheet.create({
     padding: 12,
   },
   actionErrorText: {
-    color: '#B91C1C',
+    color: '#DC2626',
     fontSize: 13,
   },
   searchWrapper: {
@@ -1237,14 +1237,14 @@ const styles = StyleSheet.create({
     color: '#6B7280',
   },
   pronunciationNotesBox: {
-    backgroundColor: '#EEF4FF',
+    backgroundColor: '#EFF6FF',
     borderRadius: 10,
     padding: 10,
     marginTop: 10,
   },
   pronunciationNoteLine: {
     fontSize: 13,
-    color: '#2C3E50',
+    color: '#1F2937',
     lineHeight: 18,
     marginTop: 2,
   },
@@ -1253,7 +1253,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     padding: 10,
     borderWidth: 1,
-    borderColor: '#F2E8B9',
+    borderColor: '#FDE68A',
     gap: 8,
   },
   addMeaningHint: {

@@ -106,7 +106,7 @@ export default function ReassessmentScreen({
   if (loading) {
     return (
       <View style={styles.centered}>
-        <ActivityIndicator size="large" color="#0066CC" />
+        <ActivityIndicator size="large" color="#2563EB" />
         <Text style={styles.loadingText}>Checking your assessment history…</Text>
       </View>
     );

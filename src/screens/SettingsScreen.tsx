@@ -59,13 +59,13 @@ const STATUS_LABELS: Record<ProviderConfigurationSnapshot['status'], string> = {
 };
 
 const STATUS_TONES: Record<ProviderConfigurationSnapshot['status'], string> = {
-  configured: '#0f7b3f',
-  unverified: '#8a6d00',
-  'development-fallback': '#8a6d00',
-  'not-configured': '#8e8e93',
-  'invalid-credential': '#b3261e',
-  'temporarily-unavailable': '#8a6d00',
-  'storage-unavailable': '#b3261e',
+  configured: '#059669',
+  unverified: '#92400E',
+  'development-fallback': '#92400E',
+  'not-configured': '#9CA3AF',
+  'invalid-credential': '#DC2626',
+  'temporarily-unavailable': '#92400E',
+  'storage-unavailable': '#DC2626',
 };
 
 export default function SettingsScreen(props?: SettingsScreenProps) {
@@ -283,7 +283,7 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
           value={draftKey}
           onChangeText={setDraftKey}
           placeholder={hasStoredKey ? 'Enter a new key to replace it' : 'Paste your API key'}
-          placeholderTextColor="#a4a4a8"
+          placeholderTextColor="#9CA3AF"
           secureTextEntry
           autoCapitalize="none"
           autoCorrect={false}
@@ -511,7 +511,7 @@ const styles = StyleSheet.create({
   },
   warning: {
     fontSize: 12,
-    color: '#8a6d00',
+    color: '#92400E',
     marginTop: 8,
     lineHeight: 17,
   },
@@ -574,7 +574,7 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 12,
   },
-  busyText: { fontSize: 13, color: '#8e8e93' },
+  busyText: { fontSize: 13, color: '#9CA3AF' },
   feedback: {
     fontSize: 13,
     color: '#374151',

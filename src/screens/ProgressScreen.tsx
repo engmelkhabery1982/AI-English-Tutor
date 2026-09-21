@@ -662,7 +662,7 @@ const styles = StyleSheet.create({
   },
   errorText: {
     fontSize: 14,
-    color: '#B91C1C',
+    color: '#DC2626',
     textAlign: 'center',
     marginBottom: 12,
   },

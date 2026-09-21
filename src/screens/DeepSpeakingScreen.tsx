@@ -1080,7 +1080,7 @@ const styles = StyleSheet.create({
   pillGeneral: { backgroundColor: '#F3F4F6' },
   pillText: { fontSize: 12, color: '#374151', fontWeight: '600' },
   userTurn: {
-    backgroundColor: '#eef4ff',
+    backgroundColor: '#EFF6FF',
     borderRadius: 10,
     padding: 10,
     marginBottom: 8,

@@ -1227,7 +1227,7 @@ const styles = StyleSheet.create({
   },
   sessionErrorBannerText: {
     fontSize: 13,
-    color: '#B91C1C',
+    color: '#DC2626',
     lineHeight: 18,
   },
   emptyQueueBanner: {
@@ -1452,19 +1452,19 @@ const styles = StyleSheet.create({
   typeBadge_vocabulary: { backgroundColor: '#ECFDF5' },
   typeBadge_expression: { backgroundColor: '#FFF7ED' },
   typeBadge_pronunciation: {
-    backgroundColor: '#EEF4FF',
-    borderColor: '#1F4E9C',
+    backgroundColor: '#EFF6FF',
+    borderColor: '#1D4ED8',
   },
   typeBadge_listening: {
-    backgroundColor: '#E8F5E9',
-    borderColor: '#2E7D32',
+    backgroundColor: '#ECFDF5',
+    borderColor: '#059669',
   },
   listeningPlayRow: {
     marginTop: 8,
     marginBottom: 4,
   },
   listeningPlayButton: {
-    backgroundColor: '#2E7D32',
+    backgroundColor: '#059669',
     borderRadius: 10,
     paddingVertical: 10,
     paddingHorizontal: 16,
@@ -1572,7 +1572,7 @@ const styles = StyleSheet.create({
   },
   evalResultTitle_correct: { color: '#047857' },
   evalResultTitle_partial: { color: '#B45309' },
-  evalResultTitle_incorrect: { color: '#B91C1C' },
+  evalResultTitle_incorrect: { color: '#DC2626' },
   evalFeedbackText: {
     fontSize: 13,
     color: '#374151',

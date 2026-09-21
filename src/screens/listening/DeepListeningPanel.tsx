@@ -1095,7 +1095,7 @@ const styles = StyleSheet.create({
   },
   feedbackLine: { fontSize: 14, color: '#374151', lineHeight: 20, marginBottom: 4 },
   nextButton: {
-    backgroundColor: '#2E7D32',
+    backgroundColor: '#059669',
     borderRadius: 12,
     paddingVertical: 12,
     alignItems: 'center',
