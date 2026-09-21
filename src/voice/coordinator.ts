@@ -62,6 +62,12 @@ export const VOICE_SWITCHING_MESSAGE = 'The conversation is changing. Please try
 export const VOICE_NOTHING_TO_STOP_MESSAGE =
   'Nothing is recording right now, so there was nothing to stop.';
 
+/**
+ * The FINAL submission boundary refused a transcript that contained no speech.
+ * Nothing was committed, no evidence exists, and the learner simply tries again.
+ */
+export const VOICE_EMPTY_TRANSCRIPT_MESSAGE = "I didn't catch any speech. Try again.";
+
 export const VOICE_NOTHING_TO_RETRY_MESSAGE =
   'There is nothing to send again yet. Record your answer first.';
 
@@ -1006,7 +1012,23 @@ export class VoiceSessionCoordinator {
     readonly generation: number;
     readonly onStreamChunk?: (chunk: string) => void;
   }): Promise<VoiceTurnOutcome> {
-    const { transcript, session, generation } = input;
+    const { session, generation } = input;
+
+    // FINAL TRANSCRIPT GUARD (defense in depth): this is the last point before
+    // `session.send()`, so EVERY coordinator path that can commit a learner
+    // voice turn (first spoken turn, transcription retry, explicit pending-turn
+    // retry) passes through it. A missing, empty or whitespace-only transcript
+    // must never create a user message ("You said: \"\""), never create
+    // evidence, never trigger tutor inference and never advance the turn.
+    const normalized = typeof input.transcript === 'string' ? input.transcript.trim() : '';
+    if (normalized.length === 0) {
+      this.pendingTurn = null;
+      this.processing = false;
+      this.setStateIfCurrent(session, generation, 'error', VOICE_EMPTY_TRANSCRIPT_MESSAGE);
+      return { ok: false, error: VOICE_EMPTY_TRANSCRIPT_MESSAGE };
+    }
+    const transcript = normalized;
+
     const baselineLearnerTurns = countCommittedLearnerTurns(session);
     let streamed = false;
     const onChunk = input.onStreamChunk
