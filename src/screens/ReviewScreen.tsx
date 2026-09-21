@@ -761,21 +761,36 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           <Text style={styles.subtitle}>Recall saved language and revisit areas that need practice</Text>
         </View>
 
-        {hasNoProfile && (
-          <View style={styles.demoBanner}>
-            <Text style={styles.demoBannerText}>
-              No learning profile yet. Set up your profile to build your own review queue. Or explicitly choose Demo Mode to try sample cards, not real AI.
+        {/*
+          Package 3 (E) — ONE clear empty state with ONE clear CTA. Without a
+          profile there is no queue to show, so the zero counters/breakdown
+          are not repeated here at all.
+        */}
+        {hasNoProfile && !isDemoMode ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyStateTitle}>Nothing to review yet</Text>
+            <Text style={styles.emptyCardText}>
+              No learning profile yet, so there is no review queue to show. Set up your
+              profile to start saving words and expressions from real practice — or
+              explicitly choose Demo Mode to try sample cards, not real AI.
             </Text>
-            <TouchableOpacity onPress={() => navigation.navigate('Onboarding')}><Text>Set up my learning profile</Text></TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.startSessionButton, { marginTop: 12, backgroundColor: '#2563EB' }]}
+              onPress={() => navigation.navigate('Onboarding')}
+              accessibilityRole="button"
+            >
+              <Text style={[styles.startSessionButtonText, { color: '#FFFFFF' }]}>Set up my learning profile</Text>
+            </TouchableOpacity>
             <TouchableOpacity
               style={[styles.startSessionButton, { marginTop: 12, backgroundColor: '#059669' }]}
               onPress={enableDemoMode}
+              accessibilityRole="button"
             >
               <Text style={styles.startSessionButtonText}>Try Demo Mode · Not real AI</Text>
             </TouchableOpacity>
           </View>
-        )}
-
+        ) : (
+        <>
         {isDemoMode && (
           <View style={styles.demoBanner}>
             <Text style={styles.demoBannerText}>
@@ -824,48 +839,67 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
           </TouchableOpacity>
         </View>
 
-        {/* Summary Breakdown Grid */}
-        <Text style={styles.sectionHeader}>Item Type Breakdown</Text>
-        <View style={styles.grid}>
-          <View style={styles.gridCard}>
-            <Text style={styles.gridCardEmoji}>📝</Text>
-            <Text style={styles.gridCardValue}>{summary.dueVocabularyCount}</Text>
-            <Text style={styles.gridCardLabel}>Vocabulary</Text>
-          </View>
-          <View style={styles.gridCard}>
-            <Text style={styles.gridCardEmoji}>🗣️</Text>
-            <Text style={styles.gridCardValue}>{summary.dueExpressionCount}</Text>
-            <Text style={styles.gridCardLabel}>Expressions</Text>
-          </View>
-          <View style={styles.gridCard}>
-            <Text style={styles.gridCardEmoji}>🧠</Text>
-            <Text style={styles.gridCardValue}>{summary.activeWeaknessCount}</Text>
-            <Text style={styles.gridCardLabel}>Areas to practise</Text>
-          </View>
-        </View>
+        {/*
+          Package 3 (E) — the breakdown and priority areas render only when
+          they communicate something; an all-zero dashboard collapses into
+          ONE honest empty card instead of repeated zeros.
+        */}
+        {summary.totalDue > 0 || activeWeaknesses.length > 0 ? (
+          <>
+            {/* Summary Breakdown Grid */}
+            <Text style={styles.sectionHeader}>Item Type Breakdown</Text>
+            <View style={styles.grid}>
+              <View style={styles.gridCard}>
+                <Text style={styles.gridCardEmoji}>📝</Text>
+                <Text style={styles.gridCardValue}>{summary.dueVocabularyCount}</Text>
+                <Text style={styles.gridCardLabel}>Vocabulary</Text>
+              </View>
+              <View style={styles.gridCard}>
+                <Text style={styles.gridCardEmoji}>🗣️</Text>
+                <Text style={styles.gridCardValue}>{summary.dueExpressionCount}</Text>
+                <Text style={styles.gridCardLabel}>Expressions</Text>
+              </View>
+              <View style={styles.gridCard}>
+                <Text style={styles.gridCardEmoji}>🧠</Text>
+                <Text style={styles.gridCardValue}>{summary.activeWeaknessCount}</Text>
+                <Text style={styles.gridCardLabel}>Areas to practise</Text>
+              </View>
+            </View>
 
-        {/* Active Weaknesses List */}
-        <Text style={styles.sectionHeader}>Priority practice areas</Text>
-        {activeWeaknesses.length === 0 ? (
+            {/* Active Weaknesses List */}
+            <Text style={styles.sectionHeader}>Priority practice areas</Text>
+            {activeWeaknesses.length === 0 ? (
+              <View style={styles.emptyCard}>
+                <Text style={styles.emptyCardText}>
+                  No priority practice areas are recorded here yet. Saved words, expressions and supported observations from real practice can create future reviews. An empty list is not a measurement of your English level.
+                </Text>
+              </View>
+            ) : (
+              activeWeaknesses.map((w, idx) => (
+                <View key={w.id || idx} style={styles.weaknessCard}>
+                  <View style={styles.weaknessHeader}>
+                    <Text style={styles.weaknessCategory}>{w.notes || (w.type === 'grammar' ? 'Grammar Error' : 'Speaking Error')}</Text>
+                    <View style={[styles.statusBadge, STATUS_BADGE_STYLES[w.status] ?? styles.statusBadge_observed]}>
+                      <Text style={styles.statusBadgeText}>{w.status.replace('_', ' ')}</Text>
+                    </View>
+                  </View>
+                  <Text style={styles.weaknessMeta}>
+                    Severity: {(w.severity * 100).toFixed(0)}% • Practice count: {w.occurrenceCount}
+                  </Text>
+                </View>
+              ))
+            )}
+          </>
+        ) : (
           <View style={styles.emptyCard}>
             <Text style={styles.emptyCardText}>
-              No priority practice areas are recorded here yet. Saved words, expressions and supported observations from real practice can create future reviews. An empty list is not a measurement of your English level.
+              Nothing is due right now. Saved words, expressions and supported
+              observations from real practice can create future reviews. An empty list
+              is not a measurement of your English level.
             </Text>
           </View>
-        ) : (
-          activeWeaknesses.map((w, idx) => (
-            <View key={w.id || idx} style={styles.weaknessCard}>
-              <View style={styles.weaknessHeader}>
-                <Text style={styles.weaknessCategory}>{w.notes || (w.type === 'grammar' ? 'Grammar Error' : 'Speaking Error')}</Text>
-                <View style={[styles.statusBadge, STATUS_BADGE_STYLES[w.status] ?? styles.statusBadge_observed]}>
-                  <Text style={styles.statusBadgeText}>{w.status.replace('_', ' ')}</Text>
-                </View>
-              </View>
-              <Text style={styles.weaknessMeta}>
-                Severity: {(w.severity * 100).toFixed(0)}% • Practice count: {w.occurrenceCount}
-              </Text>
-            </View>
-          ))
+        )}
+        </>
         )}
       </ScrollView>
     );
@@ -1348,6 +1382,12 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     padding: 16,
     alignItems: 'center',
+  },
+  emptyStateTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#111827',
+    marginBottom: 8,
   },
   emptyCardText: {
     fontSize: 13,

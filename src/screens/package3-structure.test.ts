@@ -127,6 +127,37 @@ describe('Talk — voice-first hierarchy with progressive disclosure', () => {
   });
 });
 
+describe('Review — deduplicated empty/summary states', () => {
+  const review = read('ReviewScreen.tsx');
+
+  it('shows ONE empty state with ONE CTA when there is no profile', () => {
+    expect(review).toContain('Nothing to review yet');
+    expect(review).toContain('hasNoProfile && !isDemoMode ? (');
+    expect(review).toContain('Set up my learning profile');
+    // The zero counters are NOT repeated for a missing profile: the due
+    // card, breakdown grid and priority list live in the else branch.
+    const emptyAt = review.indexOf('Nothing to review yet');
+    const dueAt = review.indexOf('Items due for review');
+    expect(dueAt).toBeGreaterThan(emptyAt);
+    expect(review).toContain('{summary.totalDue > 0 || activeWeaknesses.length > 0 ? (');
+  });
+
+  it('collapses an all-zero dashboard into one honest card', () => {
+    expect(review).toContain('Nothing is due right now.');
+    expect(review).toContain('An empty list');
+    expect(review).toContain('is not a measurement of your English level.');
+  });
+
+  it('keeps Package 2 sticky continuation and all review semantics', () => {
+    expect(review).toContain('styles.continuationBar');
+    expect(review).toContain('id="next_card_button"');
+    expect(review).toContain('{ paddingTop: insets.top }');
+    expect(review).toContain('isDemoMode');
+    expect(review).toContain('recordPracticeResult');
+    expect(review).toContain('service.changeMode');
+  });
+});
+
 describe('Bottom navigation — full discoverable labels', () => {
   const navigator = read('../navigation/RootNavigator.tsx');
 
