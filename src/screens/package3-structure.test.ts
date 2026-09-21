@@ -158,6 +158,47 @@ describe('Review — deduplicated empty/summary states', () => {
   });
 });
 
+describe('Settings — grouped sections with progressive disclosure', () => {
+  const settings = read('SettingsScreen.tsx');
+
+  it('groups the long screen into clear sections', () => {
+    const providerAt = settings.indexOf('<SectionHeader title="AI provider" />');
+    const learningAt = settings.indexOf('<SectionHeader title="Learning" />');
+    const infoAt = settings.indexOf('<SectionHeader title="App info" />');
+    expect(providerAt).toBeGreaterThan(-1);
+    expect(learningAt).toBeGreaterThan(providerAt);
+    expect(infoAt).toBeGreaterThan(learningAt);
+  });
+
+  it('collapses secondary explanation while critical provider controls stay visible', () => {
+    // Long storage/privacy copy sits behind explicit disclosures…
+    expect(settings).toContain('const [keyDetailsOpen, setKeyDetailsOpen] = useState<boolean>(false);');
+    expect(settings).toContain('const [aboutDetailsOpen, setAboutDetailsOpen] = useState<boolean>(false);');
+    expect(settings).toContain('How your key is stored');
+    expect(settings).toContain('Privacy details');
+    expect(settings.match(/accessibilityState=\{\{ expanded: (keyDetailsOpen|aboutDetailsOpen) \}\}/g)).toHaveLength(2);
+    // …and every critical control/pinned copy is preserved.
+    for (const required of [
+      'secureTextEntry',
+      'service.saveKey(draftKey)',
+      'verifyConnection',
+      'settings-save',
+      'settings-remove',
+      'settings-verify',
+      'stays on this device',
+      'secure storage',
+      'never shown again',
+      'STATUS_LABELS[snapshot.status]',
+      'never switched on for you',
+      'Test connection',
+      "navigation.navigate('Onboarding')",
+      'Assess my English',
+    ]) {
+      expect(settings, required).toContain(required);
+    }
+  });
+});
+
 describe('Bottom navigation — full discoverable labels', () => {
   const navigator = read('../navigation/RootNavigator.tsx');
 

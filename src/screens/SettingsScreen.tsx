@@ -24,6 +24,7 @@ import {
   createCorrectionPreferencesService,
 } from '../learner-agency';
 import type { CorrectionIntensity } from '../learner-agency';
+import { SectionHeader } from './components/ui/SectionHeader';
 
 /**
  * SettingsScreen
@@ -78,6 +79,12 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
 
   const [snapshot, setSnapshot] = useState<ProviderConfigurationSnapshot>(() => service.snapshot());
   const [draftKey, setDraftKey] = useState<string>('');
+  /**
+   * Package 3 (F) — progressive disclosure: long explanatory copy collapses
+   * behind explicit toggles; the controls themselves stay visible.
+   */
+  const [keyDetailsOpen, setKeyDetailsOpen] = useState<boolean>(false);
+  const [aboutDetailsOpen, setAboutDetailsOpen] = useState<boolean>(false);
   const [busy, setBusy] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [diagnostic, setDiagnostic] = useState<ProviderDiagnosticResult | null>(null);
@@ -215,6 +222,8 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
       <Text style={styles.title}>Settings</Text>
       <Text style={styles.subtitle}>AI provider, learning profile and privacy</Text>
 
+      <SectionHeader title="AI provider" />
+
       {/* ------------------------- provider status ------------------------- */}
       <View style={styles.card}>
         <View style={styles.cardHeader}>
@@ -265,16 +274,31 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
         <Text style={styles.cardTitle}>
           {hasStoredKey ? 'Replace your API key' : 'Add your API key'}
         </Text>
-        <Text style={styles.body}>
-          The key is stored in this device&apos;s secure storage (Android Keystore / iOS Keychain).
-          The saved copy stays on this device, is never written to the app database, and is never shown again
-          after you save it.
-        </Text>
-        {hasStoredKey ? (
-          <Text style={styles.body}>
-            A key is already saved on this device. The stored value is not displayed, not even
-            partially. Saving a new key replaces it.
+        <TouchableOpacity
+          style={styles.detailsToggle}
+          onPress={() => setKeyDetailsOpen(open => !open)}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: keyDetailsOpen }}
+          accessibilityLabel="How your API key is stored"
+        >
+          <Text style={styles.detailsToggleText}>
+            {keyDetailsOpen ? 'How your key is stored ▲' : 'How your key is stored ▼'}
           </Text>
+        </TouchableOpacity>
+        {keyDetailsOpen ? (
+          <>
+            <Text style={styles.body}>
+              The key is stored in this device&apos;s secure storage (Android Keystore / iOS Keychain).
+              The saved copy stays on this device, is never written to the app database, and is never shown again
+              after you save it.
+            </Text>
+            {hasStoredKey ? (
+              <Text style={styles.body}>
+                A key is already saved on this device. The stored value is not displayed, not even
+                partially. Saving a new key replaces it.
+              </Text>
+            ) : null}
+          </>
         ) : null}
 
         <TextInput
@@ -367,6 +391,8 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
         </Text>
       </View>
 
+      <SectionHeader title="Learning" />
+
       {/* --------------------- correction intensity (WO2) ------------------ */}
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Correction intensity</Text>
@@ -427,11 +453,28 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
         </TouchableOpacity>
         <Text style={styles.note}>After some practice, reassess to see what has changed. Your working level does not change continuously or without your acceptance.</Text>
       </View>
+      <SectionHeader title="App info" />
+
       <View style={styles.card}>
         <Text style={styles.cardTitle}>About & privacy</Text>
         <Text style={styles.body}>AI English Tutor · English practice with your own learning history.</Text>
-        <Text style={styles.body}>Learning records are stored locally. When you use a real provider, practice text or recorded audio needed for that request is sent to that provider. Your API key is sent to authenticate provider requests, but is never displayed here.</Text>
-        <Text style={styles.note}>Audio replay is a listening aid, not proof of learner practice. Provider or microphone failures are not evidence of a weakness.</Text>
+        <TouchableOpacity
+          style={styles.detailsToggle}
+          onPress={() => setAboutDetailsOpen(open => !open)}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: aboutDetailsOpen }}
+          accessibilityLabel="Privacy details"
+        >
+          <Text style={styles.detailsToggleText}>
+            {aboutDetailsOpen ? 'Privacy details ▲' : 'Privacy details ▼'}
+          </Text>
+        </TouchableOpacity>
+        {aboutDetailsOpen ? (
+          <>
+            <Text style={styles.body}>Learning records are stored locally. When you use a real provider, practice text or recorded audio needed for that request is sent to that provider. Your API key is sent to authenticate provider requests, but is never displayed here.</Text>
+            <Text style={styles.note}>Audio replay is a listening aid, not proof of learner practice. Provider or microphone failures are not evidence of a weakness.</Text>
+          </>
+        ) : null}
       </View>
     </ScrollView>
   );
@@ -457,6 +500,18 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#6B7280',
     marginBottom: 16,
+  },
+  detailsToggle: {
+    minHeight: 44,
+    justifyContent: 'center',
+    alignSelf: 'flex-start',
+    paddingHorizontal: 4,
+    marginBottom: 4,
+  },
+  detailsToggleText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#2563EB',
   },
   card: {
     backgroundColor: '#FFFFFF',
