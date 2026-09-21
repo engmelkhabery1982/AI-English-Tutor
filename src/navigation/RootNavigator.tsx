@@ -95,8 +95,8 @@ function MainTabs() {
         tabBarButton: route.name === 'Listening' || route.name === 'Vocabulary' ? () => null : undefined,
         tabBarLabelStyle: { fontSize: 12 },
         tabBarIcon: () => <Text>{route.name.charAt(0)}</Text>,
-        tabBarActiveTintColor: '#007AFF',
-        tabBarInactiveTintColor: '#8e8e93',
+        tabBarActiveTintColor: '#2563EB',
+        tabBarInactiveTintColor: '#9CA3AF',
       })}
     >
       {MAIN_TAB_ROUTES.map((name) => (
@@ -172,10 +172,10 @@ export default function RootNavigator() {
           </SafeAreaView>
         )}
         screenOptions={{
-          headerTintColor: '#007AFF',
-          headerTitleStyle: { color: '#1c1c1e', fontWeight: '600' },
-          headerStyle: { backgroundColor: '#f5f7fa', shadowOpacity: 0, elevation: 0 },
-          cardStyle: { backgroundColor: '#f5f7fa' },
+          headerTintColor: '#2563EB',
+          headerTitleStyle: { color: '#111827', fontWeight: '700' },
+          headerStyle: { backgroundColor: '#FFFFFF', shadowOpacity: 0, elevation: 0, borderBottomWidth: 1, borderBottomColor: '#F3F4F6' },
+          cardStyle: { backgroundColor: '#F7F8FA' },
         }}
       >
         {ROOT_SCREENS.map((screen) => (

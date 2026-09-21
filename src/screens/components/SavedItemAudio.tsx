@@ -43,7 +43,7 @@ export default function SavedItemAudio({ text }: { readonly text: string }) {
     <LearnerButton accessibilityLabel={speaking ? 'Stop pronunciation playback' : `Hear ${text}`}
       accessibilityHint="Audio replay only; does not record practice or change review progress"
       onPress={speaking ? stop : () => void play()}>
-      <Text style={{ color: '#0066CC', fontSize: 16 }}>{speaking ? 'Stop audio' : 'Hear pronunciation'}</Text>
+      <Text style={{ color: '#2563EB', fontSize: 16 }}>{speaking ? 'Stop audio' : 'Hear pronunciation'}</Text>
     </LearnerButton>
     <Text accessibilityLiveRegion="polite">{error ? 'Audio is unavailable. You can try again; your saved item is unchanged.' : speaking ? 'Playing audio…' : 'Listening only — this does not count as practice.'}</Text>
   </View>;

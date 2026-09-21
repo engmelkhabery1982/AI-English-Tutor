@@ -106,7 +106,7 @@ export default function ReassessmentScreen({
   if (loading) {
     return (
       <View style={styles.centered}>
-        <ActivityIndicator size="large" color="#0066CC" />
+        <ActivityIndicator size="large" color="#2563EB" />
         <Text style={styles.loadingText}>Checking your assessment history…</Text>
       </View>
     );
@@ -168,7 +168,7 @@ export default function ReassessmentScreen({
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F8F9FA',
+    backgroundColor: '#F7F8FA',
   },
   content: {
     padding: 20,
@@ -182,69 +182,80 @@ const styles = StyleSheet.create({
   loadingText: {
     marginTop: 12,
     fontSize: 16,
-    color: '#666666',
+    color: '#6B7280',
   },
   headerTitle: {
     fontSize: 24,
-    fontWeight: '700',
-    color: '#1A1A1A',
+    fontWeight: '800',
+    color: '#111827',
+    letterSpacing: -0.5,
     marginBottom: 16,
   },
   card: {
     backgroundColor: '#FFFFFF',
-    borderRadius: 12,
+    borderRadius: 16,
     padding: 18,
     marginBottom: 16,
     borderWidth: 1,
-    borderColor: '#E2E8F0',
+    borderColor: '#F3F4F6',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 3,
+    elevation: 1,
   },
   cardTitle: {
     fontSize: 18,
-    fontWeight: '600',
-    color: '#2D3748',
+    fontWeight: '700',
+    color: '#111827',
     marginBottom: 10,
   },
   descriptionText: {
     fontSize: 15,
-    color: '#4A5568',
+    color: '#374151',
     lineHeight: 22,
     marginBottom: 12,
   },
   primaryButton: {
-    backgroundColor: '#0066CC',
+    backgroundColor: '#2563EB',
     paddingVertical: 14,
     paddingHorizontal: 20,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: 'center',
     marginVertical: 6,
+    shadowColor: '#2563EB',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 6,
+    elevation: 3,
   },
   buttonText: {
     color: '#FFFFFF',
     fontSize: 16,
-    fontWeight: '600',
+    fontWeight: '700',
   },
   secondaryButton: {
-    backgroundColor: '#EDF2F7',
+    backgroundColor: '#F3F4F6',
     paddingVertical: 14,
     paddingHorizontal: 20,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: 'center',
     marginVertical: 6,
   },
   secondaryButtonText: {
-    color: '#2D3748',
+    color: '#374151',
     fontSize: 16,
     fontWeight: '600',
   },
   disabledBox: {
     marginTop: 12,
     padding: 12,
-    backgroundColor: '#EDF2F7',
-    borderRadius: 8,
+    backgroundColor: '#F3F4F6',
+    borderRadius: 12,
   },
   disabledText: {
     fontSize: 14,
-    color: '#718096',
+    color: '#9CA3AF',
     lineHeight: 20,
     marginBottom: 10,
   },

@@ -1179,7 +1179,7 @@ export default function ReviewScreen(props?: ReviewScreenProps) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F9FAFB',
+    backgroundColor: '#F7F8FA',
   },
   contentContainer: {
     padding: 20,
@@ -1227,7 +1227,7 @@ const styles = StyleSheet.create({
   },
   sessionErrorBannerText: {
     fontSize: 13,
-    color: '#B91C1C',
+    color: '#DC2626',
     lineHeight: 18,
   },
   emptyQueueBanner: {
@@ -1244,16 +1244,16 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   totalDueCard: {
-    backgroundColor: '#1E3A8A',
-    borderRadius: 16,
+    backgroundColor: '#2563EB',
+    borderRadius: 20,
     padding: 24,
     alignItems: 'center',
     marginBottom: 24,
-    shadowColor: '#1E3A8A',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.15,
-    shadowRadius: 10,
-    elevation: 3,
+    shadowColor: '#2563EB',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.25,
+    shadowRadius: 12,
+    elevation: 5,
   },
   totalDueNumber: {
     fontSize: 48,
@@ -1263,7 +1263,7 @@ const styles = StyleSheet.create({
   },
   totalDueLabel: {
     fontSize: 14,
-    color: '#93C5FD',
+    color: '#DBEAFE',
     fontWeight: '600',
     marginBottom: 16,
     textTransform: 'uppercase',
@@ -1272,7 +1272,7 @@ const styles = StyleSheet.create({
   startSessionButton: {
     backgroundColor: '#FFFFFF',
     paddingHorizontal: 20,
-    paddingVertical: 12,
+    paddingVertical: 14,
     borderRadius: 12,
     width: '100%',
     alignItems: 'center',
@@ -1280,7 +1280,7 @@ const styles = StyleSheet.create({
   startSessionButtonText: {
     fontSize: 15,
     fontWeight: '700',
-    color: '#1E3A8A',
+    color: '#2563EB',
   },
   sectionHeader: {
     fontSize: 16,
@@ -1298,10 +1298,15 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#FFFFFF',
     borderWidth: 1,
-    borderColor: '#E5E7EB',
+    borderColor: '#F3F4F6',
     borderRadius: 12,
     padding: 14,
     alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 3,
+    elevation: 1,
   },
   gridCardEmoji: {
     fontSize: 20,
@@ -1335,10 +1340,15 @@ const styles = StyleSheet.create({
   weaknessCard: {
     backgroundColor: '#FFFFFF',
     borderWidth: 1,
-    borderColor: '#E5E7EB',
+    borderColor: '#F3F4F6',
     borderRadius: 12,
     padding: 16,
     marginBottom: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 3,
+    elevation: 1,
   },
   weaknessHeader: {
     flexDirection: 'row',
@@ -1419,13 +1429,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: '#E5E7EB',
+    borderColor: '#F3F4F6',
     padding: 20,
     shadowColor: '#000000',
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
+    shadowOpacity: 0.06,
     shadowRadius: 8,
-    elevation: 2,
+    elevation: 3,
   },
   cardTypeRow: {
     flexDirection: 'row',
@@ -1442,20 +1452,20 @@ const styles = StyleSheet.create({
   typeBadge_vocabulary: { backgroundColor: '#ECFDF5' },
   typeBadge_expression: { backgroundColor: '#FFF7ED' },
   typeBadge_pronunciation: {
-    backgroundColor: '#EEF4FF',
-    borderColor: '#1F4E9C',
+    backgroundColor: '#EFF6FF',
+    borderColor: '#1D4ED8',
   },
   typeBadge_listening: {
-    backgroundColor: '#E8F5E9',
-    borderColor: '#2E7D32',
+    backgroundColor: '#ECFDF5',
+    borderColor: '#059669',
   },
   listeningPlayRow: {
     marginTop: 8,
     marginBottom: 4,
   },
   listeningPlayButton: {
-    backgroundColor: '#2E7D32',
-    borderRadius: 10,
+    backgroundColor: '#059669',
+    borderRadius: 12,
     paddingVertical: 10,
     paddingHorizontal: 16,
     alignItems: 'center',
@@ -1523,7 +1533,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderWidth: 1,
     borderColor: '#D1D5DB',
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 12,
     fontSize: 15,
     color: '#111827',
@@ -1532,7 +1542,7 @@ const styles = StyleSheet.create({
   submitButton: {
     backgroundColor: '#2563EB',
     paddingVertical: 12,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1549,7 +1559,7 @@ const styles = StyleSheet.create({
     gap: 16,
   },
   evalResultBanner: {
-    borderRadius: 10,
+    borderRadius: 12,
     padding: 14,
   },
   evalResultBanner_correct: { backgroundColor: '#ECFDF5' },
@@ -1562,7 +1572,7 @@ const styles = StyleSheet.create({
   },
   evalResultTitle_correct: { color: '#047857' },
   evalResultTitle_partial: { color: '#B45309' },
-  evalResultTitle_incorrect: { color: '#B91C1C' },
+  evalResultTitle_incorrect: { color: '#DC2626' },
   evalFeedbackText: {
     fontSize: 13,
     color: '#374151',
@@ -1606,7 +1616,7 @@ const styles = StyleSheet.create({
   nextButton: {
     backgroundColor: '#111827',
     paddingVertical: 12,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: 'center',
   },
   nextButtonText: {

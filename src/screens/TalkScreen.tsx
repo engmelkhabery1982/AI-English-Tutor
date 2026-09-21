@@ -2420,7 +2420,7 @@ const styles = StyleSheet.create({
     color: '#DC2626',
   },
   turnStatusLabelError: {
-    color: '#B91C1C',
+    color: '#DC2626',
   },
   turnHint: {
     paddingHorizontal: 16,
@@ -2434,19 +2434,20 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: 16,
-    paddingTop: 12,
-    paddingBottom: 10,
+    paddingTop: 14,
+    paddingBottom: 12,
     backgroundColor: '#FFFFFF',
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E7EB',
+    borderBottomWidth: 1,
+    borderBottomColor: '#F3F4F6',
   },
   headerTextGroup: {
     flex: 1,
   },
   title: {
-    fontSize: 20,
-    fontWeight: '700',
+    fontSize: 22,
+    fontWeight: '800',
     color: '#111827',
+    letterSpacing: -0.3,
   },
   providerBadgeContainer: {
     flexDirection: 'row',
@@ -2551,21 +2552,21 @@ const styles = StyleSheet.create({
   emptyState: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 40,
-    paddingHorizontal: 20,
+    paddingVertical: 48,
+    paddingHorizontal: 24,
   },
   emptyStateTitle: {
-    fontSize: 17,
-    fontWeight: '600',
-    color: '#374151',
-    marginBottom: 6,
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#111827',
+    marginBottom: 8,
   },
   emptyStateDescription: {
     fontSize: 14,
     color: '#6B7280',
     textAlign: 'center',
-    lineHeight: 20,
-    marginBottom: 20,
+    lineHeight: 22,
+    marginBottom: 24,
   },
   suggestionsContainer: {
     flexDirection: 'column',
@@ -2575,16 +2576,21 @@ const styles = StyleSheet.create({
   },
   suggestionPill: {
     backgroundColor: '#FFFFFF',
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: '#E5E7EB',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 2,
+    elevation: 1,
   },
   suggestionText: {
-    fontSize: 13,
+    fontSize: 14,
     color: '#2563EB',
-    fontWeight: '500',
+    fontWeight: '600',
   },
   turnContainer: {
     marginBottom: 8,
@@ -2609,7 +2615,7 @@ const styles = StyleSheet.create({
     marginHorizontal: 4,
   },
   bubble: {
-    borderRadius: 14,
+    borderRadius: 16,
     paddingHorizontal: 14,
     paddingVertical: 10,
   },
@@ -2620,8 +2626,13 @@ const styles = StyleSheet.create({
   assistantBubble: {
     backgroundColor: '#FFFFFF',
     borderWidth: 1,
-    borderColor: '#E5E7EB',
+    borderColor: '#F3F4F6',
     borderBottomLeftRadius: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 3,
+    elevation: 1,
   },
   messageText: {
     fontSize: 15,
@@ -2634,8 +2645,8 @@ const styles = StyleSheet.create({
     color: '#1F2937',
   },
   pronunciationContainer: {
-    backgroundColor: '#EEF4FF',
-    borderColor: '#C9DAF8',
+    backgroundColor: '#EFF6FF',
+    borderColor: '#DBEAFE',
     borderWidth: 1,
     borderRadius: 12,
     padding: 10,
@@ -2644,12 +2655,12 @@ const styles = StyleSheet.create({
   pronunciationTitle: {
     fontSize: 12,
     fontWeight: '600',
-    color: '#1F4E9C',
+    color: '#1D4ED8',
     marginBottom: 4,
   },
   pronunciationLine: {
     fontSize: 13,
-    color: '#2C3E50',
+    color: '#1F2937',
     lineHeight: 18,
   },
   feedbackContainer: {
@@ -2659,10 +2670,15 @@ const styles = StyleSheet.create({
   },
   feedbackCard: {
     backgroundColor: '#FFFFFF',
-    borderRadius: 10,
+    borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#E5E7EB',
-    padding: 12,
+    borderColor: '#F3F4F6',
+    padding: 14,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 3,
+    elevation: 1,
   },
   feedbackCardHeader: {
     flexDirection: 'row',
@@ -2806,7 +2822,7 @@ const styles = StyleSheet.create({
   },
   errorText: {
     fontSize: 13,
-    color: '#B91C1C',
+    color: '#DC2626',
   },
   /** One explicit recovery action inside the failure notice. */
   errorAction: {
@@ -2827,7 +2843,7 @@ const styles = StyleSheet.create({
   errorActionText: {
     fontSize: 12,
     fontWeight: '600',
-    color: '#B91C1C',
+    color: '#DC2626',
   },
   /** Explicit "apply this drafted topic" action (no per-keystroke replacement). */
   topicApplyButton: {
@@ -2998,7 +3014,7 @@ const styles = StyleSheet.create({
   },
   micButtonRecording: {
     backgroundColor: '#DC2626',
-    borderColor: '#B91C1C',
+    borderColor: '#DC2626',
   },
   micButtonTranscribing: {
     backgroundColor: '#2563EB',
@@ -3085,7 +3101,7 @@ const styles = StyleSheet.create({
   reviewButton: {
     marginTop: 8,
     backgroundColor: '#2563EB',
-    borderRadius: 10,
+    borderRadius: 12,
     paddingVertical: 12,
     alignItems: 'center',
   },
@@ -3159,7 +3175,7 @@ const styles = StyleSheet.create({
   },
   helpCardError: {
     fontSize: 14,
-    color: '#B91C1C',
+    color: '#DC2626',
     lineHeight: 20,
   },
   helpCardNote: {

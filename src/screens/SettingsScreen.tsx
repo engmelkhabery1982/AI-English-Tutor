@@ -59,13 +59,13 @@ const STATUS_LABELS: Record<ProviderConfigurationSnapshot['status'], string> = {
 };
 
 const STATUS_TONES: Record<ProviderConfigurationSnapshot['status'], string> = {
-  configured: '#0f7b3f',
-  unverified: '#8a6d00',
-  'development-fallback': '#8a6d00',
-  'not-configured': '#8e8e93',
-  'invalid-credential': '#b3261e',
-  'temporarily-unavailable': '#8a6d00',
-  'storage-unavailable': '#b3261e',
+  configured: '#059669',
+  unverified: '#92400E',
+  'development-fallback': '#92400E',
+  'not-configured': '#9CA3AF',
+  'invalid-credential': '#DC2626',
+  'temporarily-unavailable': '#92400E',
+  'storage-unavailable': '#DC2626',
 };
 
 export default function SettingsScreen(props?: SettingsScreenProps) {
@@ -283,7 +283,7 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
           value={draftKey}
           onChangeText={setDraftKey}
           placeholder={hasStoredKey ? 'Enter a new key to replace it' : 'Paste your API key'}
-          placeholderTextColor="#a4a4a8"
+          placeholderTextColor="#9CA3AF"
           secureTextEntry
           autoCapitalize="none"
           autoCorrect={false}
@@ -440,29 +440,36 @@ export default function SettingsScreen(props?: SettingsScreenProps) {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: '#fff',
+    backgroundColor: '#F7F8FA',
   },
   content: {
-    padding: 20,
+    padding: 16,
     paddingBottom: 40,
   },
   title: {
-    fontSize: 26,
-    fontWeight: '700',
+    fontSize: 24,
+    fontWeight: '800',
+    color: '#111827',
+    letterSpacing: -0.5,
     marginBottom: 4,
   },
   subtitle: {
-    fontSize: 15,
-    color: '#666',
-    marginBottom: 18,
+    fontSize: 14,
+    color: '#6B7280',
+    marginBottom: 16,
   },
   card: {
-    backgroundColor: '#f7f8fa',
-    borderRadius: 14,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
     padding: 16,
-    marginBottom: 14,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#e2e4e8',
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#F3F4F6',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 3,
+    elevation: 1,
   },
   cardHeader: {
     flexDirection: 'row', flexWrap: 'wrap',
@@ -474,6 +481,7 @@ const styles = StyleSheet.create({
   cardTitle: {
     fontSize: 17,
     fontWeight: '700',
+    color: '#111827',
     marginBottom: 6,
   },
   chip: {
@@ -488,33 +496,33 @@ const styles = StyleSheet.create({
   },
   body: {
     fontSize: 14,
-    color: '#3c3c43',
-    lineHeight: 20,
+    color: '#374151',
+    lineHeight: 22,
     marginBottom: 8,
   },
   metaRow: {
     fontSize: 12,
-    color: '#8e8e93',
+    color: '#9CA3AF',
     marginTop: 2,
   },
   metaValue: {
-    color: '#3c3c43',
+    color: '#374151',
     fontWeight: '600',
   },
   warning: {
     fontSize: 12,
-    color: '#8a6d00',
+    color: '#92400E',
     marginTop: 8,
     lineHeight: 17,
   },
   input: {
     borderWidth: 1,
-    borderColor: '#d1d1d6',
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 11,
+    borderColor: '#D1D5DB',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
     fontSize: 15,
-    backgroundColor: '#fff',
+    backgroundColor: '#F9FAFB',
     marginTop: 4,
   },
   buttonRow: {
@@ -524,36 +532,41 @@ const styles = StyleSheet.create({
   },
   primaryButton: {
     flex: 1,
-    backgroundColor: '#007AFF',
+    backgroundColor: '#2563EB',
     borderRadius: 12,
-    paddingVertical: 13,
+    paddingVertical: 14,
     paddingHorizontal: 16,
     alignItems: 'center',
     justifyContent: 'center',
+    shadowColor: '#2563EB',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 6,
+    elevation: 3,
   },
-  primaryButtonText: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  primaryButtonText: { color: '#FFFFFF', fontSize: 15, fontWeight: '700' },
   secondaryButton: {
     flex: 1,
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#007AFF',
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1.5,
+    borderColor: '#2563EB',
     borderRadius: 12,
-    paddingVertical: 13,
+    paddingVertical: 14,
     paddingHorizontal: 16,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  secondaryButtonText: { color: '#007AFF', fontSize: 15, fontWeight: '700' },
+  secondaryButtonText: { color: '#2563EB', fontSize: 15, fontWeight: '600' },
   dangerButton: {
     marginTop: 10,
     borderRadius: 12,
     paddingVertical: 12,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#b3261e',
-    backgroundColor: '#fff',
+    borderColor: '#DC2626',
+    backgroundColor: '#FFFFFF',
   },
-  dangerButtonText: { color: '#b3261e', fontSize: 14, fontWeight: '700' },
+  dangerButtonText: { color: '#DC2626', fontSize: 14, fontWeight: '600' },
   buttonDisabled: { opacity: 0.5 },
   busyRow: {
     flexDirection: 'row', flexWrap: 'wrap',
@@ -561,23 +574,23 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 12,
   },
-  busyText: { fontSize: 13, color: '#8e8e93' },
+  busyText: { fontSize: 13, color: '#9CA3AF' },
   feedback: {
     fontSize: 13,
-    color: '#3c3c43',
+    color: '#374151',
     marginTop: 12,
     lineHeight: 19,
   },
   diagnostic: {
     fontSize: 13,
-    color: '#3c3c43',
+    color: '#374151',
     marginTop: 10,
     lineHeight: 19,
     fontWeight: '600',
   },
   note: {
     fontSize: 12,
-    color: '#8e8e93',
+    color: '#9CA3AF',
     marginTop: 12,
     lineHeight: 17,
   },
