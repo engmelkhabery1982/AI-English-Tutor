@@ -96,7 +96,7 @@ export default function LearningToolsScreen() {
       style={styles.container}
       contentContainerStyle={styles.content}
     >
-      <AppHeader title="Learning tools" subtitle="Inspect language, read and listen to stories, and read aloud" />
+      <AppHeader title="Learning tools" subtitle="Dictionary & Translate · Listening · Reading — look up a word, phrase, expression, or sentence in context" />
 
       {loading ? (
         <LoadingState message="Preparing your learning tools…" />
@@ -154,10 +154,12 @@ export default function LearningToolsScreen() {
             </View>
           )}
 
-          <SectionHeader title="Work area" subtitle="Built-in stories work without AI; generated content and inspection require your configured provider." />
+          <SectionHeader title="Work area" subtitle="Built-in stories work without AI. Dictionary & Translate lookups and generated lessons use your configured provider (provider-generated explanations, not authoritative dictionary truth)." />
           <SegmentedControl
             options={[
-              { key: 'inspector', label: 'Inspector' },
+              // Learner-facing name is "Dictionary & Translate"; the internal
+              // section key stays 'inspector' (the domain module is unchanged).
+              { key: 'inspector', label: 'Dictionary & Translate' },
               { key: 'listening', label: 'Listening' },
               { key: 'reading', label: 'Reading' },
             ]}
