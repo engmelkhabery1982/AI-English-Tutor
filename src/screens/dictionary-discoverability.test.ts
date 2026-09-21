@@ -108,6 +108,26 @@ describe('contextual inspection from content (one shared pattern)', () => {
     expect(COMPONENT).toContain('onInspect(');
   });
 
+  it('multi-word phrases are selectable through an explicit, understandable flow', () => {
+    // Tap word → "Select phrase" → tap the last word → confirm. No text
+    // selection engine, no WebView: only tap regions and the pure span helper.
+    expect(COMPONENT).toContain('Select phrase');
+    expect(COMPONENT).toContain('selectInspectablePhraseRange');
+    expect(COMPONENT).toContain('extending');
+    expect(COMPONENT).toContain('Tap the last word of the phrase…');
+    expect(COMPONENT).toContain('Cancel phrase selection');
+    // Phrase selection stays inside the same sentence and confirms before
+    // any lookup — the component never calls a provider itself.
+    expect(COMPONENT).toContain('current.sentence === sentence');
+    expect(COMPONENT).not.toContain('provider.generate(');
+    // While extending, the confirm action is not offered (no premature lookup).
+    expect(COMPONENT).toContain('{!selection.extending && (');
+    // Single word and whole sentence remain available:
+    expect(COMPONENT).toContain('firstIndex: index');
+    expect(COMPONENT).toContain("itemType: 'sentence'");
+    expect(COMPONENT).not.toContain('WebView');
+  });
+
   it('story passages (reading + listening transcript) are inspectable in context', () => {
     expect(STORY).toContain('<InspectableText');
     expect(STORY).toContain('session.inspection(sel.selectedText, target)');

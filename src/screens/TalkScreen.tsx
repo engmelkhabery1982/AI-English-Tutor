@@ -2,6 +2,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import type { VocabularyCategory } from '../domain/shared/types';
 import MicrophoneHelp from './components/MicrophoneHelp';
 import InspectableText from './components/InspectableText';
+import { useTargetLanguage } from './components/use-target-language';
 import TouchableOpacity from './components/LearnerButton';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { NavigationProp, ParamListBase } from '@react-navigation/native';
@@ -149,6 +150,9 @@ export function buildTutorOpeningMessage(topic: string): string {
 
 export default function TalkScreen(props?: TalkScreenProps) {
   const navigation = useNavigation<NavigationProp<ParamListBase>>();
+  // Translation target for contextual inspection: the learner profile's
+  // native language when available, otherwise the existing app default.
+  const inspectionTargetLanguage = useTargetLanguage();
   const [mode, setMode] = useState<ConversationMode>('natural');
   /**
    * The topic DRAFT the learner is typing. It is deliberately NOT the identity of
@@ -1935,7 +1939,7 @@ export default function TalkScreen(props?: TalkScreenProps) {
                         styles.messageText,
                         isUser ? styles.userMessageText : styles.assistantMessageText,
                       ]}
-                      targetLanguage="Arabic"
+                      targetLanguage={inspectionTargetLanguage}
                       accessibilityLabel={`${isUser ? 'Your' : 'Tutor'} message — tap any word to look it up`}
                       onInspect={(prefill) => {
                         navigation.navigate('LearningTools', { inspect: prefill });

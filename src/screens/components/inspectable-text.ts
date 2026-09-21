@@ -64,6 +64,69 @@ export function inferInspectableItemType(selectedText: string): 'word' | 'phrase
 }
 
 /**
+ * The existing app-wide default translation target, used ONLY when the
+ * learner profile has no native language (see resolveTargetLanguage).
+ */
+export const DEFAULT_INSPECTION_TARGET_LANGUAGE = 'Arabic';
+
+/**
+ * ONE translation-target rule for every contextual entry point (Talk,
+ * Reading, Listening, Deep Listening): the learner profile's native language
+ * wins; the existing default applies only when it is unavailable.
+ */
+export function resolveTargetLanguage(
+  profileNativeLanguage: string | null | undefined,
+): string {
+  const native = profileNativeLanguage?.trim();
+  return native && native.length > 0 ? native : DEFAULT_INSPECTION_TARGET_LANGUAGE;
+}
+
+/**
+ * Builds the exact selected text for a CONTIGUOUS multi-word phrase inside
+ * one sentence, from the token index of the first tapped word to the token
+ * index of the last tapped word (in either tap order — the VISIBLE order is
+ * always preserved).
+ *
+ * The result is an exact substring of the sentence (and therefore of the
+ * full source text): only boundary punctuation is trimmed away, inner text
+ * and word order are never altered. Returns null for invalid indices or when
+ * nothing inspectable remains after trimming.
+ */
+export function selectInspectablePhraseRange(
+  sentence: string,
+  firstIndex: number,
+  lastIndex: number,
+): string | null {
+  const spans: { readonly start: number; readonly end: number }[] = [];
+  const re = /\S+/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(sentence)) !== null) {
+    spans.push({ start: match.index, end: match.index + match[0].length });
+  }
+  if (
+    spans.length === 0 ||
+    !Number.isInteger(firstIndex) ||
+    !Number.isInteger(lastIndex) ||
+    firstIndex < 0 ||
+    lastIndex < 0 ||
+    firstIndex >= spans.length ||
+    lastIndex >= spans.length
+  ) {
+    return null;
+  }
+  const lo = Math.min(firstIndex, lastIndex);
+  const hi = Math.max(firstIndex, lastIndex);
+  // Exact visible slice from the first selected word to the last one…
+  const raw = sentence.slice(spans[lo].start, spans[hi].end);
+  // …with ONLY boundary punctuation trimmed (same rule as single-word
+  // lookup), so the result stays an exact substring of the source.
+  const trimmed = raw
+    .replace(/^[^\p{L}\p{N}]+/u, '')
+    .replace(/[^\p{L}\p{N}'’-]+$/u, '');
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
  * Builds the Dictionary & Translate prefill for a tap inside content. The
  * selected text is passed through EXACTLY as extracted from the passage (it is
  * a substring of the source, which the inspector validates).

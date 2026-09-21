@@ -8,8 +8,11 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_INSPECTION_TARGET_LANGUAGE,
   buildInspectionPrefill,
   inferInspectableItemType,
+  resolveTargetLanguage,
+  selectInspectablePhraseRange,
   splitInspectableSentences,
   tokenizeInspectableSentence,
 } from './inspectable-text';
@@ -79,5 +82,120 @@ describe('inspectable text helpers', () => {
     });
     const roundTrip = JSON.parse(JSON.stringify(prefill));
     expect(roundTrip).toEqual({ ...prefill });
+  });
+});
+
+describe('multi-word phrase selection (tap start word, tap end word)', () => {
+  it('selects a two-word phrase exactly as displayed', () => {
+    // Tokens: She=0 broke=1 the=2 ice=3 with=4 a=5 joke.=6
+    expect(selectInspectablePhraseRange('She broke the ice with a joke.', 1, 2)).toBe(
+      'broke the',
+    );
+    expect(selectInspectablePhraseRange('She broke the ice with a joke.', 3, 4)).toBe(
+      'ice with',
+    );
+  });
+
+  it('selects a three-or-more-word expression', () => {
+    // "look" (0) → "to" (2) in: I look forward to your reply.
+    expect(selectInspectablePhraseRange('I look forward to your reply.', 1, 3)).toBe(
+      'look forward to',
+    );
+    // Longer span: "look forward to your reply" (1..4)
+    expect(selectInspectablePhraseRange('I look forward to your reply.', 1, 4)).toBe(
+      'look forward to your',
+    );
+  });
+
+  it('preserves the visible word order regardless of tap order', () => {
+    const sentence = 'She broke the ice with a joke.';
+    // Anchoring on "broke" (1) and ending on "ice" (3)…
+    expect(selectInspectablePhraseRange(sentence, 1, 3)).toBe('broke the ice');
+    // …or tapping them in the opposite order yields the SAME visible text.
+    expect(selectInspectablePhraseRange(sentence, 3, 1)).toBe('broke the ice');
+    expect(selectInspectablePhraseRange(sentence, 2, 1)).toBe(
+      selectInspectablePhraseRange(sentence, 1, 2),
+    );
+  });
+
+  it('boundary punctuation never corrupts the selected phrase', () => {
+    // Phrase ending on a comma/quote boundary: "break the ice," → ice
+    expect(selectInspectablePhraseRange('She said, "break the ice," warmly.', 2, 4)).toBe(
+      'break the ice',
+    );
+    // Phrase ending on the terminal period:
+    expect(selectInspectablePhraseRange('We met at dawn.', 2, 3)).toBe('at dawn');
+    // The result is ALWAYS an exact substring of the sentence:
+    const sentence = 'She said, "break the ice," warmly.';
+    const phrase = selectInspectablePhraseRange(sentence, 2, 4);
+    expect(phrase).not.toBeNull();
+    expect(sentence.includes(phrase as string)).toBe(true);
+  });
+
+  it('rejects invalid indices and punctuation-only spans', () => {
+    const sentence = 'Wait — really?';
+    expect(selectInspectablePhraseRange(sentence, 5, 6)).toBeNull();
+    expect(selectInspectablePhraseRange(sentence, -1, 1)).toBeNull();
+    expect(selectInspectablePhraseRange(sentence, 0, 99)).toBeNull();
+    // Span of ONLY punctuation tokens yields nothing inspectable:
+    expect(selectInspectablePhraseRange('Hmm — … ok', 1, 2)).toBeNull();
+  });
+
+  it('keeps single-word behavior unchanged (same-index span == token lookup)', () => {
+    const sentence = 'She said, "break the ice," warmly.';
+    const tokens = tokenizeInspectableSentence(sentence);
+    tokens.forEach((token, index) => {
+      if (token.lookup.length > 0) {
+        expect(selectInspectablePhraseRange(sentence, index, index)).toBe(token.lookup);
+      }
+    });
+  });
+
+  it('prefills a phrase with the containing sentence as context and phrase type', () => {
+    const fullText = 'The room was quiet. She broke the ice with a joke. Everyone laughed.';
+    const sentence = splitInspectableSentences(fullText)[1];
+    const selectedText = selectInspectablePhraseRange(sentence, 1, 3);
+    expect(selectedText).toBe('broke the ice');
+    const prefill = buildInspectionPrefill({
+      selectedText: selectedText as string,
+      sentence,
+      fullText,
+      targetLanguage: 'Spanish',
+    });
+    expect(prefill.selectedText).toBe('broke the ice');
+    expect(prefill.context).toBe('She broke the ice with a joke.');
+    expect(prefill.originalText).toBe(fullText);
+    expect(prefill.itemType).toBe('phrase');
+    expect(prefill.targetLanguage).toBe('Spanish');
+  });
+
+  it('keeps whole-sentence behavior unchanged (explicit sentence prefill)', () => {
+    const fullText = 'The room was quiet. She broke the ice with a joke.';
+    const sentence = splitInspectableSentences(fullText)[1];
+    const prefill = buildInspectionPrefill({
+      selectedText: sentence,
+      sentence,
+      fullText,
+      targetLanguage: 'Arabic',
+      itemType: 'sentence',
+    });
+    expect(prefill.itemType).toBe('sentence');
+    expect(prefill.selectedText).toBe('She broke the ice with a joke.');
+    expect(prefill.context).toBe(sentence);
+  });
+});
+
+describe('translation target resolution (one rule, everywhere)', () => {
+  it('uses the profile native language when available', () => {
+    expect(resolveTargetLanguage('Spanish')).toBe('Spanish');
+    expect(resolveTargetLanguage('French')).toBe('French');
+  });
+
+  it('falls back to the existing default only when unavailable', () => {
+    expect(resolveTargetLanguage(undefined)).toBe(DEFAULT_INSPECTION_TARGET_LANGUAGE);
+    expect(resolveTargetLanguage(null)).toBe(DEFAULT_INSPECTION_TARGET_LANGUAGE);
+    expect(resolveTargetLanguage('')).toBe(DEFAULT_INSPECTION_TARGET_LANGUAGE);
+    expect(resolveTargetLanguage('   ')).toBe(DEFAULT_INSPECTION_TARGET_LANGUAGE);
+    expect(DEFAULT_INSPECTION_TARGET_LANGUAGE).toBe('Arabic');
   });
 });

@@ -6,10 +6,14 @@
  *
  * Interaction (Package 2, C/D — smallest safe fallback, no fake native
  * selection): every word is a tap region. Tapping a word selects it and
- * reveals an explicit contextual action row ("Look up …" / "Translate the
- * whole sentence"). Only that action opens Dictionary & Translate, prefilled
- * through the pure helpers in ./inspectable-text. Nothing is inspected — and
- * no provider request is made — until the learner confirms the action.
+ * reveals an explicit contextual action row ("Meaning / Translate" /
+ * "Select phrase" / "Whole sentence"). "Select phrase" lets the learner
+ * extend the selection across adjacent words in the SAME sentence with a
+ * second tap — the contiguous words between the two taps become the
+ * selection, in exact visible order. Only the confirm action opens
+ * Dictionary & Translate, prefilled through the pure helpers in
+ * ./inspectable-text. Nothing is inspected — and no provider request is
+ * made — until the learner confirms the action.
  */
 
 import React, { useState } from 'react';
@@ -17,8 +21,10 @@ import { StyleSheet, Text, View } from 'react-native';
 import TouchableOpacity from './LearnerButton';
 import {
   buildInspectionPrefill,
+  selectInspectablePhraseRange,
   splitInspectableSentences,
   tokenizeInspectableSentence,
+  type InspectableToken,
   type InspectionPrefillParam,
 } from './inspectable-text';
 
@@ -46,9 +52,52 @@ export default function InspectableText({
   const [selection, setSelection] = useState<{
     readonly selectedText: string;
     readonly sentence: string;
+    /** Token index of the first (anchor) word of the selection. */
+    readonly firstIndex: number;
+    /** Token index of the last word of the selection. */
+    readonly lastIndex: number;
+    /** True while waiting for the second tap that ends a phrase. */
+    readonly extending: boolean;
   } | null>(null);
 
   const sentences = splitInspectableSentences(text);
+
+  /**
+   * Word tap. While extending, a tap inside the SAME sentence completes the
+   * contiguous phrase (in exact visible order, whatever the tap order);
+   * anywhere else it starts a fresh single-word selection.
+   */
+  const handleTokenPress = (sentence: string, index: number, token: InspectableToken): void => {
+    setSelection((current) => {
+      if (current?.extending && current.sentence === sentence) {
+        const phrase = selectInspectablePhraseRange(sentence, current.firstIndex, index);
+        if (phrase) {
+          return {
+            selectedText: phrase,
+            sentence,
+            firstIndex: current.firstIndex,
+            lastIndex: index,
+            extending: false,
+          };
+        }
+        return current;
+      }
+      return {
+        selectedText: token.lookup,
+        sentence,
+        firstIndex: index,
+        lastIndex: index,
+        extending: false,
+      };
+    });
+  };
+
+  const isSelectedToken = (sentence: string, index: number): boolean => {
+    if (!selection || selection.sentence !== sentence) return false;
+    const lo = Math.min(selection.firstIndex, selection.lastIndex);
+    const hi = Math.max(selection.firstIndex, selection.lastIndex);
+    return index >= lo && index <= hi;
+  };
 
   return (
     <View>
@@ -60,11 +109,11 @@ export default function InspectableText({
                 key={`${sentence.slice(0, 12)}-${index}-${token.display}`}
                 onPress={
                   token.lookup.length > 0
-                    ? () => setSelection({ selectedText: token.lookup, sentence })
+                    ? () => handleTokenPress(sentence, index, token)
                     : undefined
                 }
                 style={
-                  token.lookup.length > 0 && selection?.selectedText === token.lookup
+                  token.lookup.length > 0 && isSelectedToken(sentence, index)
                     ? styles.tokenSelected
                     : styles.token
                 }
@@ -81,26 +130,57 @@ export default function InspectableText({
       {selection && (
         <View style={styles.actionRow}>
           <Text style={styles.actionLabel} numberOfLines={1}>
-            “{selection.selectedText}”
+            {selection.extending
+              ? 'Tap the last word of the phrase…'
+              : `“${selection.selectedText}”`}
           </Text>
-          <TouchableOpacity
-            style={styles.actionButton}
-            onPress={() =>
-              onInspect(
-                buildInspectionPrefill({
-                  selectedText: selection.selectedText,
-                  sentence: selection.sentence,
-                  fullText: text,
-                  targetLanguage,
-                  ...(sourceRef ? { sourceRef } : {}),
-                }),
-              )
-            }
-            accessibilityRole="button"
-            accessibilityLabel={`Look up the meaning of ${selection.selectedText}`}
-          >
-            <Text style={styles.actionButtonText}>Meaning / Translate</Text>
-          </TouchableOpacity>
+          {!selection.extending && (
+            <TouchableOpacity
+              style={styles.actionButton}
+              onPress={() =>
+                onInspect(
+                  buildInspectionPrefill({
+                    selectedText: selection.selectedText,
+                    sentence: selection.sentence,
+                    fullText: text,
+                    targetLanguage,
+                    ...(sourceRef ? { sourceRef } : {}),
+                  }),
+                )
+              }
+              accessibilityRole="button"
+              accessibilityLabel={`Look up the meaning of ${selection.selectedText}`}
+            >
+              <Text style={styles.actionButtonText}>Meaning / Translate</Text>
+            </TouchableOpacity>
+          )}
+          {selection.extending ? (
+            <TouchableOpacity
+              style={styles.actionButtonSecondary}
+              onPress={() =>
+                setSelection((current) =>
+                  current ? { ...current, extending: false } : current,
+                )
+              }
+              accessibilityRole="button"
+              accessibilityLabel="Cancel phrase selection"
+            >
+              <Text style={styles.actionButtonTextSecondary}>Cancel</Text>
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity
+              style={styles.actionButtonSecondary}
+              onPress={() =>
+                setSelection((current) =>
+                  current ? { ...current, extending: true } : current,
+                )
+              }
+              accessibilityRole="button"
+              accessibilityLabel="Select phrase — tap the last word of the phrase"
+            >
+              <Text style={styles.actionButtonTextSecondary}>Select phrase</Text>
+            </TouchableOpacity>
+          )}
           <TouchableOpacity
             style={styles.actionButtonSecondary}
             onPress={() =>

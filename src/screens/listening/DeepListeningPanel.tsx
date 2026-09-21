@@ -2,6 +2,7 @@ import ProviderSettingsLink from '../components/ProviderSettingsLink';
 import { useVoiceAppStateGuard } from '../../voice/use-app-state-guard';
 import MicrophoneHelp from '../components/MicrophoneHelp';
 import InspectableText from '../components/InspectableText';
+import { useTargetLanguage } from '../components/use-target-language';
 import type { InspectionPrefillParam } from '../components/inspectable-text';
 import TouchableOpacity from '../components/LearnerButton';
 /**
@@ -135,6 +136,9 @@ async function resolveVoiceInput(
 
 export default function DeepListeningPanel(props: DeepListeningPanelProps): React.ReactElement {
   const { service, onExit } = props;
+  // Translation target for transcript inspection: the learner profile's
+  // native language when available, otherwise the existing app default.
+  const inspectionTargetLanguage = useTargetLanguage();
 
   const [activities, setActivities] = useState<readonly DeepListeningActivity[]>([]);
   const [sourceNote, setSourceNote] = useState<string>('');
@@ -754,7 +758,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
                   <InspectableText
                     text={readable}
                     textStyle={styles.transcriptText}
-                    targetLanguage="Arabic"
+                    targetLanguage={inspectionTargetLanguage}
                     accessibilityLabel="Transcript — tap any word to look it up"
                     onInspect={props.onInspectText}
                   />
@@ -972,7 +976,7 @@ export default function DeepListeningPanel(props: DeepListeningPanelProps): Reac
                       <InspectableText
                         text={revealed}
                         textStyle={styles.transcriptText}
-                        targetLanguage="Arabic"
+                        targetLanguage={inspectionTargetLanguage}
                         accessibilityLabel="Revealed transcript — tap any word to look it up"
                         onInspect={props.onInspectText}
                       />
